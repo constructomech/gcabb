@@ -1,14 +1,20 @@
-use std::ops::Range;
+use std::{
+    ops::Range,
+    time::{Duration, Instant},
+};
 
 use gpui::{
     App, Bounds, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, IntoElement,
     LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, Render, ShapedLine, SharedString,
-    Style, TextRun, UTF16Selection, Window, actions, div, fill, point, prelude::*, px, relative,
-    rgb, size,
+    Style, Task, TextRun, Timer, UTF16Selection, Window, actions, div, fill, point, prelude::*, px,
+    relative, rgb, size,
 };
 
 actions!(text_input, [Backspace, Submit, Paste, SelectAll]);
+
+const CURSOR_BLINK_INTERVAL: Duration = Duration::from_millis(530);
+const CURSOR_BLINK_TICK: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug)]
 pub struct InputSubmitted {
@@ -22,11 +28,33 @@ pub struct TextInput {
     selected_range: Range<usize>,
     marked_range: Option<Range<usize>>,
     last_layout: Option<ShapedLine>,
+    cursor_visible: bool,
+    cursor_blink_started_at: Instant,
+    _cursor_blink_task: Task<()>,
 }
 
 impl TextInput {
     #[must_use]
     pub fn new(cx: &mut Context<Self>, placeholder: impl Into<SharedString>) -> Self {
+        let cursor_blink_task = cx.spawn(async move |input, cx| {
+            loop {
+                Timer::after(CURSOR_BLINK_TICK).await;
+                if input
+                    .update(cx, |input, cx| {
+                        let elapsed = input.cursor_blink_started_at.elapsed();
+                        let visible = (elapsed.as_millis() / CURSOR_BLINK_INTERVAL.as_millis())
+                            .is_multiple_of(2);
+                        if visible != input.cursor_visible {
+                            input.cursor_visible = visible;
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
         Self {
             focus_handle: cx.focus_handle(),
             content: "".into(),
@@ -34,6 +62,9 @@ impl TextInput {
             selected_range: 0..0,
             marked_range: None,
             last_layout: None,
+            cursor_visible: true,
+            cursor_blink_started_at: Instant::now(),
+            _cursor_blink_task: cursor_blink_task,
         }
     }
 
@@ -45,6 +76,7 @@ impl TextInput {
     pub fn set_value(&mut self, value: impl Into<SharedString>, cx: &mut Context<Self>) {
         self.content = value.into();
         self.selected_range = self.content.len()..self.content.len();
+        self.reset_cursor_blink();
         cx.notify();
     }
 
@@ -78,13 +110,20 @@ impl TextInput {
 
     fn select_all(&mut self, _: &SelectAll, _: &mut Window, cx: &mut Context<Self>) {
         self.selected_range = 0..self.content.len();
+        self.reset_cursor_blink();
         cx.notify();
     }
 
     fn on_mouse_down(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
         window.focus(&self.focus_handle);
         self.selected_range = self.content.len()..self.content.len();
+        self.reset_cursor_blink();
         cx.notify();
+    }
+
+    fn reset_cursor_blink(&mut self) {
+        self.cursor_visible = true;
+        self.cursor_blink_started_at = Instant::now();
     }
 
     fn offset_from_utf16(&self, offset: usize) -> usize {
@@ -185,6 +224,7 @@ impl EntityInputHandler for TextInput {
         let cursor = range.start + new_text.len();
         self.selected_range = cursor..cursor;
         self.marked_range = None;
+        self.reset_cursor_blink();
         cx.notify();
     }
 
@@ -309,11 +349,11 @@ impl Element for TextElement {
             .text_system()
             .shape_line(display_text, font_size, &[run], None);
         let cursor_x = line.x_for_index(input.selected_range.end);
-        let cursor = input.focus_handle.is_focused(window).then(|| {
+        let cursor = (input.focus_handle.is_focused(window) && input.cursor_visible).then(|| {
             fill(
                 Bounds::new(
                     point(bounds.left() + cursor_x, bounds.top()),
-                    size(px(1.), bounds.size.height),
+                    size(px(1.5), bounds.size.height),
                 ),
                 rgb(0x6b_a6ff),
             )
