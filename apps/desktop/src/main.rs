@@ -674,13 +674,6 @@ impl SessionMvpView {
         cx.notify();
     }
 
-    fn use_suggestion(&mut self, prompt: &'static str, cx: &mut Context<Self>) {
-        self.composer.update(cx, |input, cx| {
-            input.set_value(prompt, cx);
-        });
-        cx.notify();
-    }
-
     fn submit_composer(&mut self, cx: &mut Context<Self>) {
         let prompt = self.composer.read(cx).value();
         let prompt = prompt.trim();
@@ -1667,26 +1660,8 @@ impl SessionMvpView {
             )
     }
 
-    #[allow(clippy::too_many_lines)]
     fn home(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let (provider_status, provider_color) = self.provider_status();
-        let suggestions = [
-            (
-                "suggestion-security",
-                "Scan for security vulnerabilities and fix them.",
-                "Security",
-            ),
-            (
-                "suggestion-maintenance",
-                "Upgrade outdated dependencies and fix breaking changes.",
-                "Maintenance",
-            ),
-            (
-                "suggestion-release",
-                "Generate a changelog from recent commits grouped by type.",
-                "Release",
-            ),
-        ];
 
         div()
             .id("home")
@@ -1738,62 +1713,7 @@ impl SessionMvpView {
                             .font_weight(gpui::FontWeight::BOLD)
                             .child("GC"),
                     )
-                    .child(self.home_composer(cx))
-                    .child(
-                        div()
-                            .id("suggestions")
-                            .role(Role::List)
-                            .aria_label("Suggested tasks")
-                            .w_full()
-                            .max_w(px(820.0))
-                            .mt_10()
-                            .flex()
-                            .gap_3()
-                            .when(compact, gpui::Styled::flex_col)
-                            .children(suggestions.into_iter().map(|(id, prompt, category)| {
-                                suggestion_card(id, prompt, category, cx)
-                            })),
-                    )
-                    .when(!compact, |content| {
-                        content.child(
-                            div()
-                                .id("up-next")
-                                .role(Role::Group)
-                                .aria_label("Up next, no pending items")
-                                .w_full()
-                                .max_w(px(820.0))
-                                .mt_10()
-                                .flex()
-                                .flex_col()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_lg()
-                                        .font_weight(gpui::FontWeight::SEMIBOLD)
-                                        .child("Up next"),
-                                )
-                                .child(
-                                    div()
-                                        .text_sm()
-                                        .text_color(rgb(MUTED))
-                                        .child("No pending pull requests or issues in this build."),
-                                )
-                                .child(
-                                    div()
-                                        .mt_2()
-                                        .h(px(92.0))
-                                        .rounded_lg()
-                                        .border_1()
-                                        .border_color(rgb(BORDER))
-                                        .flex()
-                                        .items_center()
-                                        .justify_center()
-                                        .text_sm()
-                                        .text_color(rgb(MUTED))
-                                        .child("You're all caught up"),
-                                ),
-                        )
-                    }),
+                    .child(self.home_composer(cx)),
             )
     }
 
@@ -2150,41 +2070,6 @@ fn disabled_destination(
         .child(label)
         .child(div().flex_1())
         .child(div().text_xs().child("Unavailable"))
-}
-
-fn suggestion_card(
-    id: &'static str,
-    prompt: &'static str,
-    category: &'static str,
-    cx: &mut Context<SessionMvpView>,
-) -> impl IntoElement + use<> {
-    semantic_button(
-        id,
-        format!("Use suggestion: {prompt}"),
-        cx.listener(move |view, _, _, cx| {
-            view.use_suggestion(prompt, cx);
-        }),
-    )
-    .flex()
-    .flex_col()
-    .flex_1()
-    .min_w_0()
-    .min_h(px(104.0))
-    .justify_between()
-    .gap_4()
-    .p_4()
-    .rounded_lg()
-    .border_1()
-    .border_color(rgb(BORDER))
-    .bg(rgb(PANEL))
-    .hover(|style| {
-        style
-            .bg(rgb(SUBTLE))
-            .border_color(rgb(MUTED))
-            .cursor_pointer()
-    })
-    .child(div().text_sm().child(prompt))
-    .child(div().text_sm().text_color(rgb(MUTED)).child(category))
 }
 
 fn compact_layout(width: f32) -> bool {

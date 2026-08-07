@@ -22,7 +22,7 @@ The application shell and session surface expose:
 - SDK-backed mode and model selectors with expanded state and labelled option
   lists; reasoning effort appears only when the selected model reports supported
   levels.
-- Suggestion, submit, session, and interaction buttons with press actions.
+- Submit, session, and interaction buttons with press actions.
 - Permission and input dialogs.
 - Tab and Shift-Tab focus traversal.
 
@@ -37,7 +37,7 @@ The atlas-aligned application was inspected through `AXUIElement` on 2026-08-07.
 macOS reported named application, navigation, list, image, status, text-field,
 and button nodes. `AXPress` opened the mode, model, and effort option lists,
 selected Plan, GPT-5.6 Sol, and High, collapsed and reopened the sidebar, and
-inserted a suggestion into the text field without submitting a prompt.
+verified the composer without submitting a prompt.
 
 New UI components should receive a lightweight AX/AccessKit interaction contract
 covering role, label, value or state, stable identity, keyboard focus, and
