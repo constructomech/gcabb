@@ -11,6 +11,7 @@ copilot-provider.workspace = true
 diagnostics.workspace = true
 dirs.workspace = true
 gpui.workspace = true
+gpui_platform.workspace = true
 session-manager.workspace = true
 storage.workspace = true
 tokio.workspace = true

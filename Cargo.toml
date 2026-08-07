@@ -9,13 +9,14 @@ members = [
     "crates/storage",
     "crates/test-harness",
     "crates/ui-components",
+    "crates/ztracing-compat",
 ]
 resolver = "2"
 
 [workspace.package]
 edition = "2024"
 license = "MIT"
-rust-version = "1.94"
+rust-version = "1.95"
 version = "0.1.0"
 
 [workspace.dependencies]
@@ -27,7 +28,8 @@ copilot-provider = { path = "crates/copilot-provider" }
 diagnostics = { path = "crates/diagnostics" }
 dirs = "5.0.1"
 github-copilot-sdk = "=1.0.9"
-gpui = { version = "=0.2.2", default-features = false, features = ["font-kit", "windows-manifest"] }
+gpui = { git = "https://github.com/zed-industries/zed", rev = "027cf0def75e5c027504f402a6a6c0dcac11f178", default-features = false }
+gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "027cf0def75e5c027504f402a6a6c0dcac11f178", features = ["font-kit", "wayland", "x11"] }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
@@ -40,6 +42,9 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 uuid = { version = "1.24.0", features = ["serde", "v4"] }
 ui-components = { path = "crates/ui-components" }
+
+[patch."https://github.com/zed-industries/zed"]
+ztracing = { path = "crates/ztracing-compat" }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

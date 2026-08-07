@@ -4,11 +4,11 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
+    App, Bounds, ClickEvent, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, IntoElement,
-    LayoutId, MouseButton, MouseDownEvent, PaintQuad, Pixels, Render, ShapedLine, SharedString,
-    Style, Task, TextRun, Timer, UTF16Selection, Window, actions, div, fill, point, prelude::*, px,
-    relative, rgb, size,
+    LayoutId, PaintQuad, Pixels, Render, Role, ShapedLine, SharedString, Style, Task, TextAlign,
+    TextRun, Timer, UTF16Selection, Window, actions, div, fill, point, prelude::*, px, relative,
+    rgb, size,
 };
 
 actions!(text_input, [Backspace, Submit, Paste, SelectAll]);
@@ -22,6 +22,7 @@ pub struct InputSubmitted {
 }
 
 pub struct TextInput {
+    accessibility_id: SharedString,
     focus_handle: FocusHandle,
     content: SharedString,
     placeholder: SharedString,
@@ -35,7 +36,11 @@ pub struct TextInput {
 
 impl TextInput {
     #[must_use]
-    pub fn new(cx: &mut Context<Self>, placeholder: impl Into<SharedString>) -> Self {
+    pub fn new(
+        cx: &mut Context<Self>,
+        accessibility_id: impl Into<SharedString>,
+        placeholder: impl Into<SharedString>,
+    ) -> Self {
         let cursor_blink_task = cx.spawn(async move |input, cx| {
             loop {
                 Timer::after(CURSOR_BLINK_TICK).await;
@@ -56,6 +61,7 @@ impl TextInput {
             }
         });
         Self {
+            accessibility_id: accessibility_id.into(),
             focus_handle: cx.focus_handle(),
             content: "".into(),
             placeholder: placeholder.into(),
@@ -114,8 +120,8 @@ impl TextInput {
         cx.notify();
     }
 
-    fn on_mouse_down(&mut self, _: &MouseDownEvent, window: &mut Window, cx: &mut Context<Self>) {
-        window.focus(&self.focus_handle);
+    fn on_click(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        window.focus(&self.focus_handle, cx);
         self.selected_range = self.content.len()..self.content.len();
         self.reset_cursor_blink();
         cx.notify();
@@ -381,8 +387,15 @@ impl Element for TextElement {
             cx,
         );
         let line = prepaint.line.take().expect("prepaint creates a line");
-        line.paint(bounds.origin, window.line_height(), window, cx)
-            .expect("text paint should succeed");
+        line.paint(
+            bounds.origin,
+            window.line_height(),
+            TextAlign::Left,
+            None,
+            window,
+            cx,
+        )
+        .expect("text paint should succeed");
         if let Some(cursor) = prepaint.cursor.take() {
             window.paint_quad(cursor);
         }
@@ -395,6 +408,14 @@ impl Element for TextElement {
 impl Render for TextInput {
     fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         div()
+            .id(self.accessibility_id.clone())
+            .accessibility_id(self.accessibility_id.clone())
+            .role(Role::TextInput)
+            .aria_label(self.placeholder.clone())
+            .aria_placeholder(self.placeholder.clone())
+            .aria_value(self.content.clone())
+            .focusable()
+            .tab_stop(true)
             .flex()
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))
@@ -403,7 +424,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::submit))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::select_all))
-            .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
+            .on_click(cx.listener(Self::on_click))
             .w_full()
             .p_3()
             .line_height(px(22.))

@@ -1,5 +1,8 @@
 # Phase 0 Feasibility Report
 
+> Historical Phase 0 baseline. GPUI was subsequently upgraded to Zed commit
+> `027cf0de` with `gpui_platform` and AccessKit support.
+
 Date: 2026-08-06
 
 ## Outcome

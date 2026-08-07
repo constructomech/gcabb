@@ -106,7 +106,7 @@ selectable.
 
 | Area | Choice |
 | --- | --- |
-| Native UI | GPUI with `gpui_platform` |
+| Native UI | GPUI and `gpui_platform` pinned to Zed commit `027cf0de` |
 | Async runtime | Tokio |
 | Copilot runtime | `github-copilot-sdk` |
 | Persistence | SQLite in WAL mode |

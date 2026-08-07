@@ -1,5 +1,9 @@
 # SDK and CLI Compatibility
 
+> Historical Phase 0 baseline. The application now uses Rust 1.95 and pins GPUI
+> plus `gpui_platform` to Zed commit `027cf0de` for AccessKit support. SDK and CLI
+> versions below remain the verified runtime combination.
+
 ## Verified combination
 
 | Component | Version |

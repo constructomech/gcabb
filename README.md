@@ -56,7 +56,7 @@ The repository retains the executable SDK feasibility probe:
   session lifecycle and typed RPCs, and writes raw plus normalized events as
   JSON Lines.
 
-Rust 1.94 is pinned in `rust-toolchain.toml`.
+Rust 1.95 is pinned in `rust-toolchain.toml`.
 
 ```sh
 # Lifecycle and capability smoke test; no model prompt is sent.
