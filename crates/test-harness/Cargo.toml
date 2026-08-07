@@ -6,6 +6,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+app-model.workspace = true
 async-trait.workspace = true
 copilot-provider.workspace = true
 serde_json.workspace = true
@@ -14,4 +15,3 @@ tokio.workspace = true
 
 [lints]
 workspace = true
-

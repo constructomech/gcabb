@@ -441,6 +441,8 @@ Exit criteria:
 
 ### Phase 2: Session MVP (2 weeks)
 
+Status: implemented; UX hardening continues with later phases.
+
 - Project and session list.
 - Create, resume, close, and cancel.
 - Prompt composer, streaming transcript, model, mode, and effort controls.

@@ -6,6 +6,7 @@ rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+app-model.workspace = true
 async-trait.workspace = true
 diagnostics.workspace = true
 github-copilot-sdk.workspace = true
@@ -14,6 +15,7 @@ serde_json.workspace = true
 thiserror.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
 
 [lints]
 workspace = true

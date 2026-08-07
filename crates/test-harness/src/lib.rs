@@ -3,13 +3,14 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
+use app_model::{InteractionRequest, InteractionResponse, SessionControls};
 use async_trait::async_trait;
 use copilot_provider::{
-    AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderSession, Result,
-    SDK_CRATE_VERSION, SessionRequest,
+    AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderInteraction,
+    ProviderSession, Result, SDK_CRATE_VERSION, SessionRequest,
 };
 use serde_json::Value;
-use tokio::sync::{Mutex, mpsc};
+use tokio::sync::{Mutex, mpsc, oneshot};
 
 pub const GOLDEN_SESSION_EVENTS: &str = include_str!("../fixtures/session-events.json");
 
@@ -20,6 +21,7 @@ pub struct FakeProvider {
     script: Mutex<Vec<Value>>,
     history: Mutex<HashMap<String, Vec<Value>>>,
     live: Mutex<HashMap<String, mpsc::Sender<ProviderEvent>>>,
+    interactions: Mutex<HashMap<String, mpsc::Sender<ProviderInteraction>>>,
     fail_resume: AtomicBool,
     fail_history: AtomicBool,
 }
@@ -49,6 +51,26 @@ impl FakeProvider {
         self.live.lock().await.len()
     }
 
+    pub async fn request_interaction(
+        &self,
+        sdk_session_id: &str,
+        request: InteractionRequest,
+    ) -> Result<oneshot::Receiver<InteractionResponse>> {
+        let sender = self
+            .interactions
+            .lock()
+            .await
+            .get(sdk_session_id)
+            .cloned()
+            .ok_or_else(|| ProviderError::SessionNotFound(sdk_session_id.to_owned()))?;
+        let (response, receiver) = oneshot::channel();
+        sender
+            .send(ProviderInteraction { request, response })
+            .await
+            .map_err(|_| ProviderError::Sdk("fake interaction receiver closed".to_owned()))?;
+        Ok(receiver)
+    }
+
     pub async fn emit(&self, sdk_session_id: &str, event: Value) -> Result<()> {
         self.history
             .lock()
@@ -71,13 +93,19 @@ impl FakeProvider {
 
     async fn connect(&self, sdk_session_id: String) -> ProviderSession {
         let (sender, events) = mpsc::channel(128);
+        let (interaction_sender, interactions) = mpsc::channel(16);
         self.live
             .lock()
             .await
             .insert(sdk_session_id.clone(), sender);
+        self.interactions
+            .lock()
+            .await
+            .insert(sdk_session_id.clone(), interaction_sender);
         ProviderSession {
             sdk_session_id,
             events,
+            interactions,
         }
     }
 }
@@ -98,6 +126,7 @@ impl AgentProvider for FakeProvider {
     async fn stop(&self) -> Result<()> {
         self.started.store(false, Ordering::SeqCst);
         self.live.lock().await.clear();
+        self.interactions.lock().await.clear();
         Ok(())
     }
 
@@ -161,12 +190,29 @@ impl AgentProvider for FakeProvider {
             .ok_or_else(|| ProviderError::SessionNotFound(sdk_session_id.to_owned()))
     }
 
+    async fn controls(&self, _sdk_session_id: &str) -> Result<SessionControls> {
+        Ok(SessionControls::default())
+    }
+
+    async fn set_model(&self, _sdk_session_id: &str, _model: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn set_mode(&self, _sdk_session_id: &str, _mode: &str) -> Result<()> {
+        Ok(())
+    }
+
+    async fn set_reasoning_effort(&self, _sdk_session_id: &str, _effort: &str) -> Result<()> {
+        Ok(())
+    }
+
     async fn disconnect(&self, sdk_session_id: &str) -> Result<()> {
         self.live
             .lock()
             .await
             .remove(sdk_session_id)
             .ok_or_else(|| ProviderError::SessionNotFound(sdk_session_id.to_owned()))?;
+        self.interactions.lock().await.remove(sdk_session_id);
         Ok(())
     }
 }

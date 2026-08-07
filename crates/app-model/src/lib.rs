@@ -53,6 +53,76 @@ pub enum SessionStatus {
     Disconnected,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptRole {
+    User,
+    Assistant,
+    System,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TranscriptState {
+    Streaming,
+    Complete,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct TranscriptMessage {
+    pub id: String,
+    pub role: TranscriptRole,
+    pub content: String,
+    pub state: TranscriptState,
+    pub timestamp: String,
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum InteractionKind {
+    Permission,
+    Elicitation,
+    UserInput,
+    ExitPlanMode,
+    AutoModeSwitch,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct InteractionRequest {
+    pub id: String,
+    pub session_id: String,
+    pub kind: InteractionKind,
+    pub title: String,
+    pub message: String,
+    pub choices: Vec<String>,
+    pub allow_freeform: bool,
+    pub details: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+#[serde(tag = "type", rename_all = "snake_case")]
+pub enum InteractionResponse {
+    Approve,
+    Reject { feedback: Option<String> },
+    Submit { value: Value, freeform: bool },
+    Cancel,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct SessionControls {
+    pub model: Option<String>,
+    pub mode: Option<String>,
+    pub reasoning_effort: Option<String>,
+    pub available_models: Vec<ModelOption>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ModelOption {
+    pub id: String,
+    pub name: String,
+    pub supported_reasoning_efforts: Vec<String>,
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionMetadata {
     pub id: String,
@@ -63,6 +133,15 @@ pub struct SessionMetadata {
     pub mode: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ProjectMetadata {
+    pub id: String,
+    pub path: String,
+    pub name: String,
+    pub default_branch: Option<String>,
+    pub last_opened_at: String,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -121,6 +200,12 @@ pub struct SessionSnapshot {
     pub status: SessionStatus,
     pub last_sequence: u64,
     pub activities: Vec<DomainEvent>,
+    #[serde(default)]
+    pub transcript: Vec<TranscriptMessage>,
+    #[serde(default)]
+    pub pending_interactions: Vec<InteractionRequest>,
+    #[serde(default)]
+    pub controls: SessionControls,
     pub last_error: Option<String>,
     #[serde(skip)]
     seen_event_ids: HashSet<String>,
@@ -129,12 +214,20 @@ pub struct SessionSnapshot {
 impl SessionSnapshot {
     #[must_use]
     pub fn new(metadata: SessionMetadata) -> Self {
+        let controls = SessionControls {
+            model: metadata.model.clone(),
+            mode: metadata.mode.clone(),
+            ..SessionControls::default()
+        };
         Self {
             version: SNAPSHOT_VERSION,
             metadata,
             status: SessionStatus::Starting,
             last_sequence: 0,
             activities: Vec::new(),
+            transcript: Vec::new(),
+            pending_interactions: Vec::new(),
+            controls,
             last_error: None,
             seen_event_ids: HashSet::new(),
         }
@@ -160,7 +253,17 @@ impl SessionSnapshot {
         }
 
         self.last_sequence = event.sequence;
-        self.status = status_for_event(&event);
+        let event_status = status_for_event(&event);
+        self.status = if self.pending_interactions.is_empty()
+            || matches!(
+                event_status,
+                SessionStatus::Failed | SessionStatus::Cancelled | SessionStatus::Disconnected
+            ) {
+            event_status
+        } else {
+            SessionStatus::Waiting
+        };
+        project_transcript(&mut self.transcript, &event);
         if self.status == SessionStatus::Failed {
             self.last_error = Some(event.summary.clone());
         }
@@ -172,6 +275,27 @@ impl SessionSnapshot {
     #[must_use]
     pub fn immutable(self) -> Arc<Self> {
         Arc::new(self)
+    }
+
+    pub fn add_interaction(&mut self, request: InteractionRequest) {
+        if !self
+            .pending_interactions
+            .iter()
+            .any(|pending| pending.id == request.id)
+        {
+            self.pending_interactions.push(request);
+            self.status = SessionStatus::Waiting;
+        }
+    }
+
+    pub fn remove_interaction(&mut self, interaction_id: &str) -> bool {
+        let original_len = self.pending_interactions.len();
+        self.pending_interactions
+            .retain(|request| request.id != interaction_id);
+        if self.pending_interactions.is_empty() && self.status == SessionStatus::Waiting {
+            self.status = SessionStatus::Running;
+        }
+        self.pending_interactions.len() != original_len
     }
 }
 
@@ -203,6 +327,7 @@ fn status_for_event(event: &DomainEvent) -> SessionStatus {
             SessionStatus::Idle
         };
     }
+
     if event.source_type.ends_with(".requested") {
         return SessionStatus::Waiting;
     }
@@ -214,6 +339,96 @@ fn status_for_event(event: &DomainEvent) -> SessionStatus {
             SessionStatus::Running
         }
     }
+}
+
+fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEvent) {
+    if event.agent_id.is_some()
+        || event
+            .details
+            .get("parentToolCallId")
+            .is_some_and(|value| !value.is_null())
+    {
+        return;
+    }
+    match event.source_type.as_str() {
+        "user.message" => {
+            let content = event
+                .details
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if !content.is_empty() {
+                transcript.push(TranscriptMessage {
+                    id: event.id.clone(),
+                    role: TranscriptRole::User,
+                    content: content.to_owned(),
+                    state: TranscriptState::Complete,
+                    timestamp: event.timestamp.clone(),
+                });
+            }
+        }
+        "assistant.message_start" => {
+            let id = message_id(event);
+            if !transcript.iter().any(|message| message.id == id) {
+                transcript.push(TranscriptMessage {
+                    id,
+                    role: TranscriptRole::Assistant,
+                    content: String::new(),
+                    state: TranscriptState::Streaming,
+                    timestamp: event.timestamp.clone(),
+                });
+            }
+        }
+        "assistant.message_delta" => {
+            let id = message_id(event);
+            let delta = event
+                .details
+                .get("deltaContent")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(message) = transcript.iter_mut().find(|message| message.id == id) {
+                message.content.push_str(delta);
+            } else {
+                transcript.push(TranscriptMessage {
+                    id,
+                    role: TranscriptRole::Assistant,
+                    content: delta.to_owned(),
+                    state: TranscriptState::Streaming,
+                    timestamp: event.timestamp.clone(),
+                });
+            }
+        }
+        "assistant.message" => {
+            let id = message_id(event);
+            let content = event
+                .details
+                .get("content")
+                .and_then(Value::as_str)
+                .unwrap_or_default();
+            if let Some(message) = transcript.iter_mut().find(|message| message.id == id) {
+                content.clone_into(&mut message.content);
+                message.state = TranscriptState::Complete;
+            } else if !content.is_empty() {
+                transcript.push(TranscriptMessage {
+                    id,
+                    role: TranscriptRole::Assistant,
+                    content: content.to_owned(),
+                    state: TranscriptState::Complete,
+                    timestamp: event.timestamp.clone(),
+                });
+            }
+        }
+        _ => {}
+    }
+}
+
+fn message_id(event: &DomainEvent) -> String {
+    event
+        .details
+        .get("messageId")
+        .and_then(Value::as_str)
+        .unwrap_or(&event.id)
+        .to_owned()
 }
 
 fn string_field(value: &Value, field: &str) -> Option<String> {
@@ -397,5 +612,66 @@ mod tests {
 
         assert_eq!(failed.state, ActivityState::Failed);
         assert_eq!(aborted.state, ActivityState::Cancelled);
+    }
+
+    #[test]
+    fn transcript_coalesces_streaming_deltas_and_ignores_subagents() {
+        let mut state = SessionSnapshot::new(metadata());
+        let events = [
+            json!({"id":"u","type":"user.message","data":{"content":"hello"}}),
+            json!({"id":"s","type":"assistant.message_start","data":{"messageId":"m"}}),
+            json!({"id":"d1","type":"assistant.message_delta","data":{"messageId":"m","deltaContent":"hi "}}),
+            json!({"id":"d2","type":"assistant.message_delta","data":{"messageId":"m","deltaContent":"there"}}),
+            json!({"id":"f","type":"assistant.message","data":{"messageId":"m","content":"hi there"}}),
+            json!({"id":"nested","agentId":"agent-1","type":"assistant.message","data":{"messageId":"n","content":"hidden"}}),
+        ];
+        for (index, raw) in events.iter().enumerate() {
+            let event = DomainEvent::from_sdk_event_for("app-session", index as u64 + 1, raw);
+            assert_eq!(state.apply(event), ApplyOutcome::Applied);
+        }
+
+        assert_eq!(state.transcript.len(), 2);
+        assert_eq!(state.transcript[0].role, TranscriptRole::User);
+        assert_eq!(state.transcript[1].content, "hi there");
+        assert_eq!(state.transcript[1].state, TranscriptState::Complete);
+    }
+
+    #[test]
+    fn pending_interactions_are_idempotent_and_removable() {
+        let mut state = SessionSnapshot::new(metadata());
+        let request = InteractionRequest {
+            id: "permission-1".to_owned(),
+            session_id: "app-session".to_owned(),
+            kind: InteractionKind::Permission,
+            title: "Permission required".to_owned(),
+            message: "Run command?".to_owned(),
+            choices: Vec::new(),
+            allow_freeform: false,
+            details: Value::Null,
+        };
+
+        state.add_interaction(request.clone());
+        state.add_interaction(request);
+        assert_eq!(state.pending_interactions.len(), 1);
+        assert_eq!(state.status, SessionStatus::Waiting);
+        assert!(state.remove_interaction("permission-1"));
+        assert!(state.pending_interactions.is_empty());
+    }
+
+    #[test]
+    fn phase_one_snapshots_gain_phase_two_defaults() {
+        let snapshot: SessionSnapshot = serde_json::from_value(json!({
+            "version": 1,
+            "metadata": metadata(),
+            "status": "idle",
+            "last_sequence": 0,
+            "activities": [],
+            "last_error": null
+        }))
+        .unwrap();
+
+        assert!(snapshot.transcript.is_empty());
+        assert!(snapshot.pending_interactions.is_empty());
+        assert_eq!(snapshot.controls, SessionControls::default());
     }
 }

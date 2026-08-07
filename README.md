@@ -25,21 +25,17 @@ session projection, but GCABB is a new application rather than a Zed fork.
 
 See [plan.md](plan.md) for the current architecture and implementation roadmap.
 
-## Current foundation
+## Current Session MVP
 
-Phase 1 turns the feasibility spike into production-shaped application
-boundaries:
+Phase 2 provides an end-to-end native session workflow:
 
-- `app-model` owns versioned events, deterministic reducers, and immutable
-  snapshots.
-- `copilot-provider` isolates the official SDK and checks protocol
-  compatibility.
-- `session-manager` runs one serial actor per active session.
-- `storage` persists metadata, events, and snapshots in SQLite WAL mode.
-- `diagnostics` provides structured, redacted tracing.
-- `test-harness` supplies a deterministic fake provider and golden fixtures.
-- `gcabb-desktop` starts recovery off the UI thread and renders immutable session
-  projections.
+- Persisted project and session navigation.
+- Create, resume, close, cancel, and switch between background sessions.
+- Native prompt composer and streaming transcript.
+- Model, mode, and reasoning-effort controls.
+- Permission, elicitation, user-input, plan-exit, and mode-switch dialogs.
+- Worktree branch and Copilot process-health indicators.
+- SQLite-backed selected-session restoration.
 
 ```sh
 source "$HOME/.cargo/env"
@@ -48,6 +44,9 @@ cargo run -p gcabb-desktop
 
 Set `GCABB_DATA_DIR` to isolate the application database during development.
 Without it, GCABB uses the operating system's local application-data directory.
+
+See [`docs/phase-2/`](docs/phase-2/) for the implemented interaction model and
+validation coverage.
 
 ## Phase 0 probe
 

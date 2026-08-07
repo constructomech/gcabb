@@ -3,12 +3,12 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use app_model::{DomainEvent, SessionMetadata, SessionSnapshot, rebuild};
+use app_model::{DomainEvent, ProjectMetadata, SessionMetadata, SessionSnapshot, rebuild};
 use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 1;
+const SCHEMA_VERSION: i64 = 2;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -84,6 +84,73 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    pub fn upsert_project(&self, project: &ProjectMetadata) -> Result<()> {
+        self.connection()?.execute(
+            "INSERT INTO projects (id, path, name, default_branch, last_opened_at)
+             VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                path = excluded.path,
+                name = excluded.name,
+                default_branch = excluded.default_branch,
+                last_opened_at = excluded.last_opened_at",
+            params![
+                project.id,
+                project.path,
+                project.name,
+                project.default_branch,
+                project.last_opened_at,
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_projects(&self) -> Result<Vec<ProjectMetadata>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, path, name, default_branch, last_opened_at
+             FROM projects ORDER BY last_opened_at DESC, name",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ProjectMetadata {
+                id: row.get(0)?,
+                path: row.get(1)?,
+                name: row.get(2)?,
+                default_branch: row.get(3)?,
+                last_opened_at: row.get(4)?,
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    pub fn set_selected_session(&self, session_id: Option<&str>) -> Result<()> {
+        match session_id {
+            Some(session_id) => {
+                self.connection()?.execute(
+                    "INSERT INTO app_state (key, value) VALUES ('selected_session', ?1)
+                     ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+                    [session_id],
+                )?;
+            }
+            None => {
+                self.connection()?
+                    .execute("DELETE FROM app_state WHERE key = 'selected_session'", [])?;
+            }
+        }
+        Ok(())
+    }
+
+    pub fn selected_session(&self) -> Result<Option<String>> {
+        self.connection()?
+            .query_row(
+                "SELECT value FROM app_state WHERE key = 'selected_session'",
+                [],
+                |row| row.get(0),
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>> {
@@ -206,7 +273,18 @@ impl Storage {
         let mut connection = self.connection()?;
         let transaction = connection.transaction()?;
         transaction.execute_batch(
-            "CREATE TABLE IF NOT EXISTS app_sessions (
+            "CREATE TABLE IF NOT EXISTS projects (
+                id TEXT PRIMARY KEY,
+                path TEXT NOT NULL UNIQUE,
+                name TEXT NOT NULL,
+                default_branch TEXT,
+                last_opened_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS app_state (
+                key TEXT PRIMARY KEY,
+                value TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS app_sessions (
                 id TEXT PRIMARY KEY,
                 sdk_session_id TEXT NOT NULL UNIQUE,
                 project_path TEXT NOT NULL,
@@ -334,5 +412,57 @@ mod tests {
         assert_eq!(recovered.state.last_sequence, 2);
         assert_eq!(recovered.state.activities.len(), 2);
         assert_eq!(recovered.state.status, app_model::SessionStatus::Idle);
+    }
+
+    #[test]
+    fn project_and_selected_session_state_round_trip() {
+        let storage = Storage::open_in_memory().unwrap();
+        let project = ProjectMetadata {
+            id: "project-1".to_owned(),
+            path: "/tmp/project".to_owned(),
+            name: "Project".to_owned(),
+            default_branch: Some("main".to_owned()),
+            last_opened_at: "1".to_owned(),
+        };
+
+        storage.upsert_project(&project).unwrap();
+        storage.set_selected_session(Some("session-1")).unwrap();
+
+        assert_eq!(storage.list_projects().unwrap(), vec![project]);
+        assert_eq!(
+            storage.selected_session().unwrap().as_deref(),
+            Some("session-1")
+        );
+        storage.set_selected_session(None).unwrap();
+        assert!(storage.selected_session().unwrap().is_none());
+    }
+
+    #[test]
+    fn version_one_database_migrates_forward() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gcabb.db");
+        let connection = Connection::open(&path).unwrap();
+        connection
+            .execute_batch(
+                "CREATE TABLE app_sessions (
+                    id TEXT PRIMARY KEY,
+                    sdk_session_id TEXT NOT NULL UNIQUE,
+                    project_path TEXT NOT NULL,
+                    title TEXT NOT NULL,
+                    model TEXT,
+                    mode TEXT,
+                    created_at TEXT NOT NULL,
+                    updated_at TEXT NOT NULL
+                 );
+                 PRAGMA user_version = 1;",
+            )
+            .unwrap();
+        drop(connection);
+
+        let storage = Storage::open(&path).unwrap();
+
+        assert_eq!(storage.schema_version().unwrap(), 2);
+        assert!(storage.list_projects().unwrap().is_empty());
+        assert!(storage.selected_session().unwrap().is_none());
     }
 }

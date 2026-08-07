@@ -5,10 +5,13 @@ use std::path::PathBuf;
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use app_model::{ApplyOutcome, DomainEvent, SessionMetadata, SessionSnapshot, SessionStatus};
+use app_model::{
+    ApplyOutcome, DomainEvent, InteractionResponse, ProjectMetadata, SessionMetadata,
+    SessionSnapshot, SessionStatus,
+};
 use copilot_provider::{
-    AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderSession,
-    SessionRequest,
+    AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderInteraction,
+    ProviderSession, SessionRequest,
 };
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
 use serde_json::{Value, json};
@@ -39,6 +42,7 @@ pub struct CreateSessionRequest {
     pub title: String,
     pub model: Option<String>,
     pub mode: Option<String>,
+    pub reasoning_effort: Option<String>,
 }
 
 #[derive(Clone)]
@@ -86,11 +90,58 @@ impl SessionHandle {
         self.command(SessionCommandKind::Disconnect).await
     }
 
+    pub async fn respond(
+        &self,
+        interaction_id: impl Into<String>,
+        answer: InteractionResponse,
+    ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(SessionCommand::Respond {
+                interaction_id: interaction_id.into(),
+                answer,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| SessionManagerError::ActorClosed)?;
+        response_rx
+            .await
+            .map_err(|_| SessionManagerError::ActorClosed)?
+    }
+
+    pub async fn set_model(&self, model: impl Into<String>) -> Result<()> {
+        self.control(SessionControlCommand::Model(model.into()))
+            .await
+    }
+
+    pub async fn set_mode(&self, mode: impl Into<String>) -> Result<()> {
+        self.control(SessionControlCommand::Mode(mode.into())).await
+    }
+
+    pub async fn set_reasoning_effort(&self, effort: impl Into<String>) -> Result<()> {
+        self.control(SessionControlCommand::ReasoningEffort(effort.into()))
+            .await
+    }
+
     async fn command(&self, kind: SessionCommandKind) -> Result<()> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(SessionCommand::Lifecycle {
                 kind,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| SessionManagerError::ActorClosed)?;
+        response_rx
+            .await
+            .map_err(|_| SessionManagerError::ActorClosed)?
+    }
+
+    async fn control(&self, control: SessionControlCommand) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(SessionCommand::Control {
+                control,
                 response: response_tx,
             })
             .await
@@ -164,8 +215,23 @@ impl SessionManager {
                 working_directory: request.project_path.clone(),
                 model: request.model.clone(),
                 mode: request.mode.clone(),
+                reasoning_effort: request.reasoning_effort.clone(),
             })
             .await?;
+        let controls = match self
+            .provider
+            .controls(&provider_session.sdk_session_id)
+            .await
+        {
+            Ok(controls) => controls,
+            Err(error) => {
+                let _ = self
+                    .provider
+                    .disconnect(&provider_session.sdk_session_id)
+                    .await;
+                return Err(error.into());
+            }
+        };
         let now = timestamp();
         let metadata = SessionMetadata {
             id: Uuid::new_v4().to_string(),
@@ -178,7 +244,11 @@ impl SessionManager {
             updated_at: now,
         };
         self.storage.upsert_session(&metadata)?;
-        let state = SessionSnapshot::new(metadata);
+        let mut state = SessionSnapshot::new(metadata);
+        state.controls = controls;
+        if request.reasoning_effort.is_some() {
+            state.controls.reasoning_effort = request.reasoning_effort;
+        }
         let handle = self.spawn_actor(state, provider_session);
         self.sessions
             .lock()
@@ -198,6 +268,60 @@ impl SessionManager {
 
     pub async fn sessions(&self) -> Vec<SessionHandle> {
         self.sessions.lock().await.values().cloned().collect()
+    }
+
+    pub async fn close_session(&self, app_session_id: &str) -> Result<()> {
+        let handle = self.session(app_session_id).await?;
+        if handle.snapshot().status == SessionStatus::Disconnected {
+            self.sessions.lock().await.remove(app_session_id);
+            return Ok(());
+        }
+        handle.disconnect().await?;
+        self.sessions.lock().await.remove(app_session_id);
+        Ok(())
+    }
+
+    pub async fn resume_closed_session(&self, app_session_id: &str) -> Result<SessionHandle> {
+        let existing = {
+            let sessions = self.sessions.lock().await;
+            sessions.get(app_session_id).cloned()
+        };
+        if let Some(handle) = existing {
+            if handle.snapshot().status != SessionStatus::Disconnected {
+                return Ok(handle);
+            }
+            self.sessions.lock().await.remove(app_session_id);
+        }
+        let metadata = self
+            .storage
+            .list_sessions()?
+            .into_iter()
+            .find(|metadata| metadata.id == app_session_id)
+            .ok_or_else(|| SessionManagerError::SessionNotFound(app_session_id.to_owned()))?;
+        let handle = self.restore_session(metadata).await?;
+        self.sessions
+            .lock()
+            .await
+            .insert(app_session_id.to_owned(), handle.clone());
+        Ok(handle)
+    }
+
+    pub fn register_project(&self, project: &ProjectMetadata) -> Result<()> {
+        self.storage.upsert_project(project)?;
+        Ok(())
+    }
+
+    pub fn projects(&self) -> Result<Vec<ProjectMetadata>> {
+        self.storage.list_projects().map_err(Into::into)
+    }
+
+    pub fn set_selected_session(&self, session_id: Option<&str>) -> Result<()> {
+        self.storage.set_selected_session(session_id)?;
+        Ok(())
+    }
+
+    pub fn selected_session(&self) -> Result<Option<String>> {
+        self.storage.selected_session().map_err(Into::into)
     }
 
     async fn restore_sessions(&self) -> Result<RestoreReport> {
@@ -228,6 +352,7 @@ impl SessionManager {
         let recovered = self.storage.recover_session(&metadata.id)?;
         let mut state = recovered.state;
         state.status = SessionStatus::Recovering;
+        state.pending_interactions.clear();
         let provider_session = self
             .provider
             .resume_session(
@@ -236,6 +361,7 @@ impl SessionManager {
                     working_directory: PathBuf::from(&metadata.project_path),
                     model: metadata.model.clone(),
                     mode: metadata.mode.clone(),
+                    reasoning_effort: state.controls.reasoning_effort.clone(),
                 },
             )
             .await?;
@@ -254,6 +380,13 @@ impl SessionManager {
             }
         };
         reconcile_history(&self.storage, &mut state, history)?;
+        state.controls = match self.provider.controls(&metadata.sdk_session_id).await {
+            Ok(controls) => controls,
+            Err(error) => {
+                let _ = self.provider.disconnect(&metadata.sdk_session_id).await;
+                return Err(error.into());
+            }
+        };
         state.status = SessionStatus::Idle;
         self.storage.write_snapshot(&state)?;
         Ok(self.spawn_actor(state, provider_session))
@@ -274,6 +407,8 @@ impl SessionManager {
             state,
             sdk_session_id: provider_session.sdk_session_id,
             provider_events: provider_session.events,
+            provider_interactions: provider_session.interactions,
+            pending_responses: HashMap::new(),
             commands: command_rx,
             snapshots: snapshot_tx,
         };
@@ -331,11 +466,26 @@ enum SessionCommand {
         kind: SessionCommandKind,
         response: oneshot::Sender<Result<()>>,
     },
+    Respond {
+        interaction_id: String,
+        answer: InteractionResponse,
+        response: oneshot::Sender<Result<()>>,
+    },
+    Control {
+        control: SessionControlCommand,
+        response: oneshot::Sender<Result<()>>,
+    },
 }
 
 enum SessionCommandKind {
     Cancel,
     Disconnect,
+}
+
+enum SessionControlCommand {
+    Model(String),
+    Mode(String),
+    ReasoningEffort(String),
 }
 
 struct SessionActor {
@@ -345,6 +495,8 @@ struct SessionActor {
     state: SessionSnapshot,
     sdk_session_id: String,
     provider_events: mpsc::Receiver<ProviderEvent>,
+    provider_interactions: mpsc::Receiver<ProviderInteraction>,
+    pending_responses: HashMap<String, oneshot::Sender<InteractionResponse>>,
     commands: mpsc::Receiver<SessionCommand>,
     snapshots: watch::Sender<Arc<SessionSnapshot>>,
 }
@@ -366,6 +518,9 @@ impl SessionActor {
                             break;
                         }
                     }
+                }
+                Some(interaction) = self.provider_interactions.recv() => {
+                    self.receive_interaction(interaction);
                 }
                 command = self.commands.recv() => {
                     match command {
@@ -394,6 +549,18 @@ impl SessionActor {
                             let _ = response.send(result);
                             break;
                         }
+                        Some(SessionCommand::Respond {
+                            interaction_id,
+                            answer,
+                            response,
+                        }) => {
+                            let result = self.respond(&interaction_id, answer);
+                            let _ = response.send(result);
+                        }
+                        Some(SessionCommand::Control { control, response }) => {
+                            let result = self.apply_control(control).await;
+                            let _ = response.send(result);
+                        }
                         None => {
                             let _ = self.disconnect().await;
                             break;
@@ -416,12 +583,68 @@ impl SessionActor {
                     self.publish(force_snapshot);
                 }
             }
-            Ok(false) => tracing::debug!(event_id = event.id, "duplicate event ignored"),
+            Ok(false) => {
+                self.state.last_sequence = sequence;
+                tracing::debug!(event_id = event.id, "duplicate event ignored");
+            }
             Err(error) => self.record_actor_error("append_event", &error.to_string()),
         }
     }
 
+    fn receive_interaction(&mut self, mut interaction: ProviderInteraction) {
+        interaction
+            .request
+            .session_id
+            .clone_from(&self.state.metadata.id);
+        let interaction_id = interaction.request.id.clone();
+        self.pending_responses
+            .insert(interaction_id, interaction.response);
+        self.state.add_interaction(interaction.request);
+        self.publish(true);
+    }
+
+    fn respond(&mut self, interaction_id: &str, answer: InteractionResponse) -> Result<()> {
+        let response = self
+            .pending_responses
+            .remove(interaction_id)
+            .ok_or_else(|| SessionManagerError::SessionNotFound(interaction_id.to_owned()))?;
+        response
+            .send(answer)
+            .map_err(|_| SessionManagerError::ActorClosed)?;
+        self.state.remove_interaction(interaction_id);
+        self.publish(true);
+        Ok(())
+    }
+
+    async fn apply_control(&mut self, control: SessionControlCommand) -> Result<()> {
+        match control {
+            SessionControlCommand::Model(model) => {
+                self.provider
+                    .set_model(&self.sdk_session_id, &model)
+                    .await?;
+                self.state.controls.model = Some(model.clone());
+                self.state.metadata.model = Some(model);
+            }
+            SessionControlCommand::Mode(mode) => {
+                self.provider.set_mode(&self.sdk_session_id, &mode).await?;
+                self.state.controls.mode = Some(mode.clone());
+                self.state.metadata.mode = Some(mode);
+            }
+            SessionControlCommand::ReasoningEffort(effort) => {
+                self.provider
+                    .set_reasoning_effort(&self.sdk_session_id, &effort)
+                    .await?;
+                self.state.controls.reasoning_effort = Some(effort);
+            }
+        }
+        self.state.metadata.updated_at = timestamp();
+        self.storage.upsert_session(&self.state.metadata)?;
+        self.publish(true);
+        Ok(())
+    }
+
     async fn disconnect(&mut self) -> Result<()> {
+        self.cancel_pending_interactions();
         self.storage.write_snapshot(&self.state)?;
         self.provider.disconnect(&self.sdk_session_id).await?;
         self.state.status = SessionStatus::Disconnected;
@@ -433,11 +656,19 @@ impl SessionActor {
         let message = "provider event stream closed unexpectedly";
         self.state.status = SessionStatus::Disconnected;
         self.state.last_error = Some(message.to_owned());
+        self.cancel_pending_interactions();
         self.record_actor_error("provider_stream_closed", message);
         if let Err(error) = self.provider.disconnect(&self.sdk_session_id).await {
             self.record_actor_error("provider_stream_cleanup", &error.to_string());
         }
         self.publish(true);
+    }
+
+    fn cancel_pending_interactions(&mut self) {
+        for (_, response) in self.pending_responses.drain() {
+            let _ = response.send(InteractionResponse::Cancel);
+        }
+        self.state.pending_interactions.clear();
     }
 
     fn publish(&self, persist: bool) {
@@ -482,6 +713,8 @@ fn reconcile_history(
         if storage.append_event(&event)? {
             seen.insert(event.id.clone());
             let _ = state.apply(event);
+        } else {
+            state.last_sequence += 1;
         }
     }
     Ok(())
@@ -508,6 +741,7 @@ mod tests {
             title: "Foundation test".to_owned(),
             model: None,
             mode: Some("interactive".to_owned()),
+            reasoning_effort: Some("medium".to_owned()),
         }
     }
 
@@ -649,5 +883,153 @@ mod tests {
             Some("provider event stream closed unexpectedly")
         );
         assert!(!diagnostics.events().is_empty());
+
+        let resumed = manager.resume_closed_session(handle.id()).await.unwrap();
+        assert_eq!(resumed.id(), handle.id());
+        assert_eq!(provider.active_sessions().await, 1);
+    }
+
+    #[tokio::test]
+    async fn interaction_round_trip_waits_for_native_response() {
+        let provider = Arc::new(FakeProvider::default());
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider.clone(), storage, diagnostics);
+        manager.start().await.unwrap();
+        let handle = manager
+            .create_session(request(std::env::temp_dir()))
+            .await
+            .unwrap();
+        let sdk_session_id = handle.snapshot().metadata.sdk_session_id.clone();
+        let mut snapshots = handle.subscribe();
+        let request = app_model::InteractionRequest {
+            id: "permission-1".to_owned(),
+            session_id: sdk_session_id.clone(),
+            kind: app_model::InteractionKind::Permission,
+            title: "Permission required".to_owned(),
+            message: "Run cargo test?".to_owned(),
+            choices: vec!["Allow once".to_owned(), "Deny".to_owned()],
+            allow_freeform: true,
+            details: Value::Null,
+        };
+
+        let response = provider
+            .request_interaction(&sdk_session_id, request)
+            .await
+            .unwrap();
+        snapshots
+            .wait_for(|snapshot| !snapshot.pending_interactions.is_empty())
+            .await
+            .unwrap();
+        provider
+            .emit(
+                &sdk_session_id,
+                json!({
+                    "id": "nested-event",
+                    "agentId": "agent-1",
+                    "type": "assistant.turn_start",
+                    "data": {}
+                }),
+            )
+            .await
+            .unwrap();
+        snapshots
+            .wait_for(|snapshot| snapshot.last_sequence == 1)
+            .await
+            .unwrap();
+        assert_eq!(snapshots.borrow().status, SessionStatus::Waiting);
+        handle
+            .respond("permission-1", InteractionResponse::Approve)
+            .await
+            .unwrap();
+
+        assert_eq!(response.await.unwrap(), InteractionResponse::Approve);
+        assert!(handle.snapshot().pending_interactions.is_empty());
+    }
+
+    #[tokio::test]
+    async fn controls_update_snapshot_and_persist_metadata() {
+        let provider = Arc::new(FakeProvider::default());
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider, storage.clone(), diagnostics);
+        manager.start().await.unwrap();
+        let handle = manager
+            .create_session(request(std::env::temp_dir()))
+            .await
+            .unwrap();
+
+        handle.set_model("model-1").await.unwrap();
+        handle.set_mode("plan").await.unwrap();
+        handle.set_reasoning_effort("high").await.unwrap();
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.controls.model.as_deref(), Some("model-1"));
+        assert_eq!(snapshot.controls.mode.as_deref(), Some("plan"));
+        assert_eq!(snapshot.controls.reasoning_effort.as_deref(), Some("high"));
+        let metadata = storage.list_sessions().unwrap();
+        assert_eq!(metadata[0].model.as_deref(), Some("model-1"));
+        assert_eq!(metadata[0].mode.as_deref(), Some("plan"));
+    }
+
+    #[tokio::test]
+    async fn closed_session_can_resume_without_restarting_manager() {
+        let provider = Arc::new(FakeProvider::default());
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider.clone(), storage, diagnostics);
+        manager.start().await.unwrap();
+        let handle = manager
+            .create_session(request(std::env::temp_dir()))
+            .await
+            .unwrap();
+        let id = handle.id().to_owned();
+
+        manager.close_session(&id).await.unwrap();
+        assert!(manager.session(&id).await.is_err());
+        assert_eq!(provider.active_sessions().await, 0);
+
+        let resumed = manager.resume_closed_session(&id).await.unwrap();
+        assert_eq!(resumed.id(), id);
+        assert_eq!(provider.active_sessions().await, 1);
+    }
+
+    #[tokio::test]
+    async fn close_cancels_pending_interaction_callback() {
+        let provider = Arc::new(FakeProvider::default());
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider.clone(), storage, diagnostics);
+        manager.start().await.unwrap();
+        let handle = manager
+            .create_session(request(std::env::temp_dir()))
+            .await
+            .unwrap();
+        let mut snapshots = handle.subscribe();
+        let sdk_session_id = handle.snapshot().metadata.sdk_session_id.clone();
+        let response = provider
+            .request_interaction(
+                &sdk_session_id,
+                app_model::InteractionRequest {
+                    id: "input-1".to_owned(),
+                    session_id: sdk_session_id.clone(),
+                    kind: app_model::InteractionKind::UserInput,
+                    title: "Input".to_owned(),
+                    message: "Continue?".to_owned(),
+                    choices: Vec::new(),
+                    allow_freeform: true,
+                    details: Value::Null,
+                },
+            )
+            .await
+            .unwrap();
+        snapshots
+            .wait_for(|snapshot| !snapshot.pending_interactions.is_empty())
+            .await
+            .unwrap();
+
+        manager.close_session(handle.id()).await.unwrap();
+
+        assert_eq!(response.await.unwrap(), InteractionResponse::Cancel);
     }
 }
