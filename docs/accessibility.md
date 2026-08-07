@@ -11,14 +11,18 @@ package with the local MIT-compatible `crates/ztracing-compat` shim, which
 re-exports `tracing::instrument`. This keeps GPL implementation code out of the
 binary while retaining the pinned AccessKit APIs.
 
-The initial session shell exposes:
+The application shell and session surface expose:
 
-- An application root and projects/sessions navigation region.
+- An application root and labelled primary/projects/sessions navigation region.
 - Project and session lists with selected state.
 - Headings, status messages, and alerts.
 - A conversation list with attributed messages.
 - A labelled text input with current value and placeholder.
-- Mode, model, effort, session, and interaction buttons with press actions.
+- A sidebar disclosure control with expanded state.
+- SDK-backed mode and model selectors with expanded state and labelled option
+  lists; reasoning effort appears only when the selected model reports supported
+  levels.
+- Suggestion, submit, session, and interaction buttons with press actions.
 - Permission and input dialogs.
 - Tab and Shift-Tab focus traversal.
 
@@ -29,11 +33,11 @@ registering a mouse handler does not create an accessibility node.
 
 ## macOS smoke check
 
-The upgraded application was inspected through `AXUIElement` on 2026-08-07.
-macOS reported named navigation, list, heading, status, text-field, and button
-nodes. `AXPress` changed mode from interactive to plan and effort from medium to
-high. Pressing the text field through AX focused it, and typed text was reflected
-in `AXValue` without submitting a prompt.
+The atlas-aligned application was inspected through `AXUIElement` on 2026-08-07.
+macOS reported named application, navigation, list, image, status, text-field,
+and button nodes. `AXPress` opened the mode, model, and effort option lists,
+selected Plan, GPT-5.6 Sol, and High, collapsed and reopened the sidebar, and
+inserted a suggestion into the text field without submitting a prompt.
 
 New UI components should receive a lightweight AX/AccessKit interaction contract
 covering role, label, value or state, stable identity, keyboard focus, and

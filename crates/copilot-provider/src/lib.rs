@@ -86,6 +86,10 @@ pub struct ProviderCompatibility {
     pub negotiated_protocol_version: u32,
     pub process_id: Option<u32>,
     pub startup: Option<StartupBreakdown>,
+    #[serde(default)]
+    pub available_modes: Vec<String>,
+    #[serde(default)]
+    pub available_models: Vec<ModelOption>,
 }
 
 #[async_trait]
@@ -432,7 +436,7 @@ impl CopilotProvider {
 impl AgentProvider for CopilotProvider {
     async fn start(&self) -> Result<ProviderCompatibility> {
         if let Some(client) = self.client.lock().await.clone() {
-            return compatibility(&client);
+            return compatibility(&client).await;
         }
 
         let started = Instant::now();
@@ -448,7 +452,7 @@ impl AgentProvider for CopilotProvider {
             );
             ProviderError::Sdk(error.to_string())
         })?;
-        let compatibility = compatibility(&client)?;
+        let compatibility = compatibility(&client).await?;
         self.record(
             "start",
             millis(started.elapsed().as_millis()),
@@ -647,7 +651,7 @@ impl AgentProvider for CopilotProvider {
     }
 }
 
-fn compatibility(client: &Client) -> Result<ProviderCompatibility> {
+async fn compatibility(client: &Client) -> Result<ProviderCompatibility> {
     let negotiated = client
         .protocol_version()
         .ok_or_else(|| ProviderError::Sdk("protocol negotiation did not complete".to_owned()))?;
@@ -665,12 +669,41 @@ fn compatibility(client: &Client) -> Result<ProviderCompatibility> {
         handshake_ms: timings.handshake_ms,
         total_ms: timings.total_ms,
     });
+    let models = client
+        .rpc()
+        .models()
+        .list()
+        .await
+        .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+    let available_models = models
+        .models
+        .into_iter()
+        .map(|model| ModelOption {
+            id: model.id,
+            name: model.name,
+            supported_reasoning_efforts: model.supported_reasoning_efforts.unwrap_or_default(),
+        })
+        .collect();
+    let session_modes = [
+        github_copilot_sdk::session_events::SessionMode::Interactive,
+        github_copilot_sdk::session_events::SessionMode::Plan,
+        github_copilot_sdk::session_events::SessionMode::Autopilot,
+    ]
+    .into_iter()
+    .filter_map(|mode| {
+        serde_json::to_value(mode)
+            .ok()
+            .and_then(|value| value.as_str().map(str::to_owned))
+    })
+    .collect();
     Ok(ProviderCompatibility {
         sdk_crate_version: SDK_CRATE_VERSION.to_owned(),
         sdk_protocol_version: github_copilot_sdk::SDK_PROTOCOL_VERSION,
         negotiated_protocol_version: negotiated,
         process_id: client.pid(),
         startup,
+        available_modes: session_modes,
+        available_models,
     })
 }
 

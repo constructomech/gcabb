@@ -120,6 +120,8 @@ impl AgentProvider for FakeProvider {
             negotiated_protocol_version: 3,
             process_id: None,
             startup: None,
+            available_modes: Vec::new(),
+            available_models: Vec::new(),
         })
     }
 

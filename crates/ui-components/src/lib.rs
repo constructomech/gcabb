@@ -408,3 +408,18 @@ pub fn bind_text_input_keys(cx: &mut App) {
         KeyBinding::new("cmd-a", SelectAll, Some("TextInput")),
     ]);
 }
+
+pub fn semantic_button(
+    id: &'static str,
+    label: impl Into<SharedString>,
+    on_click: impl Fn(&ClickEvent, &mut Window, &mut App) + 'static,
+) -> gpui::Stateful<gpui::Div> {
+    div()
+        .id(id)
+        .accessibility_id(id)
+        .role(Role::Button)
+        .aria_label(label.into())
+        .focusable()
+        .tab_stop(true)
+        .on_click(on_click)
+}
