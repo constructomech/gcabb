@@ -762,13 +762,7 @@ impl SessionMvpView {
             })
             .into_iter()
             .flatten()
-            .map(|model| {
-                (
-                    model.id.clone(),
-                    model.name.clone(),
-                    "Available from Copilot".to_owned(),
-                )
-            })
+            .map(|model| (model.id.clone(), model.name.clone(), String::new()))
             .collect()
     }
 
@@ -895,6 +889,7 @@ impl SessionMvpView {
                     |(index, (value, label, description))| {
                         let is_selected = value == selected;
                         let option_value = value.clone();
+                        let has_description = !description.is_empty();
                         div()
                             .id(("control-option", index))
                             .flex()
@@ -922,11 +917,14 @@ impl SessionMvpView {
                                     .text_color(rgb(MUTED))
                                     .child(if is_selected { "✓" } else { "" }),
                             )
-                            .child(
-                                div().flex().flex_col().min_w_0().child(label).child(
-                                    div().text_xs().text_color(rgb(MUTED)).child(description),
-                                ),
-                            )
+                            .child(div().flex().flex_col().min_w_0().child(label).when(
+                                has_description,
+                                |content| {
+                                    content.child(
+                                        div().text_xs().text_color(rgb(MUTED)).child(description),
+                                    )
+                                },
+                            ))
                     },
                 )),
         )
