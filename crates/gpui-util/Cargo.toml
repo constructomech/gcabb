@@ -1,0 +1,14 @@
+[package]
+name = "gpui_util"
+description = "Independent utility compatibility layer for GCABB's GPUI integration"
+edition.workspace = true
+license.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+version = "0.1.0"
+
+[dependencies]
+log = "0.4.29"
+
+[lints]
+workspace = true

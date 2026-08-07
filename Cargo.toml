@@ -5,6 +5,8 @@ members = [
     "crates/app-model",
     "crates/copilot-provider",
     "crates/diagnostics",
+    "crates/gpui-shared-string",
+    "crates/gpui-util",
     "crates/session-manager",
     "crates/storage",
     "crates/test-harness",
@@ -44,6 +46,8 @@ uuid = { version = "1.24.0", features = ["serde", "v4"] }
 ui-components = { path = "crates/ui-components" }
 
 [patch."https://github.com/zed-industries/zed"]
+gpui_shared_string = { path = "crates/gpui-shared-string" }
+gpui_util = { path = "crates/gpui-util" }
 ztracing = { path = "crates/ztracing-compat" }
 
 [workspace.lints.rust]

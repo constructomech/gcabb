@@ -25,6 +25,12 @@ session projection, but GCABB is a new application rather than a Zed fork.
 
 See [plan.md](plan.md) for the current architecture and implementation roadmap.
 
+## License
+
+GCABB is licensed under the [MIT License](LICENSE.txt). Required notices for
+included third-party software are collected in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
+
 ## Current Session MVP
 
 Phase 2 provides an end-to-end native session workflow:

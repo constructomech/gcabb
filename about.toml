@@ -1,0 +1,36 @@
+accepted = [
+    "0BSD",
+    "Apache-2.0",
+    "BSD-2-Clause",
+    "BSD-3-Clause",
+    "BSL-1.0",
+    "CC0-1.0",
+    "ISC",
+    "MIT",
+    "MIT-0",
+    "MPL-2.0",
+    "NCSA",
+    "Unicode-3.0",
+    "Unlicense",
+    "Zlib",
+    "bzip2-1.0.6",
+]
+ignore-build-dependencies = false
+ignore-dev-dependencies = false
+ignore-transitive-dependencies = false
+targets = [
+    "aarch64-apple-darwin",
+    "x86_64-apple-darwin",
+    "x86_64-pc-windows-msvc",
+    "x86_64-unknown-linux-gnu",
+]
+
+# cargo-about does not accept SPDX exceptions as policy entries. Treating this
+# crate as Apache-2.0 is conservative; its complete Apache-2.0 WITH
+# LLVM-exception text is still reproduced from the verified distributed file.
+[ar_archive_writer.clarify]
+license = "Apache-2.0"
+
+[[ar_archive_writer.clarify.files]]
+path = "LICENSE.txt"
+checksum = "f72b120d1385408e9e380acc020756eb6ba1b461d66c328ea67327ba08d7dcfd"
