@@ -35,6 +35,21 @@ nodes. `AXPress` changed mode from interactive to plan and effort from medium to
 high. Pressing the text field through AX focused it, and typed text was reflected
 in `AXValue` without submitting a prompt.
 
+The smoke validator checks the required roles and identifiers, presses the
+composer from AX, verifies that it receives focus even when GCABB starts in the
+background, and exercises the mode control:
+
+```sh
+cargo build -p gcabb-desktop
+GCABB_DATA_DIR="$(mktemp -d)" target/debug/gcabb-desktop &
+app_pid=$!
+swift scripts/validate_macos_accessibility.swift "$app_pid"
+kill "$app_pid"
+```
+
+The terminal or host application running the validator must have permission in
+**System Settings > Privacy & Security > Accessibility**.
+
 New UI components should receive a lightweight AX/AccessKit interaction contract
 covering role, label, value or state, stable identity, keyboard focus, and
 supported actions.

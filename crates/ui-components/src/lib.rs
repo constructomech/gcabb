@@ -121,7 +121,13 @@ impl TextInput {
     }
 
     fn on_click(&mut self, _: &ClickEvent, window: &mut Window, cx: &mut Context<Self>) {
+        cx.activate(true);
+        window.activate_window();
         window.focus(&self.focus_handle, cx);
+        let focus_handle = self.focus_handle.clone();
+        cx.on_next_frame(window, move |_, window, cx| {
+            window.focus(&focus_handle, cx);
+        });
         self.selected_range = self.content.len()..self.content.len();
         self.reset_cursor_blink();
         cx.notify();
