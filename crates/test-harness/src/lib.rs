@@ -120,6 +120,8 @@ impl AgentProvider for FakeProvider {
             negotiated_protocol_version: 3,
             process_id: None,
             startup: None,
+            available_modes: Vec::new(),
+            available_models: Vec::new(),
         })
     }
 
@@ -194,7 +196,12 @@ impl AgentProvider for FakeProvider {
         Ok(SessionControls::default())
     }
 
-    async fn set_model(&self, _sdk_session_id: &str, _model: &str) -> Result<()> {
+    async fn set_model(
+        &self,
+        _sdk_session_id: &str,
+        _model: &str,
+        _reasoning_effort: Option<&str>,
+    ) -> Result<()> {
         Ok(())
     }
 

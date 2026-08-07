@@ -110,8 +110,23 @@ impl SessionHandle {
     }
 
     pub async fn set_model(&self, model: impl Into<String>) -> Result<()> {
-        self.control(SessionControlCommand::Model(model.into()))
-            .await
+        self.control(SessionControlCommand::Model {
+            model: model.into(),
+            reasoning_effort: ReasoningEffortUpdate::Preserve,
+        })
+        .await
+    }
+
+    pub async fn set_model_with_reasoning_effort(
+        &self,
+        model: impl Into<String>,
+        reasoning_effort: Option<String>,
+    ) -> Result<()> {
+        self.control(SessionControlCommand::Model {
+            model: model.into(),
+            reasoning_effort: ReasoningEffortUpdate::Set(reasoning_effort),
+        })
+        .await
     }
 
     pub async fn set_mode(&self, mode: impl Into<String>) -> Result<()> {
@@ -483,9 +498,17 @@ enum SessionCommandKind {
 }
 
 enum SessionControlCommand {
-    Model(String),
+    Model {
+        model: String,
+        reasoning_effort: ReasoningEffortUpdate,
+    },
     Mode(String),
     ReasoningEffort(String),
+}
+
+enum ReasoningEffortUpdate {
+    Preserve,
+    Set(Option<String>),
 }
 
 struct SessionActor {
@@ -618,10 +641,20 @@ impl SessionActor {
 
     async fn apply_control(&mut self, control: SessionControlCommand) -> Result<()> {
         match control {
-            SessionControlCommand::Model(model) => {
+            SessionControlCommand::Model {
+                model,
+                reasoning_effort,
+            } => {
+                let sdk_reasoning_effort = match &reasoning_effort {
+                    ReasoningEffortUpdate::Preserve => None,
+                    ReasoningEffortUpdate::Set(effort) => effort.as_deref(),
+                };
                 self.provider
-                    .set_model(&self.sdk_session_id, &model)
+                    .set_model(&self.sdk_session_id, &model, sdk_reasoning_effort)
                     .await?;
+                if let ReasoningEffortUpdate::Set(reasoning_effort) = reasoning_effort {
+                    self.state.controls.reasoning_effort = reasoning_effort;
+                }
                 self.state.controls.model = Some(model.clone());
                 self.state.metadata.model = Some(model);
             }
@@ -962,13 +995,20 @@ mod tests {
         handle.set_model("model-1").await.unwrap();
         handle.set_mode("plan").await.unwrap();
         handle.set_reasoning_effort("high").await.unwrap();
+        handle
+            .set_model_with_reasoning_effort("model-2", Some("medium".to_owned()))
+            .await
+            .unwrap();
 
         let snapshot = handle.snapshot();
-        assert_eq!(snapshot.controls.model.as_deref(), Some("model-1"));
+        assert_eq!(snapshot.controls.model.as_deref(), Some("model-2"));
         assert_eq!(snapshot.controls.mode.as_deref(), Some("plan"));
-        assert_eq!(snapshot.controls.reasoning_effort.as_deref(), Some("high"));
+        assert_eq!(
+            snapshot.controls.reasoning_effort.as_deref(),
+            Some("medium")
+        );
         let metadata = storage.list_sessions().unwrap();
-        assert_eq!(metadata[0].model.as_deref(), Some("model-1"));
+        assert_eq!(metadata[0].model.as_deref(), Some("model-2"));
         assert_eq!(metadata[0].mode.as_deref(), Some("plan"));
     }
 
