@@ -7,8 +7,8 @@ use gpui::{
     App, Bounds, ClickEvent, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
     EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, IntoElement,
     LayoutId, PaintQuad, Pixels, Render, Role, ShapedLine, SharedString, Style, Task, TextAlign,
-    TextRun, Timer, UTF16Selection, Window, actions, div, fill, point, prelude::*, px, relative,
-    rgb, size,
+    TextRun, UTF16Selection, Window, actions, div, fill, point, prelude::*, px, relative, rgb,
+    size,
 };
 
 actions!(text_input, [Backspace, Submit, Paste, SelectAll]);
@@ -43,7 +43,7 @@ impl TextInput {
     ) -> Self {
         let cursor_blink_task = cx.spawn(async move |input, cx| {
             loop {
-                Timer::after(CURSOR_BLINK_TICK).await;
+                cx.background_executor().timer(CURSOR_BLINK_TICK).await;
                 if input
                     .update(cx, |input, cx| {
                         let elapsed = input.cursor_blink_started_at.elapsed();

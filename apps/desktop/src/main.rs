@@ -12,10 +12,9 @@ use copilot_provider::{CopilotProvider, ProviderCompatibility};
 use diagnostics::{TracingDiagnostics, init_tracing};
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Application, Bounds, Context, Entity, Focusable, InteractiveElement,
-    IntoElement, KeyBinding, MouseButton, ParentElement, Render, Role, SharedString,
-    StatefulInteractiveElement, Styled, Timer, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, actions, div, px, rgb, size,
+    App, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement, IntoElement,
+    KeyBinding, MouseButton, ParentElement, Render, Role, SharedString, StatefulInteractiveElement,
+    Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, px, rgb, size,
 };
 use session_manager::{CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager};
 use storage::Storage;
@@ -2160,7 +2159,7 @@ fn main() {
     gpui_platform::application().run(move |cx: &mut App| {
         bind_text_input_keys(cx);
         cx.bind_keys([KeyBinding::new("escape", DismissPopup, None)]);
-        cx.on_window_closed(|cx| {
+        cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
