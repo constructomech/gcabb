@@ -6,6 +6,7 @@ use std::sync::{Arc, Mutex};
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
+use app_model::DomainEvent;
 use async_trait::async_trait;
 use clap::Parser;
 use github_copilot_sdk::handler::{
@@ -21,7 +22,6 @@ use github_copilot_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
-use spike_core::DomainEvent;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{info, warn};

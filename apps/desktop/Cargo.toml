@@ -1,13 +1,19 @@
 [package]
-name = "gcabb-desktop-spike"
+name = "gcabb-desktop"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
+app-model.workspace = true
+copilot-provider.workspace = true
+diagnostics.workspace = true
+dirs.workspace = true
 gpui.workspace = true
+session-manager.workspace = true
+storage.workspace = true
+tokio.workspace = true
 
 [lints]
 workspace = true
-

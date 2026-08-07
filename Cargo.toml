@@ -2,7 +2,12 @@
 members = [
     "apps/desktop",
     "apps/sdk-probe",
-    "crates/spike-core",
+    "crates/app-model",
+    "crates/copilot-provider",
+    "crates/diagnostics",
+    "crates/session-manager",
+    "crates/storage",
+    "crates/test-harness",
 ]
 resolver = "2"
 
@@ -14,16 +19,25 @@ version = "0.1.0"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
+app-model = { path = "crates/app-model" }
 async-trait = "0.1.89"
 clap = { version = "4.5.54", features = ["derive"] }
+copilot-provider = { path = "crates/copilot-provider" }
+diagnostics = { path = "crates/diagnostics" }
+dirs = "5.0.1"
 github-copilot-sdk = "=1.0.9"
 gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
+rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
-spike-core = { path = "crates/spike-core" }
-tokio = { version = "1.49.0", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
+session-manager = { path = "crates/session-manager" }
+storage = { path = "crates/storage" }
+tempfile = "3.27.0"
+thiserror = "2.0.19"
+tokio = { version = "1.49.0", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "sync", "time"] }
 tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+uuid = { version = "1.24.0", features = ["serde", "v4"] }
 
 [workspace.lints.rust]
 unsafe_code = "forbid"

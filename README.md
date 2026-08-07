@@ -25,16 +25,37 @@ session projection, but GCABB is a new application rather than a Zed fork.
 
 See [plan.md](plan.md) for the current architecture and implementation roadmap.
 
-## Phase 0 spike
+## Current foundation
 
-The repository contains an executable feasibility spike:
+Phase 1 turns the feasibility spike into production-shaped application
+boundaries:
+
+- `app-model` owns versioned events, deterministic reducers, and immutable
+  snapshots.
+- `copilot-provider` isolates the official SDK and checks protocol
+  compatibility.
+- `session-manager` runs one serial actor per active session.
+- `storage` persists metadata, events, and snapshots in SQLite WAL mode.
+- `diagnostics` provides structured, redacted tracing.
+- `test-harness` supplies a deterministic fake provider and golden fixtures.
+- `gcabb-desktop` starts recovery off the UI thread and renders immutable session
+  projections.
+
+```sh
+source "$HOME/.cargo/env"
+cargo run -p gcabb-desktop
+```
+
+Set `GCABB_DATA_DIR` to isolate the application database during development.
+Without it, GCABB uses the operating system's local application-data directory.
+
+## Phase 0 probe
+
+The repository retains the executable SDK feasibility probe:
 
 - `sdk-probe` starts the SDK-bundled CLI, records startup timing, exercises
   session lifecycle and typed RPCs, and writes raw plus normalized events as
   JSON Lines.
-- `gcabb-desktop-spike` is a native GPUI surface for a streaming activity
-  timeline, terminal output, and a Git comparison against a selected base.
-- `spike-core` owns the versioned event normalization boundary.
 
 Rust 1.94 is pinned in `rust-toolchain.toml`.
 
@@ -48,12 +69,6 @@ cargo run -p sdk-probe -- \
   --cwd .phase0/workspace \
   --approve-permissions \
   --prompt "Inspect the workspace and report what you find."
-
-# Open the native prototype. The optional argument is a Git base.
-cargo run -p gcabb-desktop-spike -- main
-
-# Coalesce 50,000 simulated token and terminal updates on frame boundaries.
-GCABB_STRESS_EVENTS=50000 cargo run -p gcabb-desktop-spike -- main
 ```
 
 Probe output defaults to `.phase0/events.jsonl`, which is ignored by Git because

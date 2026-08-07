@@ -1,6 +1,6 @@
 /target/
 /.phase0/
+/.phase1-smoke/
 *.jsonl
 *.log
 .DS_Store
-

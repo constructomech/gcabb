@@ -1,21 +1,17 @@
 [package]
-name = "sdk-probe"
+name = "test-harness"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
 version.workspace = true
 
 [dependencies]
-anyhow.workspace = true
-app-model.workspace = true
 async-trait.workspace = true
-clap.workspace = true
-github-copilot-sdk.workspace = true
-serde.workspace = true
+copilot-provider.workspace = true
 serde_json.workspace = true
+thiserror.workspace = true
 tokio.workspace = true
-tracing.workspace = true
-tracing-subscriber.workspace = true
 
 [lints]
 workspace = true
+

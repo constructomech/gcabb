@@ -399,6 +399,8 @@ crates/
 
 ### Phase 0: Feasibility and Event-Coverage Spike (1-2 weeks)
 
+Status: completed.
+
 - Start the latest compatible CLI through the Rust SDK.
 - Measure CLI startup and first-token timing.
 - Create, prompt, cancel, disconnect, and resume a session.
@@ -422,6 +424,8 @@ Exit criteria:
 - GPUI remains responsive under token and terminal-output load.
 
 ### Phase 1: Application Foundation (2 weeks)
+
+Status: implemented; hardening continues with later phases.
 
 - Create the workspace and GPUI shell.
 - Implement app state, domain events, reducers, and session actors.

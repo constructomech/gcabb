@@ -1,0 +1,30 @@
+[
+  {
+    "id": "golden-1",
+    "timestamp": "2026-08-06T12:00:00Z",
+    "type": "assistant.turn_start",
+    "data": { "turnId": "turn-1" }
+  },
+  {
+    "id": "golden-2",
+    "parentId": "golden-1",
+    "timestamp": "2026-08-06T12:00:00Z",
+    "type": "tool.execution_start",
+    "data": { "toolCallId": "tool-1", "toolName": "view" }
+  },
+  {
+    "id": "golden-3",
+    "parentId": "golden-2",
+    "timestamp": "2026-08-06T12:00:01Z",
+    "type": "tool.execution_complete",
+    "data": { "toolCallId": "tool-1", "success": true }
+  },
+  {
+    "id": "golden-4",
+    "parentId": "golden-3",
+    "timestamp": "2026-08-06T12:00:01Z",
+    "type": "session.idle",
+    "data": {}
+  }
+]
+
