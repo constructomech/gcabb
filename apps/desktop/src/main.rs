@@ -1762,6 +1762,7 @@ impl Render for SessionMvpView {
         } else {
             0.0
         };
+        let control_menu_left = self.open_control_menu.map_or(0, control_menu_offset);
         let session_selected = self.selected_session.is_some();
         let title = self.selected().map_or_else(
             || "New session".to_owned(),
@@ -1894,7 +1895,13 @@ impl Render for SessionMvpView {
                         })
                         .flex()
                         .justify_center()
-                        .child(menu),
+                        .child(
+                            div()
+                                .w_full()
+                                .max_w(px(820.0))
+                                .pl(px(f32::from(control_menu_left)))
+                                .child(menu),
+                        ),
                 )
             })
             .when_some(self.interaction_dialog(cx), |root, dialog| {
@@ -1950,6 +1957,14 @@ fn disabled_destination(
 
 fn compact_layout(width: f32) -> bool {
     width < COMPACT_WIDTH
+}
+
+fn control_menu_offset(menu: ControlMenu) -> u16 {
+    match menu {
+        ControlMenu::Mode => 40,
+        ControlMenu::Model => 128,
+        ControlMenu::Effort => 216,
+    }
 }
 
 fn toggled_menu(current: Option<ControlMenu>, requested: ControlMenu) -> Option<ControlMenu> {
@@ -2106,8 +2121,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPACT_WIDTH, ControlMenu, compact_layout, effort_label, reasoning_effort_for_model,
-        toggled_menu,
+        COMPACT_WIDTH, ControlMenu, compact_layout, control_menu_offset, effort_label,
+        reasoning_effort_for_model, toggled_menu,
     };
 
     #[test]
@@ -2130,6 +2145,13 @@ mod tests {
             toggled_menu(Some(ControlMenu::Model), ControlMenu::Model),
             None
         );
+    }
+
+    #[test]
+    fn selector_menus_align_with_their_composer_pills() {
+        assert_eq!(control_menu_offset(ControlMenu::Mode), 40);
+        assert_eq!(control_menu_offset(ControlMenu::Model), 128);
+        assert_eq!(control_menu_offset(ControlMenu::Effort), 216);
     }
 
     #[test]
