@@ -13,26 +13,30 @@ use diagnostics::{TracingDiagnostics, init_tracing};
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Application, Bounds, Context, Entity, Focusable, InteractiveElement,
-    IntoElement, MouseButton, ParentElement, Render, Styled, Timer, Window, WindowBounds,
-    WindowOptions, div, px, rgb, size,
+    IntoElement, KeyBinding, MouseButton, ParentElement, Render, SharedString,
+    StatefulInteractiveElement, Styled, Timer, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, actions, div, point, px, rgb, size,
 };
 use session_manager::{CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager};
 use storage::Storage;
 use tokio::sync::watch;
 use ui_components::{InputSubmitted, TextInput, bind_text_input_keys};
 
-const BACKGROUND: u32 = 0x0012_1419;
-const SIDEBAR: u32 = 0x0018_1b21;
-const PANEL: u32 = 0x001e_222a;
-const ELEVATED: u32 = 0x0027_2c35;
-const BORDER: u32 = 0x0034_3a46;
-const PRIMARY: u32 = 0x00ef_f2f7;
-const MUTED: u32 = 0x0095_9eae;
-const GREEN: u32 = 0x0068_d391;
-const BLUE: u32 = 0x006f_a8ff;
-const AMBER: u32 = 0x00e2_b76a;
-const RED: u32 = 0x00ed_6a72;
+const BACKGROUND: u32 = 0x000d_1117;
+const SIDEBAR: u32 = 0x0016_1b22;
+const PANEL: u32 = 0x000d_1117;
+const ELEVATED: u32 = 0x0021_262d;
+const SUBTLE: u32 = 0x001b_222c;
+const BORDER: u32 = 0x0030_363d;
+const PRIMARY: u32 = 0x00f0_f3f6;
+const MUTED: u32 = 0x008b_949e;
+const GREEN: u32 = 0x003f_b950;
+const BLUE: u32 = 0x0058_a6ff;
+const AMBER: u32 = 0x00d2_9900;
+const RED: u32 = 0x00f8_5161;
+const COMPACT_WIDTH: f32 = 920.0;
 
+actions!(gcabb, [DismissPopup]);
 enum ServiceUpdate {
     Ready {
         compatibility: ProviderCompatibility,
@@ -55,7 +59,7 @@ enum ServiceCommand {
         project_path: PathBuf,
         model: Option<String>,
         mode: String,
-        reasoning_effort: String,
+        reasoning_effort: Option<String>,
     },
     Cancel {
         app_session_id: String,
@@ -74,6 +78,7 @@ enum ServiceCommand {
     SetModel {
         app_session_id: String,
         model: String,
+        reasoning_effort: Option<String>,
     },
     SetMode {
         app_session_id: String,
@@ -253,7 +258,7 @@ async fn handle_service_command(
                         title: session_title(&prompt),
                         model,
                         mode: Some(mode),
-                        reasoning_effort: Some(reasoning_effort),
+                        reasoning_effort,
                     })
                     .await
                     .map_err(|error| error.to_string())?;
@@ -305,11 +310,12 @@ async fn handle_service_command(
         ServiceCommand::SetModel {
             app_session_id,
             model,
+            reasoning_effort,
         } => manager
             .session(&app_session_id)
             .await
             .map_err(|error| error.to_string())?
-            .set_model(model)
+            .set_model_with_reasoning_effort(model, reasoning_effort)
             .await
             .map_err(|error| error.to_string())?,
         ServiceCommand::SetMode {
@@ -377,6 +383,13 @@ enum StartupState {
     Failed(String),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum ControlMenu {
+    Mode,
+    Model,
+    Effort,
+}
+
 struct SessionMvpView {
     startup: StartupState,
     projects: Vec<ProjectMetadata>,
@@ -392,6 +405,8 @@ struct SessionMvpView {
     draft_mode: String,
     draft_model: Option<String>,
     draft_effort: String,
+    sidebar_open: bool,
+    open_control_menu: Option<ControlMenu>,
     action_error: Option<String>,
     _poll_task: gpui::Task<()>,
 }
@@ -424,7 +439,12 @@ impl SessionMvpView {
         })
         .detach();
 
-        let composer = cx.new(|cx| TextInput::new(cx, "Ask Copilot to work on this project..."));
+        let composer = cx.new(|cx| {
+            TextInput::new(
+                cx,
+                "Ask anything, paste a URL, type / for commands, # for issues or & for sessions...",
+            )
+        });
         cx.subscribe(&composer, |view, _, event: &InputSubmitted, cx| {
             view.submit_prompt(event.text.clone());
             cx.notify();
@@ -469,6 +489,8 @@ impl SessionMvpView {
             draft_mode: "interactive".to_owned(),
             draft_model: None,
             draft_effort: "medium".to_owned(),
+            sidebar_open: true,
+            open_control_menu: None,
             action_error: None,
             _poll_task: poll_task,
         }
@@ -560,13 +582,17 @@ impl SessionMvpView {
 
     fn submit_prompt(&mut self, prompt: String) {
         self.action_error = None;
+        let supported_efforts = self
+            .draft_model
+            .as_deref()
+            .map_or_else(Vec::new, |model| self.supported_reasoning_efforts(model));
         let _ = self.commands.send(ServiceCommand::Submit {
             app_session_id: self.selected_session.clone(),
             prompt,
             project_path: self.selected_project.clone(),
             model: self.draft_model.clone(),
             mode: self.draft_mode.clone(),
-            reasoning_effort: self.draft_effort.clone(),
+            reasoning_effort: reasoning_effort_for_model(&supported_efforts, &self.draft_effort),
         });
     }
 
@@ -588,6 +614,7 @@ impl SessionMvpView {
     }
 
     fn select_session(&mut self, id: String, cx: &mut Context<Self>) {
+        self.open_control_menu = None;
         self.selected_session = Some(id);
         let _ = self.commands.send(ServiceCommand::Select {
             app_session_id: self.selected_session.clone(),
@@ -612,6 +639,7 @@ impl SessionMvpView {
     }
 
     fn select_project(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.open_control_menu = None;
         self.selected_project = PathBuf::from(path);
         self.selected_session = self
             .sessions
@@ -625,64 +653,86 @@ impl SessionMvpView {
     }
 
     fn new_session(&mut self, cx: &mut Context<Self>) {
+        self.open_control_menu = None;
         self.selected_session = None;
         let _ = self.commands.send(ServiceCommand::Select {
             app_session_id: None,
         });
         self.action_error = None;
+        self.composer.update(cx, TextInput::clear);
         cx.notify();
     }
 
-    fn cycle_mode(&mut self) {
-        let next = match self.draft_mode.as_str() {
-            "interactive" => "plan",
-            "plan" => "autopilot",
-            _ => "interactive",
-        };
-        next.clone_into(&mut self.draft_mode);
-        if let Some(id) = self.selected_session.clone() {
-            let _ = self.commands.send(ServiceCommand::SetMode {
-                app_session_id: id,
-                mode: self.draft_mode.clone(),
-            });
+    fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
+        self.sidebar_open = !self.sidebar_open;
+        cx.notify();
+    }
+
+    fn submit_composer(&mut self, cx: &mut Context<Self>) {
+        let prompt = self.composer.read(cx).value();
+        let prompt = prompt.trim();
+        if !prompt.is_empty() {
+            self.submit_prompt(prompt.to_owned());
+            cx.notify();
         }
     }
 
-    fn cycle_effort(&mut self) {
-        let next = match self.draft_effort.as_str() {
-            "low" => "medium",
-            "medium" => "high",
-            "high" => "xhigh",
-            _ => "low",
-        };
-        next.clone_into(&mut self.draft_effort);
-        if let Some(id) = self.selected_session.clone() {
-            let _ = self.commands.send(ServiceCommand::SetReasoningEffort {
-                app_session_id: id,
-                effort: self.draft_effort.clone(),
-            });
+    fn toggle_control_menu(&mut self, menu: ControlMenu) {
+        self.open_control_menu = toggled_menu(self.open_control_menu, menu);
+    }
+
+    fn dismiss_control_menu(&mut self, cx: &mut Context<Self>) {
+        if self.open_control_menu.take().is_some() {
+            cx.notify();
         }
     }
 
-    fn cycle_model(&mut self) {
-        let models = self.selected().map_or_else(Vec::new, |session| {
-            session.snapshot.controls.available_models.clone()
-        });
-        if models.is_empty() {
-            return;
+    fn choose_control(&mut self, menu: ControlMenu, value: String) {
+        match menu {
+            ControlMenu::Mode => {
+                value.clone_into(&mut self.draft_mode);
+                if let Some(id) = self.selected_session.clone() {
+                    let _ = self.commands.send(ServiceCommand::SetMode {
+                        app_session_id: id,
+                        mode: value,
+                    });
+                }
+            }
+            ControlMenu::Model => {
+                let supported_efforts = self.supported_reasoning_efforts(&value);
+                self.draft_model = Some(value.clone());
+                let reasoning_effort = if supported_efforts.is_empty() {
+                    None
+                } else {
+                    if !supported_efforts.contains(&self.draft_effort) {
+                        self.draft_effort.clone_from(
+                            supported_efforts
+                                .iter()
+                                .find(|effort| effort.as_str() == "medium")
+                                .unwrap_or(&supported_efforts[0]),
+                        );
+                    }
+                    Some(self.draft_effort.clone())
+                };
+                if let Some(id) = self.selected_session.clone() {
+                    let _ = self.commands.send(ServiceCommand::SetModel {
+                        app_session_id: id,
+                        model: value,
+                        reasoning_effort,
+                    });
+                }
+            }
+            ControlMenu::Effort => {
+                value.clone_into(&mut self.draft_effort);
+                if let Some(id) = self.selected_session.clone() {
+                    let _ = self.commands.send(ServiceCommand::SetReasoningEffort {
+                        app_session_id: id,
+                        effort: value,
+                    });
+                }
+            }
         }
-        let current = self.draft_model.as_deref();
-        let index = models
-            .iter()
-            .position(|model| Some(model.id.as_str()) == current)
-            .map_or(0, |index| (index + 1) % models.len());
-        self.draft_model = Some(models[index].id.clone());
-        if let Some(id) = self.selected_session.clone() {
-            let _ = self.commands.send(ServiceCommand::SetModel {
-                app_session_id: id,
-                model: models[index].id.clone(),
-            });
-        }
+        self.open_control_menu = None;
     }
 
     fn provider_status(&self) -> (String, u32) {
@@ -702,23 +752,202 @@ impl SessionMvpView {
         }
     }
 
+    fn model_options(&self) -> Vec<(String, String, String)> {
+        self.selected()
+            .map(|session| &session.snapshot.controls.available_models)
+            .filter(|models| !models.is_empty())
+            .or(match &self.startup {
+                StartupState::Ready(compatibility) => Some(&compatibility.available_models),
+                StartupState::Starting | StartupState::Failed(_) => None,
+            })
+            .into_iter()
+            .flatten()
+            .map(|model| (model.id.clone(), model.name.clone(), String::new()))
+            .collect()
+    }
+
+    fn mode_options(&self) -> Vec<(String, String, String)> {
+        let modes = match &self.startup {
+            StartupState::Ready(compatibility) => &compatibility.available_modes,
+            StartupState::Starting | StartupState::Failed(_) => return Vec::new(),
+        };
+        modes
+            .iter()
+            .map(|mode| {
+                let description = match mode.as_str() {
+                    "interactive" => "Step-by-step collaboration",
+                    "plan" => "Plan first, execute when ready",
+                    "autopilot" => "End-to-end execution",
+                    _ => "Copilot agent mode",
+                };
+                (mode.clone(), title_case(mode), description.to_owned())
+            })
+            .collect()
+    }
+
+    fn supported_reasoning_efforts(&self, model_id: &str) -> Vec<String> {
+        self.selected()
+            .and_then(|session| {
+                session
+                    .snapshot
+                    .controls
+                    .available_models
+                    .iter()
+                    .find(|model| model.id == model_id)
+            })
+            .or_else(|| match &self.startup {
+                StartupState::Ready(compatibility) => compatibility
+                    .available_models
+                    .iter()
+                    .find(|model| model.id == model_id),
+                StartupState::Starting | StartupState::Failed(_) => None,
+            })
+            .map_or_else(Vec::new, |model| model.supported_reasoning_efforts.clone())
+    }
+
+    fn effort_options(&self) -> Vec<(String, String, String)> {
+        let model_id = self.draft_model.as_deref().unwrap_or("gpt-5.6-sol");
+        self.supported_reasoning_efforts(model_id)
+            .into_iter()
+            .map(|effort| {
+                let description = match effort.as_str() {
+                    "low" => "Faster responses",
+                    "medium" => "Balanced reasoning",
+                    "high" => "Deeper reasoning",
+                    "xhigh" => "Most thorough reasoning",
+                    _ => "Provider-supported reasoning level",
+                };
+                (
+                    effort.clone(),
+                    effort_label(&effort),
+                    description.to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn draft_model_label(&self) -> String {
+        let Some(selected) = self.draft_model.as_deref() else {
+            return "Auto".to_owned();
+        };
+        self.model_options()
+            .into_iter()
+            .find_map(|(id, label, _)| (id == selected).then_some(label))
+            .unwrap_or_else(|| selected.to_owned())
+    }
+
+    fn control_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let menu = self.open_control_menu?;
+        let (title, selected, options) = match menu {
+            ControlMenu::Mode => ("Mode", self.draft_mode.clone(), self.mode_options()),
+            ControlMenu::Model => {
+                let options = self.model_options();
+                let selected = self
+                    .draft_model
+                    .clone()
+                    .or_else(|| {
+                        options.iter().find_map(|(id, label, _)| {
+                            (label.eq_ignore_ascii_case("auto")).then(|| id.clone())
+                        })
+                    })
+                    .unwrap_or_default();
+                ("Model", selected, options)
+            }
+            ControlMenu::Effort => (
+                "Reasoning effort",
+                self.draft_effort.clone(),
+                self.effort_options(),
+            ),
+        };
+        let width = if menu == ControlMenu::Model {
+            px(340.0)
+        } else {
+            px(260.0)
+        };
+        Some(
+            div()
+                .id("composer-control-menu")
+                .w(width)
+                .max_h(px(460.0))
+                .overflow_y_scroll()
+                .p_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(PANEL))
+                .shadow_lg()
+                .child(
+                    div()
+                        .px_2()
+                        .py_1()
+                        .text_sm()
+                        .font_weight(gpui::FontWeight::SEMIBOLD)
+                        .text_color(rgb(MUTED))
+                        .child(title),
+                )
+                .children(options.into_iter().enumerate().map(
+                    |(index, (value, label, description))| {
+                        let is_selected = value == selected;
+                        let option_value = value.clone();
+                        let has_description = !description.is_empty();
+                        div()
+                            .id(("control-option", index))
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_2()
+                            .py_2()
+                            .rounded_md()
+                            .bg(if is_selected {
+                                rgb(ELEVATED)
+                            } else {
+                                rgb(PANEL)
+                            })
+                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(move |view, _, _, cx| {
+                                    view.choose_control(menu, option_value.clone());
+                                    cx.notify();
+                                }),
+                            )
+                            .child(
+                                div()
+                                    .w(px(16.0))
+                                    .text_color(rgb(MUTED))
+                                    .child(if is_selected { "✓" } else { "" }),
+                            )
+                            .child(div().flex().flex_col().min_w_0().child(label).when(
+                                has_description,
+                                |content| {
+                                    content.child(
+                                        div().text_xs().text_color(rgb(MUTED)).child(description),
+                                    )
+                                },
+                            ))
+                    },
+                )),
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
-    fn sidebar(&self, cx: &mut Context<Self>) -> gpui::Div {
+    fn sidebar(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_path = self.selected_project.to_string_lossy();
         let sessions = self
             .sessions
             .iter()
-            .enumerate()
-            .filter(|(_, session)| session.snapshot.metadata.project_path == selected_path)
-            .map(|(index, session)| {
+            .filter(|session| session.snapshot.metadata.project_path == selected_path)
+            .map(|session| {
                 let id = session.handle.id().to_owned();
                 let selected = self.selected_session.as_deref() == Some(id.as_str());
                 div()
-                    .id(("session", index))
+                    .id(SharedString::from(format!("session-{id}")))
                     .flex()
-                    .flex_col()
-                    .gap_1()
-                    .p_3()
+                    .items_center()
+                    .gap_2()
+                    .ml_5()
+                    .px_3()
+                    .py_2()
                     .rounded_md()
                     .bg(if selected {
                         rgb(ELEVATED)
@@ -732,36 +961,36 @@ impl SessionMvpView {
                     )
                     .child(
                         div()
-                            .text_sm()
-                            .text_color(rgb(PRIMARY))
-                            .child(session.snapshot.metadata.title.clone()),
+                            .w(px(7.0))
+                            .h(px(7.0))
+                            .rounded_full()
+                            .bg(status_color(session.snapshot.status)),
                     )
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(status_color(session.snapshot.status))
-                            .child(format!(
-                                "{:?} · {} messages",
-                                session.snapshot.status,
-                                session.snapshot.transcript.len()
-                            )),
+                            .min_w_0()
+                            .flex_1()
+                            .text_sm()
+                            .text_color(rgb(PRIMARY))
+                            .overflow_hidden()
+                            .child(session.snapshot.metadata.title.clone()),
                     )
             });
-        let projects = self.projects.iter().enumerate().map(|(index, project)| {
+        let projects = self.projects.iter().map(|project| {
             let path = project.path.clone();
             let selected = project.path == selected_path;
             div()
-                .id(("project", index))
-                .px_2()
-                .py_1()
+                .id(SharedString::from(format!("project-{path}")))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
                 .rounded_md()
                 .text_sm()
                 .text_color(if selected { rgb(PRIMARY) } else { rgb(MUTED) })
-                .bg(if selected {
-                    rgb(ELEVATED)
-                } else {
-                    rgb(SIDEBAR)
-                })
+                .bg(rgb(SIDEBAR))
+                .child(div().text_color(rgb(MUTED)).child("▱"))
                 .child(project.name.clone())
                 .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                 .on_mouse_up(
@@ -769,63 +998,212 @@ impl SessionMvpView {
                     cx.listener(move |view, _, _, cx| view.select_project(&path, cx)),
                 )
         });
-        let new_button = div()
-            .id("new-session")
-            .p_2()
-            .rounded_md()
-            .bg(rgb(BLUE))
-            .text_color(rgb(BACKGROUND))
-            .text_sm()
-            .child("+ New session")
-            .hover(|style| style.opacity(0.85).cursor_pointer())
-            .on_mouse_up(
-                MouseButton::Left,
-                cx.listener(|view, _, _, cx| view.new_session(cx)),
-            );
         div()
+            .id("sidebar")
             .flex()
             .flex_col()
-            .w(px(286.0))
+            .w(if compact { px(300.0) } else { px(280.0) })
             .h_full()
             .bg(rgb(SIDEBAR))
             .border_r_1()
             .border_color(rgb(BORDER))
-            .p_3()
-            .gap_3()
             .child(
                 div()
+                    .id("sidebar-titlebar")
+                    .h(px(56.0))
                     .flex()
-                    .justify_between()
                     .items_center()
-                    .child(div().font_weight(gpui::FontWeight::BOLD).child("GCABB"))
-                    .child(new_button),
-            )
-            .child(div().flex().flex_col().gap_1().children(projects))
-            .child(div().flex().flex_col().gap_1().children(sessions))
-            .children(self.restore_failures.iter().map(|failure| {
-                div()
-                    .text_xs()
-                    .text_color(rgb(RED))
-                    .child(format!("Restore failed: {}", failure.error))
-            }))
-    }
-
-    fn transcript(&self) -> gpui::Div {
-        let Some(session) = self.selected() else {
-            return div().flex().flex_1().items_center().justify_center().child(
-                div()
-                    .w(px(640.0))
-                    .flex()
-                    .flex_col()
+                    .pl(px(84.0))
+                    .pr_3()
                     .gap_3()
-                    .items_center()
-                    .child(div().text_2xl().child("What should Copilot work on?"))
                     .child(
                         div()
+                            .id("sidebar-toggle")
+                            .w(px(24.0))
+                            .h(px(24.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
                             .text_color(rgb(MUTED))
-                            .child("Start a new isolated coding session in this project."),
+                            .child("▯")
+                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|view, _, _, cx| view.toggle_sidebar(cx)),
+                            ),
+                    )
+                    .child(div().flex_1())
+                    .child(div().text_color(rgb(MUTED)).child("<"))
+                    .child(div().text_color(rgb(MUTED)).child(">")),
+            )
+            .child(
+                div()
+                    .id("primary-destinations")
+                    .flex()
+                    .flex_col()
+                    .px_2()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("destination-home")
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .bg(if self.selected_session.is_none() {
+                                rgb(ELEVATED)
+                            } else {
+                                rgb(SIDEBAR)
+                            })
+                            .child(div().text_color(rgb(MUTED)).child("⌂"))
+                            .child("Home")
+                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|view, _, _, cx| view.new_session(cx)),
+                            ),
+                    )
+                    .child(disabled_destination("destination-my-work", "☷", "My work"))
+                    .child(disabled_destination(
+                        "destination-automations",
+                        "□",
+                        "Automations",
+                    ))
+                    .child(disabled_destination("destination-search", "⌕", "Search")),
+            )
+            .child(
+                div()
+                    .mt_5()
+                    .flex()
+                    .items_center()
+                    .px_4()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child("Sessions")
+                    .child(div().flex_1())
+                    .child(div().id("session-grouping").text_xs().child("By project"))
+                    .child(
+                        div()
+                            .id("new-session")
+                            .ml_3()
+                            .w(px(24.0))
+                            .h(px(24.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_md()
+                            .text_lg()
+                            .child("+")
+                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|view, _, _, cx| view.new_session(cx)),
+                            ),
                     ),
-            );
+            )
+            .child(
+                div()
+                    .id("session-list")
+                    .flex()
+                    .flex_col()
+                    .px_2()
+                    .mt_2()
+                    .gap_1()
+                    .child(
+                        div()
+                            .id("chats-home")
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .text_color(rgb(MUTED))
+                            .child("◯")
+                            .child("Chats")
+                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|view, _, _, cx| view.new_session(cx)),
+                            ),
+                    )
+                    .children(projects)
+                    .children(sessions),
+            )
+            .children(
+                self.restore_failures
+                    .iter()
+                    .enumerate()
+                    .map(|(index, failure)| {
+                        div()
+                            .id(("restore-failure", index))
+                            .text_xs()
+                            .text_color(rgb(RED))
+                            .child(format!("Restore failed: {}", failure.error))
+                    }),
+            )
+            .child(div().flex_1())
+            .child(
+                div()
+                    .id("sidebar-footer")
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_4()
+                    .pb_4()
+                    .text_sm()
+                    .child(
+                        div()
+                            .w(px(24.0))
+                            .h(px(24.0))
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(rgb(ELEVATED))
+                            .text_xs()
+                            .child("GC"),
+                    )
+                    .child(div().flex_1().child("Local workspace"))
+                    .child(
+                        div()
+                            .id("settings-placeholder")
+                            .text_color(rgb(MUTED))
+                            .child("Settings — unavailable"),
+                    ),
+            )
+    }
+
+    fn transcript(&self) -> impl IntoElement {
+        let Some(session) = self.selected() else {
+            return div()
+                .id("empty-session")
+                .flex()
+                .flex_1()
+                .items_center()
+                .justify_center()
+                .child(
+                    div()
+                        .w(px(640.0))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .items_center()
+                        .child(
+                            div()
+                                .id("empty-session-heading")
+                                .text_2xl()
+                                .child("What should Copilot work on?"),
+                        )
+                        .child(
+                            div()
+                                .text_color(rgb(MUTED))
+                                .child("Start a coding session in the current checkout."),
+                        ),
+                );
         };
         let messages = session
             .snapshot
@@ -837,6 +1215,7 @@ impl SessionMvpView {
             .map(|message| {
                 let is_user = message.role == TranscriptRole::User;
                 div()
+                    .id(SharedString::from(format!("message-{}", message.id)))
                     .flex()
                     .w_full()
                     .justify_end()
@@ -873,6 +1252,7 @@ impl SessionMvpView {
                     )
             });
         div()
+            .id("transcript")
             .flex()
             .flex_col()
             .flex_1()
@@ -884,13 +1264,11 @@ impl SessionMvpView {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn composer(&self, cx: &mut Context<Self>) -> gpui::Div {
-        let mode = self.draft_mode.clone();
-        let effort = self.draft_effort.clone();
-        let model = self
-            .draft_model
-            .clone()
-            .unwrap_or_else(|| "Auto model".to_owned());
+    fn session_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mode = title_case(&self.draft_mode);
+        let effort = effort_label(&self.draft_effort);
+        let model = self.draft_model_label();
+        let supports_reasoning = !self.effort_options().is_empty();
         let selected = self.selected();
         let running = selected.is_some_and(|session| {
             matches!(
@@ -908,9 +1286,12 @@ impl SessionMvpView {
             .then(|| self.selected_session.clone())
             .flatten();
         div()
+            .id("composer")
+            .relative()
             .mx_auto()
             .mb_4()
-            .w(px(820.0))
+            .w_full()
+            .max_w(px(820.0))
             .flex()
             .flex_col()
             .bg(rgb(PANEL))
@@ -926,17 +1307,60 @@ impl SessionMvpView {
                     .gap_2()
                     .px_3()
                     .pb_3()
-                    .child(control_pill("mode", mode, cx, SessionMvpView::cycle_mode))
+                    .child(
+                        div()
+                            .id("attachments-placeholder")
+                            .text_lg()
+                            .text_color(rgb(MUTED))
+                            .child("+"),
+                    )
+                    .child(control_pill(
+                        "mode",
+                        mode,
+                        ControlMenu::Mode,
+                        self.open_control_menu == Some(ControlMenu::Mode),
+                        cx,
+                    ))
                     .child(control_pill(
                         "model",
                         model,
+                        ControlMenu::Model,
+                        self.open_control_menu == Some(ControlMenu::Model),
                         cx,
-                        SessionMvpView::cycle_model,
                     ))
-                    .child(control_pill("effort", effort, cx, |view| {
-                        view.cycle_effort();
-                    }))
+                    .when(supports_reasoning, |row| {
+                        row.child(control_pill(
+                            "effort",
+                            effort,
+                            ControlMenu::Effort,
+                            self.open_control_menu == Some(ControlMenu::Effort),
+                            cx,
+                        ))
+                    })
                     .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("submit-prompt")
+                            .w(px(32.0))
+                            .h(px(32.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(rgb(ELEVATED))
+                            .text_color(rgb(MUTED))
+                            .child("↑")
+                            .hover(|style| {
+                                style
+                                    .bg(rgb(BORDER))
+                                    .text_color(rgb(PRIMARY))
+                                    .cursor_pointer()
+                            })
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|view, _, _, cx| view.submit_composer(cx)),
+                            ),
+                    )
                     .when_some(cancel, |row, id| {
                         row.child(
                             div()
@@ -1011,7 +1435,199 @@ impl SessionMvpView {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn interaction_dialog(&self, cx: &mut Context<Self>) -> Option<gpui::Div> {
+    fn home_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let project_name = self
+            .projects
+            .iter()
+            .find(|project| Path::new(&project.path) == self.selected_project)
+            .map_or_else(
+                || {
+                    self.selected_project
+                        .file_name()
+                        .and_then(|name| name.to_str())
+                        .unwrap_or("Project")
+                        .to_owned()
+                },
+                |project| project.name.clone(),
+            );
+        let branch = self
+            .projects
+            .iter()
+            .find(|project| Path::new(&project.path) == self.selected_project)
+            .and_then(|project| project.default_branch.clone())
+            .unwrap_or_else(|| self.branch.clone());
+        let mode = title_case(&self.draft_mode);
+        let model = self.draft_model_label();
+        let effort = effort_label(&self.draft_effort);
+        let supports_reasoning = !self.effort_options().is_empty();
+
+        div()
+            .id("home-composer")
+            .relative()
+            .w_full()
+            .max_w(px(820.0))
+            .flex()
+            .flex_col()
+            .rounded_lg()
+            .bg(rgb(SUBTLE))
+            .shadow_lg()
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .min_h(px(108.0))
+                    .bg(rgb(PANEL))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_lg()
+                    .child(self.composer.clone())
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .px_3()
+                            .pb_3()
+                            .child(
+                                div()
+                                    .id("home-attachments-placeholder")
+                                    .w(px(28.0))
+                                    .h(px(28.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_md()
+                                    .text_lg()
+                                    .text_color(rgb(MUTED))
+                                    .child("+"),
+                            )
+                            .child(control_pill(
+                                "mode",
+                                mode,
+                                ControlMenu::Mode,
+                                self.open_control_menu == Some(ControlMenu::Mode),
+                                cx,
+                            ))
+                            .child(div().h(px(20.0)).border_l_1().border_color(rgb(BORDER)))
+                            .child(control_pill(
+                                "model",
+                                model,
+                                ControlMenu::Model,
+                                self.open_control_menu == Some(ControlMenu::Model),
+                                cx,
+                            ))
+                            .when(supports_reasoning, |row| {
+                                row.child(control_pill(
+                                    "effort",
+                                    effort,
+                                    ControlMenu::Effort,
+                                    self.open_control_menu == Some(ControlMenu::Effort),
+                                    cx,
+                                ))
+                            })
+                            .child(div().flex_1())
+                            .child(
+                                div()
+                                    .id("home-submit-prompt")
+                                    .w(px(32.0))
+                                    .h(px(32.0))
+                                    .flex()
+                                    .items_center()
+                                    .justify_center()
+                                    .rounded_full()
+                                    .bg(rgb(ELEVATED))
+                                    .text_color(rgb(MUTED))
+                                    .child("↑")
+                                    .hover(|style| {
+                                        style
+                                            .bg(rgb(BORDER))
+                                            .text_color(rgb(PRIMARY))
+                                            .cursor_pointer()
+                                    })
+                                    .on_mouse_up(
+                                        MouseButton::Left,
+                                        cx.listener(|view, _, _, cx| view.submit_composer(cx)),
+                                    ),
+                            ),
+                    ),
+            )
+            .child(
+                div()
+                    .id("checkout-context")
+                    .flex()
+                    .items_center()
+                    .gap_4()
+                    .h(px(48.0))
+                    .px_4()
+                    .text_sm()
+                    .text_color(rgb(MUTED))
+                    .child(format!("▱ {project_name}"))
+                    .child("↗ Current checkout")
+                    .child(format!("⌁ {branch}"))
+                    .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("add-project-placeholder")
+                            .child("+ Add project — unavailable"),
+                    ),
+            )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn home(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
+        let (provider_status, provider_color) = self.provider_status();
+
+        div()
+            .id("home")
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .when(compact, gpui::StatefulInteractiveElement::overflow_y_scroll)
+            .when(!compact, gpui::Styled::overflow_hidden)
+            .px(if compact { px(24.0) } else { px(40.0) })
+            .pb_6()
+            .child(
+                div()
+                    .id("provider-status")
+                    .absolute()
+                    .top(px(20.0))
+                    .right(px(24.0))
+                    .text_xs()
+                    .text_color(rgb(provider_color))
+                    .child(provider_status),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .items_center()
+                    .w_full()
+                    .pt(if compact { px(92.0) } else { px(118.0) })
+                    .child(
+                        div()
+                            .id("gcabb-mark")
+                            .w(px(72.0))
+                            .h(px(72.0))
+                            .mb_10()
+                            .rounded_full()
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .bg(rgb(MUTED))
+                            .text_color(rgb(BACKGROUND))
+                            .text_xl()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .child("GC"),
+                    )
+                    .child(self.home_composer(cx)),
+            )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn interaction_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let session = self.selected()?;
         let interaction = session.snapshot.pending_interactions.first()?.clone();
         let app_session_id = session.handle.id().to_owned();
@@ -1060,6 +1676,7 @@ impl SessionMvpView {
                 .bg(gpui::rgba(0x0000_00a8))
                 .child(
                     div()
+                        .id("interaction-panel")
                         .w(px(560.0))
                         .flex()
                         .flex_col()
@@ -1072,6 +1689,7 @@ impl SessionMvpView {
                         .shadow_lg()
                         .child(
                             div()
+                                .id("interaction-heading")
                                 .text_xl()
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .child(interaction.title),
@@ -1132,8 +1750,18 @@ impl SessionMvpView {
 }
 
 impl Render for SessionMvpView {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    #[allow(clippy::too_many_lines)]
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         let (provider_status, provider_color) = self.provider_status();
+        let compact = compact_layout(f32::from(window.viewport_size().width));
+        let show_sidebar = self.sidebar_open;
+        let content_left = if show_sidebar {
+            if compact { 300.0 } else { 280.0 }
+        } else {
+            0.0
+        };
+        let control_menu_left = self.open_control_menu.map_or(0, control_menu_offset);
+        let session_selected = self.selected_session.is_some();
         let title = self.selected().map_or_else(
             || "New session".to_owned(),
             |session| session.snapshot.metadata.title.clone(),
@@ -1145,42 +1773,88 @@ impl Render for SessionMvpView {
             .and_then(|project| project.default_branch.clone())
             .unwrap_or_else(|| self.branch.clone());
         div()
+            .id("gcabb")
+            .on_action(cx.listener(|view, _: &DismissPopup, _, cx| {
+                view.dismiss_control_menu(cx);
+            }))
             .relative()
             .flex()
             .size_full()
             .bg(rgb(BACKGROUND))
             .text_color(rgb(PRIMARY))
-            .child(self.sidebar(cx))
+            .when(show_sidebar, |root| root.child(self.sidebar(compact, cx)))
             .child(
                 div()
+                    .id("main-content")
+                    .relative()
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_w_0()
-                    .child(
-                        div()
-                            .h(px(56.0))
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .px_5()
-                            .border_b_1()
-                            .border_color(rgb(BORDER))
-                            .child(div().flex().flex_col().child(div().child(title)).child(
-                                div().text_xs().text_color(rgb(MUTED)).child(format!(
-                                    "{} · {}",
-                                    self.selected_project.display(),
-                                    branch
-                                )),
-                            ))
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(rgb(provider_color))
-                                    .child(provider_status),
-                            ),
-                    )
-                    .child(self.transcript())
+                    .when(!show_sidebar, |main| {
+                        main.child(
+                            div()
+                                .id("collapsed-titlebar")
+                                .absolute()
+                                .top_0()
+                                .left_0()
+                                .h(px(56.0))
+                                .flex()
+                                .items_center()
+                                .pl(px(84.0))
+                                .child(
+                                    div()
+                                        .id("sidebar-toggle")
+                                        .w(px(24.0))
+                                        .h(px(24.0))
+                                        .flex()
+                                        .items_center()
+                                        .justify_center()
+                                        .rounded_md()
+                                        .text_color(rgb(MUTED))
+                                        .child("▯")
+                                        .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                                        .on_mouse_up(
+                                            MouseButton::Left,
+                                            cx.listener(|view, _, _, cx| {
+                                                view.toggle_sidebar(cx);
+                                            }),
+                                        ),
+                                ),
+                        )
+                    })
+                    .when(self.selected_session.is_none(), |main| {
+                        main.child(self.home(compact, cx))
+                    })
+                    .when(self.selected_session.is_some(), |main| {
+                        main.child(
+                            div()
+                                .h(px(56.0))
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .px_5()
+                                .border_b_1()
+                                .border_color(rgb(BORDER))
+                                .child(div().flex().flex_col().child(div().child(title)).child(
+                                    div().text_xs().text_color(rgb(MUTED)).child(format!(
+                                        "{} · {}",
+                                        self.selected_project.display(),
+                                        branch
+                                    )),
+                                ))
+                                .child(
+                                    div()
+                                        .id("provider-status")
+                                        .text_xs()
+                                        .text_color(rgb(provider_color))
+                                        .child(provider_status),
+                                ),
+                        )
+                    })
+                    .when(self.selected_session.is_some(), |main| {
+                        main.child(self.transcript())
+                    })
                     .when_some(self.action_error.clone(), |column, error| {
                         column.child(
                             div()
@@ -1191,8 +1865,43 @@ impl Render for SessionMvpView {
                                 .child(error),
                         )
                     })
-                    .child(self.composer(cx)),
+                    .when(self.selected_session.is_some(), |main| {
+                        main.child(div().w_full().px_5().child(self.session_composer(cx)))
+                    }),
             )
+            .when(self.open_control_menu.is_some(), |root| {
+                root.child(
+                    div()
+                        .id("dismiss-control-menu")
+                        .absolute()
+                        .inset_0()
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|view, _, _, cx| view.dismiss_control_menu(cx)),
+                        ),
+                )
+            })
+            .when_some(self.control_menu(cx), |root, menu| {
+                root.child(
+                    div()
+                        .absolute()
+                        .left(px(content_left))
+                        .right_0()
+                        .when(session_selected, |popup| popup.bottom(px(104.0)))
+                        .when(!session_selected, |popup| {
+                            popup.top(if compact { px(310.0) } else { px(332.0) })
+                        })
+                        .flex()
+                        .justify_center()
+                        .child(
+                            div()
+                                .w_full()
+                                .max_w(px(820.0))
+                                .pl(px(f32::from(control_menu_left)))
+                                .child(menu),
+                        ),
+                )
+            })
             .when_some(self.interaction_dialog(cx), |root, dialog| {
                 root.child(dialog)
             })
@@ -1202,8 +1911,9 @@ impl Render for SessionMvpView {
 fn control_pill(
     id: &'static str,
     value: String,
+    menu: ControlMenu,
+    _expanded: bool,
     cx: &mut Context<SessionMvpView>,
-    action: impl Fn(&mut SessionMvpView) + 'static,
 ) -> impl IntoElement {
     div()
         .id(id)
@@ -1218,10 +1928,63 @@ fn control_pill(
         .on_mouse_up(
             MouseButton::Left,
             cx.listener(move |view, _, _, cx| {
-                action(view);
+                view.toggle_control_menu(menu);
                 cx.notify();
             }),
         )
+}
+
+fn disabled_destination(
+    id: &'static str,
+    icon: &'static str,
+    label: &'static str,
+) -> impl IntoElement {
+    div()
+        .id(id)
+        .flex()
+        .items_center()
+        .gap_3()
+        .px_3()
+        .py_2()
+        .text_color(rgb(MUTED))
+        .child(icon)
+        .child(label)
+        .child(div().flex_1())
+        .child(div().text_xs().child("Unavailable"))
+}
+
+fn compact_layout(width: f32) -> bool {
+    width < COMPACT_WIDTH
+}
+
+fn control_menu_offset(menu: ControlMenu) -> u16 {
+    match menu {
+        ControlMenu::Mode => 40,
+        ControlMenu::Model => 128,
+        ControlMenu::Effort => 216,
+    }
+}
+
+fn toggled_menu(current: Option<ControlMenu>, requested: ControlMenu) -> Option<ControlMenu> {
+    (current != Some(requested)).then_some(requested)
+}
+
+fn title_case(value: &str) -> String {
+    let mut characters = value.chars();
+    characters.next().map_or_else(String::new, |first| {
+        first.to_uppercase().collect::<String>() + characters.as_str()
+    })
+}
+
+fn effort_label(value: &str) -> String {
+    match value {
+        "xhigh" => "Extra high".to_owned(),
+        other => title_case(other),
+    }
+}
+
+fn reasoning_effort_for_model(supported_efforts: &[String], selected: &str) -> Option<String> {
+    (!supported_efforts.is_empty()).then(|| selected.to_owned())
 }
 
 fn action_button(
@@ -1324,6 +2087,7 @@ fn main() {
 
     Application::new().run(move |cx: &mut App| {
         bind_text_input_keys(cx);
+        cx.bind_keys([KeyBinding::new("escape", DismissPopup, None)]);
         let bounds = Bounds::centered(None, size(px(1280.0), px(860.0)), cx);
         let service = service;
         let project_root = project_root.clone();
@@ -1332,6 +2096,12 @@ fn main() {
             .open_window(
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
+                    titlebar: Some(TitlebarOptions {
+                        title: Some("GCABB".into()),
+                        appears_transparent: true,
+                        traffic_light_position: Some(point(px(18.0), px(18.0))),
+                    }),
+                    window_min_size: Some(size(px(640.0), px(520.0))),
                     ..Default::default()
                 },
                 move |_, cx| cx.new(|cx| SessionMvpView::new(service, project_root, branch, cx)),
@@ -1344,4 +2114,56 @@ fn main() {
             .expect("failed to focus composer");
         cx.activate(true);
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{
+        COMPACT_WIDTH, ControlMenu, compact_layout, control_menu_offset, effort_label,
+        reasoning_effort_for_model, toggled_menu,
+    };
+
+    #[test]
+    fn compact_layout_uses_stable_breakpoint() {
+        assert!(compact_layout(COMPACT_WIDTH - 1.0));
+        assert!(!compact_layout(COMPACT_WIDTH));
+    }
+
+    #[test]
+    fn selector_menu_opens_switches_and_closes() {
+        assert_eq!(
+            toggled_menu(None, ControlMenu::Model),
+            Some(ControlMenu::Model)
+        );
+        assert_eq!(
+            toggled_menu(Some(ControlMenu::Model), ControlMenu::Effort),
+            Some(ControlMenu::Effort)
+        );
+        assert_eq!(
+            toggled_menu(Some(ControlMenu::Model), ControlMenu::Model),
+            None
+        );
+    }
+
+    #[test]
+    fn selector_menus_align_with_their_composer_pills() {
+        assert_eq!(control_menu_offset(ControlMenu::Mode), 40);
+        assert_eq!(control_menu_offset(ControlMenu::Model), 128);
+        assert_eq!(control_menu_offset(ControlMenu::Effort), 216);
+    }
+
+    #[test]
+    fn effort_labels_match_menu_copy() {
+        assert_eq!(effort_label("medium"), "Medium");
+        assert_eq!(effort_label("xhigh"), "Extra high");
+    }
+
+    #[test]
+    fn reasoning_effort_is_only_submitted_for_supported_models() {
+        assert_eq!(reasoning_effort_for_model(&[], "medium"), None);
+        assert_eq!(
+            reasoning_effort_for_model(&["low".to_owned(), "medium".to_owned()], "medium"),
+            Some("medium".to_owned())
+        );
+    }
 }
