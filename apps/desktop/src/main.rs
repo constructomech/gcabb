@@ -15,7 +15,7 @@ use gpui::{
     App, AppContext, Application, Bounds, Context, Entity, Focusable, InteractiveElement,
     IntoElement, KeyBinding, MouseButton, ParentElement, Render, SharedString,
     StatefulInteractiveElement, Styled, Timer, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, actions, div, point, px, rgb, size,
+    WindowOptions, actions, div, px, rgb, size,
 };
 use session_manager::{CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager};
 use storage::Storage;
@@ -1013,7 +1013,7 @@ impl SessionMvpView {
                     .h(px(56.0))
                     .flex()
                     .items_center()
-                    .pl(px(84.0))
+                    .pl_3()
                     .pr_3()
                     .gap_3()
                     .child(
@@ -1801,7 +1801,7 @@ impl Render for SessionMvpView {
                                 .h(px(56.0))
                                 .flex()
                                 .items_center()
-                                .pl(px(84.0))
+                                .pl_3()
                                 .child(
                                     div()
                                         .id("sidebar-toggle")
@@ -2088,6 +2088,12 @@ fn main() {
     Application::new().run(move |cx: &mut App| {
         bind_text_input_keys(cx);
         cx.bind_keys([KeyBinding::new("escape", DismissPopup, None)]);
+        cx.on_window_closed(|cx| {
+            if cx.windows().is_empty() {
+                cx.quit();
+            }
+        })
+        .detach();
         let bounds = Bounds::centered(None, size(px(1280.0), px(860.0)), cx);
         let service = service;
         let project_root = project_root.clone();
@@ -2098,8 +2104,7 @@ fn main() {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
                         title: Some("GCABB".into()),
-                        appears_transparent: true,
-                        traffic_light_position: Some(point(px(18.0), px(18.0))),
+                        ..Default::default()
                     }),
                     window_min_size: Some(size(px(640.0), px(520.0))),
                     ..Default::default()

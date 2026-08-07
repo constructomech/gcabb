@@ -1785,6 +1785,7 @@ dependencies = [
  "copilot-provider",
  "diagnostics",
  "dirs 5.0.1",
+ "embed-resource",
  "gpui",
  "session-manager",
  "storage",

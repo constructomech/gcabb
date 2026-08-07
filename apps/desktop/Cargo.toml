@@ -17,5 +17,8 @@ tokio.workspace = true
 tracing.workspace = true
 ui-components.workspace = true
 
+[target.'cfg(windows)'.build-dependencies]
+embed-resource = "3.0"
+
 [lints]
 workspace = true
