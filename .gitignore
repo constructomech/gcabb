@@ -1,0 +1,6 @@
+/target/
+/.phase0/
+*.jsonl
+*.log
+.DS_Store
+

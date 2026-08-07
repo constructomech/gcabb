@@ -25,11 +25,40 @@ session projection, but GCABB is a new application rather than a Zed fork.
 
 See [plan.md](plan.md) for the current architecture and implementation roadmap.
 
-## Status
+## Phase 0 spike
 
-GCABB is in the design and feasibility stage. The first implementation milestone
-will validate Copilot SDK event coverage, live terminal output, session recovery,
-and native GPUI rendering.
+The repository contains an executable feasibility spike:
+
+- `sdk-probe` starts the SDK-bundled CLI, records startup timing, exercises
+  session lifecycle and typed RPCs, and writes raw plus normalized events as
+  JSON Lines.
+- `gcabb-desktop-spike` is a native GPUI surface for a streaming activity
+  timeline, terminal output, and a Git comparison against a selected base.
+- `spike-core` owns the versioned event normalization boundary.
+
+Rust 1.94 is pinned in `rust-toolchain.toml`.
+
+```sh
+# Lifecycle and capability smoke test; no model prompt is sent.
+cargo run -p sdk-probe -- --cwd .
+
+# Isolate model-driven probes from the source tree.
+mkdir -p .phase0/workspace
+cargo run -p sdk-probe -- \
+  --cwd .phase0/workspace \
+  --approve-permissions \
+  --prompt "Inspect the workspace and report what you find."
+
+# Open the native prototype. The optional argument is a Git base.
+cargo run -p gcabb-desktop-spike -- main
+
+# Coalesce 50,000 simulated token and terminal updates on frame boundaries.
+GCABB_STRESS_EVENTS=50000 cargo run -p gcabb-desktop-spike -- main
+```
+
+Probe output defaults to `.phase0/events.jsonl`, which is ignored by Git because
+it can contain prompts, model output, file paths, and tool arguments. See
+[`docs/phase-0/`](docs/phase-0/) for results, scenario commands, and known gaps.
 
 ## Disclaimer
 

@@ -1,0 +1,33 @@
+[workspace]
+members = [
+    "apps/desktop",
+    "apps/sdk-probe",
+    "crates/spike-core",
+]
+resolver = "2"
+
+[workspace.package]
+edition = "2024"
+license = "MIT"
+rust-version = "1.94"
+version = "0.1.0"
+
+[workspace.dependencies]
+anyhow = "1.0.100"
+async-trait = "0.1.89"
+clap = { version = "4.5.54", features = ["derive"] }
+github-copilot-sdk = "=1.0.9"
+gpui = { version = "=0.2.2", default-features = false, features = ["font-kit"] }
+serde = { version = "1.0.228", features = ["derive"] }
+serde_json = "1.0.149"
+spike-core = { path = "crates/spike-core" }
+tokio = { version = "1.49.0", features = ["io-util", "macros", "process", "rt-multi-thread", "signal", "time"] }
+tracing = "0.1.44"
+tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
+
+[workspace.lints.rust]
+unsafe_code = "forbid"
+
+[workspace.lints.clippy]
+all = "warn"
+pedantic = "warn"

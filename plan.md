@@ -144,7 +144,8 @@ Learn from these Zed patterns:
 - Full terminal output for the user with bounded output for the model.
 - Virtualized terminal and diff rendering.
 - SQLite thread metadata and snapshot persistence.
-- Undo-aware edit tracking and explicit subagent correlation.
+- Undo-aware edit tracking and explicit subagent correlation through `agentId`,
+  `toolCallId`, and `parentToolCallId`.
 
 Do not copy GPL implementation code unless the project deliberately adopts GPL
 after legal review.
@@ -266,6 +267,8 @@ Build a unified activity timeline from:
 
 - Assistant message and reasoning events exposed by the SDK.
 - Tool start, progress, result, and failure events.
+- `subagent.started`, `subagent.completed`, and `subagent.failed` events, with
+  child activity correlated through agent and tool-call identifiers.
 - Permission and user-input callbacks.
 - Session hooks before and after tool use.
 - Fleet, task, and agent RPCs.
@@ -278,6 +281,8 @@ Views:
 - **Timeline:** chronological activity with duration and status.
 - **Agent tree:** main agent, subagents, parent tool call, elapsed time, and last
   observed activity.
+- **Nested activity:** subagent messages and tools appear beneath the task that
+  spawned them rather than being interleaved into the main transcript.
 - **Inspector:** normalized details plus optional redacted raw SDK payload.
 - **Diagnostics:** startup, model, tool, terminal, Git, idle, and UI propagation
   timing.

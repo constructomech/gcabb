@@ -1,0 +1,13 @@
+[package]
+name = "gcabb-desktop-spike"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+gpui.workspace = true
+
+[lints]
+workspace = true
+
