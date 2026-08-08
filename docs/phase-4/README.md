@@ -188,3 +188,21 @@ Portable archives, not native installers. Production OS code signing,
 notarization, MSI/NSIS, DMG, and distro packaging are Phase 7. The update
 mechanism is designed so that adding them changes the packaging step and not the
 trust or swap logic.
+
+## Remaining work
+
+Two items are deliberately sequenced after Phase 3 merges.
+
+**The in-app update prompt.** `Updater` exposes everything the UI needs —
+`check`, `stage` with progress, `apply`, `settings_mut` for deferral and
+opt-out, and a `disabled_reason` that explains why an install is not updating.
+What is missing is the banner and Update button. That code lands in the session
+view's struct and render path, which is where Phase 3 has its largest changes,
+so building it now would create an avoidable merge conflict for no functional
+gain: the loop cannot be exercised end to end until a real release exists
+anyway.
+
+**The first tagged release.** Before a tag is pushed, the signing key must exist
+in repository settings (see the key setup table above). The workflow fails
+loudly when the key or public-key variable is missing rather than publishing
+builds no client could verify, so this cannot be forgotten silently.
