@@ -1,15 +1,15 @@
 # Accessibility
 
-GCABB pins GPUI and `gpui_platform` to Zed commit
+GCABB pins GPUI and `gpui_platform` to upstream revision
 `027cf0def75e5c027504f402a6a6c0dcac11f178`. This revision uses AccessKit to
 project GPUI elements into each operating system's native accessibility API.
 Rust 1.95 is required by that upstream revision.
 
-Current GPUI uses Zed's GPL-licensed `ztracing` package only for the
-`instrument` attribute in the dependency path GCABB compiles. GCABB patches that
-package with the local MIT-compatible `crates/ztracing-compat` shim, which
-re-exports `tracing::instrument`. This keeps GPL implementation code out of the
-binary while retaining the pinned AccessKit APIs.
+The upstream dependency graph uses the GPL-licensed `ztracing` package only for
+the `instrument` attribute in the path GCABB compiles. GCABB patches that package
+with the local MIT-compatible `crates/ztracing-compat` shim, which re-exports
+`tracing::instrument`. This keeps GPL implementation code out of the binary
+while retaining the pinned AccessKit APIs.
 
 The initial session shell exposes:
 

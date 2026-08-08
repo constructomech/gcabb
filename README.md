@@ -19,9 +19,7 @@ App while improving performance, transparency, and developer control.
 ## Approach
 
 The initial architecture uses GPUI for the desktop interface and the official
-Rust Copilot SDK for session and runtime integration. Zed is an architectural
-reference for native rendering, background execution, terminal handling, and
-session projection, but GCABB is a new application rather than a Zed fork.
+Rust Copilot SDK for session and runtime integration.
 
 See [plan.md](plan.md) for the current architecture and implementation roadmap.
 
