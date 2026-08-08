@@ -1,0 +1,12 @@
+[Desktop Entry]
+Type=Application
+Name=GCABB
+GenericName=Copilot Desktop Client
+Comment=Rust-native desktop client for GitHub Copilot CLI
+Exec=gcabb-desktop
+Icon=com.constructomech.gcabb
+Terminal=false
+Categories=Development;IDE;
+Keywords=Copilot;GitHub;AI;Agent;
+StartupNotify=true
+StartupWMClass=com.constructomech.gcabb
