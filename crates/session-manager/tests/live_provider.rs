@@ -24,6 +24,7 @@ async fn real_provider_streams_a_complete_transcript() {
             model: None,
             mode: Some("interactive".to_owned()),
             reasoning_effort: Some("low".to_owned()),
+            context_tier: None,
         })
         .await
         .unwrap();

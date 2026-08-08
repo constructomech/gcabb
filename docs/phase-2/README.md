@@ -11,6 +11,8 @@ CLI:
 - Switch sessions without pausing their actors or provider event streams.
 - Cancel active work, close a session, and resume it without restarting GCABB.
 - Change the model, interaction mode, and reasoning effort.
+- Pick the context-window length for models that expose more than one, and read
+  the fixed length for models that expose exactly one.
 - Answer permission, elicitation, user-input, plan-exit, and automatic
   mode-switch callbacks in native dialogs.
 - Restore the selected session and its transcript on restart.

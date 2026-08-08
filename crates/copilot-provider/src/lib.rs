@@ -6,7 +6,8 @@ use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    InteractionKind, InteractionRequest, InteractionResponse, ModelOption, SessionControls,
+    ContextWindowOption, InteractionKind, InteractionRequest, InteractionResponse, ModelOption,
+    SessionControls,
 };
 use async_trait::async_trait;
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
@@ -50,6 +51,7 @@ pub struct SessionRequest {
     pub model: Option<String>,
     pub mode: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub context_tier: Option<String>,
 }
 
 #[derive(Clone, Debug)]
@@ -111,6 +113,7 @@ pub trait AgentProvider: Send + Sync {
         sdk_session_id: &str,
         model: &str,
         reasoning_effort: Option<&str>,
+        context_tier: Option<&str>,
     ) -> Result<()>;
     async fn set_mode(&self, sdk_session_id: &str, mode: &str) -> Result<()>;
     async fn set_reasoning_effort(&self, sdk_session_id: &str, effort: &str) -> Result<()>;
@@ -394,6 +397,7 @@ impl CopilotProvider {
         config
             .reasoning_effort
             .clone_from(&request.reasoning_effort);
+        config.context_tier.clone_from(&request.context_tier);
         config
     }
 
@@ -414,6 +418,7 @@ impl CopilotProvider {
         config
             .reasoning_effort
             .clone_from(&request.reasoning_effort);
+        config.context_tier.clone_from(&request.context_tier);
         config
     }
 
@@ -597,6 +602,7 @@ impl AgentProvider for CopilotProvider {
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_owned)),
             reasoning_effort: current.reasoning_effort,
+            context_tier: current.context_tier.as_ref().and_then(context_tier_id),
             available_models: models.list.iter().filter_map(model_option).collect(),
         })
     }
@@ -606,13 +612,21 @@ impl AgentProvider for CopilotProvider {
         sdk_session_id: &str,
         model: &str,
         reasoning_effort: Option<&str>,
+        context_tier: Option<&str>,
     ) -> Result<()> {
-        let options = reasoning_effort.map(|effort| {
-            github_copilot_sdk::types::SetModelOptions::default().with_reasoning_effort(effort)
-        });
+        let mut options = github_copilot_sdk::types::SetModelOptions::default();
+        let mut configured = false;
+        if let Some(effort) = reasoning_effort {
+            options = options.with_reasoning_effort(effort);
+            configured = true;
+        }
+        if let Some(tier) = context_tier {
+            options = options.with_context_tier(context_tier_value(tier)?);
+            configured = true;
+        }
         self.session(sdk_session_id)
             .await?
-            .set_model(model, options)
+            .set_model(model, configured.then_some(options))
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))
     }
@@ -690,6 +704,10 @@ async fn compatibility(client: &Client) -> Result<ProviderCompatibility> {
                 id: model.id,
                 name: model.name,
                 supported_reasoning_efforts: model.supported_reasoning_efforts.unwrap_or_default(),
+                context_windows: sdk_context_windows(
+                    model.billing.as_ref(),
+                    model.capabilities.limits.as_ref(),
+                ),
             })
             .collect(),
         Err(error) => {
@@ -768,7 +786,108 @@ fn model_option(value: &Value) -> Option<ModelOption> {
         id,
         name,
         supported_reasoning_efforts,
+        context_windows: json_context_windows(value),
     })
+}
+
+/// Builds the selectable context-window tiers for a model. The default tier is
+/// always reported when a size is known; the extended tier is only reported for
+/// models whose billing metadata carries long-context pricing.
+fn context_windows(
+    default_prompt_tokens: Option<i64>,
+    long_context_prompt_tokens: Option<i64>,
+    max_output_tokens: Option<i64>,
+    max_context_window_tokens: Option<i64>,
+) -> Vec<ContextWindowOption> {
+    let output = max_output_tokens.unwrap_or_default();
+    let default_tokens = default_prompt_tokens
+        .and_then(|prompt| token_count(prompt.saturating_add(output)))
+        .or_else(|| max_context_window_tokens.and_then(token_count));
+    let long_tokens =
+        long_context_prompt_tokens.and_then(|prompt| token_count(prompt.saturating_add(output)));
+    let mut windows = Vec::new();
+    if default_tokens.is_some() || long_tokens.is_some() {
+        windows.push(ContextWindowOption {
+            tier: "default".to_owned(),
+            max_tokens: default_tokens,
+        });
+    }
+    if let Some(max_tokens) = long_tokens
+        && Some(max_tokens) != default_tokens
+    {
+        windows.push(ContextWindowOption {
+            tier: "long_context".to_owned(),
+            max_tokens: Some(max_tokens),
+        });
+    }
+    windows
+}
+
+fn sdk_context_windows(
+    billing: Option<&github_copilot_sdk::types::ModelBilling>,
+    limits: Option<&github_copilot_sdk::types::ModelCapabilitiesLimits>,
+) -> Vec<ContextWindowOption> {
+    let prices = billing.and_then(|billing| billing.token_prices.as_ref());
+    context_windows(
+        prices.and_then(|prices| prices.max_prompt_tokens),
+        prices
+            .and_then(|prices| prices.long_context.as_ref())
+            .and_then(|long| long.max_prompt_tokens),
+        limits.and_then(|limits| limits.max_output_tokens),
+        limits.and_then(|limits| limits.max_context_window_tokens),
+    )
+}
+
+fn json_context_windows(value: &Value) -> Vec<ContextWindowOption> {
+    let prices = value.pointer("/billing/tokenPrices");
+    let limits = value.pointer("/capabilities/limits");
+    context_windows(
+        prices.and_then(|prices| json_i64(prices, "maxPromptTokens", "max_prompt_tokens")),
+        prices
+            .and_then(|prices| {
+                prices
+                    .get("longContext")
+                    .or_else(|| prices.get("long_context"))
+            })
+            .and_then(|long| json_i64(long, "maxPromptTokens", "max_prompt_tokens")),
+        limits.and_then(|limits| json_i64(limits, "maxOutputTokens", "max_output_tokens")),
+        limits.and_then(|limits| {
+            json_i64(
+                limits,
+                "maxContextWindowTokens",
+                "max_context_window_tokens",
+            )
+        }),
+    )
+}
+
+fn json_i64(value: &Value, camel: &str, snake: &str) -> Option<i64> {
+    value
+        .get(camel)
+        .or_else(|| value.get(snake))
+        .and_then(Value::as_i64)
+}
+
+fn token_count(value: i64) -> Option<u64> {
+    (value > 0).then(|| u64::try_from(value).unwrap_or_default())
+}
+
+fn context_tier_id(tier: &github_copilot_sdk::types::ContextTier) -> Option<String> {
+    match tier {
+        github_copilot_sdk::types::ContextTier::Default => Some("default".to_owned()),
+        github_copilot_sdk::types::ContextTier::LongContext => Some("long_context".to_owned()),
+        github_copilot_sdk::types::ContextTier::Unknown => None,
+    }
+}
+
+fn context_tier_value(tier: &str) -> Result<github_copilot_sdk::types::ContextTier> {
+    match tier {
+        "default" => Ok(github_copilot_sdk::types::ContextTier::Default),
+        "long_context" => Ok(github_copilot_sdk::types::ContextTier::LongContext),
+        other => Err(ProviderError::Sdk(format!(
+            "unsupported context tier: {other}"
+        ))),
+    }
 }
 
 fn parse_lag_count(message: &str) -> Option<u64> {
@@ -791,4 +910,51 @@ fn timestamp() -> String {
 #[must_use]
 pub fn default_database_path(root: &Path) -> PathBuf {
     root.join(".gcabb").join("gcabb.db")
+}
+
+#[cfg(test)]
+mod tests {
+    use serde_json::json;
+
+    use super::{model_option, sdk_context_windows};
+
+    #[test]
+    fn model_metadata_reports_both_context_windows_when_long_context_is_priced() {
+        let option = model_option(&json!({
+            "id": "claude-sonnet-5",
+            "name": "Claude Sonnet 5",
+            "capabilities": {"limits": {"max_output_tokens": 64000}},
+            "billing": {"tokenPrices": {
+                "maxPromptTokens": 136_000,
+                "longContext": {"maxPromptTokens": 936_000}
+            }}
+        }))
+        .unwrap();
+        let windows = option.context_windows;
+        assert_eq!(windows.len(), 2);
+        assert_eq!(windows[0].tier, "default");
+        assert_eq!(windows[0].max_tokens, Some(200_000));
+        assert_eq!(windows[1].tier, "long_context");
+        assert_eq!(windows[1].max_tokens, Some(1_000_000));
+    }
+
+    #[test]
+    fn model_metadata_reports_a_single_window_without_long_context_pricing() {
+        let option = model_option(&json!({
+            "id": "gpt-5.6-sol",
+            "name": "GPT-5.6 Sol",
+            "capabilities": {"limits": {"max_context_window_tokens": 264_000}}
+        }))
+        .unwrap();
+        assert_eq!(option.context_windows.len(), 1);
+        assert_eq!(option.context_windows[0].tier, "default");
+        assert_eq!(option.context_windows[0].max_tokens, Some(264_000));
+    }
+
+    #[test]
+    fn models_without_token_limits_report_no_context_windows() {
+        let option = model_option(&json!({"id": "byok/local", "name": "Local"})).unwrap();
+        assert!(option.context_windows.is_empty());
+        assert!(sdk_context_windows(None, None).is_empty());
+    }
 }

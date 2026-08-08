@@ -43,6 +43,7 @@ pub struct CreateSessionRequest {
     pub model: Option<String>,
     pub mode: Option<String>,
     pub reasoning_effort: Option<String>,
+    pub context_tier: Option<String>,
 }
 
 #[derive(Clone)]
@@ -113,6 +114,7 @@ impl SessionHandle {
         self.control(SessionControlCommand::Model {
             model: model.into(),
             reasoning_effort: ReasoningEffortUpdate::Preserve,
+            context_tier: None,
         })
         .await
     }
@@ -125,8 +127,28 @@ impl SessionHandle {
         self.control(SessionControlCommand::Model {
             model: model.into(),
             reasoning_effort: ReasoningEffortUpdate::Set(reasoning_effort),
+            context_tier: None,
         })
         .await
+    }
+
+    pub async fn set_model_with_options(
+        &self,
+        model: impl Into<String>,
+        reasoning_effort: Option<String>,
+        context_tier: Option<String>,
+    ) -> Result<()> {
+        self.control(SessionControlCommand::Model {
+            model: model.into(),
+            reasoning_effort: ReasoningEffortUpdate::Set(reasoning_effort),
+            context_tier,
+        })
+        .await
+    }
+
+    pub async fn set_context_tier(&self, tier: impl Into<String>) -> Result<()> {
+        self.control(SessionControlCommand::ContextTier(tier.into()))
+            .await
     }
 
     pub async fn set_mode(&self, mode: impl Into<String>) -> Result<()> {
@@ -231,6 +253,7 @@ impl SessionManager {
                 model: request.model.clone(),
                 mode: request.mode.clone(),
                 reasoning_effort: request.reasoning_effort.clone(),
+                context_tier: request.context_tier.clone(),
             })
             .await?;
         let controls = match self
@@ -263,6 +286,9 @@ impl SessionManager {
         state.controls = controls;
         if request.reasoning_effort.is_some() {
             state.controls.reasoning_effort = request.reasoning_effort;
+        }
+        if request.context_tier.is_some() {
+            state.controls.context_tier = request.context_tier;
         }
         let handle = self.spawn_actor(state, provider_session);
         self.sessions
@@ -377,6 +403,7 @@ impl SessionManager {
                     model: metadata.model.clone(),
                     mode: metadata.mode.clone(),
                     reasoning_effort: state.controls.reasoning_effort.clone(),
+                    context_tier: state.controls.context_tier.clone(),
                 },
             )
             .await?;
@@ -501,9 +528,11 @@ enum SessionControlCommand {
     Model {
         model: String,
         reasoning_effort: ReasoningEffortUpdate,
+        context_tier: Option<String>,
     },
     Mode(String),
     ReasoningEffort(String),
+    ContextTier(String),
 }
 
 enum ReasoningEffortUpdate {
@@ -644,16 +673,25 @@ impl SessionActor {
             SessionControlCommand::Model {
                 model,
                 reasoning_effort,
+                context_tier,
             } => {
                 let sdk_reasoning_effort = match &reasoning_effort {
                     ReasoningEffortUpdate::Preserve => None,
                     ReasoningEffortUpdate::Set(effort) => effort.as_deref(),
                 };
                 self.provider
-                    .set_model(&self.sdk_session_id, &model, sdk_reasoning_effort)
+                    .set_model(
+                        &self.sdk_session_id,
+                        &model,
+                        sdk_reasoning_effort,
+                        context_tier.as_deref(),
+                    )
                     .await?;
                 if let ReasoningEffortUpdate::Set(reasoning_effort) = reasoning_effort {
                     self.state.controls.reasoning_effort = reasoning_effort;
+                }
+                if context_tier.is_some() {
+                    self.state.controls.context_tier = context_tier;
                 }
                 self.state.controls.model = Some(model.clone());
                 self.state.metadata.model = Some(model);
@@ -668,6 +706,20 @@ impl SessionActor {
                     .set_reasoning_effort(&self.sdk_session_id, &effort)
                     .await?;
                 self.state.controls.reasoning_effort = Some(effort);
+            }
+            SessionControlCommand::ContextTier(tier) => {
+                let model = self.state.controls.model.clone().ok_or_else(|| {
+                    SessionManagerError::SessionNotFound(self.sdk_session_id.clone())
+                })?;
+                self.provider
+                    .set_model(
+                        &self.sdk_session_id,
+                        &model,
+                        self.state.controls.reasoning_effort.as_deref(),
+                        Some(tier.as_str()),
+                    )
+                    .await?;
+                self.state.controls.context_tier = Some(tier);
             }
         }
         self.state.metadata.updated_at = timestamp();
@@ -775,6 +827,7 @@ mod tests {
             model: None,
             mode: Some("interactive".to_owned()),
             reasoning_effort: Some("medium".to_owned()),
+            context_tier: None,
         }
     }
 
