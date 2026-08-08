@@ -494,9 +494,12 @@ impl SessionMvpView {
                     .await;
                 if view
                     .update(cx, |view, cx| {
-                        view.apply_service_updates(cx);
-                        view.refresh_snapshots();
-                        cx.notify();
+                        // Both sides must run, so avoid short-circuiting here.
+                        let updated = view.apply_service_updates(cx);
+                        let refreshed = view.refresh_snapshots();
+                        if updated || refreshed {
+                            cx.notify();
+                        }
                     })
                     .is_err()
                 {
@@ -528,16 +531,24 @@ impl SessionMvpView {
         }
     }
 
-    fn apply_service_updates(&mut self, cx: &mut Context<Self>) {
+    /// Drains pending service updates, returning whether any were applied so the
+    /// caller can skip repainting when the poll tick found nothing to do.
+    fn apply_service_updates(&mut self, cx: &mut Context<Self>) -> bool {
+        let mut changed = false;
         loop {
-            match self.updates.try_recv() {
-                Ok(ServiceUpdate::Ready {
+            let update = match self.updates.try_recv() {
+                Ok(update) => update,
+                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+            };
+            changed = true;
+            match update {
+                ServiceUpdate::Ready {
                     compatibility,
                     projects,
                     restored,
                     failures,
                     selected_session,
-                }) => {
+                } => {
                     self.startup = StartupState::Ready(compatibility);
                     self.projects = projects;
                     self.sessions = restored.into_iter().map(SessionProjection::new).collect();
@@ -560,7 +571,7 @@ impl SessionMvpView {
                     }
                     self.restore_failures = failures;
                 }
-                Ok(ServiceUpdate::SessionAdded(handle)) => {
+                ServiceUpdate::SessionAdded(handle) => {
                     let id = handle.id().to_owned();
                     if let Some(index) = self
                         .sessions
@@ -573,7 +584,7 @@ impl SessionMvpView {
                     }
                     self.selected_session = Some(id);
                 }
-                Ok(ServiceUpdate::SessionsDiscovered(handles)) => {
+                ServiceUpdate::SessionsDiscovered(handles) => {
                     for handle in handles {
                         let id = handle.id().to_owned();
                         if let Some(index) = self
@@ -587,22 +598,26 @@ impl SessionMvpView {
                         }
                     }
                 }
-                Ok(ServiceUpdate::PromptAccepted) => {
+                ServiceUpdate::PromptAccepted => {
                     self.composer.update(cx, TextInput::clear);
                 }
-                Ok(ServiceUpdate::ActionFailed(error)) => self.action_error = Some(error),
-                Ok(ServiceUpdate::Failed(error)) => self.startup = StartupState::Failed(error),
-                Err(TryRecvError::Empty | TryRecvError::Disconnected) => break,
+                ServiceUpdate::ActionFailed(error) => self.action_error = Some(error),
+                ServiceUpdate::Failed(error) => self.startup = StartupState::Failed(error),
             }
         }
+        changed
     }
 
-    fn refresh_snapshots(&mut self) {
+    /// Pulls any changed session snapshots, returning whether one actually moved.
+    fn refresh_snapshots(&mut self) -> bool {
+        let mut changed = false;
         for projection in &mut self.sessions {
             if projection.receiver.has_changed().unwrap_or(false) {
                 projection.snapshot = projection.receiver.borrow_and_update().clone();
+                changed = true;
             }
         }
+        changed
     }
 
     fn selected(&self) -> Option<&SessionProjection> {
