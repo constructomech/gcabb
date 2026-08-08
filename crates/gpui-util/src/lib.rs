@@ -91,28 +91,33 @@ pub fn defer<F: FnOnce()>(callback: F) -> Deferred<F> {
 pub trait ResultExt<T> {
     fn log_err(self) -> Option<T>;
     fn warn_on_err(self) -> Option<T>;
+    fn log_with_level(self, level: log::Level) -> Option<T>;
 }
 
 impl<T, E: Display> ResultExt<T> for Result<T, E> {
     #[track_caller]
     fn log_err(self) -> Option<T> {
-        match self {
-            Ok(value) => Some(value),
-            Err(error) => {
-                let location = Location::caller();
-                log::error!("{} at {}:{}", error, location.file(), location.line());
-                None
-            }
-        }
+        self.log_with_level(log::Level::Error)
     }
 
     #[track_caller]
     fn warn_on_err(self) -> Option<T> {
+        self.log_with_level(log::Level::Warn)
+    }
+
+    #[track_caller]
+    fn log_with_level(self, level: log::Level) -> Option<T> {
         match self {
             Ok(value) => Some(value),
             Err(error) => {
                 let location = Location::caller();
-                log::warn!("{} at {}:{}", error, location.file(), location.line());
+                log::log!(
+                    level,
+                    "{} at {}:{}",
+                    error,
+                    location.file(),
+                    location.line()
+                );
                 None
             }
         }

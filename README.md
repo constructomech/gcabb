@@ -49,6 +49,15 @@ cargo run -p gcabb-desktop
 Set `GCABB_DATA_DIR` to isolate the application database during development.
 Without it, GCABB uses the operating system's local application-data directory.
 
+On Linux, install the desktop entry once so the taskbar and window titlebar can
+resolve the application icon. Windows embeds its icon in the executable and
+macOS uses the app bundle, but Wayland and X11 match the window's application ID
+against an installed desktop entry instead.
+
+```sh
+./scripts/install-linux-desktop-entry.sh
+```
+
 See [`docs/phase-2/`](docs/phase-2/) for the implemented interaction model and
 validation coverage.
 

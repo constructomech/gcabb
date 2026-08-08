@@ -35,6 +35,11 @@ const AMBER: u32 = 0x00d2_9900;
 const RED: u32 = 0x00f8_5161;
 const COMPACT_WIDTH: f32 = 920.0;
 
+/// Desktop-environment application identifier. On Wayland this becomes the
+/// `xdg_toplevel` app ID and on X11 the `WM_CLASS`; both are used to match the
+/// installed `com.constructomech.gcabb.desktop` entry that supplies the icon.
+const APP_ID: &str = "com.constructomech.gcabb";
+
 actions!(gcabb, [DismissPopup, FocusNext, FocusPrevious]);
 enum ServiceUpdate {
     Ready {
@@ -2265,6 +2270,7 @@ fn main() {
                         title: Some("GCABB".into()),
                         ..Default::default()
                     }),
+                    app_id: Some(APP_ID.to_owned()),
                     window_min_size: Some(size(px(640.0), px(520.0))),
                     ..Default::default()
                 },
