@@ -3,8 +3,7 @@
 ## Decision
 
 Build a new Rust-native desktop application around the official
-`github-copilot-sdk` crate. Use Zed as an architectural reference, not as a
-codebase to fork.
+`github-copilot-sdk` crate.
 
 Do not put AHP or ACP on the critical path:
 
@@ -106,7 +105,7 @@ selectable.
 
 | Area | Choice |
 | --- | --- |
-| Native UI | GPUI with `gpui_platform` |
+| Native UI | GPUI and `gpui_platform` pinned to revision `027cf0de` |
 | Async runtime | Tokio |
 | Copilot runtime | `github-copilot-sdk` |
 | Persistence | SQLite in WAL mode |
@@ -127,19 +126,14 @@ Slint is the fallback if GPUI proves too unstable during the feasibility spike.
 
 ## Source Strategy
 
-Do not fork Zed:
+Use GPUI as a standalone Apache-2.0 dependency and keep the application surface
+small. Avoid unrelated editor, workspace, project, LSP, extension, remote,
+cloud, multi-buffer, and settings systems.
 
-- `gpui` is separately reusable under Apache-2.0.
-- Zed's `agent`, `acp_thread`, and `agent_ui` crates are GPL-3.0-or-later.
-- Those crates depend heavily on Zed's editor, workspace, project, LSP,
-  extension, remote, cloud, multi-buffer, and settings systems.
-- Removing features would create a large downstream editor fork rather than a
-  small sessions application.
-
-Learn from these Zed patterns:
+Implementation principles:
 
 - Foreground GPUI entity mutations plus background executors.
-- A provider boundary similar to `AgentConnection`.
+- An explicit provider boundary.
 - A normalized thread projection between provider events and UI.
 - Full terminal output for the user with bounded output for the model.
 - Virtualized terminal and diff rendering.
@@ -653,13 +647,4 @@ interaction specification:
 - Copilot SDK: https://github.com/github/copilot-sdk
 - Rust Copilot SDK:
   https://github.com/github/copilot-sdk/tree/main/rust
-- GPUI:
-  https://github.com/zed-industries/zed/tree/main/crates/gpui
-- Zed ACP integration:
-  https://github.com/zed-industries/zed/blob/main/crates/agent_servers/src/acp.rs
-- Zed provider abstraction:
-  https://github.com/zed-industries/zed/blob/main/crates/acp_thread/src/connection.rs
-- Zed terminal integration:
-  https://github.com/zed-industries/zed/blob/main/crates/acp_thread/src/terminal.rs
-- Zed diff model:
-  https://github.com/zed-industries/zed/blob/main/crates/acp_thread/src/diff.rs
+- GPUI: https://docs.rs/gpui

@@ -1,5 +1,9 @@
 # SDK and CLI Compatibility
 
+> Historical Phase 0 baseline. The application now uses Rust 1.95 and pins GPUI
+> plus `gpui_platform` to upstream revision `027cf0de` for AccessKit support. SDK
+> and CLI versions below remain the verified runtime combination.
+
 ## Verified combination
 
 | Component | Version |
@@ -44,9 +48,9 @@ SDK surface documented for fleet mode and the same event path used by VS Code's
 Copilot CLI session renderer.
 
 GPUI 0.2.2 is the latest published standalone crate and owns
-`Application::new()`. Zed main has since introduced `gpui_platform`, but that
-crate is not published alongside GPUI 0.2.2. The spike therefore pins the
-published API rather than a moving Zed Git revision.
+`Application::new()`. Newer revisions introduced `gpui_platform`, but that crate
+is not published alongside GPUI 0.2.2. The spike therefore pins the published
+API rather than a moving Git revision.
 
 On macOS, GPUI shader compilation requires Xcode's Metal toolchain:
 

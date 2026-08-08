@@ -1,0 +1,15 @@
+[package]
+name = "gpui_shared_string"
+description = "Independent shared string type for GCABB's GPUI integration"
+edition.workspace = true
+license.workspace = true
+readme = "README.md"
+rust-version.workspace = true
+version = "0.1.0"
+
+[dependencies]
+schemars = "1.2.1"
+serde.workspace = true
+
+[lints]
+workspace = true

@@ -1,5 +1,8 @@
 # Phase 0 Feasibility Report
 
+> Historical Phase 0 baseline. GPUI was subsequently upgraded to revision
+> `027cf0de` with `gpui_platform` and AccessKit support.
+
 Date: 2026-08-06
 
 ## Outcome
@@ -14,7 +17,7 @@ track and several callback cases that still need purpose-built fixtures.
 | Consume built-in shell output | Viable through `tool.execution_partial_result` |
 | Keep a host-owned terminal fallback | Viable; `phase0_terminal` streams stdout/stderr independently |
 | Attribute subagent activity | Viable through `agentId` and `toolCallId` |
-| Use GPUI without Zed | Viable with pinned `gpui` 0.2.2 |
+| Use standalone GPUI | Viable with pinned `gpui` 0.2.2 |
 | Use `gpui_platform` now | No; it is not published with GPUI 0.2.2 |
 
 ## Live evidence
@@ -95,9 +98,9 @@ separately.
   are registered but were not naturally triggered by the live scenarios.
 - The custom terminal fallback proves streaming and bounded return data, not PTY
   input, resize, detach, or process-tree cancellation. Those belong to Phase 4.
-- GPUI 0.2.2 uses `Application::new()`. Zed main has moved platform startup into
-  an unpublished `gpui_platform`; upgrading must be isolated behind the desktop
-  entry point.
+- GPUI 0.2.2 uses `Application::new()`. Newer revisions moved platform startup
+  into an unpublished `gpui_platform`; upgrading must be isolated behind the
+  desktop entry point.
 
 ## Subagent UI model
 

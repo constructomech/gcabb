@@ -19,11 +19,15 @@ App while improving performance, transparency, and developer control.
 ## Approach
 
 The initial architecture uses GPUI for the desktop interface and the official
-Rust Copilot SDK for session and runtime integration. Zed is an architectural
-reference for native rendering, background execution, terminal handling, and
-session projection, but GCABB is a new application rather than a Zed fork.
+Rust Copilot SDK for session and runtime integration.
 
 See [plan.md](plan.md) for the current architecture and implementation roadmap.
+
+## License
+
+GCABB is licensed under the [MIT License](LICENSE.txt). Required notices for
+included third-party software are collected in
+[THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md).
 
 ## Current Session MVP
 
@@ -56,7 +60,7 @@ The repository retains the executable SDK feasibility probe:
   session lifecycle and typed RPCs, and writes raw plus normalized events as
   JSON Lines.
 
-Rust 1.94 is pinned in `rust-toolchain.toml`.
+Rust 1.95 is pinned in `rust-toolchain.toml`.
 
 ```sh
 # Lifecycle and capability smoke test; no model prompt is sent.
