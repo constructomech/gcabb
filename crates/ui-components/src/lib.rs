@@ -31,7 +31,8 @@ pub struct TextInput {
     last_layout: Option<ShapedLine>,
     cursor_visible: bool,
     cursor_blink_started_at: Instant,
-    _cursor_blink_task: Task<()>,
+    cursor_blink_enabled: bool,
+    cursor_blink_task: Option<Task<()>>,
 }
 
 impl TextInput {
@@ -41,11 +42,50 @@ impl TextInput {
         accessibility_id: impl Into<SharedString>,
         placeholder: impl Into<SharedString>,
     ) -> Self {
-        let cursor_blink_task = cx.spawn(async move |input, cx| {
+        Self {
+            accessibility_id: accessibility_id.into(),
+            focus_handle: cx.focus_handle(),
+            content: "".into(),
+            placeholder: placeholder.into(),
+            selected_range: 0..0,
+            marked_range: None,
+            last_layout: None,
+            cursor_visible: true,
+            cursor_blink_started_at: Instant::now(),
+            cursor_blink_enabled: false,
+            cursor_blink_task: None,
+        }
+    }
+
+    /// Starts or stops the blink timer so it only runs while the caret is
+    /// actually on screen. The caret is painted only when this input holds focus
+    /// in an active window, so blinking outside that state repaints the whole
+    /// window without changing a pixel.
+    fn sync_cursor_blink(&mut self, window: &Window, cx: &mut Context<Self>) {
+        let enabled = self.focus_handle.is_focused(window) && window.is_window_active();
+        if enabled == self.cursor_blink_enabled {
+            return;
+        }
+        self.cursor_blink_enabled = enabled;
+        if enabled {
+            self.reset_cursor_blink();
+            self.cursor_blink_task = Some(Self::spawn_cursor_blink(cx));
+        } else {
+            // Dropping the task cancels it at its next await point.
+            self.cursor_blink_task = None;
+            self.cursor_visible = false;
+        }
+    }
+
+    fn spawn_cursor_blink(cx: &mut Context<Self>) -> Task<()> {
+        cx.spawn(async move |input, cx| {
             loop {
                 cx.background_executor().timer(CURSOR_BLINK_TICK).await;
                 if input
                     .update(cx, |input, cx| {
+                        if !input.cursor_blink_enabled {
+                            return;
+                        }
                         let elapsed = input.cursor_blink_started_at.elapsed();
                         let visible = (elapsed.as_millis() / CURSOR_BLINK_INTERVAL.as_millis())
                             .is_multiple_of(2);
@@ -59,19 +99,7 @@ impl TextInput {
                     break;
                 }
             }
-        });
-        Self {
-            accessibility_id: accessibility_id.into(),
-            focus_handle: cx.focus_handle(),
-            content: "".into(),
-            placeholder: placeholder.into(),
-            selected_range: 0..0,
-            marked_range: None,
-            last_layout: None,
-            cursor_visible: true,
-            cursor_blink_started_at: Instant::now(),
-            _cursor_blink_task: cursor_blink_task,
-        }
+        })
     }
 
     #[must_use]
@@ -412,7 +440,8 @@ impl Element for TextElement {
 }
 
 impl Render for TextInput {
-    fn render(&mut self, _window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.sync_cursor_blink(window, cx);
         div()
             .id(self.accessibility_id.clone())
             .accessibility_id(self.accessibility_id.clone())
