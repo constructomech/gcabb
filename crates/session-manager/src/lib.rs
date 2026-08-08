@@ -1,19 +1,21 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::collections::{HashMap, HashSet};
-use std::path::PathBuf;
+use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    ApplyOutcome, DomainEvent, InteractionResponse, ProjectMetadata, SessionMetadata,
-    SessionSnapshot, SessionStatus,
+    ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus, DomainEvent,
+    InteractionResponse, ProjectMetadata, SessionMetadata, SessionSnapshot, SessionStatus,
+    ToolCatalog,
 };
 use copilot_provider::{
     AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderInteraction,
     ProviderSession, SessionRequest,
 };
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
+use git_service::GitService;
 use serde_json::{Value, json};
 use storage::{Storage, StorageError};
 use thiserror::Error;
@@ -44,6 +46,8 @@ pub struct CreateSessionRequest {
     pub mode: Option<String>,
     pub reasoning_effort: Option<String>,
     pub context_tier: Option<String>,
+    /// Git ref the changes view compares against, e.g. `main`.
+    pub base_ref: Option<String>,
 }
 
 #[derive(Clone)]
@@ -278,6 +282,7 @@ impl SessionManager {
             title: request.title,
             model: request.model,
             mode: request.mode,
+            base_ref: request.base_ref,
             created_at: now.clone(),
             updated_at: now,
         };
@@ -290,6 +295,11 @@ impl SessionManager {
         if request.context_tier.is_some() {
             state.controls.context_tier = request.context_tier;
         }
+        // Prove inherited tool capabilities through the SDK before the first
+        // prompt, so a runtime that is missing file or shell tools is visible
+        // as capability state rather than as an unexplained model failure.
+        self.populate_capabilities(&mut state).await;
+        refresh_changes(&mut state);
         let handle = self.spawn_actor(state, provider_session);
         self.sessions
             .lock()
@@ -389,6 +399,39 @@ impl SessionManager {
         Ok(report)
     }
 
+    /// Discover tools for the session's model and derive capability status.
+    ///
+    /// Discovery failure is recorded rather than fatal: the session still
+    /// runs, but capabilities report `Unknown` with the underlying error so
+    /// the UI can explain why the loop may not work.
+    async fn populate_capabilities(&self, state: &mut SessionSnapshot) {
+        let model = state
+            .controls
+            .model
+            .clone()
+            .or_else(|| state.metadata.model.clone());
+        let catalog = match self.provider.discover_tools(model.as_deref()).await {
+            Ok(catalog) => catalog,
+            Err(error) => {
+                self.diagnostics.record(DiagnosticEvent {
+                    timestamp: timestamp(),
+                    category: "session_manager".to_owned(),
+                    operation: "discover_tools".to_owned(),
+                    elapsed_ms: None,
+                    session_id: Some(state.metadata.id.clone()),
+                    success: false,
+                    details: json!({"error": error.to_string()}),
+                });
+                ToolCatalog {
+                    error: Some(error.to_string()),
+                    ..ToolCatalog::default()
+                }
+            }
+        };
+        state.capabilities = CapabilityReport::from_catalog(&catalog);
+        state.tool_catalog = catalog;
+    }
+
     async fn restore_session(&self, metadata: SessionMetadata) -> Result<SessionHandle> {
         let recovered = self.storage.recover_session(&metadata.id)?;
         let mut state = recovered.state;
@@ -430,6 +473,8 @@ impl SessionManager {
             }
         };
         state.status = SessionStatus::Idle;
+        self.populate_capabilities(&mut state).await;
+        refresh_changes(&mut state);
         self.storage.write_snapshot(&state)?;
         Ok(self.spawn_actor(state, provider_session))
     }
@@ -559,12 +604,12 @@ impl SessionActor {
             tokio::select! {
                 event = self.provider_events.recv() => {
                     match event {
-                        Some(ProviderEvent::Event(raw)) => self.apply_raw(&raw),
+                        Some(ProviderEvent::Event(raw)) => self.apply_raw(&raw).await,
                         Some(ProviderEvent::Lagged(count)) => self.apply_raw(&json!({
                             "id": format!("lagged-{}-{count}", self.state.last_sequence + 1),
                             "type": "session.warning",
                             "data": {"message": format!("provider subscriber skipped {count} events")}
-                        })),
+                        })).await,
                         Some(ProviderEvent::Closed) | None => {
                             self.handle_provider_closed().await;
                             break;
@@ -623,16 +668,25 @@ impl SessionActor {
         }
     }
 
-    fn apply_raw(&mut self, raw: &Value) {
+    async fn apply_raw(&mut self, raw: &Value) {
         let sequence = self.state.last_sequence + 1;
         let event = DomainEvent::from_sdk_event_for(&self.state.metadata.id, sequence, raw);
         match self.storage.append_event(&event) {
             Ok(true) => {
-                if self.state.apply(event) == ApplyOutcome::Applied {
-                    let force_snapshot = self.state.status == SessionStatus::Idle
-                        || self.state.status == SessionStatus::Failed
-                        || self.state.last_sequence.is_multiple_of(SNAPSHOT_INTERVAL);
-                    self.publish(force_snapshot);
+                let refresh_after = {
+                    let applied = self.state.apply(event);
+                    if applied == ApplyOutcome::Applied {
+                        let force_snapshot = self.state.status == SessionStatus::Idle
+                            || self.state.status == SessionStatus::Failed
+                            || self.state.last_sequence.is_multiple_of(SNAPSHOT_INTERVAL);
+                        self.publish(force_snapshot);
+                        true
+                    } else {
+                        false
+                    }
+                };
+                if refresh_after {
+                    self.refresh_changes_if_needed(raw).await;
                 }
             }
             Ok(false) => {
@@ -640,6 +694,29 @@ impl SessionActor {
                 tracing::debug!(event_id = event.id, "duplicate event ignored");
             }
             Err(error) => self.record_actor_error("append_event", &error.to_string()),
+        }
+    }
+
+    /// Recompute changes when a worktree-mutating tool has just completed.
+    ///
+    /// Git runs on a blocking thread so a large diff cannot stall the actor's
+    /// event loop or delay unrelated sessions.
+    async fn refresh_changes_if_needed(&mut self, raw: &Value) {
+        let event =
+            DomainEvent::from_sdk_event_for(&self.state.metadata.id, self.state.last_sequence, raw);
+        if !needs_changes_refresh(&self.state, &event) {
+            return;
+        }
+        let worktree = PathBuf::from(&self.state.metadata.project_path);
+        let base_ref = base_ref_for(&self.state);
+        let computed =
+            tokio::task::spawn_blocking(move || compute_changes(&worktree, &base_ref)).await;
+        match computed {
+            Ok(changes) => {
+                apply_changes(&mut self.state, changes);
+                self.publish(false);
+            }
+            Err(error) => self.record_actor_error("refresh_changes", &error.to_string()),
         }
     }
 
@@ -805,6 +882,96 @@ fn reconcile_history(
     Ok(())
 }
 
+/// Compute a changes view for a worktree. Runs git, so callers must keep it
+/// off the actor's async loop.
+fn compute_changes(worktree: &Path, base_ref: &str) -> app_model::ChangesView {
+    let service = GitService::new(worktree);
+    if !service.is_worktree() {
+        return app_model::ChangesView {
+            error: Some(format!(
+                "{} is not a git worktree; changes are unavailable.",
+                worktree.display()
+            )),
+            generated_at: Some(timestamp()),
+            ..app_model::ChangesView::default()
+        };
+    }
+    service.changes(base_ref, timestamp())
+}
+
+/// Apply a computed changes view and derive the `Changes` capability.
+fn apply_changes(state: &mut SessionSnapshot, changes: app_model::ChangesView) {
+    let base_ref = changes
+        .base_label
+        .clone()
+        .unwrap_or_else(|| "HEAD".to_owned());
+    let capability = if let Some(error) = &changes.error {
+        let unavailable = error.contains("not a git worktree");
+        app_model::Capability {
+            id: CapabilityId::Changes,
+            status: if unavailable {
+                CapabilityStatus::Unavailable
+            } else {
+                CapabilityStatus::NeedsAttention
+            },
+            detail: error.clone(),
+            evidence: Vec::new(),
+        }
+    } else {
+        app_model::Capability {
+            id: CapabilityId::Changes,
+            status: CapabilityStatus::Available,
+            detail: format!(
+                "{} changed file(s) against {base_ref}.",
+                changes.files.len()
+            ),
+            evidence: vec![base_ref],
+        }
+    };
+    state.changes = changes;
+    state.capabilities.set(capability);
+}
+
+/// The base ref a session compares against.
+///
+/// Falls back to `HEAD` when none was recorded, which keeps sessions created
+/// before the changes view usable after the schema upgrade.
+fn base_ref_for(state: &SessionSnapshot) -> String {
+    state
+        .metadata
+        .base_ref
+        .clone()
+        .unwrap_or_else(|| "HEAD".to_owned())
+}
+
+/// Recompute the session's changes view synchronously.
+///
+/// Used on session creation and restore, where blocking briefly is acceptable
+/// and the result must be present in the first published snapshot.
+fn refresh_changes(state: &mut SessionSnapshot) {
+    let worktree = PathBuf::from(&state.metadata.project_path);
+    let base_ref = base_ref_for(state);
+    let changes = compute_changes(&worktree, &base_ref);
+    apply_changes(state, changes);
+}
+
+/// Whether an event indicates the worktree may have changed.
+///
+/// Only completions of worktree-mutating tool classes trigger a refresh, so
+/// read-only activity does not cause repeated git invocations.
+fn needs_changes_refresh(state: &SessionSnapshot, event: &DomainEvent) -> bool {
+    if event.source_type != "tool.execution_complete" {
+        return false;
+    }
+    let Some(call_id) = event.details.get("toolCallId").and_then(Value::as_str) else {
+        return false;
+    };
+    state
+        .tool_activity
+        .invocation(call_id)
+        .is_some_and(|invocation| invocation.class.mutates_worktree())
+}
+
 fn timestamp() -> String {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
         |_| "0".to_owned(),
@@ -828,6 +995,7 @@ mod tests {
             mode: Some("interactive".to_owned()),
             reasoning_effort: Some("medium".to_owned()),
             context_tier: None,
+            base_ref: None,
         }
     }
 
@@ -905,6 +1073,7 @@ mod tests {
             title: "Broken restore".to_owned(),
             model: None,
             mode: None,
+            base_ref: None,
             created_at: "1".to_owned(),
             updated_at: "1".to_owned(),
         };

@@ -450,7 +450,9 @@ Exit criteria:
 
 ### Phase 3: Self-Hosting MVP (2-3 weeks)
 
-Status: next.
+Status: implemented; hardening continues with later phases. See
+[docs/phase-3](docs/phase-3/README.md) and the verified runtime inventory in
+[docs/phase-3/tool-surface.md](docs/phase-3/tool-surface.md).
 
 Make GCABB capable of developing GCABB. Prefer capabilities inherited from the
 official Copilot CLI runtime over app-specific reimplementations, and prove each
@@ -459,9 +461,18 @@ Copilot App.
 
 - Preserve the session worktree as the CLI working directory so built-in file
   inspection, search, editing, and Git tools operate on the correct checkout.
+- Discover the runtime tool set through the SDK's `tools.list` RPC at session
+  start rather than hardcoding tool names, and pin `ClientMode::CopilotCli`
+  explicitly. `ClientMode::Empty` strips the built-in file, search, and shell
+  tools, and that regression would otherwise appear as an unexplained model
+  failure rather than a configuration error.
 - Enable terminal calls with incremental command, output, exit-status, and
-  cancellation UI. Use built-in shell events when sufficient; otherwise use the
-  host-owned terminal tool proven in Phase 0.
+  cancellation UI. Key terminal state by the runtime's `shellId` rather than by
+  tool call: Copilot CLI models background execution as four tools
+  (`bash`, `read_bash`, `stop_bash`, `list_bash`) that share a shell handle, so
+  a terminal outlives the call that created it and a later read must append to
+  the terminal already on screen. Use built-in shell events when sufficient;
+  otherwise use the host-owned terminal tool proven in Phase 0.
 - Preserve the CLI's GitHub MCP integration and authentication. Verify tool
   discovery and an authenticated read operation from a GCABB-created session;
   do not build a second GitHub client into the agent loop.

@@ -1,5 +1,5 @@
 [package]
-name = "session-manager"
+name = "git-service"
 edition.workspace = true
 license.workspace = true
 rust-version.workspace = true
@@ -7,20 +7,11 @@ version.workspace = true
 
 [dependencies]
 app-model.workspace = true
-copilot-provider.workspace = true
-diagnostics.workspace = true
-git-service.workspace = true
-serde_json.workspace = true
-storage.workspace = true
 thiserror.workspace = true
-tokio.workspace = true
 tracing.workspace = true
-uuid.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
-test-harness = { path = "../test-harness" }
 
 [lints]
 workspace = true
-

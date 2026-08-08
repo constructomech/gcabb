@@ -3,7 +3,10 @@
 use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
-use app_model::{InteractionRequest, InteractionResponse, SessionControls};
+use app_model::{
+    InteractionRequest, InteractionResponse, SessionControls, ToolCatalog, ToolClass,
+    ToolDescriptor, ToolSource,
+};
 use async_trait::async_trait;
 use copilot_provider::{
     AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderInteraction,
@@ -24,6 +27,9 @@ pub struct FakeProvider {
     interactions: Mutex<HashMap<String, mpsc::Sender<ProviderInteraction>>>,
     fail_resume: AtomicBool,
     fail_history: AtomicBool,
+    fail_tool_discovery: AtomicBool,
+    extra_tools: Mutex<Vec<String>>,
+    omit_tools: Mutex<Vec<String>>,
 }
 
 impl FakeProvider {
@@ -41,6 +47,33 @@ impl FakeProvider {
 
     pub fn fail_history(&self, fail: bool) {
         self.fail_history.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn fail_tool_discovery(&self, fail: bool) {
+        self.fail_tool_discovery.store(fail, Ordering::SeqCst);
+    }
+
+    /// Add tools beyond the built-in set, e.g. to simulate GitHub MCP.
+    pub async fn add_tools(&self, names: &[&str]) {
+        let mut extra = self.extra_tools.lock().await;
+        extra.extend(names.iter().map(|name| (*name).to_owned()));
+    }
+
+    /// Hide built-in tools, to simulate a runtime missing a capability.
+    pub async fn omit_tools(&self, names: &[&str]) {
+        let mut omit = self.omit_tools.lock().await;
+        omit.extend(names.iter().map(|name| (*name).to_owned()));
+    }
+
+    async fn tool_names(&self) -> Vec<String> {
+        let omit = self.omit_tools.lock().await.clone();
+        let extra = self.extra_tools.lock().await.clone();
+        FAKE_BUILTIN_TOOLS
+            .iter()
+            .map(|name| (*name).to_owned())
+            .chain(extra)
+            .filter(|name| !omit.contains(name))
+            .collect()
     }
 
     pub async fn close_stream(&self, sdk_session_id: &str) {
@@ -222,6 +255,63 @@ impl AgentProvider for FakeProvider {
             .ok_or_else(|| ProviderError::SessionNotFound(sdk_session_id.to_owned()))?;
         self.interactions.lock().await.remove(sdk_session_id);
         Ok(())
+    }
+
+    async fn discover_tools(&self, _model: Option<&str>) -> Result<ToolCatalog> {
+        if self.fail_tool_discovery.load(Ordering::SeqCst) {
+            return Err(ProviderError::Sdk("tool discovery unavailable".to_owned()));
+        }
+        Ok(ToolCatalog {
+            tools: self
+                .tool_names()
+                .await
+                .into_iter()
+                .map(descriptor)
+                .collect(),
+            discovered_at: Some("fake".to_owned()),
+            error: None,
+        })
+    }
+}
+
+/// Model-facing tool names the runtime returns from `tools.list`, used so
+/// deterministic tests exercise the same catalog shape as the live runtime.
+///
+/// These are deliberately the `tools.list` names, not the CLI's user-facing
+/// aliases: file editing arrives as a single `str_replace_editor` tool.
+pub const FAKE_BUILTIN_TOOLS: &[&str] = &[
+    "str_replace_editor",
+    "glob",
+    "grep",
+    "bash",
+    "read_bash",
+    "stop_bash",
+    "list_bash",
+    "web_fetch",
+    "fetch_copilot_cli_documentation",
+    "task",
+    "read_agent",
+    "write_agent",
+    "list_agents",
+    "ask_user",
+    "skill",
+];
+
+fn descriptor(name: String) -> ToolDescriptor {
+    let source = name
+        .strip_prefix("github-mcp-server-")
+        .map_or(ToolSource::Builtin, |_| ToolSource::Mcp {
+            server: "github-mcp-server".to_owned(),
+        });
+    ToolDescriptor {
+        class: ToolClass::classify(&name),
+        namespaced_name: match &source {
+            ToolSource::Mcp { server } => Some(format!("{server}/{name}")),
+            _ => None,
+        },
+        description: format!("Fake {name} tool"),
+        name,
+        source,
     }
 }
 

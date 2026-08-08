@@ -65,6 +65,8 @@ enum ServiceCommand {
         mode: String,
         reasoning_effort: Option<String>,
         context_tier: Option<String>,
+        /// Git ref new sessions compare their changes against.
+        base_ref: Option<String>,
     },
     Cancel {
         app_session_id: String,
@@ -255,6 +257,7 @@ async fn handle_service_command(
             mode,
             reasoning_effort,
             context_tier,
+            base_ref,
         } => {
             let handle = if let Some(id) = app_session_id {
                 manager
@@ -271,6 +274,7 @@ async fn handle_service_command(
                         mode: Some(mode),
                         reasoning_effort,
                         context_tier,
+                        base_ref,
                     })
                     .await
                     .map_err(|error| error.to_string())?;
@@ -414,6 +418,34 @@ enum ControlMenu {
     Context,
 }
 
+/// Phase 3 inspector tabs for the session side panel.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionPanel {
+    Changes,
+    Terminals,
+    Capabilities,
+}
+
+impl SessionPanel {
+    const ALL: [Self; 3] = [Self::Changes, Self::Terminals, Self::Capabilities];
+
+    const fn label(self) -> &'static str {
+        match self {
+            Self::Changes => "Changes",
+            Self::Terminals => "Terminals",
+            Self::Capabilities => "Capabilities",
+        }
+    }
+
+    const fn id(self) -> &'static str {
+        match self {
+            Self::Changes => "panel-changes",
+            Self::Terminals => "panel-terminals",
+            Self::Capabilities => "panel-capabilities",
+        }
+    }
+}
+
 struct SessionMvpView {
     startup: StartupState,
     projects: Vec<ProjectMetadata>,
@@ -431,6 +463,9 @@ struct SessionMvpView {
     draft_effort: String,
     draft_context_tier: Option<String>,
     sidebar_open: bool,
+    panel_open: bool,
+    active_panel: SessionPanel,
+    selected_change: Option<String>,
     open_control_menu: Option<ControlMenu>,
     action_error: Option<String>,
     _poll_task: gpui::Task<()>,
@@ -525,6 +560,9 @@ impl SessionMvpView {
             draft_effort: "medium".to_owned(),
             draft_context_tier: None,
             sidebar_open: true,
+            panel_open: false,
+            active_panel: SessionPanel::Changes,
+            selected_change: None,
             open_control_menu: None,
             action_error: None,
             _poll_task: poll_task,
@@ -641,7 +679,20 @@ impl SessionMvpView {
             mode: self.draft_mode.clone(),
             reasoning_effort: reasoning_effort_for_model(&supported_efforts, &self.draft_effort),
             context_tier: self.selectable_context_tier(),
+            base_ref: self.selected_project_base_ref(),
         });
+    }
+
+    /// Base ref new sessions in the selected project compare against.
+    ///
+    /// The project's default branch is the natural base for a session
+    /// worktree; sessions record it once so later movement on that branch does
+    /// not silently change what the changes view reports.
+    fn selected_project_base_ref(&self) -> Option<String> {
+        self.projects
+            .iter()
+            .find(|project| Path::new(&project.path) == self.selected_project)
+            .and_then(|project| project.default_branch.clone())
     }
 
     fn submit_interaction(&mut self, value: String) {
@@ -1504,6 +1555,451 @@ impl SessionMvpView {
             .children(messages)
     }
 
+    /// Phase 3 inspector: changes, terminals, and capability state.
+    ///
+    /// Rendered beside the transcript so the edit-command-result-diff loop can
+    /// be completed without leaving GCABB.
+    fn side_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let session = self.selected()?;
+        let snapshot = session.snapshot.clone();
+        let active = self.active_panel;
+        let tabs = SessionPanel::ALL.map(|panel| {
+            let selected = panel == active;
+            div()
+                .id(panel.id())
+                .accessibility_id(panel.id())
+                .role(Role::Tab)
+                .aria_label(panel.label())
+                .aria_selected(selected)
+                .focusable()
+                .tab_stop(true)
+                .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                .px_3()
+                .py_1()
+                .text_xs()
+                .rounded_md()
+                .text_color(if selected { rgb(PRIMARY) } else { rgb(MUTED) })
+                .when(selected, |tab| tab.bg(rgb(ELEVATED)))
+                .child(panel.label())
+                .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.active_panel = panel;
+                    cx.notify();
+                }))
+        });
+
+        let body = match active {
+            SessionPanel::Changes => self.changes_panel(&snapshot, cx).into_any_element(),
+            SessionPanel::Terminals => Self::terminals_panel(&snapshot).into_any_element(),
+            SessionPanel::Capabilities => Self::capabilities_panel(&snapshot).into_any_element(),
+        };
+
+        Some(
+            div()
+                .id("session-panel")
+                .accessibility_id("session-panel")
+                .role(Role::Group)
+                .aria_label("Session inspector")
+                .flex()
+                .flex_col()
+                .w(px(420.0))
+                .min_h_0()
+                .border_l_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(SIDEBAR))
+                .child(
+                    div()
+                        .id("session-panel-tabs")
+                        .role(Role::TabList)
+                        .aria_label("Inspector sections")
+                        .flex()
+                        .gap_1()
+                        .p_2()
+                        .border_b_1()
+                        .border_color(rgb(BORDER))
+                        .children(tabs),
+                )
+                .child(
+                    div()
+                        .id("session-panel-body")
+                        .flex()
+                        .flex_col()
+                        .flex_1()
+                        .min_h_0()
+                        .overflow_hidden()
+                        .p_3()
+                        .gap_2()
+                        .child(body),
+                ),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn changes_panel(
+        &self,
+        snapshot: &SessionSnapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let changes = &snapshot.changes;
+        if let Some(error) = &changes.error {
+            return div()
+                .id("changes-error")
+                .role(Role::Alert)
+                .aria_label(error.clone())
+                .text_sm()
+                .text_color(rgb(RED))
+                .child(error.clone())
+                .into_any_element();
+        }
+        if changes.is_empty() {
+            return div()
+                .id("changes-empty")
+                .role(Role::Status)
+                .aria_label("No changes")
+                .text_sm()
+                .text_color(rgb(MUTED))
+                .child(format!(
+                    "No changes against {}.",
+                    changes.base_label.as_deref().unwrap_or("base")
+                ))
+                .into_any_element();
+        }
+
+        let totals = changes.totals();
+        let selected_path = self
+            .selected_change
+            .clone()
+            .or_else(|| changes.files.first().map(|file| file.path.clone()));
+        let rows = changes.files.iter().map(|file| {
+            let path = file.path.clone();
+            let is_selected = selected_path.as_deref() == Some(path.as_str());
+            let label = format!(
+                "{} {} +{} -{}",
+                file.status.label(),
+                path,
+                file.stats.insertions,
+                file.stats.deletions
+            );
+            div()
+                .id(SharedString::from(format!("change-{path}")))
+                .role(Role::ListItem)
+                .aria_label(label)
+                .aria_selected(is_selected)
+                .focusable()
+                .tab_stop(true)
+                .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                .flex()
+                .justify_between()
+                .gap_2()
+                .px_2()
+                .py_1()
+                .rounded_md()
+                .when(is_selected, |row| row.bg(rgb(ELEVATED)))
+                .child(
+                    div()
+                        .flex_1()
+                        .min_w_0()
+                        .text_xs()
+                        .text_color(rgb(PRIMARY))
+                        .child(path.clone()),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(GREEN))
+                        .child(format!("+{}", file.stats.insertions)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(RED))
+                        .child(format!("-{}", file.stats.deletions)),
+                )
+                .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.selected_change = Some(path.clone());
+                    cx.notify();
+                }))
+        });
+
+        let diff = selected_path
+            .as_deref()
+            .and_then(|path| changes.file(path))
+            .map(|file| {
+                file.diff.clone().unwrap_or_else(|| {
+                    file.diff_omitted_reason
+                        .clone()
+                        .unwrap_or_else(|| "No diff available.".to_owned())
+                })
+            })
+            .unwrap_or_default();
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap_2()
+            .child(
+                div()
+                    .id("changes-summary")
+                    .role(Role::Status)
+                    .aria_label(format!(
+                        "{} files changed, {} insertions, {} deletions against {}",
+                        changes.files.len(),
+                        totals.insertions,
+                        totals.deletions,
+                        changes.base_label.as_deref().unwrap_or("base")
+                    ))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!(
+                        "{} file(s) · +{} −{} · vs {}",
+                        changes.files.len(),
+                        totals.insertions,
+                        totals.deletions,
+                        changes.base_label.as_deref().unwrap_or("base")
+                    )),
+            )
+            .child(
+                div()
+                    .id("changes-list")
+                    .role(Role::List)
+                    .aria_label("Changed files")
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .max_h(px(220.0))
+                    .overflow_hidden()
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .id("changes-diff")
+                    .role(Role::Group)
+                    .aria_label("Unified diff")
+                    .flex()
+                    .flex_1()
+                    .min_h_0()
+                    .overflow_hidden()
+                    .p_2()
+                    .rounded_md()
+                    .bg(rgb(PANEL))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .text_xs()
+                    .text_color(rgb(PRIMARY))
+                    .child(diff),
+            )
+            .into_any_element()
+    }
+
+    fn terminals_panel(snapshot: &SessionSnapshot) -> impl IntoElement {
+        let terminals = &snapshot.tool_activity.terminals;
+        if terminals.is_empty() {
+            return div()
+                .id("terminals-empty")
+                .role(Role::Status)
+                .aria_label("No terminals")
+                .text_sm()
+                .text_color(rgb(MUTED))
+                .child("No shell commands have run in this session.")
+                .into_any_element();
+        }
+        let cards = terminals.iter().rev().take(12).map(|terminal| {
+            let (state_label, state_color) = match terminal.state {
+                app_model::TerminalState::Running => ("running", GREEN),
+                app_model::TerminalState::Exited => ("exited", MUTED),
+                app_model::TerminalState::Cancelled => ("cancelled", RED),
+            };
+            let exit = terminal
+                .exit_code
+                .map_or_else(String::new, |code| format!(" · exit {code}"));
+            let command = terminal
+                .command
+                .clone()
+                .unwrap_or_else(|| "(command unavailable)".to_owned());
+            div()
+                .id(SharedString::from(format!(
+                    "terminal-{}",
+                    terminal.shell_id
+                )))
+                .accessibility_id(terminal.shell_id.clone())
+                .role(Role::Group)
+                .aria_label(format!("Shell {} {state_label}", terminal.shell_id))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .bg(rgb(PANEL))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .min_w_0()
+                                .text_xs()
+                                .text_color(rgb(PRIMARY))
+                                .child(command),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(state_color))
+                                .child(format!("{state_label}{exit}")),
+                        ),
+                )
+                .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
+                    "shell {} · {} call(s)",
+                    terminal.shell_id,
+                    terminal.tool_call_ids.len()
+                )))
+                .child(
+                    div()
+                        .max_h(px(160.0))
+                        .overflow_hidden()
+                        .text_xs()
+                        .text_color(rgb(PRIMARY))
+                        .child(terminal_tail(&terminal.output)),
+                )
+                .when(terminal.output_truncated, |card| {
+                    card.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("Earlier output was trimmed."),
+                    )
+                })
+        });
+        div()
+            .id("terminals-list")
+            .role(Role::List)
+            .aria_label("Terminals")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .flex_1()
+            .min_h_0()
+            .overflow_hidden()
+            .children(cards)
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn capabilities_panel(snapshot: &SessionSnapshot) -> impl IntoElement {
+        let report = &snapshot.capabilities;
+        let failures = snapshot.tool_activity.failures();
+        let rows = report.capabilities.iter().map(|capability| {
+            let (label, color) = match capability.status {
+                app_model::CapabilityStatus::Available => ("available", GREEN),
+                app_model::CapabilityStatus::Unavailable => ("unavailable", RED),
+                app_model::CapabilityStatus::NeedsAttention => ("needs attention", AMBER),
+                app_model::CapabilityStatus::Unknown => ("unknown", MUTED),
+            };
+            div()
+                .id(SharedString::from(format!(
+                    "capability-{}",
+                    capability.id.label().to_lowercase().replace(' ', "-")
+                )))
+                .role(Role::ListItem)
+                .aria_label(format!(
+                    "{}: {label}. {}",
+                    capability.id.label(),
+                    capability.detail
+                ))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .bg(rgb(PANEL))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(PRIMARY))
+                                .child(capability.id.label()),
+                        )
+                        .child(div().text_xs().text_color(rgb(color)).child(label)),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(capability.detail.clone()),
+                )
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap_2()
+            .overflow_hidden()
+            .child(
+                div()
+                    .id("capabilities-list")
+                    .role(Role::List)
+                    .aria_label("Capabilities")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(rows),
+            )
+            .when(!failures.is_empty(), |panel| {
+                let items = failures.into_iter().rev().take(6).map(|invocation| {
+                    let message = invocation
+                        .error_message
+                        .clone()
+                        .unwrap_or_else(|| "Tool failed without a message.".to_owned());
+                    div()
+                        .id(SharedString::from(format!(
+                            "tool-failure-{}",
+                            invocation.call_id
+                        )))
+                        .role(Role::ListItem)
+                        .aria_label(format!("{} failed: {message}", invocation.tool_name))
+                        .flex()
+                        .flex_col()
+                        .p_2()
+                        .rounded_md()
+                        .bg(rgb(PANEL))
+                        .border_1()
+                        .border_color(rgb(RED))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(RED))
+                                .child(invocation.tool_name.clone()),
+                        )
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(message))
+                });
+                panel.child(
+                    div()
+                        .id("tool-failures")
+                        .role(Role::List)
+                        .aria_label("Recent tool failures")
+                        .flex()
+                        .flex_col()
+                        .gap_2()
+                        .children(items),
+                )
+            })
+            .into_any_element()
+    }
+
     #[allow(clippy::too_many_lines)]
     fn session_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = title_case(&self.draft_mode);
@@ -2143,17 +2639,63 @@ impl Render for SessionMvpView {
                                 ))
                                 .child(
                                     div()
-                                        .id("provider-status")
-                                        .role(Role::Status)
-                                        .aria_label(provider_status.clone())
-                                        .text_xs()
-                                        .text_color(rgb(provider_color))
-                                        .child(provider_status),
+                                        .flex()
+                                        .items_center()
+                                        .gap_3()
+                                        .child(
+                                            div()
+                                                .id("panel-toggle")
+                                                .accessibility_id("panel-toggle")
+                                                .role(Role::Button)
+                                                .aria_label("Toggle session inspector")
+                                                .aria_expanded(self.panel_open)
+                                                .focusable()
+                                                .tab_stop(true)
+                                                .focus_visible(|style| {
+                                                    style.border_1().border_color(rgb(BLUE))
+                                                })
+                                                .px_2()
+                                                .py_1()
+                                                .rounded_md()
+                                                .text_xs()
+                                                .text_color(rgb(MUTED))
+                                                .child(changes_badge(self.selected()))
+                                                .hover(|style| {
+                                                    style.bg(rgb(ELEVATED)).cursor_pointer()
+                                                })
+                                                .on_click(cx.listener(|view, _, _, cx| {
+                                                    view.panel_open = !view.panel_open;
+                                                    cx.notify();
+                                                })),
+                                        )
+                                        .child(
+                                            div()
+                                                .id("provider-status")
+                                                .role(Role::Status)
+                                                .aria_label(provider_status.clone())
+                                                .text_xs()
+                                                .text_color(rgb(provider_color))
+                                                .child(provider_status),
+                                        ),
                                 ),
                         )
                     })
                     .when(self.selected_session.is_some(), |main| {
-                        main.child(self.transcript())
+                        main.child(
+                            div()
+                                .flex()
+                                .flex_1()
+                                .min_h_0()
+                                .child(self.transcript())
+                                .when_some(
+                                    if self.panel_open {
+                                        self.side_panel(cx)
+                                    } else {
+                                        None
+                                    },
+                                    gpui::ParentElement::child,
+                                ),
+                        )
                     })
                     .when_some(self.action_error.clone(), |column, error| {
                         column.child(
@@ -2209,6 +2751,39 @@ impl Render for SessionMvpView {
                 root.child(dialog)
             })
     }
+}
+
+/// Trailing slice of terminal output kept for display.
+///
+/// Phase 3 renders a bounded tail; Phase 6 replaces this with the virtualized
+/// terminal and real scrollback.
+fn terminal_tail(output: &str) -> String {
+    const MAX_LINES: usize = 40;
+    let lines: Vec<&str> = output.lines().collect();
+    if lines.len() <= MAX_LINES {
+        return output.to_owned();
+    }
+    lines[lines.len() - MAX_LINES..].join("\n")
+}
+
+/// Label for the inspector toggle, summarizing changed files at a glance.
+fn changes_badge(session: Option<&SessionProjection>) -> String {
+    session.map_or_else(
+        || "Inspector".to_owned(),
+        |session| {
+            let changed = session.snapshot.changes.files.len();
+            let terminals = session.snapshot.tool_activity.active_terminals().len();
+            let blocking = session.snapshot.capabilities.blocking().len();
+            let mut parts = vec![format!("{changed} changed")];
+            if terminals > 0 {
+                parts.push(format!("{terminals} running"));
+            }
+            if blocking > 0 {
+                parts.push(format!("{blocking} blocked"));
+            }
+            parts.join(" · ")
+        },
+    )
 }
 
 fn control_pill(

@@ -7,7 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
     ContextWindowOption, InteractionKind, InteractionRequest, InteractionResponse, ModelOption,
-    SessionControls,
+    SessionControls, ToolCatalog, ToolClass, ToolDescriptor, ToolSource,
 };
 use async_trait::async_trait;
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
@@ -15,9 +15,10 @@ use github_copilot_sdk::handler::{
     AutoModeSwitchHandler, AutoModeSwitchResponse, ElicitationHandler, ExitPlanModeHandler,
     ExitPlanModeResult, PermissionHandler, PermissionResult, UserInputHandler, UserInputResponse,
 };
+use github_copilot_sdk::rpc::ToolsListRequest;
 use github_copilot_sdk::session::Session;
 use github_copilot_sdk::{
-    Client, ClientOptions, ElicitationRequest, ElicitationResult, ExitPlanModeData,
+    Client, ClientMode, ClientOptions, ElicitationRequest, ElicitationResult, ExitPlanModeData,
     PermissionRequestData, RequestId, ResumeSessionConfig, SessionConfig, SessionId,
 };
 use serde::{Deserialize, Serialize};
@@ -118,6 +119,12 @@ pub trait AgentProvider: Send + Sync {
     async fn set_mode(&self, sdk_session_id: &str, mode: &str) -> Result<()>;
     async fn set_reasoning_effort(&self, sdk_session_id: &str, effort: &str) -> Result<()>;
     async fn disconnect(&self, sdk_session_id: &str) -> Result<()>;
+    /// Discover the tools the runtime advertises for `model`.
+    ///
+    /// Phase 3 requires proving inherited capabilities through the SDK rather
+    /// than hardcoding a tool list, so this is called at session start and
+    /// whenever the model changes.
+    async fn discover_tools(&self, model: Option<&str>) -> Result<ToolCatalog>;
 }
 
 #[derive(Clone)]
@@ -452,6 +459,11 @@ impl AgentProvider for CopilotProvider {
         let started = Instant::now();
         let mut options = ClientOptions::default();
         options.working_directory.clone_from(&self.root);
+        // Pin CopilotCli mode explicitly. `ClientMode::Empty` silently strips
+        // the built-in file, search, and shell tools the self-hosting loop
+        // depends on, and that regression would surface as an unexplained
+        // model failure rather than a configuration error.
+        options.mode = ClientMode::CopilotCli;
         let client = Client::start(options).await.map_err(|error| {
             self.record(
                 "start",
@@ -675,6 +687,60 @@ impl AgentProvider for CopilotProvider {
             .disconnect()
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))
+    }
+
+    async fn discover_tools(&self, model: Option<&str>) -> Result<ToolCatalog> {
+        let started = Instant::now();
+        let request = ToolsListRequest {
+            model: model.map(str::to_owned),
+        };
+        let listed = self
+            .client()
+            .await?
+            .rpc()
+            .tools()
+            .list(request)
+            .await
+            .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+
+        let tools: Vec<ToolDescriptor> = listed.tools.into_iter().map(tool_descriptor).collect();
+        self.record(
+            "discover_tools",
+            millis(started.elapsed().as_millis()),
+            None,
+            true,
+            json!({
+                "model": model,
+                "toolCount": tools.len(),
+                "tools": tools.iter().map(|tool| tool.name.clone()).collect::<Vec<_>>()
+            }),
+        );
+        Ok(ToolCatalog {
+            tools,
+            discovered_at: Some(timestamp()),
+            error: None,
+        })
+    }
+}
+
+/// Convert an SDK tool description into the app-owned descriptor.
+///
+/// MCP tools are identified by a `server/tool` namespaced name, which is the
+/// only signal the wire type carries about tool origin.
+fn tool_descriptor(tool: github_copilot_sdk::rpc::Tool) -> ToolDescriptor {
+    let source = tool
+        .namespaced_name
+        .as_deref()
+        .and_then(|namespaced| namespaced.split_once('/'))
+        .map_or(ToolSource::Builtin, |(server, _)| ToolSource::Mcp {
+            server: server.to_owned(),
+        });
+    ToolDescriptor {
+        class: ToolClass::classify(&tool.name),
+        name: tool.name,
+        namespaced_name: tool.namespaced_name,
+        description: tool.description,
+        source,
     }
 }
 

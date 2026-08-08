@@ -8,7 +8,7 @@ use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 2;
+const SCHEMA_VERSION: i64 = 3;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -63,14 +63,16 @@ impl Storage {
     pub fn upsert_session(&self, metadata: &SessionMetadata) -> Result<()> {
         self.connection()?.execute(
             "INSERT INTO app_sessions (
-                id, sdk_session_id, project_path, title, model, mode, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8)
+                id, sdk_session_id, project_path, title, model, mode, base_ref,
+                created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
              ON CONFLICT(id) DO UPDATE SET
                 sdk_session_id = excluded.sdk_session_id,
                 project_path = excluded.project_path,
                 title = excluded.title,
                 model = excluded.model,
                 mode = excluded.mode,
+                base_ref = excluded.base_ref,
                 updated_at = excluded.updated_at",
             params![
                 metadata.id,
@@ -79,6 +81,7 @@ impl Storage {
                 metadata.title,
                 metadata.model,
                 metadata.mode,
+                metadata.base_ref,
                 metadata.created_at,
                 metadata.updated_at,
             ],
@@ -156,7 +159,7 @@ impl Storage {
     pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, sdk_session_id, project_path, title, model, mode, created_at, updated_at
+            "SELECT id, sdk_session_id, project_path, title, model, mode, base_ref, created_at, updated_at
              FROM app_sessions ORDER BY updated_at DESC, id",
         )?;
         let rows = statement.query_map([], metadata_from_row)?;
@@ -201,7 +204,7 @@ impl Storage {
         let connection = self.connection()?;
         let metadata = connection
             .query_row(
-                "SELECT id, sdk_session_id, project_path, title, model, mode, created_at, updated_at
+                "SELECT id, sdk_session_id, project_path, title, model, mode, base_ref, created_at, updated_at
                  FROM app_sessions WHERE id = ?1",
                 [session_id],
                 metadata_from_row,
@@ -291,6 +294,7 @@ impl Storage {
                 title TEXT NOT NULL,
                 model TEXT,
                 mode TEXT,
+                base_ref TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
              );
@@ -321,6 +325,16 @@ impl Storage {
                 details TEXT NOT NULL
              );",
         )?;
+        // Databases created before schema version 3 predate the changes view
+        // and lack `base_ref`. `CREATE TABLE IF NOT EXISTS` does not add
+        // columns to an existing table, so add it explicitly and tolerate the
+        // duplicate-column error when the column is already present.
+        if let Err(error) =
+            transaction.execute("ALTER TABLE app_sessions ADD COLUMN base_ref TEXT", [])
+            && !is_duplicate_column(&error)
+        {
+            return Err(error.into());
+        }
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         Ok(())
@@ -333,6 +347,13 @@ impl Storage {
     }
 }
 
+/// Whether a rusqlite error reports a duplicate column name.
+///
+/// Used to make the `base_ref` migration idempotent across repeated opens.
+fn is_duplicate_column(error: &rusqlite::Error) -> bool {
+    error.to_string().contains("duplicate column name")
+}
+
 fn metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMetadata> {
     Ok(SessionMetadata {
         id: row.get(0)?,
@@ -341,8 +362,9 @@ fn metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMetadat
         title: row.get(3)?,
         model: row.get(4)?,
         mode: row.get(5)?,
-        created_at: row.get(6)?,
-        updated_at: row.get(7)?,
+        base_ref: row.get(6)?,
+        created_at: row.get(7)?,
+        updated_at: row.get(8)?,
     })
 }
 
@@ -362,6 +384,7 @@ mod tests {
             title: "Recovered session".to_owned(),
             model: Some("test-model".to_owned()),
             mode: Some("interactive".to_owned()),
+            base_ref: Some("main".to_owned()),
             created_at: "1".to_owned(),
             updated_at: "2".to_owned(),
         }
@@ -454,6 +477,9 @@ mod tests {
                     created_at TEXT NOT NULL,
                     updated_at TEXT NOT NULL
                  );
+                 INSERT INTO app_sessions VALUES (
+                    'legacy', 'legacy-sdk', '/tmp/legacy', 'Legacy', NULL, NULL, '1', '2'
+                 );
                  PRAGMA user_version = 1;",
             )
             .unwrap();
@@ -461,8 +487,30 @@ mod tests {
 
         let storage = Storage::open(&path).unwrap();
 
-        assert_eq!(storage.schema_version().unwrap(), 2);
+        assert_eq!(storage.schema_version().unwrap(), SCHEMA_VERSION);
         assert!(storage.list_projects().unwrap().is_empty());
         assert!(storage.selected_session().unwrap().is_none());
+
+        // The pre-existing row must survive the added column and read back
+        // with an absent base ref rather than failing the query.
+        let sessions = storage.list_sessions().unwrap();
+        assert_eq!(sessions.len(), 1);
+        assert_eq!(sessions[0].id, "legacy");
+        assert!(sessions[0].base_ref.is_none());
+    }
+
+    #[test]
+    fn repeated_open_does_not_duplicate_base_ref_column() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gcabb.db");
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage.upsert_session(&metadata()).unwrap();
+        }
+        // Opening again re-runs the migration; the duplicate-column error must
+        // be tolerated rather than failing startup.
+        let storage = Storage::open(&path).unwrap();
+        let sessions = storage.list_sessions().unwrap();
+        assert_eq!(sessions[0].base_ref.as_deref(), Some("main"));
     }
 }
