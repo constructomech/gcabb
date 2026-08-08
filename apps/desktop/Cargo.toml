@@ -19,6 +19,7 @@ storage.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 ui-components.workspace = true
+updater.workspace = true
 
 [dev-dependencies]
 serde_json.workspace = true

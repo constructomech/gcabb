@@ -1,0 +1,304 @@
+name: Release
+
+# Pushing a version tag is the only trigger. The tag is the single input: the
+# version, the channel, and the notes are all derived from it, so a release
+# cannot disagree with the tag that produced it.
+on:
+  push:
+    tags:
+      - "v*"
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: "Existing tag to build a release from"
+        required: true
+
+permissions:
+  contents: write
+
+env:
+  CARGO_TERM_COLOR: always
+  # The release channel is what makes a build a release build rather than a
+  # developer build. It is compiled in, so a binary always knows what it is.
+  GCABB_UPDATE_KEY_ID: ${{ vars.GCABB_UPDATE_KEY_ID || 'release-2026' }}
+
+jobs:
+  prepare:
+    name: Resolve release identity
+    runs-on: ubuntu-latest
+    outputs:
+      tag: ${{ steps.identity.outputs.tag }}
+      version: ${{ steps.identity.outputs.version }}
+      channel: ${{ steps.identity.outputs.channel }}
+      prerelease: ${{ steps.identity.outputs.prerelease }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Derive version and channel from the tag
+        id: identity
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ github.event.inputs.tag || github.ref_name }}"
+          version="${tag#v}"
+
+          # A tag with a semver prerelease segment publishes to the prerelease
+          # channel; a bare version publishes to stable. Nothing else selects
+          # the channel, so a self-hosting build cannot be promoted by accident.
+          if [[ "$version" == *-* ]]; then
+            channel=prerelease
+            prerelease=true
+          else
+            channel=stable
+            prerelease=false
+          fi
+
+          {
+            echo "tag=$tag"
+            echo "version=$version"
+            echo "channel=$channel"
+            echo "prerelease=$prerelease"
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Fail if the tag disagrees with the workspace version
+        shell: bash
+        run: |
+          set -euo pipefail
+          declared=$(grep -m1 '^version = ' Cargo.toml | cut -d'"' -f2)
+          tagged="${{ steps.identity.outputs.version }}"
+          if [ "$declared" != "$tagged" ]; then
+            echo "::error::Tag ${{ steps.identity.outputs.tag }} does not match the" \
+                 "workspace version $declared in Cargo.toml. The version is defined" \
+                 "in one place; update Cargo.toml and retag."
+            exit 1
+          fi
+
+  build:
+    name: Build ${{ matrix.target }}
+    needs: prepare
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: ubuntu-22.04
+            target: x86_64-unknown-linux-gnu
+            format: tar.gz
+          - os: macos-14
+            target: aarch64-apple-darwin
+            format: tar.gz
+          - os: macos-13
+            target: x86_64-apple-darwin
+            format: tar.gz
+          - os: windows-2022
+            target: x86_64-pc-windows-msvc
+            format: zip
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            clang cmake mold libasound2-dev libfontconfig-dev libwayland-dev \
+            libxkbcommon-x11-dev libssl-dev libzstd-dev libvulkan-dev \
+            libgit2-dev libstdc++-12-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          # rust-toolchain.toml pins the version; the target is added here so
+          # cross-architecture macOS builds resolve.
+          toolchain: "1.95"
+          targets: ${{ matrix.target }}
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.target }}
+
+      - name: Build release binary
+        shell: bash
+        env:
+          GCABB_RELEASE_CHANNEL: ${{ needs.prepare.outputs.channel }}
+          GCABB_BUILD_COMMIT: ${{ github.sha }}
+          GCABB_UPDATE_PUBLIC_KEY: ${{ vars.GCABB_UPDATE_PUBLIC_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GCABB_UPDATE_PUBLIC_KEY:-}" ]; then
+            echo "::error::The GCABB_UPDATE_PUBLIC_KEY repository variable is not" \
+                 "set. Without it the published build trusts no signing key and" \
+                 "could never accept an update."
+            exit 1
+          fi
+          cargo build --release --locked --target ${{ matrix.target }} -p gcabb-desktop
+
+      - name: Package artifact
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="${{ needs.prepare.outputs.version }}"
+          target="${{ matrix.target }}"
+          staging="package/gcabb-$version-$target"
+          mkdir -p "$staging" dist
+
+          if [ "${{ runner.os }}" = "Windows" ]; then
+            cp "target/$target/release/gcabb-desktop.exe" "$staging/"
+          else
+            cp "target/$target/release/gcabb-desktop" "$staging/"
+          fi
+          cp README.md LICENSE.txt THIRD_PARTY_NOTICES.md "$staging/"
+
+          # Archives contain the payload at the root so the updater can swap a
+          # staged directory straight into the install location.
+          if [ "${{ matrix.format }}" = "zip" ]; then
+            (cd "$staging" && 7z a -tzip "../../dist/gcabb-$version-$target.zip" .)
+          else
+            tar -czf "dist/gcabb-$version-$target.tar.gz" -C "$staging" .
+          fi
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: gcabb-${{ matrix.target }}
+          path: dist/*
+          if-no-files-found: error
+
+  validate:
+    name: Release validation
+    needs: prepare
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            clang cmake mold libasound2-dev libfontconfig-dev libwayland-dev \
+            libxkbcommon-x11-dev libssl-dev libzstd-dev libvulkan-dev \
+            libgit2-dev libstdc++-12-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+      # The update path is the part of a release that cannot be fixed by a
+      # later release, so its tests gate publication.
+      - run: cargo test --workspace --locked
+
+  publish:
+    name: Publish release
+    needs: [prepare, build, validate]
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          ref: ${{ needs.prepare.outputs.tag }}
+          fetch-depth: 0
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+
+      - uses: actions/download-artifact@v4
+        with:
+          path: staging
+
+      - name: Collect artifacts
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p dist
+          find staging -type f \( -name '*.tar.gz' -o -name '*.zip' \) \
+            -exec mv {} dist/ \;
+          ls -l dist
+
+      - name: Generate release notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          tag="${{ needs.prepare.outputs.tag }}"
+          previous=$(git tag --list 'v*' --sort=-version:refname \
+            | grep -v "^$tag$" | head -n1 || true)
+
+          {
+            echo "## GCABB $tag"
+            echo
+            echo "Channel: \`${{ needs.prepare.outputs.channel }}\`"
+            echo
+            echo "### Changes"
+            echo
+            if [ -n "$previous" ]; then
+              git log --no-merges --pretty='- %s (%h)' "$previous..$tag"
+            else
+              git log --no-merges --pretty='- %s (%h)' "$tag" | head -n 50
+            fi
+            echo
+            echo "### Verifying this release"
+            echo
+            echo "Artifact checksums are listed in \`checksums.txt\` and are also"
+            echo "covered by the signed \`update-manifest.json\`."
+          } > notes.md
+          cat notes.md
+
+      - name: Build and sign update metadata
+        shell: bash
+        env:
+          GCABB_UPDATE_PRIVATE_KEY: ${{ secrets.GCABB_UPDATE_PRIVATE_KEY }}
+        run: |
+          set -euo pipefail
+          if [ -z "${GCABB_UPDATE_PRIVATE_KEY:-}" ]; then
+            echo "::error::The GCABB_UPDATE_PRIVATE_KEY secret is not set, so this" \
+                 "release could not be signed and no client would accept it."
+            exit 1
+          fi
+
+          cargo run --release -q -p gcabb-release -- manifest \
+            --version "${{ needs.prepare.outputs.version }}" \
+            --channel "${{ needs.prepare.outputs.channel }}" \
+            --tag "${{ needs.prepare.outputs.tag }}" \
+            --published-at "$(date -u +%Y-%m-%dT%H:%M:%SZ)" \
+            --base-url "https://github.com/${{ github.repository }}/releases/download/${{ needs.prepare.outputs.tag }}" \
+            --artifacts-dir dist \
+            --notes-file notes.md \
+            --out dist/update-manifest.json
+
+          cargo run --release -q -p gcabb-release -- sign \
+            --input dist/update-manifest.json \
+            --key-id "$GCABB_UPDATE_KEY_ID" \
+            --out dist/update-manifest.json.sig
+
+          # Verify with the public key clients ship, so a key mismatch fails
+          # here instead of silently shipping unusable metadata.
+          cargo run --release -q -p gcabb-release -- verify \
+            --input dist/update-manifest.json \
+            --signature dist/update-manifest.json.sig \
+            --key-id "$GCABB_UPDATE_KEY_ID" \
+            --public-key "${{ vars.GCABB_UPDATE_PUBLIC_KEY }}"
+
+      - name: Generate checksums
+        shell: bash
+        run: |
+          set -euo pipefail
+          (cd dist && sha256sum gcabb-* update-manifest.json > checksums.txt)
+          cat dist/checksums.txt
+
+      - name: Publish GitHub Release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: ${{ needs.prepare.outputs.tag }}
+          name: GCABB ${{ needs.prepare.outputs.tag }}
+          body_path: notes.md
+          prerelease: ${{ needs.prepare.outputs.prerelease }}
+          files: dist/*
+          fail_on_unmatched_files: true

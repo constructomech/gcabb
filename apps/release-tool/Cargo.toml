@@ -1,0 +1,19 @@
+[package]
+name = "gcabb-release"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+anyhow.workspace = true
+base64 = "0.22.1"
+clap.workspace = true
+ed25519-dalek = { version = "2.2.0", features = ["rand_core"] }
+rand = "0.8.5"
+semver = { version = "1.0.28", features = ["serde"] }
+serde_json.workspace = true
+updater.workspace = true
+
+[lints]
+workspace = true

@@ -99,6 +99,27 @@ against an installed desktop entry instead.
 See [`docs/phase-2/`](docs/phase-2/) for the implemented interaction model and
 validation coverage.
 
+## Releases and updates
+
+Releases are tag-driven and cover Linux, macOS, and Windows. Pushing a `v*` tag
+builds every target, validates the workspace, signs update metadata, and
+publishes a single GitHub Release.
+
+```sh
+# The version is declared once, in [workspace.package] of the root Cargo.toml.
+git tag v0.2.0 && git push origin v0.2.0     # stable channel
+git tag v0.2.0-rc.1 && git push origin --tags # prerelease channel
+```
+
+Installed builds verify an ed25519 signature over the release manifest and the
+SHA-256 of the downloaded artifact before replacing anything, and keep the
+previous installation until the new one starts successfully. Builds from a
+developer checkout report channel `dev` and never update themselves, so
+`cargo run` cannot be overwritten by a release.
+
+See [`docs/phase-4/`](docs/phase-4/) for key setup, channel rules, and the
+rollback design.
+
 ## Phase 0 probe
 
 The repository retains the executable SDK feasibility probe:

@@ -584,6 +584,10 @@ Still open, and deferred rather than done:
 
 ### Phase 4: Tagged Releases and Auto-Update (1-2 weeks)
 
+Status: release pipeline, signing, and update client implemented; see
+[docs/phase-4](docs/phase-4/README.md). The in-app update prompt and the first
+real tagged release remain.
+
 Turn the Phase 3a self-hosting build into a repeatable dogfooding loop without
 making release engineering a prerequisite for the Self-Hosting MVP itself.
 

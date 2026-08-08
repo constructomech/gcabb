@@ -27,6 +27,8 @@ use session_manager::{
 use storage::Storage;
 use tokio::sync::watch;
 use ui_components::{ImagesPasted, InputSubmitted, PastedImage, TextInput, bind_text_input_keys};
+use updater::install::InstallLayout;
+use updater::version::BuildStamp;
 
 const BACKGROUND: u32 = 0x000d_1117;
 const SIDEBAR: u32 = 0x0016_1b22;
@@ -5297,10 +5299,37 @@ fn bind_app_keys(cx: &mut App) {
     ]);
 }
 
+/// Records the running build's identity and clears any update left over from a
+/// previous run.
+///
+/// Reaching startup is the signal that an applied update actually works, so it
+/// is the point at which the previous installation stops being needed as a
+/// rollback target.
+fn resolve_build_identity() -> BuildStamp {
+    let build = BuildStamp::current();
+    tracing::info!(
+        version = %build.version,
+        channel = %build.channel,
+        commit = build.commit.as_deref().unwrap_or("unknown"),
+        target = build.target,
+        release = build.is_release(),
+        "gcabb build identity"
+    );
+    if build.is_release() {
+        match InstallLayout::for_running_executable() {
+            Ok(layout) => layout.clean_completed_updates(),
+            Err(error) => tracing::warn!(%error, "could not resolve the installation layout"),
+        }
+    }
+    build
+}
+
 fn main() {
     if let Err(error) = init_tracing("gcabb=info") {
         eprintln!("failed to initialize structured tracing: {error}");
     }
+    let build = resolve_build_identity();
+    let window_title = format!("GCABB {}", build.display());
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let branch = git_branch(&project_root);
     let service = match database_path() {
@@ -5327,7 +5356,7 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("GCABB".into()),
+                        title: Some(window_title.clone().into()),
                         ..Default::default()
                     }),
                     app_id: Some(APP_ID.to_owned()),
