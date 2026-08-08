@@ -422,6 +422,7 @@ impl Render for TextInput {
             .aria_value(self.content.clone())
             .focusable()
             .tab_stop(true)
+            .focus_visible(|style| style.border_1().border_color(rgb(0x58_a6ff)))
             .flex()
             .key_context("TextInput")
             .track_focus(&self.focus_handle(cx))

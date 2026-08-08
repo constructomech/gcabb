@@ -39,6 +39,14 @@ func boolean(_ element: AXUIElement, _ name: CFString) -> Bool {
     return CFBooleanGetValue((value as! CFBoolean))
 }
 
+func actions(_ element: AXUIElement) -> [String] {
+    var names: CFArray?
+    guard AXUIElementCopyActionNames(element, &names) == .success else {
+        return []
+    }
+    return names as? [String] ?? []
+}
+
 func children(_ element: AXUIElement) -> [AXUIElement] {
     attribute(element, kAXChildrenAttribute as CFString) as? [AXUIElement] ?? []
 }
@@ -81,13 +89,17 @@ else {
     fail("unable to query GCABB through the macOS accessibility API")
 }
 
-let expected: [(identifier: String, role: String)] = [
-    ("sidebar", "AXGroup"),
-    ("new-session", "AXButton"),
-    ("composer-input", "AXTextField"),
-    ("mode", "AXButton"),
-    ("model", "AXButton"),
-    ("effort", "AXButton"),
+let expected: [(identifier: String, role: String, pressable: Bool)] = [
+    ("sidebar", "AXGroup", false),
+    ("sidebar-toggle", "AXButton", true),
+    ("destination-home", "AXButton", true),
+    ("new-session", "AXButton", true),
+    ("chats-home", "AXButton", true),
+    ("composer-input", "AXTextField", true),
+    ("home-submit-prompt", "AXButton", true),
+    ("mode", "AXPopUpButton", true),
+    ("model", "AXPopUpButton", true),
+    ("effort", "AXPopUpButton", true),
 ]
 
 for item in expected {
@@ -100,16 +112,23 @@ for item in expected {
             "\(item.identifier) has role \(actualRole), expected \(item.role)"
         )
     }
+    guard !item.pressable || actions(element).contains(kAXPressAction) else {
+        fail("\(item.identifier) does not expose AXPress")
+    }
+    guard !(text(element, kAXTitleAttribute as CFString) ?? "").isEmpty else {
+        fail("\(item.identifier) does not expose an accessible name")
+    }
+    if ["mode", "model", "effort"].contains(item.identifier) {
+        guard !(text(element, kAXValueAttribute as CFString) ?? "").isEmpty else {
+            fail("\(item.identifier) does not expose its current value")
+        }
+    }
 }
 
 guard let composer = find("composer-input", in: app) else {
     fail("composer-input disappeared from the accessibility tree")
 }
-var composerActions: CFArray?
-guard AXUIElementCopyActionNames(composer, &composerActions) == .success,
-      let actions = composerActions as? [String],
-      actions.contains(kAXPressAction)
-else {
+guard actions(composer).contains(kAXPressAction) else {
     fail("composer-input does not expose AXPress")
 }
 
@@ -141,16 +160,49 @@ guard composerFocused else {
 guard let mode = find("mode", in: app) else {
     fail("mode control disappeared from the accessibility tree")
 }
-let modeBefore = text(mode, kAXTitleAttribute as CFString) ?? ""
+let modeBefore = text(mode, kAXValueAttribute as CFString) ?? ""
+guard !modeBefore.isEmpty else {
+    fail("mode control does not expose its current value")
+}
 let modePress = AXUIElementPerformAction(mode, kAXPressAction as CFString)
 guard modePress == .success else {
     fail("AXPress failed for mode: \(modePress.rawValue)")
 }
 
+guard let menu = waitForElement("composer-control-menu", in: app) else {
+    fail("pressing mode did not expose its option list")
+}
+guard text(menu, kAXRoleAttribute as CFString) == "AXList" else {
+    fail("mode options are not exposed as a list")
+}
+
+var nextMode: AXUIElement?
+for child in children(menu) {
+    let identifier = text(child, kAXIdentifierAttribute as CFString) ?? ""
+    let selected = boolean(child, kAXSelectedAttribute as CFString)
+    if identifier.hasPrefix("mode-option-") && !selected {
+        nextMode = child
+        break
+    }
+}
+guard let nextMode else {
+    fail("mode option list does not expose an unselected option")
+}
+guard text(nextMode, kAXRoleAttribute as CFString) == "AXStaticText" else {
+    fail("mode option has an unexpected accessibility role")
+}
+guard actions(nextMode).contains(kAXPressAction) else {
+    fail("mode option does not expose AXPress")
+}
+let nextModePress = AXUIElementPerformAction(nextMode, kAXPressAction as CFString)
+guard nextModePress == .success else {
+    fail("AXPress failed for mode option: \(nextModePress.rawValue)")
+}
+
 var modeAfter = modeBefore
 for _ in 0..<30 {
     if let currentMode = find("mode", in: app) {
-        modeAfter = text(currentMode, kAXTitleAttribute as CFString) ?? ""
+        modeAfter = text(currentMode, kAXValueAttribute as CFString) ?? ""
     }
     if modeAfter != modeBefore {
         break

@@ -18,7 +18,10 @@ The initial session shell exposes:
 - Headings, status messages, and alerts.
 - A conversation list with attributed messages.
 - A labelled text input with current value and placeholder.
-- Mode, model, effort, session, and interaction buttons with press actions.
+- Mode, model, and effort comboboxes with values, expanded state, selectable
+  options, and press actions.
+- Sidebar, navigation, session, submit, lifecycle, and interaction controls with
+  names, selection state where applicable, keyboard focus, and press actions.
 - Permission and input dialogs.
 - Tab and Shift-Tab focus traversal.
 
@@ -53,3 +56,9 @@ The terminal or host application running the validator must have permission in
 New UI components should receive a lightweight AX/AccessKit interaction contract
 covering role, label, value or state, stable identity, keyboard focus, and
 supported actions.
+
+Unavailable placeholders (attachments, add project, My work, Automations,
+Search, Settings, and back/forward glyphs) are intentionally omitted from the
+accessibility tree because they do not perform an action. The pointer-only popup
+backdrop is also presentational; selector triggers and Escape provide accessible
+ways to close the popup.

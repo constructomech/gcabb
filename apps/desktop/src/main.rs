@@ -841,6 +841,7 @@ impl SessionMvpView {
             .unwrap_or_else(|| selected.to_owned())
     }
 
+    #[allow(clippy::too_many_lines)]
     fn control_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let menu = self.open_control_menu?;
         let (title, selected, options) = match menu {
@@ -872,6 +873,9 @@ impl SessionMvpView {
         Some(
             div()
                 .id("composer-control-menu")
+                .accessibility_id("composer-control-menu")
+                .role(Role::ListBox)
+                .aria_label(title)
                 .w(width)
                 .max_h(px(460.0))
                 .overflow_y_scroll()
@@ -895,8 +899,20 @@ impl SessionMvpView {
                         let is_selected = value == selected;
                         let option_value = value.clone();
                         let has_description = !description.is_empty();
+                        let accessible_label = label.clone();
+                        let accessible_description = description.clone();
                         div()
                             .id(("control-option", index))
+                            .accessibility_id(format!("{}-option-{value}", control_menu_id(menu)))
+                            .role(Role::ListBoxOption)
+                            .aria_label(accessible_label)
+                            .aria_selected(is_selected)
+                            .when(has_description, |option| {
+                                option.aria_description(accessible_description)
+                            })
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                             .flex()
                             .items_center()
                             .gap_2()
@@ -909,13 +925,10 @@ impl SessionMvpView {
                                 rgb(PANEL)
                             })
                             .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(move |view, _, _, cx| {
-                                    view.choose_control(menu, option_value.clone());
-                                    cx.notify();
-                                }),
-                            )
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.choose_control(menu, option_value.clone());
+                                cx.notify();
+                            }))
                             .child(
                                 div()
                                     .w(px(16.0))
@@ -955,6 +968,7 @@ impl SessionMvpView {
                     .aria_selected(selected)
                     .focusable()
                     .tab_stop(true)
+                    .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -1000,6 +1014,7 @@ impl SessionMvpView {
                 .aria_selected(selected)
                 .focusable()
                 .tab_stop(true)
+                .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                 .flex()
                 .items_center()
                 .gap_2()
@@ -1040,6 +1055,13 @@ impl SessionMvpView {
                     .child(
                         div()
                             .id("sidebar-toggle")
+                            .accessibility_id("sidebar-toggle")
+                            .role(Role::Button)
+                            .aria_label("Collapse sidebar")
+                            .aria_expanded(true)
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                             .w(px(24.0))
                             .h(px(24.0))
                             .flex()
@@ -1049,10 +1071,9 @@ impl SessionMvpView {
                             .text_color(rgb(MUTED))
                             .child("▯")
                             .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|view, _, _, cx| view.toggle_sidebar(cx)),
-                            ),
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.toggle_sidebar(cx);
+                            })),
                     )
                     .child(div().flex_1())
                     .child(div().text_color(rgb(MUTED)).child("<"))
@@ -1061,6 +1082,8 @@ impl SessionMvpView {
             .child(
                 div()
                     .id("primary-destinations")
+                    .role(Role::Navigation)
+                    .aria_label("Primary")
                     .flex()
                     .flex_col()
                     .px_2()
@@ -1068,6 +1091,13 @@ impl SessionMvpView {
                     .child(
                         div()
                             .id("destination-home")
+                            .accessibility_id("destination-home")
+                            .role(Role::Button)
+                            .aria_label("Home")
+                            .aria_selected(self.selected_session.is_none())
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                             .flex()
                             .items_center()
                             .gap_3()
@@ -1082,10 +1112,9 @@ impl SessionMvpView {
                             .child(div().text_color(rgb(MUTED)).child("⌂"))
                             .child("Home")
                             .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|view, _, _, cx| view.new_session(cx)),
-                            ),
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.new_session(cx);
+                            })),
                     )
                     .child(disabled_destination("destination-my-work", "☷", "My work"))
                     .child(disabled_destination(
@@ -1109,6 +1138,12 @@ impl SessionMvpView {
                     .child(
                         div()
                             .id("new-session")
+                            .accessibility_id("new-session")
+                            .role(Role::Button)
+                            .aria_label("New session")
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                             .ml_3()
                             .w(px(24.0))
                             .h(px(24.0))
@@ -1119,10 +1154,9 @@ impl SessionMvpView {
                             .text_lg()
                             .child("+")
                             .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|view, _, _, cx| view.new_session(cx)),
-                            ),
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.new_session(cx);
+                            })),
                     ),
             )
             .child(
@@ -1138,6 +1172,13 @@ impl SessionMvpView {
                     .child(
                         div()
                             .id("chats-home")
+                            .accessibility_id("chats-home")
+                            .role(Role::Button)
+                            .aria_label("Chats home")
+                            .aria_selected(self.selected_session.is_none())
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                             .flex()
                             .items_center()
                             .gap_3()
@@ -1148,10 +1189,9 @@ impl SessionMvpView {
                             .child("◯")
                             .child("Chats")
                             .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|view, _, _, cx| view.new_session(cx)),
-                            ),
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.new_session(cx);
+                            })),
                     )
                     .children(projects)
                     .children(sessions),
@@ -1323,6 +1363,7 @@ impl SessionMvpView {
             .flatten();
         div()
             .id("composer")
+            .accessibility_id("composer")
             .relative()
             .role(Role::Group)
             .aria_label("Message composer")
@@ -1379,6 +1420,12 @@ impl SessionMvpView {
                     .child(
                         div()
                             .id("submit-prompt")
+                            .accessibility_id("submit-prompt")
+                            .role(Role::Button)
+                            .aria_label("Send message")
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                             .w(px(32.0))
                             .h(px(32.0))
                             .flex()
@@ -1394,10 +1441,9 @@ impl SessionMvpView {
                                     .text_color(rgb(PRIMARY))
                                     .cursor_pointer()
                             })
-                            .on_mouse_up(
-                                MouseButton::Left,
-                                cx.listener(|view, _, _, cx| view.submit_composer(cx)),
-                            ),
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.submit_composer(cx);
+                            })),
                     )
                     .when_some(cancel, |row, id| {
                         row.child(
@@ -1417,6 +1463,9 @@ impl SessionMvpView {
                                         .aria_label("Cancel current session")
                                         .focusable()
                                         .tab_stop(true)
+                                        .focus_visible(|style| {
+                                            style.border_1().border_color(rgb(BLUE))
+                                        })
                                         .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                                         .on_click(cx.listener(move |view, _, _, _| {
                                             let _ = view.commands.send(ServiceCommand::Cancel {
@@ -1435,6 +1484,7 @@ impl SessionMvpView {
                                 .aria_label("Close session")
                                 .focusable()
                                 .tab_stop(true)
+                                .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                                 .px_3()
                                 .py_1()
                                 .rounded_md()
@@ -1459,6 +1509,7 @@ impl SessionMvpView {
                                     .aria_label("Resume session")
                                     .focusable()
                                     .tab_stop(true)
+                                    .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                                     .px_3()
                                     .py_1()
                                     .rounded_md()
@@ -1506,6 +1557,9 @@ impl SessionMvpView {
 
         div()
             .id("home-composer")
+            .accessibility_id("home-composer")
+            .role(Role::Group)
+            .aria_label("Message composer")
             .relative()
             .w_full()
             .max_w(px(820.0))
@@ -1573,6 +1627,12 @@ impl SessionMvpView {
                             .child(
                                 div()
                                     .id("home-submit-prompt")
+                                    .accessibility_id("home-submit-prompt")
+                                    .role(Role::Button)
+                                    .aria_label("Send message")
+                                    .focusable()
+                                    .tab_stop(true)
+                                    .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                                     .w(px(32.0))
                                     .h(px(32.0))
                                     .flex()
@@ -1588,10 +1648,9 @@ impl SessionMvpView {
                                             .text_color(rgb(PRIMARY))
                                             .cursor_pointer()
                                     })
-                                    .on_mouse_up(
-                                        MouseButton::Left,
-                                        cx.listener(|view, _, _, cx| view.submit_composer(cx)),
-                                    ),
+                                    .on_click(cx.listener(|view, _, _, cx| {
+                                        view.submit_composer(cx);
+                                    })),
                             ),
                     ),
             )
@@ -1635,6 +1694,8 @@ impl SessionMvpView {
             .child(
                 div()
                     .id("provider-status")
+                    .role(Role::Status)
+                    .aria_label(provider_status.clone())
                     .absolute()
                     .top(px(20.0))
                     .right(px(24.0))
@@ -1696,6 +1757,7 @@ impl SessionMvpView {
                     .aria_label(choice.clone())
                     .focusable()
                     .tab_stop(true)
+                    .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                     .px_3()
                     .py_2()
                     .rounded_md()
@@ -1829,7 +1891,6 @@ impl Render for SessionMvpView {
             .accessibility_id("gcabb")
             .role(Role::Application)
             .aria_label("GCABB")
-            .track_focus(&self.composer.focus_handle(cx))
             .on_action(cx.listener(|_, _: &FocusNext, window, cx| {
                 window.focus_next(cx);
             }))
@@ -1867,6 +1928,15 @@ impl Render for SessionMvpView {
                                 .child(
                                     div()
                                         .id("sidebar-toggle")
+                                        .accessibility_id("sidebar-toggle")
+                                        .role(Role::Button)
+                                        .aria_label("Expand sidebar")
+                                        .aria_expanded(false)
+                                        .focusable()
+                                        .tab_stop(true)
+                                        .focus_visible(|style| {
+                                            style.border_1().border_color(rgb(BLUE))
+                                        })
                                         .w(px(24.0))
                                         .h(px(24.0))
                                         .flex()
@@ -1876,12 +1946,9 @@ impl Render for SessionMvpView {
                                         .text_color(rgb(MUTED))
                                         .child("▯")
                                         .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                                        .on_mouse_up(
-                                            MouseButton::Left,
-                                            cx.listener(|view, _, _, cx| {
-                                                view.toggle_sidebar(cx);
-                                            }),
-                                        ),
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            view.toggle_sidebar(cx);
+                                        })),
                                 ),
                         )
                     })
@@ -1979,16 +2046,24 @@ fn control_pill(
     id: &'static str,
     value: String,
     menu: ControlMenu,
-    _expanded: bool,
+    expanded: bool,
     cx: &mut Context<SessionMvpView>,
 ) -> impl IntoElement {
+    let label = match menu {
+        ControlMenu::Mode => "Mode",
+        ControlMenu::Model => "Model",
+        ControlMenu::Effort => "Reasoning effort",
+    };
     div()
         .id(id)
         .accessibility_id(id)
-        .role(Role::Button)
-        .aria_label(format!("{id}: {value}"))
+        .role(Role::ComboBox)
+        .aria_label(label)
+        .aria_value(value.clone())
+        .aria_expanded(expanded)
         .focusable()
         .tab_stop(true)
+        .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
         .px_3()
         .py_1()
         .rounded_md()
@@ -2001,6 +2076,14 @@ fn control_pill(
             view.toggle_control_menu(menu);
             cx.notify();
         }))
+}
+
+fn control_menu_id(menu: ControlMenu) -> &'static str {
+    match menu {
+        ControlMenu::Mode => "mode",
+        ControlMenu::Model => "model",
+        ControlMenu::Effort => "effort",
+    }
 }
 
 fn disabled_destination(
@@ -2069,6 +2152,7 @@ fn action_button(
         .aria_label(label)
         .focusable()
         .tab_stop(true)
+        .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
         .px_4()
         .py_2()
         .rounded_md()
@@ -2199,8 +2283,8 @@ fn main() {
 #[cfg(test)]
 mod tests {
     use super::{
-        COMPACT_WIDTH, ControlMenu, compact_layout, control_menu_offset, effort_label,
-        reasoning_effort_for_model, toggled_menu,
+        COMPACT_WIDTH, ControlMenu, compact_layout, control_menu_id, control_menu_offset,
+        effort_label, reasoning_effort_for_model, toggled_menu,
     };
 
     #[test]
@@ -2230,6 +2314,13 @@ mod tests {
         assert_eq!(control_menu_offset(ControlMenu::Mode), 40);
         assert_eq!(control_menu_offset(ControlMenu::Model), 128);
         assert_eq!(control_menu_offset(ControlMenu::Effort), 216);
+    }
+
+    #[test]
+    fn selector_accessibility_ids_match_their_triggers() {
+        assert_eq!(control_menu_id(ControlMenu::Mode), "mode");
+        assert_eq!(control_menu_id(ControlMenu::Model), "model");
+        assert_eq!(control_menu_id(ControlMenu::Effort), "effort");
     }
 
     #[test]
