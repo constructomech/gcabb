@@ -36,7 +36,7 @@ Phase 2 provides an end-to-end native session workflow:
 - Persisted project and session navigation.
 - Create, resume, close, cancel, and switch between background sessions.
 - Native prompt composer and streaming transcript.
-- Model, mode, and reasoning-effort controls.
+- Model, mode, reasoning-effort, and context-length controls.
 - Permission, elicitation, user-input, plan-exit, and mode-switch dialogs.
 - Worktree branch and Copilot process-health indicators.
 - SQLite-backed selected-session restoration.

@@ -113,6 +113,8 @@ pub struct SessionControls {
     pub model: Option<String>,
     pub mode: Option<String>,
     pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub context_tier: Option<String>,
     pub available_models: Vec<ModelOption>,
 }
 
@@ -121,6 +123,16 @@ pub struct ModelOption {
     pub id: String,
     pub name: String,
     pub supported_reasoning_efforts: Vec<String>,
+    #[serde(default)]
+    pub context_windows: Vec<ContextWindowOption>,
+}
+
+/// A selectable context-window tier for a model. Models that expose an
+/// extended tier report more than one; the rest report at most one.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ContextWindowOption {
+    pub tier: String,
+    pub max_tokens: Option<u64>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]

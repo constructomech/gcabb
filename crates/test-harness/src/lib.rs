@@ -201,6 +201,7 @@ impl AgentProvider for FakeProvider {
         _sdk_session_id: &str,
         _model: &str,
         _reasoning_effort: Option<&str>,
+        _context_tier: Option<&str>,
     ) -> Result<()> {
         Ok(())
     }

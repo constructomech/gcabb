@@ -5,8 +5,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    InteractionKind, InteractionResponse, ProjectMetadata, SessionSnapshot, SessionStatus,
-    TranscriptRole, TranscriptState,
+    ContextWindowOption, InteractionKind, InteractionResponse, ProjectMetadata, SessionSnapshot,
+    SessionStatus, TranscriptRole, TranscriptState,
 };
 use copilot_provider::{CopilotProvider, ProviderCompatibility};
 use diagnostics::{TracingDiagnostics, init_tracing};
@@ -64,6 +64,7 @@ enum ServiceCommand {
         model: Option<String>,
         mode: String,
         reasoning_effort: Option<String>,
+        context_tier: Option<String>,
     },
     Cancel {
         app_session_id: String,
@@ -83,6 +84,7 @@ enum ServiceCommand {
         app_session_id: String,
         model: String,
         reasoning_effort: Option<String>,
+        context_tier: Option<String>,
     },
     SetMode {
         app_session_id: String,
@@ -91,6 +93,10 @@ enum ServiceCommand {
     SetReasoningEffort {
         app_session_id: String,
         effort: String,
+    },
+    SetContextTier {
+        app_session_id: String,
+        tier: String,
     },
     Select {
         app_session_id: Option<String>,
@@ -248,6 +254,7 @@ async fn handle_service_command(
             model,
             mode,
             reasoning_effort,
+            context_tier,
         } => {
             let handle = if let Some(id) = app_session_id {
                 manager
@@ -263,6 +270,7 @@ async fn handle_service_command(
                         model,
                         mode: Some(mode),
                         reasoning_effort,
+                        context_tier,
                     })
                     .await
                     .map_err(|error| error.to_string())?;
@@ -315,11 +323,12 @@ async fn handle_service_command(
             app_session_id,
             model,
             reasoning_effort,
+            context_tier,
         } => manager
             .session(&app_session_id)
             .await
             .map_err(|error| error.to_string())?
-            .set_model_with_reasoning_effort(model, reasoning_effort)
+            .set_model_with_options(model, reasoning_effort, context_tier)
             .await
             .map_err(|error| error.to_string())?,
         ServiceCommand::SetMode {
@@ -340,6 +349,16 @@ async fn handle_service_command(
             .await
             .map_err(|error| error.to_string())?
             .set_reasoning_effort(effort)
+            .await
+            .map_err(|error| error.to_string())?,
+        ServiceCommand::SetContextTier {
+            app_session_id,
+            tier,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .set_context_tier(tier)
             .await
             .map_err(|error| error.to_string())?,
         ServiceCommand::Select { app_session_id } => manager
@@ -392,6 +411,7 @@ enum ControlMenu {
     Mode,
     Model,
     Effort,
+    Context,
 }
 
 struct SessionMvpView {
@@ -409,6 +429,7 @@ struct SessionMvpView {
     draft_mode: String,
     draft_model: Option<String>,
     draft_effort: String,
+    draft_context_tier: Option<String>,
     sidebar_open: bool,
     open_control_menu: Option<ControlMenu>,
     action_error: Option<String>,
@@ -499,6 +520,7 @@ impl SessionMvpView {
             draft_mode: "interactive".to_owned(),
             draft_model: None,
             draft_effort: "medium".to_owned(),
+            draft_context_tier: None,
             sidebar_open: true,
             open_control_menu: None,
             action_error: None,
@@ -603,6 +625,7 @@ impl SessionMvpView {
             model: self.draft_model.clone(),
             mode: self.draft_mode.clone(),
             reasoning_effort: reasoning_effort_for_model(&supported_efforts, &self.draft_effort),
+            context_tier: self.selectable_context_tier(),
         });
     }
 
@@ -644,6 +667,7 @@ impl SessionMvpView {
             self.draft_effort = controls
                 .reasoning_effort
                 .unwrap_or_else(|| "medium".to_owned());
+            self.draft_context_tier = controls.context_tier;
         }
         cx.notify();
     }
@@ -724,11 +748,14 @@ impl SessionMvpView {
                     }
                     Some(self.draft_effort.clone())
                 };
+                self.draft_context_tier = default_context_tier(&self.context_windows(&value));
+                let context_tier = self.selectable_context_tier();
                 if let Some(id) = self.selected_session.clone() {
                     let _ = self.commands.send(ServiceCommand::SetModel {
                         app_session_id: id,
                         model: value,
                         reasoning_effort,
+                        context_tier,
                     });
                 }
             }
@@ -738,6 +765,15 @@ impl SessionMvpView {
                     let _ = self.commands.send(ServiceCommand::SetReasoningEffort {
                         app_session_id: id,
                         effort: value,
+                    });
+                }
+            }
+            ControlMenu::Context => {
+                self.draft_context_tier = Some(value.clone());
+                if let Some(id) = self.selected_session.clone() {
+                    let _ = self.commands.send(ServiceCommand::SetContextTier {
+                        app_session_id: id,
+                        tier: value,
                     });
                 }
             }
@@ -836,6 +872,106 @@ impl SessionMvpView {
             .collect()
     }
 
+    fn context_windows(&self, model_id: &str) -> Vec<ContextWindowOption> {
+        self.selected()
+            .and_then(|session| {
+                session
+                    .snapshot
+                    .controls
+                    .available_models
+                    .iter()
+                    .find(|model| model.id == model_id)
+            })
+            .or_else(|| match &self.startup {
+                StartupState::Ready(compatibility) => compatibility
+                    .available_models
+                    .iter()
+                    .find(|model| model.id == model_id),
+                StartupState::Starting | StartupState::Failed(_) => None,
+            })
+            .map_or_else(Vec::new, |model| model.context_windows.clone())
+    }
+
+    /// The model the composer will actually submit with, which falls back to
+    /// the catalog's auto entry while no model has been picked explicitly.
+    fn effective_model(&self) -> Option<String> {
+        self.draft_model.clone().or_else(|| {
+            self.model_options()
+                .into_iter()
+                .find_map(|(id, label, _)| label.eq_ignore_ascii_case("auto").then_some(id))
+        })
+    }
+
+    fn draft_context_windows(&self) -> Vec<ContextWindowOption> {
+        self.effective_model()
+            .map_or_else(Vec::new, |model| self.context_windows(&model))
+    }
+
+    /// The tier to submit with a request, which is only meaningful when the
+    /// model actually offers a choice between context windows.
+    fn selectable_context_tier(&self) -> Option<String> {
+        let windows = self.draft_context_windows();
+        if windows.len() < 2 {
+            return None;
+        }
+        self.draft_context_tier
+            .clone()
+            .or_else(|| default_context_tier(&windows))
+    }
+
+    fn context_options(&self) -> Vec<(String, String, String)> {
+        self.draft_context_windows()
+            .into_iter()
+            .map(|window| {
+                let description = match window.tier.as_str() {
+                    "default" => "Standard context window",
+                    "long_context" => "Extended context window",
+                    _ => "Provider-supported context window",
+                };
+                (
+                    window.tier.clone(),
+                    context_window_label(&window),
+                    description.to_owned(),
+                )
+            })
+            .collect()
+    }
+
+    fn draft_context_label(&self) -> Option<String> {
+        let windows = self.draft_context_windows();
+        if windows.len() < 2 {
+            return windows.first().map(context_window_label);
+        }
+        let selected = self
+            .draft_context_tier
+            .clone()
+            .or_else(|| default_context_tier(&windows))?;
+        windows
+            .iter()
+            .find(|window| window.tier == selected)
+            .map(context_window_label)
+    }
+
+    /// Renders a context-length selector when the model offers more than one
+    /// context window, and a plain readout when it offers exactly one.
+    fn context_control(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let label = self.draft_context_label()?;
+        if self.draft_context_windows().len() > 1 {
+            Some(
+                control_pill(
+                    "context",
+                    label,
+                    ControlMenu::Context,
+                    self.open_control_menu == Some(ControlMenu::Context),
+                    cx,
+                )
+                .into_any_element(),
+            )
+        } else {
+            Some(context_readout(label).into_any_element())
+        }
+    }
+
     fn draft_model_label(&self) -> String {
         let Some(selected) = self.draft_model.as_deref() else {
             return "Auto".to_owned();
@@ -869,6 +1005,15 @@ impl SessionMvpView {
                 self.draft_effort.clone(),
                 self.effort_options(),
             ),
+            ControlMenu::Context => {
+                let options = self.context_options();
+                let selected = self
+                    .draft_context_tier
+                    .clone()
+                    .or_else(|| options.first().map(|(tier, _, _)| tier.clone()))
+                    .unwrap_or_default();
+                ("Context length", selected, options)
+            }
         };
         let width = if menu == ControlMenu::Model {
             px(340.0)
@@ -1350,6 +1495,7 @@ impl SessionMvpView {
         let effort = effort_label(&self.draft_effort);
         let model = self.draft_model_label();
         let supports_reasoning = !self.effort_options().is_empty();
+        let context_control = self.context_control(cx);
         let selected = self.selected();
         let running = selected.is_some_and(|session| {
             matches!(
@@ -1421,6 +1567,7 @@ impl SessionMvpView {
                             cx,
                         ))
                     })
+                    .children(context_control)
                     .child(div().flex_1())
                     .child(
                         div()
@@ -1559,6 +1706,7 @@ impl SessionMvpView {
         let model = self.draft_model_label();
         let effort = effort_label(&self.draft_effort);
         let supports_reasoning = !self.effort_options().is_empty();
+        let context_control = self.context_control(cx);
 
         div()
             .id("home-composer")
@@ -1628,6 +1776,7 @@ impl SessionMvpView {
                                     cx,
                                 ))
                             })
+                            .children(context_control)
                             .child(div().flex_1())
                             .child(
                                 div()
@@ -2058,6 +2207,7 @@ fn control_pill(
         ControlMenu::Mode => "Mode",
         ControlMenu::Model => "Model",
         ControlMenu::Effort => "Reasoning effort",
+        ControlMenu::Context => "Context length",
     };
     div()
         .id(id)
@@ -2083,11 +2233,25 @@ fn control_pill(
         }))
 }
 
+fn context_readout(value: String) -> impl IntoElement {
+    div()
+        .id("context")
+        .accessibility_id("context")
+        .role(Role::Definition)
+        .aria_label("Context length")
+        .px_3()
+        .py_1()
+        .text_xs()
+        .text_color(rgb(MUTED))
+        .child(value)
+}
+
 fn control_menu_id(menu: ControlMenu) -> &'static str {
     match menu {
         ControlMenu::Mode => "mode",
         ControlMenu::Model => "model",
         ControlMenu::Effort => "effort",
+        ControlMenu::Context => "context",
     }
 }
 
@@ -2119,6 +2283,7 @@ fn control_menu_offset(menu: ControlMenu) -> u16 {
         ControlMenu::Mode => 40,
         ControlMenu::Model => 128,
         ControlMenu::Effort => 216,
+        ControlMenu::Context => 304,
     }
 }
 
@@ -2142,6 +2307,39 @@ fn effort_label(value: &str) -> String {
 
 fn reasoning_effort_for_model(supported_efforts: &[String], selected: &str) -> Option<String> {
     (!supported_efforts.is_empty()).then(|| selected.to_owned())
+}
+
+fn default_context_tier(windows: &[ContextWindowOption]) -> Option<String> {
+    windows
+        .iter()
+        .find(|window| window.tier == "default")
+        .or_else(|| windows.first())
+        .map(|window| window.tier.clone())
+}
+
+fn context_window_label(window: &ContextWindowOption) -> String {
+    window.max_tokens.map_or_else(
+        || match window.tier.as_str() {
+            "long_context" => "Long context".to_owned(),
+            other => title_case(other),
+        },
+        |tokens| format!("{} context", token_label(tokens)),
+    )
+}
+
+fn token_label(tokens: u64) -> String {
+    if tokens >= 1_000_000 {
+        let tenths = tokens / 100_000;
+        if tenths.is_multiple_of(10) {
+            format!("{}M", tenths / 10)
+        } else {
+            format!("{}.{}M", tenths / 10, tenths % 10)
+        }
+    } else if tokens >= 1_000 {
+        format!("{}K", tokens / 1_000)
+    } else {
+        tokens.to_string()
+    }
 }
 
 fn action_button(
@@ -2288,10 +2486,20 @@ fn main() {
 
 #[cfg(test)]
 mod tests {
+    use app_model::ContextWindowOption;
+
     use super::{
-        COMPACT_WIDTH, ControlMenu, compact_layout, control_menu_id, control_menu_offset,
-        effort_label, reasoning_effort_for_model, toggled_menu,
+        COMPACT_WIDTH, ControlMenu, compact_layout, context_window_label, control_menu_id,
+        control_menu_offset, default_context_tier, effort_label, reasoning_effort_for_model,
+        toggled_menu, token_label,
     };
+
+    fn window(tier: &str, max_tokens: Option<u64>) -> ContextWindowOption {
+        ContextWindowOption {
+            tier: tier.to_owned(),
+            max_tokens,
+        }
+    }
 
     #[test]
     fn compact_layout_uses_stable_breakpoint() {
@@ -2333,6 +2541,39 @@ mod tests {
     fn effort_labels_match_menu_copy() {
         assert_eq!(effort_label("medium"), "Medium");
         assert_eq!(effort_label("xhigh"), "Extra high");
+    }
+
+    #[test]
+    fn context_length_labels_are_human_readable() {
+        assert_eq!(token_label(200_000), "200K");
+        assert_eq!(token_label(1_000_000), "1M");
+        assert_eq!(token_label(1_500_000), "1.5M");
+        assert_eq!(
+            context_window_label(&window("long_context", Some(1_000_000))),
+            "1M context"
+        );
+        assert_eq!(
+            context_window_label(&window("long_context", None)),
+            "Long context"
+        );
+    }
+
+    #[test]
+    fn context_tier_defaults_to_the_standard_window() {
+        assert_eq!(default_context_tier(&[]), None);
+        assert_eq!(
+            default_context_tier(&[
+                window("long_context", Some(1_000_000)),
+                window("default", Some(200_000)),
+            ]),
+            Some("default".to_owned())
+        );
+    }
+
+    #[test]
+    fn context_selector_only_appears_for_multiple_windows() {
+        assert_eq!(control_menu_id(ControlMenu::Context), "context");
+        assert_eq!(control_menu_offset(ControlMenu::Context), 304);
     }
 
     #[test]
