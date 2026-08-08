@@ -587,11 +587,24 @@ Still open, and deferred rather than done:
 Turn the Phase 3a self-hosting build into a repeatable dogfooding loop without
 making release engineering a prerequisite for the Self-Hosting MVP itself.
 
+Phase 4 produces the first installable GCABB. Until now the application has only
+ever run from a developer checkout, so this phase owns both halves of the loop:
+the installer that creates an installation, and the updater that moves an
+existing installation to the next tag. The loop is therefore bootstrapped and
+validated entirely within Phase 4, between tag N and tag N+1, rather than
+starting from any earlier phase's output.
+
 - Define the application version in one authoritative location and expose it in
   the UI and diagnostics.
+- Package an installed build that is distinct from a developer checkout: a
+  stable install location, user data and session state outside the install
+  directory, and a build stamp that identifies the release. Disable update
+  checks for unreleased developer builds so `cargo run` never offers to replace
+  itself.
 - Add a tag-driven GitHub Actions release workflow that builds the pinned
-  Windows target, runs release validation, packages an installer, generates
-  checksums and update metadata, and publishes a GitHub Release.
+  Linux, macOS, and Windows targets in a matrix, runs release validation,
+  packages a per-platform artifact, generates checksums and update metadata,
+  and publishes a single GitHub Release covering all three.
 - Produce release notes from the tag and repository history, with an explicit
   prerelease channel for self-hosting builds and a stable channel for promoted
   releases.
@@ -601,18 +614,27 @@ making release engineering a prerequisite for the Self-Hosting MVP itself.
 - Add a client updater that checks the selected channel, compares semantic
   versions, shows release notes and download progress, stages the update, and
   applies it on restart.
-- Make Windows replacement and rollback safe when GCABB is updating the
-  executable currently in use. Preserve user data, session state, and the
-  bundled CLI compatibility contract across updates.
+- Make replacement and rollback safe on every target when GCABB is updating the
+  executable currently in use, respecting each platform's rules: Windows cannot
+  overwrite a running image and needs a swap-on-restart handoff, macOS replaces
+  a signed `.app` bundle atomically, and Linux can rename over a running binary
+  but must handle a read-only or system-managed install. Preserve user data,
+  session state, and the bundled CLI compatibility contract across updates.
 - Allow automatic checks to be disabled and updates to be deferred; never
   interrupt an active coding session to install an update.
 
 Exit criteria:
 
-- Pushing a version tag produces a versioned Windows GitHub Release and valid
-  update metadata without manual packaging.
-- A Phase 3a installation can discover, verify, download, and apply the next
-  tagged prerelease, then resume its existing projects and sessions.
+- Pushing a version tag produces a versioned GitHub Release carrying Linux,
+  macOS, and Windows artifacts plus valid update metadata, without manual
+  packaging.
+- The published artifact for tag N produces a working installation on each
+  target platform on a machine with no developer checkout.
+- That installation discovers, verifies, downloads, and applies tag N+1 when the
+  user accepts the update, then restarts and resumes its existing projects and
+  sessions. Linux is the primary dogfooding target because it is the current
+  development platform; Windows and macOS must pass the same check before the
+  phase is complete.
 - Invalid signatures, interrupted downloads, incompatible updates, and failed
   replacement leave the installed client runnable and provide a recovery path.
 
@@ -707,9 +729,10 @@ Exit criteria:
 
 ### Phase 8: Product Hardening and Cross-Platform Distribution (2-3 weeks)
 
-- Production OS code signing and installer polish.
-- Extend the Phase 4 release and update pipeline to macOS and Linux.
-- Windows-first release testing, then macOS and Linux.
+- Production OS code signing and notarization, and installer polish.
+- Harden the Phase 4 release and update pipeline: native platform installers
+  (MSI/NSIS, notarized DMG, distro packaging) replacing the portable artifacts,
+  and release testing across all three platforms.
 - Accessibility, keyboard navigation, high-DPI, and theme support.
 - Resource limits, redaction, retention, dependency review, and opt-in crash
   reporting.
@@ -758,10 +781,11 @@ These remain outside the MVP and must not distort the initial domain model.
 
 ## Estimate
 
-The Windows-first implementation is approximately **15-20 engineer-weeks** for
-one experienced Rust desktop engineer. Two engineers could target roughly
-**10-13 calendar weeks** after the feasibility spike. A polished cross-platform
-release may require another 4-6 engineer-weeks.
+The implementation is approximately **15-20 engineer-weeks** for one experienced
+Rust desktop engineer. Two engineers could target roughly **10-13 calendar
+weeks** after the feasibility spike. Phase 4 ships portable artifacts for Linux,
+macOS, and Windows; the polished, signed, natively packaged release in Phase 7
+may require another 4-6 engineer-weeks.
 
 The largest near-term uncertainty is whether CLI-owned shell, GitHub MCP, and
 skill capabilities retain full behavior through SDK-created sessions. The
