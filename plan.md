@@ -454,47 +454,129 @@ Exit criteria:
 - Ordinary coding sessions can be completed without opening Copilot CLI.
 - Session switching does not pause unrelated background work.
 
-### Phase 3: Visibility MVP (2 weeks)
+### Phase 3: Self-Hosting MVP (2-3 weeks)
 
-- Activity timeline, agent tree, filters, inspector, and duration/status display.
-- Correlate SDK, hook, task, fleet, terminal, Git, and file events.
-- Add latency breakdowns and redacted diagnostic export.
+Status: next.
+
+Make GCABB capable of developing GCABB. Prefer capabilities inherited from the
+official Copilot CLI runtime over app-specific reimplementations, and prove each
+inherited capability through the SDK instead of assuming parity with GitHub
+Copilot App.
+
+- Preserve the session worktree as the CLI working directory so built-in file
+  inspection, search, editing, and Git tools operate on the correct checkout.
+- Enable terminal calls with incremental command, output, exit-status, and
+  cancellation UI. Use built-in shell events when sufficient; otherwise use the
+  host-owned terminal tool proven in Phase 0.
+- Preserve the CLI's GitHub MCP integration and authentication. Verify tool
+  discovery and an authenticated read operation from a GCABB-created session;
+  do not build a second GitHub client into the agent loop.
+- Preserve the CLI's existing skill discovery semantics, including user-level
+  skills under `~/.copilot` and repository-level skills from the session
+  worktree. Verify that both scopes load and that repository skills cannot leak
+  across projects.
+- Add a GCA-like changes view with a changed-file list and readable unified
+  diffs for the session worktree, refreshed after file and Git changes.
+- Surface tool failures, permission requests, missing authentication, and
+  unavailable capabilities as actionable session state.
+- Support a Windows self-development workflow that builds and tests GCABB into
+  an output location that does not contend with the running GCABB executable.
+- Add a deterministic capability test plus one opt-in real-provider
+  self-hosting scenario: inspect the GCABB repository, make a source change,
+  run formatting and targeted tests, inspect a GitHub resource through MCP, and
+  review the resulting diff without leaving GCABB.
+
+Exit criteria:
+
+- A developer can complete the edit-command-result-diff loop on GCABB's own
+  repository without opening Copilot CLI or another Git client.
+- Global and repository skills, GitHub MCP, file tools, and terminal tools are
+  proven available in a GCABB-created session.
+- Commands use the session worktree, stream useful progress, and can be
+  cancelled without terminating unrelated sessions.
+- The changes view accurately shows committed, staged, and unstaged changes
+  against the session's recorded base.
+
+### Phase 4: Tagged Releases and Auto-Update (1-2 weeks)
+
+Turn the Phase 3 self-hosting build into a repeatable dogfooding loop without
+making release engineering a prerequisite for the Self-Hosting MVP itself.
+
+- Define the application version in one authoritative location and expose it in
+  the UI and diagnostics.
+- Add a tag-driven GitHub Actions release workflow that builds the pinned
+  Windows target, runs release validation, packages an installer, generates
+  checksums and update metadata, and publishes a GitHub Release.
+- Produce release notes from the tag and repository history, with an explicit
+  prerelease channel for self-hosting builds and a stable channel for promoted
+  releases.
+- Cryptographically sign update metadata and artifacts independently of
+  platform code signing; keep signing keys out of the repository and fail
+  closed when verification fails.
+- Add a client updater that checks the selected channel, compares semantic
+  versions, shows release notes and download progress, stages the update, and
+  applies it on restart.
+- Make Windows replacement and rollback safe when GCABB is updating the
+  executable currently in use. Preserve user data, session state, and the
+  bundled CLI compatibility contract across updates.
+- Allow automatic checks to be disabled and updates to be deferred; never
+  interrupt an active coding session to install an update.
+
+Exit criteria:
+
+- Pushing a version tag produces a versioned Windows GitHub Release and valid
+  update metadata without manual packaging.
+- A Phase 3 installation can discover, verify, download, and apply the next
+  tagged prerelease, then resume its existing projects and sessions.
+- Invalid signatures, interrupted downloads, incompatible updates, and failed
+  replacement leave the installed client runnable and provide a recovery path.
+
+### Phase 5: Operability and Visibility (2 weeks)
+
+- Add the activity timeline, agent tree, filters, inspector, and
+  duration/status display.
+- Correlate SDK, hook, task, fleet, terminal, Git, file, MCP, and skill events.
+- Add latency breakdowns, capability diagnostics, and redacted diagnostic
+  export.
+- Link command and file activity to the Phase 3 terminal output and changes
+  view.
 
 Exit criteria:
 
 - Every observed activity has explicit lifecycle and timing.
-- A stalled session can be localized to model, tool, input, terminal, Git, SDK,
-  or UI propagation.
+- A stalled self-hosting session can be localized to model, tool, input,
+  terminal, Git, MCP, skill loading, SDK, or UI propagation.
+- Diagnostic exports explain capability discovery without exposing credentials,
+  prompts, repository content, or sensitive tool arguments.
 
-### Phase 4: Terminal MVP (2-3 weeks)
+### Phase 6: Terminal and Changes Hardening (3-4 weeks)
 
-- Integrate built-in output or the host-owned terminal tool.
-- Implement PTYs, parsing, bounded scrollback, process control, and persistence.
-- Build the native virtualized GPUI terminal.
-
-Exit criteria:
-
-- Long-running commands stream while active.
-- High-volume output remains memory-bounded and responsive.
-- Cancellation targets the correct process tree.
-
-### Phase 5: Changes View MVP (2-3 weeks)
-
-- Implement repository/ref discovery, base selection, merge-base calculation,
-  status monitoring, and diff generation.
-- Build native file tree and virtualized split/unified diff surfaces.
-- Persist the selected base and link changes to activity.
+- Upgrade Phase 3 command output into the native virtualized GPUI terminal with
+  PTYs, ANSI/VT parsing, bounded scrollback, attach/detach, interactive input,
+  resize, process-tree control, and persistence.
+- Add user-created terminals and reusable terminal sessions.
+- Expand the Phase 3 changes view with repository/ref discovery, selectable
+  bases, merge-base calculation, persisted base selection, and activity links.
+- Add virtualized split/unified diffs, syntax highlighting, context expansion,
+  and defined handling for renames, binaries, submodules, deleted files, and
+  large files.
 
 Exit criteria:
 
-- Changing the base updates the view without changing branches or agent state.
-- Results match Git across committed and uncommitted changes.
-- Edge cases have defined behavior.
+- Long-running and interactive commands remain responsive under high-volume,
+  memory-bounded output.
+- Cancellation targets the correct process tree, and view changes do not stop
+  active commands.
+- Changing the diff base updates the view without changing branches or agent
+  state.
+- Results match Git across committed and uncommitted changes, including the
+  documented edge cases.
 
-### Phase 6: Hardening and Distribution (2-3 weeks)
+### Phase 7: Product Hardening and Cross-Platform Distribution (2-3 weeks)
 
-- Signed installers and update strategy.
-- Windows-first testing, then macOS and Linux.
+- Production OS code signing and installer polish.
+- Extend the Phase 4 release and update pipeline to macOS and Linux.
+- Windows-first release testing, then macOS and Linux.
 - Accessibility, keyboard navigation, high-DPI, and theme support.
 - Resource limits, redaction, retention, dependency review, and opt-in crash
   reporting.
@@ -510,6 +592,7 @@ Exit criteria:
 | Sessions | Create, resume, cancel, crash, reconnect, reconciliation |
 | Terminal | ANSI fragmentation, UTF-8, resize, input, flood, process trees |
 | Git | Fixture repositories for refs, merge bases, renames, binaries, submodules |
+| Release/update | Tag workflow, manifest signatures, channel selection, staged replacement, rollback |
 | GPUI | Test contexts for interaction, focus, virtualization, accessibility |
 | End-to-end | Small opt-in suite against real Copilot SDK and CLI |
 
@@ -528,6 +611,7 @@ nondeterminism, and account requirements.
 | SDK/CLI version skew | Compatibility matrix, startup check, pinned support range |
 | Git comparison surprises | Display resolved base and merge-base OIDs |
 | Session event duplication | Versioned IDs, deterministic reducers, reconciliation |
+| Update supply-chain or replacement failure | Signed metadata, checksums, staged install, rollback, fail closed |
 | Diagnostic data leaks | Structured redaction and explicit export preview |
 
 ## Deferred Extensions
@@ -541,13 +625,15 @@ These remain outside the MVP and must not distort the initial domain model.
 
 ## Estimate
 
-The Windows-first implementation is approximately **11-15 engineer-weeks** for
+The Windows-first implementation is approximately **15-20 engineer-weeks** for
 one experienced Rust desktop engineer. Two engineers could target roughly
-**7-10 calendar weeks** after the feasibility spike. A polished cross-platform
+**10-13 calendar weeks** after the feasibility spike. A polished cross-platform
 release may require another 4-6 engineer-weeks.
 
-The largest uncertainty is whether SDK shell events are sufficient for a live
-terminal. The second is the amount of native terminal and diff widget work.
+The largest near-term uncertainty is whether CLI-owned shell, GitHub MCP, and
+skill capabilities retain full behavior through SDK-created sessions. The
+largest later uncertainty is the amount of native terminal and diff hardening
+needed beyond the Phase 3 self-hosting surfaces.
 
 ## UX Inputs Needed
 
