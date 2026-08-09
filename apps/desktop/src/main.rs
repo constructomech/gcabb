@@ -21,7 +21,8 @@ use gpui::{
     WindowBounds, WindowOptions, actions, div, px, rgb, size,
 };
 use session_manager::{
-    CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, WorktreeOutcome,
+    CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, SessionRoots,
+    WorktreeOutcome,
 };
 use storage::Storage;
 use tokio::sync::watch;
@@ -271,7 +272,11 @@ impl AppService {
                     diagnostics.clone(),
                 ));
                 let manager = Arc::new(SessionManager::new(provider, storage, diagnostics));
-                let worktrees = worktrees_root();
+                let session_roots = SessionRoots {
+                    worktrees: Some(worktrees_root()),
+                    attachments: attachments_directory(),
+                    runtime_state: runtime_state_root(),
+                };
                 // Projects are configured by the user, not inferred from the
                 // launch directory. Auto-registering the launch repository
                 // would silently re-add a project the user had removed.
@@ -324,7 +329,7 @@ impl AppService {
                     match command {
                         ServiceCommand::DeleteSession { app_session_id } => {
                             match runtime
-                                .block_on(manager.delete_session(&app_session_id, Some(&worktrees)))
+                                .block_on(manager.delete_session(&app_session_id, &session_roots))
                             {
                                 Ok(deletion) => {
                                     let _ =
@@ -371,9 +376,11 @@ impl AppService {
                         }
                         command => {
                             let is_submit = matches!(&command, ServiceCommand::Submit { .. });
-                            match runtime
-                                .block_on(handle_service_command(&manager, command, &worktrees))
-                            {
+                            match runtime.block_on(handle_service_command(
+                                &manager,
+                                command,
+                                &session_roots.worktrees.clone().unwrap_or_default(),
+                            )) {
                                 Ok(Some(handle)) => {
                                     let _ = update_tx.send(ServiceUpdate::SessionAdded(handle));
                                     if is_submit {
@@ -709,6 +716,15 @@ fn worktree_path(
 ///
 /// Kept beside the application database so it follows `GCABB_DATA_DIR` during
 /// development and never lands inside a repository.
+/// Where the runtime keeps per-session state, keyed by its own session id.
+///
+/// Deleting a session leaves this behind otherwise; one machine had 114 MB
+/// across 69 directories for sessions that no longer existed.
+fn runtime_state_root() -> Option<PathBuf> {
+    let path = dirs::home_dir()?.join(".copilot").join("session-state");
+    path.is_dir().then_some(path)
+}
+
 fn worktrees_root() -> PathBuf {
     if let Some(path) = std::env::var_os("GCABB_DATA_DIR") {
         return PathBuf::from(path).join("worktrees");

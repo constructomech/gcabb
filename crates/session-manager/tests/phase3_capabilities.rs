@@ -14,7 +14,7 @@ use std::time::Duration;
 use app_model::{CapabilityId, CapabilityStatus, ChangeStage, SessionKind, TerminalState};
 use copilot_provider::{AgentProvider, CopilotProvider};
 use diagnostics::MemoryDiagnostics;
-use session_manager::{CreateSessionRequest, SessionManager};
+use session_manager::{CreateSessionRequest, SessionManager, SessionRoots};
 use storage::Storage;
 use tempfile::{TempDir, tempdir};
 use test_harness::FakeProvider;
@@ -494,7 +494,13 @@ async fn deleting_a_worktree_session_reclaims_the_worktree() {
     let id = session.id().to_owned();
 
     let deletion = manager
-        .delete_session(&id, Some(roots.path()))
+        .delete_session(
+            &id,
+            &SessionRoots {
+                worktrees: Some(roots.path().to_owned()),
+                ..SessionRoots::default()
+            },
+        )
         .await
         .expect("session deleted");
 
@@ -552,7 +558,13 @@ async fn deleting_a_dirty_worktree_session_preserves_the_work() {
     let id = session.id().to_owned();
 
     let deletion = manager
-        .delete_session(&id, Some(roots.path()))
+        .delete_session(
+            &id,
+            &SessionRoots {
+                worktrees: Some(roots.path().to_owned()),
+                ..SessionRoots::default()
+            },
+        )
         .await
         .expect("session deleted");
 
@@ -592,7 +604,13 @@ async fn deleting_a_local_repository_session_leaves_the_checkout_alone() {
     let id = session.id().to_owned();
 
     let deletion = manager
-        .delete_session(&id, Some(roots.path()))
+        .delete_session(
+            &id,
+            &SessionRoots {
+                worktrees: Some(roots.path().to_owned()),
+                ..SessionRoots::default()
+            },
+        )
         .await
         .expect("session deleted");
 

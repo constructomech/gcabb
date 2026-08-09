@@ -16,8 +16,9 @@ pub use tools::{
 };
 
 pub const DOMAIN_EVENT_VERSION: u16 = 1;
-/// Version 4 records the attachments a user message was sent with.
-pub const SNAPSHOT_VERSION: u16 = 4;
+/// Version 5 drops the embedded event log, which duplicated `domain_events`
+/// and made every snapshot grow with the length of the session.
+pub const SNAPSHOT_VERSION: u16 = 5;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -540,7 +541,6 @@ pub struct SessionSnapshot {
     pub metadata: SessionMetadata,
     pub status: SessionStatus,
     pub last_sequence: u64,
-    pub activities: Vec<DomainEvent>,
     #[serde(default)]
     pub transcript: Vec<TranscriptMessage>,
     #[serde(default)]
@@ -577,7 +577,6 @@ impl SessionSnapshot {
             metadata,
             status: SessionStatus::Starting,
             last_sequence: 0,
-            activities: Vec::new(),
             transcript: Vec::new(),
             pending_interactions: Vec::new(),
             controls,
@@ -590,15 +589,19 @@ impl SessionSnapshot {
         }
     }
 
+    /// Rebuild the indexes that are derived rather than stored.
+    ///
+    /// Event ids are not among them: the event log is the record of which
+    /// events were seen, so `seen_event_ids` covers only what this instance
+    /// has applied since it was created.
     pub fn restore_indexes(&mut self) {
-        self.seen_event_ids = self
-            .activities
-            .iter()
-            .map(|event| event.id.clone())
-            .collect();
         self.tool_activity.restore_indexes();
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "an applied event is consumed conceptually; taking it by value keeps callers from reusing it"
+    )]
     pub fn apply(&mut self, event: DomainEvent) -> ApplyOutcome {
         if event.session_id != self.metadata.id {
             return ApplyOutcome::WrongSession;
@@ -631,7 +634,6 @@ impl SessionSnapshot {
             self.last_error = Some(event.summary.clone());
         }
         self.seen_event_ids.insert(event.id.clone());
-        self.activities.push(event);
         ApplyOutcome::Applied
     }
 

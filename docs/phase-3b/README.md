@@ -151,6 +151,40 @@ now judged against what a session is *for*, so a chat is not blocked by lacking
 a repository — but a chat with no shell is still blocked, because that really
 is broken.
 
+## Storage
+
+A local database reached 499 MB while holding 5.5 MB of events. Two faults
+compounded.
+
+`SessionSnapshot` carried the whole event log in an `activities` field, which
+duplicated the `domain_events` table -- the actual record of what happened --
+and made up about 99% of every snapshot written. Nothing read it: the interface
+never touched it, and the one consumer, history reconciliation, is better served
+by asking the event log directly. The field is gone.
+
+Every snapshot was also kept as its own row, 176 of them for one session, while
+only the newest is ever read. Writing a snapshot now replaces the previous one.
+Together these made storage grow with the square of a session's length.
+
+Opening an older database prunes the superseded rows and vacuums. On the
+database above that returned 486 MB.
+
+## Deleting a session
+
+Deleting used to leave several things behind. Events and snapshots cascaded
+correctly, and worktrees were already reclaimed with care, but diagnostics rows
+had no foreign key to cascade from, the runtime's own state directory was never
+touched -- 114 MB across 69 directories on one machine -- and freed database
+pages were never returned to the filesystem.
+
+All of these are now cleaned up, and the directories they live in are passed in
+rather than discovered, so nothing is ever deleted from a location the caller
+did not name. Two guards matter more than the cleanup itself: attachments are
+removed only from inside the managed directory, so a picture attached from the
+user's own folder is never deleted; and the runtime state directory is resolved
+from a session id that cannot contain path separators, so it cannot name a
+directory outside its root.
+
 ## Verifying the tests
 
 Every fix here carries a regression test, and each test was run against the
@@ -168,9 +202,7 @@ have found it. Where a defect is structural, the fix should be structural too.
 - Subagent nesting is exercised only with synthetic `subagent.started` events.
   The field shape came from Phase 0 notes and has not been observed live.
 - Chats share one working directory, so concurrent chats can collide.
-- Pasted image files are never cleaned up. They accumulate under the app data
-  directory for the life of the installation.
-- `SessionSnapshot::activities` keeps every event, and a snapshot is rewritten
-  as events arrive, so storage grows with the square of a session's length. One
-  local database reached 499 MB, with single snapshots over 5 MB.
+- Attachment files are removed only when they sit inside the managed
+  attachments directory, so a picture attached from the user's own folder
+  survives. Nothing prunes attachments of sessions deleted by older builds.
 - A true per-shell stop, if the runtime ever exposes an RPC for it.
