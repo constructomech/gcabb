@@ -475,6 +475,7 @@ impl SessionSnapshot {
         project_transcript(&mut self.transcript, &event);
         if is_abort(&event) {
             mark_streaming_interrupted(&mut self.transcript);
+            tools::mark_running_terminals_cancelled(&mut self.tool_activity, &event.timestamp);
         }
         tools::project(&mut self.tool_activity, &event);
         if self.status == SessionStatus::Failed {
@@ -1463,6 +1464,58 @@ mod tests {
         assert_eq!(message.state, TranscriptState::Interrupted);
         // The text the user saw is kept; only its status changes.
         assert_eq!(message.content, "# The Ascendance");
+    }
+
+    /// Cancelling tears down the shells the turn started, but the runtime
+    /// reports no completion for them. A terminal left showing "running"
+    /// reads as work still in flight when nothing is running at all.
+    #[test]
+    fn aborting_marks_running_terminals_cancelled() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"t","type":"tool.execution_start",
+                       "data":{"toolCallId":"c1","toolName":"bash",
+                               "arguments":{"command":"sleep 900","shellId":"shell-1"}}}),
+                json!({"id":"a","type":"abort","data":{"reason":"user_initiated"}}),
+            ],
+        );
+
+        let terminal = state
+            .tool_activity
+            .terminal("shell-1")
+            .expect("the shell was tracked");
+        assert_eq!(terminal.state, crate::tools::TerminalState::Cancelled);
+        assert!(
+            state.tool_activity.active_terminals().is_empty(),
+            "a cancelled shell still counted as active work"
+        );
+    }
+
+    /// A shell that already exited keeps its exit, not a cancellation.
+    #[test]
+    fn aborting_does_not_relabel_finished_terminals() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"t","type":"tool.execution_start",
+                       "data":{"toolCallId":"c1","toolName":"bash",
+                               "arguments":{"command":"echo hi","shellId":"shell-1"}}}),
+                json!({"id":"d","type":"tool.execution_complete",
+                       "data":{"toolCallId":"c1","toolName":"bash","success":true,
+                               "result":{"contents":[
+                                   {"type":"shell_exit","shellId":"shell-1","exitCode":0}]}}}),
+                json!({"id":"a","type":"abort","data":{"reason":"user_initiated"}}),
+            ],
+        );
+
+        let terminal = state
+            .tool_activity
+            .terminal("shell-1")
+            .expect("the shell was tracked");
+        assert_eq!(terminal.state, crate::tools::TerminalState::Exited);
     }
 
     /// A completed message must not be relabelled by a later cancellation.

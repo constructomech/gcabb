@@ -771,3 +771,21 @@ pub fn mark_terminal_cancelled(activity: &mut ToolActivity, shell_id: &str, time
         timestamp.clone_into(&mut terminal.updated_at);
     }
 }
+
+/// Mark every still-running terminal cancelled.
+///
+/// Cancelling a turn tears down the shells that turn started, but the runtime
+/// sends no completion event for them. Without this a background shell shows
+/// as running for the rest of the session, which reads as work still in
+/// flight when nothing is running at all.
+pub fn mark_running_terminals_cancelled(activity: &mut ToolActivity, timestamp: &str) {
+    let running: Vec<String> = activity
+        .terminals
+        .iter()
+        .filter(|terminal| terminal.is_active())
+        .map(|terminal| terminal.shell_id.clone())
+        .collect();
+    for shell_id in running {
+        mark_terminal_cancelled(activity, &shell_id, timestamp);
+    }
+}
