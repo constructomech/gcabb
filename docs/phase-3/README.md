@@ -23,7 +23,7 @@ runtime provides and how it compares to other harnesses.
 The transcript scrolls and follows new output as it streams, returning to the
 tail when a session is opened or when output grows. It deliberately does not
 scroll when the transcript is unchanged, so reading earlier output is not
-interrupted by re-renders. The whole conversation is rendered; Phase 6 replaces
+interrupted by re-renders. The whole conversation is rendered; Phase 7 replaces
 this with a virtualized list.
 
 Output that was streaming when a turn was cancelled is marked **interrupted**
@@ -187,5 +187,5 @@ worked around silently:
   tool names.
 - Events that arrive after `session.idle` move the projected session status
   back to `Running`, so status is not a reliable completion signal. This is
-  existing Phase 2 projection behaviour; the timeline work in Phase 5 is the
+  existing Phase 2 projection behaviour; the timeline work in Phase 6 is the
   right place to give turn completion an explicit lifecycle.

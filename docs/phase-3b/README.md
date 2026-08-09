@@ -198,7 +198,11 @@ have found it. Where a defect is structural, the fix should be structural too.
 ## Known gaps
 
 - Detail blocks render in a proportional font, so commands, diffs, and columnar
-  output do not align.
+  output do not align. Phase 5 introduces a monospace font and closes this.
+- Assistant replies are markdown and are shown as their source, so emphasis,
+  headings, lists, and code blocks read as literal punctuation. Phase 5 renders
+  them. Zed's markdown crate is GPL-3.0-or-later and cannot be used in an MIT
+  project, so the renderer will be GCABB's own over an MIT parser.
 - Subagent nesting is exercised only with synthetic `subagent.started` events.
   The field shape came from Phase 0 notes and has not been observed live.
 - Chats share one working directory, so concurrent chats can collide.
