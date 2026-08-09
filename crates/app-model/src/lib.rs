@@ -94,6 +94,12 @@ pub struct TranscriptMessage {
     pub content: String,
     pub state: TranscriptState,
     pub timestamp: String,
+    /// Event sequence this message first appeared at.
+    ///
+    /// Interleaving messages with tool calls needs a total order, and the
+    /// reducer's sequence is monotonic and app-owned, unlike event timestamps.
+    #[serde(default)]
+    pub sequence: u64,
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -442,6 +448,29 @@ impl SessionSnapshot {
         ApplyOutcome::Applied
     }
 
+    /// Messages and root-agent tool calls in the order they happened.
+    ///
+    /// Subagent calls are excluded here and reached through
+    /// [`ToolActivity::children_of`], so delegated work appears beneath the
+    /// task that requested it rather than flattened into the main thread.
+    #[must_use]
+    pub fn timeline(&self) -> Vec<TimelineEntry<'_>> {
+        let mut entries: Vec<TimelineEntry<'_>> = self
+            .transcript
+            .iter()
+            .map(TimelineEntry::Message)
+            .chain(
+                self.tool_activity
+                    .root_invocations()
+                    .into_iter()
+                    .map(TimelineEntry::Tool),
+            )
+            .collect();
+        // Sequence is monotonic per session, so this is a stable total order.
+        entries.sort_by_key(TimelineEntry::sequence);
+        entries
+    }
+
     #[must_use]
     pub fn immutable(self) -> Arc<Self> {
         Arc::new(self)
@@ -466,6 +495,27 @@ impl SessionSnapshot {
             self.status = SessionStatus::Running;
         }
         self.pending_interactions.len() != original_len
+    }
+}
+
+/// One item in the session timeline.
+///
+/// The transcript alone shows only what the agent *said*; the timeline
+/// interleaves what it *did*, which is the difference between watching a
+/// session and watching a black box.
+#[derive(Clone, Copy, Debug)]
+pub enum TimelineEntry<'a> {
+    Message(&'a TranscriptMessage),
+    Tool(&'a ToolInvocation),
+}
+
+impl TimelineEntry<'_> {
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        match self {
+            Self::Message(message) => message.sequence,
+            Self::Tool(invocation) => invocation.sequence,
+        }
     }
 }
 
@@ -534,6 +584,7 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                     content: content.to_owned(),
                     state: TranscriptState::Complete,
                     timestamp: event.timestamp.clone(),
+                    sequence: event.sequence,
                 });
             }
         }
@@ -546,6 +597,7 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                     content: String::new(),
                     state: TranscriptState::Streaming,
                     timestamp: event.timestamp.clone(),
+                    sequence: event.sequence,
                 });
             }
         }
@@ -565,6 +617,7 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                     content: delta.to_owned(),
                     state: TranscriptState::Streaming,
                     timestamp: event.timestamp.clone(),
+                    sequence: event.sequence,
                 });
             }
         }
@@ -585,6 +638,7 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                     content: content.to_owned(),
                     state: TranscriptState::Complete,
                     timestamp: event.timestamp.clone(),
+                    sequence: event.sequence,
                 });
             }
         }
@@ -1172,6 +1226,111 @@ mod tests {
             CapabilityStatus::Unavailable
         );
         assert!(!report.is_self_hosting_ready());
+    }
+
+    /// The timeline is what makes a session observable: messages and the tool
+    /// calls between them, in the order they happened.
+    #[test]
+    fn timeline_interleaves_messages_and_tool_calls() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"u","type":"user.message","data":{"content":"fix the bug"}}),
+                json!({"id":"t1","type":"tool.execution_start",
+                       "data":{"toolCallId":"c1","toolName":"grep",
+                               "arguments":{"pattern":"fn main"}}}),
+                json!({"id":"t1c","type":"tool.execution_complete",
+                       "data":{"toolCallId":"c1","success":true}}),
+                json!({"id":"t2","type":"tool.execution_start",
+                       "data":{"toolCallId":"c2","toolName":"str_replace_editor",
+                               "arguments":{"path":"src/lib.rs"}}}),
+                json!({"id":"t2c","type":"tool.execution_complete",
+                       "data":{"toolCallId":"c2","success":true,
+                               "result":{"detailedContent":"@@ -1 +1 @@\n-old\n+new"}}}),
+                json!({"id":"a","type":"assistant.message",
+                       "data":{"messageId":"m","content":"fixed"}}),
+            ],
+        );
+
+        let timeline = state.timeline();
+        let shape: Vec<&str> = timeline
+            .iter()
+            .map(|entry| match entry {
+                TimelineEntry::Message(_) => "message",
+                TimelineEntry::Tool(_) => "tool",
+            })
+            .collect();
+        assert_eq!(shape, ["message", "tool", "tool", "message"]);
+
+        // Ordering is by sequence, so the entries stay in causal order.
+        let sequences: Vec<u64> = timeline.iter().map(TimelineEntry::sequence).collect();
+        let mut sorted = sequences.clone();
+        sorted.sort_unstable();
+        assert_eq!(sequences, sorted);
+
+        // The edit carries its diff, which is what makes it reviewable.
+        let TimelineEntry::Tool(edit) = timeline[2] else {
+            panic!("expected a tool entry");
+        };
+        assert_eq!(edit.verb(), "Edit");
+        assert_eq!(edit.summary(), "src/lib.rs");
+        assert!(edit.diff().is_some_and(|diff| diff.contains("+new")));
+    }
+
+    /// Delegated work belongs under the task that asked for it, not flattened
+    /// into the main thread.
+    #[test]
+    fn subagent_calls_nest_under_their_task() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"t","type":"tool.execution_start",
+                       "data":{"toolCallId":"task-1","toolName":"task",
+                               "arguments":{"description":"survey harnesses"}}}),
+                json!({"id":"sa","type":"subagent.started",
+                       "data":{"agentId":"agent-7","parentToolCallId":"task-1"}}),
+                json!({"id":"n","type":"tool.execution_start","agentId":"agent-7",
+                       "data":{"toolCallId":"nested-1","toolName":"grep",
+                               "arguments":{"pattern":"tools.list"}}}),
+            ],
+        );
+
+        // The root timeline shows the task, not the subagent's own calls.
+        let timeline = state.timeline();
+        assert_eq!(timeline.len(), 1);
+        let TimelineEntry::Tool(task) = timeline[0] else {
+            panic!("expected the task entry");
+        };
+        assert_eq!(task.call_id, "task-1");
+
+        let children = state.tool_activity.children_of("task-1");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].call_id, "nested-1");
+        assert_eq!(children[0].summary(), "tools.list");
+    }
+
+    /// An unrelated task must not adopt another task's subagent work.
+    #[test]
+    fn subagent_calls_only_nest_under_their_own_task() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"t1","type":"tool.execution_start",
+                       "data":{"toolCallId":"task-1","toolName":"task","arguments":{}}}),
+                json!({"id":"t2","type":"tool.execution_start",
+                       "data":{"toolCallId":"task-2","toolName":"task","arguments":{}}}),
+                json!({"id":"sa","type":"subagent.started",
+                       "data":{"agentId":"agent-7","parentToolCallId":"task-2"}}),
+                json!({"id":"n","type":"tool.execution_start","agentId":"agent-7",
+                       "data":{"toolCallId":"nested-1","toolName":"grep","arguments":{}}}),
+            ],
+        );
+
+        assert!(state.tool_activity.children_of("task-1").is_empty());
+        assert_eq!(state.tool_activity.children_of("task-2").len(), 1);
     }
 
     /// Cancelling mid-stream leaves partial text on screen that the runtime

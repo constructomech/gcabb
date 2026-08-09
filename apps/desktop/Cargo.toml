@@ -20,6 +20,7 @@ tracing.workspace = true
 ui-components.workspace = true
 
 [dev-dependencies]
+serde_json.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 session-manager = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

@@ -2514,6 +2514,214 @@ impl SessionMvpView {
             )
     }
 
+    /// A tool call in the timeline, with its nested subagent work.
+    ///
+    /// This is what makes a session observable: without it the transcript
+    /// shows what the agent said while the reads, searches, edits, and
+    /// commands it actually ran stay invisible.
+    #[allow(clippy::too_many_lines)]
+    fn tool_entry(
+        invocation: &app_model::ToolInvocation,
+        children: &[&app_model::ToolInvocation],
+    ) -> impl IntoElement {
+        let (status, status_color) = match invocation.state {
+            app_model::InvocationState::Running => ("running", GREEN),
+            app_model::InvocationState::Succeeded => ("done", MUTED),
+            app_model::InvocationState::Failed => ("failed", RED),
+        };
+        let summary = invocation.summary();
+        let verb = invocation.verb();
+        let label = format!("{verb} {summary}");
+        let diff = invocation.diff().map(str::to_owned);
+        let error = invocation.error_message.clone();
+        // Shell output is the tail, since the interesting part is the end.
+        let output = (invocation.class == app_model::ToolClass::Shell
+            && !invocation.output.is_empty())
+        .then(|| terminal_tail(&invocation.output));
+        let exit = invocation
+            .exit_code
+            .filter(|code| *code != 0)
+            .map(|code| format!("exit {code}"));
+        let nested: Vec<_> = children
+            .iter()
+            .map(|child| {
+                let child_status = match child.state {
+                    app_model::InvocationState::Running => GREEN,
+                    app_model::InvocationState::Succeeded => MUTED,
+                    app_model::InvocationState::Failed => RED,
+                };
+                div()
+                    .id(SharedString::from(format!("nested-{}", child.call_id)))
+                    .role(Role::ListItem)
+                    .aria_label(format!("{} {}", child.verb(), child.summary()))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(5.0))
+                            .h(px(5.0))
+                            .rounded_full()
+                            .bg(rgb(child_status)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{} {}", child.verb(), child.summary())),
+                    )
+            })
+            .collect();
+
+        div()
+            .id(SharedString::from(format!("tool-{}", invocation.call_id)))
+            .debug_selector(|| "tool-entry".to_owned())
+            .accessibility_id(invocation.call_id.clone())
+            .role(Role::ListItem)
+            .aria_label(format!("{label} ({status})"))
+            .flex()
+            .w_full()
+            .justify_start()
+            .child(
+                div()
+                    .max_w(px(760.0))
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(SUBTLE))
+                    .border_1()
+                    .border_color(rgb(
+                        if invocation.state == app_model::InvocationState::Failed {
+                            RED
+                        } else {
+                            BORDER
+                        },
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded_full()
+                                    .bg(rgb(status_color)),
+                            )
+                            .child(div().text_xs().text_color(rgb(BLUE)).child(verb.to_owned()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_xs()
+                                    .text_color(rgb(PRIMARY))
+                                    .child(summary),
+                            )
+                            .when_some(exit, |row, exit| {
+                                row.child(div().text_xs().text_color(rgb(RED)).child(exit))
+                            }),
+                    )
+                    .when_some(error, |entry, error| {
+                        entry.child(div().text_xs().text_color(rgb(RED)).child(error))
+                    })
+                    .when_some(diff, |entry, diff| {
+                        entry.child(
+                            div()
+                                .mt_1()
+                                .max_h(px(220.0))
+                                .overflow_hidden()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(diff),
+                        )
+                    })
+                    .when_some(output, |entry, output| {
+                        entry.child(
+                            div()
+                                .mt_1()
+                                .max_h(px(180.0))
+                                .overflow_hidden()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(output),
+                        )
+                    })
+                    .when(!nested.is_empty(), |entry| {
+                        entry.child(
+                            div()
+                                .mt_1()
+                                .pl_3()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .border_l_1()
+                                .border_color(rgb(BORDER))
+                                .children(nested),
+                        )
+                    }),
+            )
+    }
+
+    /// One conversation message.
+    fn transcript_message(message: &app_model::TranscriptMessage) -> impl IntoElement {
+        let is_user = message.role == TranscriptRole::User;
+        let speaker = if is_user { "You" } else { "Copilot" };
+        div()
+            .id(SharedString::from(format!("message-{}", message.id)))
+            .accessibility_id(message.id.clone())
+            .role(Role::ListItem)
+            .aria_label(format!("{speaker}: {}", message.content))
+            .flex()
+            .w_full()
+            .justify_end()
+            .when(!is_user, gpui::Styled::justify_start)
+            .child(
+                div()
+                    .max_w(px(760.0))
+                    .p_3()
+                    .rounded_lg()
+                    .bg(if is_user { rgb(ELEVATED) } else { rgb(PANEL) })
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
+                            .child(if is_user { "You" } else { "Copilot" }),
+                    )
+                    .child(
+                        div()
+                            .mt_2()
+                            .text_color(rgb(PRIMARY))
+                            .child(message.content.clone()),
+                    )
+                    .when(message.state == TranscriptState::Interrupted, |bubble| {
+                        bubble.child(div().mt_1().text_xs().text_color(rgb(AMBER)).child(
+                            "Interrupted — the model does not have this \
+                                             in its context",
+                        ))
+                    })
+                    .when(message.state == TranscriptState::Streaming, |bubble| {
+                        bubble.child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child("Streaming..."),
+                        )
+                    }),
+            )
+    }
+
     fn transcript(&self) -> impl IntoElement {
         let Some(session) = self.selected() else {
             return div()
@@ -2550,55 +2758,23 @@ impl SessionMvpView {
         // The whole conversation is rendered now that the transcript scrolls;
         // capping it would put a wall part-way up the scrollback. Phase 6
         // replaces this with the virtualized list.
-        let messages = session.snapshot.transcript.iter().map(|message| {
-            let is_user = message.role == TranscriptRole::User;
-            let speaker = if is_user { "You" } else { "Copilot" };
-            div()
-                .id(SharedString::from(format!("message-{}", message.id)))
-                .accessibility_id(message.id.clone())
-                .role(Role::ListItem)
-                .aria_label(format!("{speaker}: {}", message.content))
-                .flex()
-                .w_full()
-                .justify_end()
-                .when(!is_user, gpui::Styled::justify_start)
-                .child(
-                    div()
-                        .max_w(px(760.0))
-                        .p_3()
-                        .rounded_lg()
-                        .bg(if is_user { rgb(ELEVATED) } else { rgb(PANEL) })
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
-                                .child(if is_user { "You" } else { "Copilot" }),
-                        )
-                        .child(
-                            div()
-                                .mt_2()
-                                .text_color(rgb(PRIMARY))
-                                .child(message.content.clone()),
-                        )
-                        .when(message.state == TranscriptState::Interrupted, |bubble| {
-                            bubble.child(div().mt_1().text_xs().text_color(rgb(AMBER)).child(
-                                "Interrupted — the model does not have this \
-                                             in its context",
-                            ))
-                        })
-                        .when(message.state == TranscriptState::Streaming, |bubble| {
-                            bubble.child(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child("Streaming..."),
-                            )
-                        }),
-                )
-        });
+        let entries = session
+            .snapshot
+            .timeline()
+            .into_iter()
+            .map(|entry| match entry {
+                app_model::TimelineEntry::Message(message) => {
+                    Self::transcript_message(message).into_any_element()
+                }
+                app_model::TimelineEntry::Tool(invocation) => {
+                    let children = session
+                        .snapshot
+                        .tool_activity
+                        .children_of(&invocation.call_id);
+                    Self::tool_entry(invocation, &children).into_any_element()
+                }
+            })
+            .collect::<Vec<_>>();
         div()
             .id("transcript")
             .debug_selector(|| "transcript".to_owned())
@@ -2612,7 +2788,7 @@ impl SessionMvpView {
             .p_5()
             .gap_3()
             .overflow_y_scroll()
-            .children(messages)
+            .children(entries)
     }
 
     /// Phase 3 inspector: changes, terminals, and capability state.
@@ -5021,6 +5197,50 @@ mod tests {
             });
         }
 
+        /// Phase 3b: tool calls must be visible in the transcript, not just
+        /// the prose around them.
+        #[gpui::test]
+        fn tool_calls_render_in_the_transcript(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for (index, raw) in [
+                    serde_json::json!({"id":"u","type":"user.message",
+                        "data":{"content":"fix it"}}),
+                    serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"str_replace_editor",
+                                "arguments":{"path":"src/lib.rs"}}}),
+                    serde_json::json!({"id":"tc","type":"tool.execution_complete",
+                        "data":{"toolCallId":"c1","success":true,
+                                "result":{"detailedContent":"@@ -1 +1 @@\n-old\n+new"}}}),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let event = app_model::DomainEvent::from_sdk_event_for(
+                        "session-1",
+                        u64::try_from(index).unwrap_or(0) + 1,
+                        &raw,
+                    );
+                    state.apply(event);
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("tool-entry").is_some(),
+                "the edit should be visible in the transcript"
+            );
+            view.read_with(cx, |view, _| {
+                let snapshot = &view.selected().unwrap().snapshot;
+                let timeline = snapshot.timeline();
+                assert_eq!(timeline.len(), 2, "one message and one tool call");
+            });
+        }
+
         /// Regression: the transcript clipped its overflow, so a long
         /// conversation ran off the bottom of the window with no way to reach
         /// it. It must scroll, and follow new output as it arrives.
@@ -5036,6 +5256,7 @@ mod tests {
                         content: format!("message {index} with enough text to take a line"),
                         state: app_model::TranscriptState::Complete,
                         timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
                     });
                 }
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
@@ -5085,6 +5306,7 @@ mod tests {
                     content: "first".to_owned(),
                     state: app_model::TranscriptState::Complete,
                     timestamp: "1".to_owned(),
+                    sequence: 1,
                 });
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
                 view.selected_session = Some("session-1".to_owned());

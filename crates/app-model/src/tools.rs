@@ -171,6 +171,9 @@ pub enum InvocationState {
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
 pub struct ToolInvocation {
     pub call_id: String,
+    /// Event sequence the call started at, used to order it against messages.
+    #[serde(default)]
+    pub sequence: u64,
     pub tool_name: String,
     pub class: ToolClass,
     pub source: ToolSource,
@@ -212,6 +215,55 @@ impl ToolInvocation {
         self.detailed_output
             .as_deref()
             .filter(|content| content.contains("@@") || content.contains("+++"))
+    }
+
+    /// One-line description of what this call is doing.
+    ///
+    /// Falls back to the tool name so an unrecognized tool still reads
+    /// sensibly rather than showing nothing.
+    #[must_use]
+    pub fn summary(&self) -> String {
+        if let Some(command) = &self.display_command {
+            return command.clone();
+        }
+        let argument = self
+            .file_path()
+            .map(str::to_owned)
+            .or_else(|| self.string_argument("pattern"))
+            .or_else(|| self.string_argument("query"))
+            .or_else(|| self.string_argument("command"))
+            .or_else(|| self.string_argument("url"))
+            .or_else(|| self.string_argument("description"))
+            .or_else(|| self.string_argument("shellId"));
+        argument.unwrap_or_else(|| self.tool_name.clone())
+    }
+
+    /// A string argument by name, when present and non-empty.
+    #[must_use]
+    pub fn string_argument(&self, name: &str) -> Option<String> {
+        self.arguments
+            .get(name)
+            .and_then(Value::as_str)
+            .filter(|value| !value.is_empty())
+            .map(str::to_owned)
+    }
+
+    /// Short verb for the tool class, used as a label in the timeline.
+    #[must_use]
+    pub const fn verb(&self) -> &'static str {
+        match self.class {
+            ToolClass::FileRead => "Read",
+            ToolClass::FileWrite | ToolClass::FileEditor => "Edit",
+            ToolClass::Search => "Search",
+            ToolClass::Shell => "Run",
+            ToolClass::ShellControl => "Shell",
+            ToolClass::Web => "Fetch",
+            ToolClass::Delegation => "Task",
+            ToolClass::Data => "Query",
+            ToolClass::Skill => "Skill",
+            ToolClass::Interaction => "Ask",
+            ToolClass::Other => "Tool",
+        }
     }
 
     /// Path argument for file-oriented tools, used for UI headers.
@@ -266,6 +318,10 @@ pub struct ToolActivity {
     pub invocations: Vec<ToolInvocation>,
     #[serde(default)]
     pub terminals: Vec<TerminalSession>,
+    /// Subagent id to the tool call that spawned it, so delegated work can be
+    /// shown beneath the task that requested it.
+    #[serde(default)]
+    pub agent_parents: HashMap<String, String>,
     #[serde(skip)]
     invocation_index: HashMap<String, usize>,
     #[serde(skip)]
@@ -301,6 +357,30 @@ impl ToolActivity {
         self.terminal_index
             .get(shell_id)
             .and_then(|index| self.terminals.get(*index))
+    }
+
+    /// Invocations that belong to the root agent.
+    #[must_use]
+    pub fn root_invocations(&self) -> Vec<&ToolInvocation> {
+        self.invocations
+            .iter()
+            .filter(|invocation| invocation.agent_id.is_none())
+            .collect()
+    }
+
+    /// Invocations a subagent made on behalf of `call_id`.
+    #[must_use]
+    pub fn children_of(&self, call_id: &str) -> Vec<&ToolInvocation> {
+        self.invocations
+            .iter()
+            .filter(|invocation| {
+                invocation
+                    .agent_id
+                    .as_deref()
+                    .and_then(|agent| self.agent_parents.get(agent))
+                    .is_some_and(|parent| parent == call_id)
+            })
+            .collect()
     }
 
     #[must_use]
@@ -419,7 +499,29 @@ pub fn project(activity: &mut ToolActivity, event: &crate::DomainEvent) {
         "tool.execution_start" => project_start(activity, event),
         "tool.execution_partial_result" => project_partial(activity, event),
         "tool.execution_complete" => project_complete(activity, event),
+        "subagent.started" => project_subagent(activity, event),
         _ => {}
+    }
+}
+
+/// Record which tool call spawned a subagent.
+///
+/// Subagent tool calls carry only an `agentId`; this mapping is what lets the
+/// UI show them beneath the task that requested them instead of as orphans.
+fn project_subagent(activity: &mut ToolActivity, event: &crate::DomainEvent) {
+    let data = &event.details;
+    let agent_id = data
+        .get("agentId")
+        .and_then(Value::as_str)
+        .or(event.agent_id.as_deref());
+    let parent = data
+        .get("parentToolCallId")
+        .or_else(|| data.get("toolCallId"))
+        .and_then(Value::as_str);
+    if let (Some(agent_id), Some(parent)) = (agent_id, parent) {
+        activity
+            .agent_parents
+            .insert(agent_id.to_owned(), parent.to_owned());
     }
 }
 
@@ -467,6 +569,7 @@ fn project_start(activity: &mut ToolActivity, event: &crate::DomainEvent) {
     let class = ToolClass::classify(&tool_name);
     activity.upsert_invocation(ToolInvocation {
         call_id: call_id.to_owned(),
+        sequence: event.sequence,
         tool_name,
         class,
         source,

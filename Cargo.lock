@@ -2125,6 +2125,7 @@ dependencies = [
  "git-service",
  "gpui",
  "gpui_platform",
+ "serde_json",
  "session-manager",
  "storage",
  "tempfile",
