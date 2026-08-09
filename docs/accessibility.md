@@ -22,6 +22,8 @@ The initial session shell exposes:
   options, and press actions.
 - Sidebar, navigation, session, submit, lifecycle, and interaction controls with
   names, selection state where applicable, keyboard focus, and press actions.
+- Attachment pickers, removable attachment chips, image-preview buttons, and a
+  labelled close action for the image-preview dialog.
 - Permission and input dialogs.
 - Tab and Shift-Tab focus traversal.
 
@@ -57,8 +59,8 @@ New UI components should receive a lightweight AX/AccessKit interaction contract
 covering role, label, value or state, stable identity, keyboard focus, and
 supported actions.
 
-Unavailable placeholders (attachments, add project, My work, Automations,
-Search, Settings, and back/forward glyphs) are intentionally omitted from the
-accessibility tree because they do not perform an action. The pointer-only popup
-backdrop is also presentational; selector triggers and Escape provide accessible
-ways to close the popup.
+Unavailable placeholders (My work, Automations, Search, Settings, and
+back/forward glyphs) are intentionally omitted from the accessibility tree
+because they do not perform an action. The pointer-only popup backdrop is also
+presentational; selector triggers and Escape provide accessible ways to close
+the popup.

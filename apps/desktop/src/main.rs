@@ -1767,16 +1767,36 @@ impl SessionMvpView {
             .map(|attachment| {
                 let identity = attachment.identity();
                 let label = attachment.display_name().to_owned();
+                let preview_identity = identity.clone();
+                let preview_label = label.clone();
+                let remove_identity = identity.clone();
+                let remove_label = label.clone();
                 let icon = if attachment.is_image() { "IMG" } else { "FILE" };
                 let preview = draft_preview(attachment);
-                div()
-                    .id(SharedString::from(format!("attachment-{identity}")))
-                    .when_some(preview, |chip, preview| {
-                        chip.hover(|style| style.border_color(rgb(BLUE)).cursor_pointer())
+                let content = div()
+                    .id(SharedString::from(format!(
+                        "preview-attachment-{preview_identity}"
+                    )))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(icon))
+                    .child(div().text_xs().text_color(rgb(PRIMARY)).child(label))
+                    .when_some(preview, |content, preview| {
+                        content
+                            .accessibility_id(format!("preview-attachment-{preview_identity}"))
+                            .role(Role::Button)
+                            .aria_label(format!("Preview {preview_label}"))
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                            .hover(gpui::Styled::cursor_pointer)
                             .on_click(cx.listener(move |view, _, window, cx| {
                                 view.open_image_preview(preview.clone(), window, cx);
                             }))
-                    })
+                    });
+                div()
+                    .id(SharedString::from(format!("attachment-{identity}")))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -1786,19 +1806,24 @@ impl SessionMvpView {
                     .bg(rgb(SUBTLE))
                     .border_1()
                     .border_color(rgb(BORDER))
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(icon))
-                    .child(div().text_xs().text_color(rgb(PRIMARY)).child(label))
+                    .child(content)
                     .child(
                         div()
-                            .id(SharedString::from(format!("remove-attachment-{identity}")))
+                            .id(SharedString::from(format!(
+                                "remove-attachment-{remove_identity}"
+                            )))
+                            .accessibility_id(format!("remove-attachment-{remove_identity}"))
                             .role(Role::Button)
-                            .aria_label("Remove attachment")
+                            .aria_label(format!("Remove {remove_label}"))
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                             .text_xs()
                             .text_color(rgb(MUTED))
                             .child("x")
                             .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
                             .on_click(cx.listener(move |view, _, _, cx| {
-                                view.remove_attachment(&identity, cx);
+                                view.remove_attachment(&remove_identity, cx);
                             })),
                     )
             })
@@ -1869,6 +1894,27 @@ impl SessionMvpView {
                 .on_mouse_up(
                     MouseButton::Left,
                     cx.listener(|view, _, _, cx| view.dismiss_image_preview(cx)),
+                )
+                .child(
+                    div()
+                        .id("image-preview-close")
+                        .accessibility_id("image-preview-close")
+                        .role(Role::Button)
+                        .aria_label("Close image preview")
+                        .focusable()
+                        .tab_stop(true)
+                        .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                        .px_3()
+                        .py_1()
+                        .rounded_md()
+                        .bg(rgb(PANEL))
+                        .text_sm()
+                        .text_color(rgb(PRIMARY))
+                        .child("Close")
+                        .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.dismiss_image_preview(cx);
+                        })),
                 )
                 .child(
                     div()
@@ -3286,6 +3332,8 @@ impl SessionMvpView {
             .iter()
             .enumerate()
             .map(|(index, attachment)| {
+                let accessible_id = format!("message-attachment-{}-{index}", message.id);
+                let accessible_label = attachment.display_name.clone();
                 // Only an image backed by a file the runtime kept can be
                 // shown; a name alone is not enough to load pixels.
                 let preview = attachment
@@ -3297,10 +3345,7 @@ impl SessionMvpView {
                         source: PreviewSource::Path(PathBuf::from(path)),
                     });
                 div()
-                    .id(SharedString::from(format!(
-                        "message-attachment-{}-{index}",
-                        message.id
-                    )))
+                    .id(SharedString::from(accessible_id.clone()))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -3311,7 +3356,13 @@ impl SessionMvpView {
                     .border_1()
                     .border_color(rgb(BORDER))
                     .when_some(preview, |chip, preview| {
-                        chip.hover(|style| style.border_color(rgb(BLUE)).cursor_pointer())
+                        chip.accessibility_id(accessible_id)
+                            .role(Role::Button)
+                            .aria_label(format!("Preview {accessible_label}"))
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                            .hover(|style| style.border_color(rgb(BLUE)).cursor_pointer())
                             .on_click(cx.listener(move |view, _, window, cx| {
                                 view.open_image_preview(preview.clone(), window, cx);
                             }))
@@ -3998,6 +4049,9 @@ impl SessionMvpView {
                             .accessibility_id("attachments-placeholder")
                             .role(Role::Button)
                             .aria_label("Attach files")
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                             .text_lg()
                             .text_color(rgb(MUTED))
                             .child("+")
@@ -4194,6 +4248,9 @@ impl SessionMvpView {
                                     .accessibility_id("home-attachments-placeholder")
                                     .role(Role::Button)
                                     .aria_label("Attach files")
+                                    .focusable()
+                                    .tab_stop(true)
+                                    .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                                     .w(px(28.0))
                                     .h(px(28.0))
                                     .flex()
@@ -5162,13 +5219,17 @@ fn git_branch(root: &Path) -> String {
 /// otherwise show one project per worktree instead of one project per
 /// repository. Falls back to `root` when it is not a git worktree.
 fn repository_root(root: &Path) -> PathBuf {
-    git_output(root, &["worktree", "list", "--porcelain"])
+    let root = root.canonicalize().unwrap_or_else(|_| root.to_owned());
+    git_output(&root, &["worktree", "list", "--porcelain"])
         .and_then(|output| {
             output
                 .lines()
                 .find_map(|line| line.strip_prefix("worktree ").map(str::to_owned))
         })
-        .map_or_else(|| root.to_owned(), PathBuf::from)
+        .map_or(root, |path| {
+            let path = PathBuf::from(path);
+            path.canonicalize().unwrap_or(path)
+        })
 }
 
 /// The repository's default branch, used as the changes-view base.
@@ -5349,15 +5410,17 @@ mod tests {
     #[test]
     fn adding_a_worktree_folder_resolves_to_the_repository() {
         let (_guard, main, worktree) = repo_with_worktree();
-        assert_eq!(repository_root(&worktree), main);
-        assert_eq!(repository_root(&main), main);
+        let canonical_main = main.canonicalize().expect("canonical main worktree");
+        assert_eq!(repository_root(&worktree), canonical_main);
+        assert_eq!(repository_root(&main), canonical_main);
     }
 
     /// A plain directory that is not a repository is still usable as a project.
     #[test]
     fn adding_a_non_repository_folder_keeps_the_folder() {
         let dir = tempfile::tempdir().expect("tempdir");
-        assert_eq!(repository_root(dir.path()), dir.path());
+        let canonical = dir.path().canonicalize().expect("canonical tempdir");
+        assert_eq!(repository_root(dir.path()), canonical);
         assert!(default_branch(dir.path()).is_none());
     }
 
