@@ -1740,17 +1740,16 @@ impl SessionMvpView {
             .unwrap_or_default()
     }
 
-    /// Catalog entry for `model_id`, preferring whichever source has the
-    /// richest record so session and home agree.
+    /// Catalog entry describing what a model *can* do.
+    ///
+    /// The application catalog is authoritative for capabilities. The
+    /// per-session catalog is a collapsed view of the session's current state:
+    /// it reports no reasoning efforts at all and folds the context tiers into
+    /// a single `default` entry holding the active window. Preferring it made
+    /// the thinking-level control vanish and the context-length control
+    /// degrade to static text as soon as a session was selected. The session
+    /// catalog is still used when the app catalog does not know the model.
     fn model_entry(&self, model_id: &str) -> Option<&app_model::ModelOption> {
-        let session = self.selected().and_then(|session| {
-            session
-                .snapshot
-                .controls
-                .available_models
-                .iter()
-                .find(|model| model.id == model_id)
-        });
         let app = match &self.startup {
             StartupState::Ready(compatibility) => compatibility
                 .available_models
@@ -1758,20 +1757,16 @@ impl SessionMvpView {
                 .find(|model| model.id == model_id),
             StartupState::Starting | StartupState::Failed(_) => None,
         };
-        match (session, app) {
-            // Prefer the entry that actually carries capability detail.
-            (Some(session), Some(app)) => {
-                if session.supported_reasoning_efforts.is_empty()
-                    && session.context_windows.is_empty()
-                {
-                    Some(app)
-                } else {
-                    Some(session)
-                }
-            }
-            (Some(session), None) => Some(session),
-            (None, app) => app,
-        }
+        app.or_else(|| {
+            self.selected().and_then(|session| {
+                session
+                    .snapshot
+                    .controls
+                    .available_models
+                    .iter()
+                    .find(|model| model.id == model_id)
+            })
+        })
     }
 
     fn effort_options(&self) -> Vec<(String, String, String)> {
@@ -5091,6 +5086,28 @@ mod tests {
             }
         }
 
+        /// A model that exposes an extended context tier.
+        fn two_tier_model(id: &str, efforts: &[&str]) -> app_model::ModelOption {
+            app_model::ModelOption {
+                id: id.to_owned(),
+                name: "GPT-5.6 Sol".to_owned(),
+                supported_reasoning_efforts: efforts
+                    .iter()
+                    .map(|effort| (*effort).to_owned())
+                    .collect(),
+                context_windows: vec![
+                    app_model::ContextWindowOption {
+                        tier: "default".to_owned(),
+                        max_tokens: Some(400_000),
+                    },
+                    app_model::ContextWindowOption {
+                        tier: "long_context".to_owned(),
+                        max_tokens: Some(1_050_000),
+                    },
+                ],
+            }
+        }
+
         /// Regression: the per-session model catalog can list a model without
         /// its reasoning efforts, which made the thinking-level pill vanish as
         /// soon as a session was selected.
@@ -5145,9 +5162,11 @@ mod tests {
             });
         }
 
-        /// A session catalog that does carry detail is preferred.
+        /// The app catalog is authoritative for capabilities, because the
+        /// per-session catalog collapses context tiers into the active window
+        /// and reports no reasoning efforts at all.
         #[gpui::test]
-        fn session_catalog_detail_wins_when_present(cx: &mut TestAppContext) {
+        fn app_catalog_is_authoritative_for_capabilities(cx: &mut TestAppContext) {
             let (view, cx, _commands) = setup(cx);
             view.update(cx, |view, cx| {
                 view.startup =
@@ -5158,11 +5177,12 @@ mod tests {
                         process_id: None,
                         startup: None,
                         available_modes: vec!["interactive".to_owned()],
-                        available_models: vec![model("gpt-5.6-sol", &["low"], Some(1_000_000))],
+                        available_models: vec![two_tier_model("gpt-5.6-sol", &["low", "medium"])],
                     });
                 let mut state = snapshot("session-1", "First session");
-                state.controls.available_models =
-                    vec![model("gpt-5.6-sol", &["low", "medium"], Some(200_000))];
+                // Shaped like the live session catalog: no efforts, and the
+                // tiers collapsed into a single active window.
+                state.controls.available_models = vec![model("gpt-5.6-sol", &[], Some(1_050_000))];
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
                 view.selected_session = Some("session-1".to_owned());
                 view.draft_model = Some("gpt-5.6-sol".to_owned());
@@ -5170,7 +5190,9 @@ mod tests {
             });
             view.read_with(cx, |view, _| {
                 assert_eq!(view.effort_options().len(), 2);
-                assert_eq!(view.draft_context_label().as_deref(), Some("200K context"));
+                // Both tiers stay selectable, so the control stays a picker
+                // instead of degrading to static text.
+                assert_eq!(view.draft_context_windows().len(), 2);
             });
         }
 
