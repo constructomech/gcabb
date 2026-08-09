@@ -1,4 +1,4 @@
-# Phase 3 Self-Hosting MVP
+# Phase 3a Self-Hosting Foundations
 
 ## Outcome
 
@@ -17,6 +17,19 @@ GCABB can complete the edit-command-result-diff loop on its own repository:
 
 See [tool-surface.md](tool-surface.md) for the verified inventory of what the
 runtime provides and how it compares to other harnesses.
+
+## Known gaps
+
+Phase 3a makes the loop work; it does not yet make it observable. Dogfooding
+GCABB against its own repository surfaced these, tracked as Phase 3b:
+
+- Tool invocations are projected and tested but never rendered, so a session
+  shows prose and terminals while the edits, reads, and searches are invisible.
+- The composer's attachment control is an inert placeholder, so screenshots
+  cannot be sent — the usual way UI defects get reported.
+- No UI reaches `stop_bash`, so a single runaway command cannot be stopped
+  without cancelling the whole session.
+- Subagent activity is correlated by `agentId` but not nested in the UI.
 
 ## Capability discovery
 

@@ -17,6 +17,11 @@ tokio.workspace = true
 tracing.workspace = true
 uuid.workspace = true
 
+[features]
+# Exposes detached constructors so downstream UI tests can build fixtures
+# without starting a provider.
+test-support = []
+
 [dev-dependencies]
 tempfile.workspace = true
 test-harness = { path = "../test-harness" }

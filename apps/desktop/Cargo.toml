@@ -10,6 +10,7 @@ app-model.workspace = true
 copilot-provider.workspace = true
 diagnostics.workspace = true
 dirs.workspace = true
+git-service.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
 session-manager.workspace = true
@@ -17,6 +18,11 @@ storage.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 ui-components.workspace = true
+
+[dev-dependencies]
+gpui = { workspace = true, features = ["test-support"] }
+session-manager = { workspace = true, features = ["test-support"] }
+tempfile.workspace = true
 
 [target.'cfg(windows)'.build-dependencies]
 embed-resource = "3.0"

@@ -3,12 +3,14 @@
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
-use app_model::{DomainEvent, ProjectMetadata, SessionMetadata, SessionSnapshot, rebuild};
+use app_model::{
+    DomainEvent, ProjectMetadata, SessionKind, SessionMetadata, SessionSnapshot, rebuild,
+};
 use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 3;
+const SCHEMA_VERSION: i64 = 5;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -63,13 +65,15 @@ impl Storage {
     pub fn upsert_session(&self, metadata: &SessionMetadata) -> Result<()> {
         self.connection()?.execute(
             "INSERT INTO app_sessions (
-                id, sdk_session_id, project_path, title, model, mode, base_ref,
-                created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
+                id, sdk_session_id, project_path, repository_root, title, kind,
+                model, mode, base_ref, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                 sdk_session_id = excluded.sdk_session_id,
                 project_path = excluded.project_path,
+                repository_root = excluded.repository_root,
                 title = excluded.title,
+                kind = excluded.kind,
                 model = excluded.model,
                 mode = excluded.mode,
                 base_ref = excluded.base_ref,
@@ -78,7 +82,9 @@ impl Storage {
                 metadata.id,
                 metadata.sdk_session_id,
                 metadata.project_path,
+                metadata.repository_root,
                 metadata.title,
+                metadata.kind.as_str(),
                 metadata.model,
                 metadata.mode,
                 metadata.base_ref,
@@ -106,6 +112,26 @@ impl Storage {
                 project.last_opened_at,
             ],
         )?;
+        Ok(())
+    }
+
+    /// Delete a session and everything derived from it.
+    ///
+    /// `domain_events` and `snapshots` reference `app_sessions` with
+    /// `ON DELETE CASCADE`, and foreign keys are enabled, so the event log and
+    /// snapshots go with it. The CLI runtime's own session state under
+    /// `~/.copilot` is owned by the runtime and is deliberately left alone.
+    pub fn delete_session(&self, session_id: &str) -> Result<()> {
+        self.connection()?
+            .execute("DELETE FROM app_sessions WHERE id = ?1", [session_id])?;
+        Ok(())
+    }
+
+    /// Remove a project row. Sessions are unaffected; they are associated by
+    /// `repository_root`, not by a foreign key.
+    pub fn remove_project(&self, project_id: &str) -> Result<()> {
+        self.connection()?
+            .execute("DELETE FROM projects WHERE id = ?1", [project_id])?;
         Ok(())
     }
 
@@ -159,7 +185,7 @@ impl Storage {
     pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, sdk_session_id, project_path, title, model, mode, base_ref, created_at, updated_at
+            "SELECT id, sdk_session_id, project_path, repository_root, title, kind, model, mode, base_ref, created_at, updated_at
              FROM app_sessions ORDER BY updated_at DESC, id",
         )?;
         let rows = statement.query_map([], metadata_from_row)?;
@@ -204,7 +230,7 @@ impl Storage {
         let connection = self.connection()?;
         let metadata = connection
             .query_row(
-                "SELECT id, sdk_session_id, project_path, title, model, mode, base_ref, created_at, updated_at
+                "SELECT id, sdk_session_id, project_path, repository_root, title, kind, model, mode, base_ref, created_at, updated_at
                  FROM app_sessions WHERE id = ?1",
                 [session_id],
                 metadata_from_row,
@@ -327,14 +353,12 @@ impl Storage {
         )?;
         // Databases created before schema version 3 predate the changes view
         // and lack `base_ref`. `CREATE TABLE IF NOT EXISTS` does not add
-        // columns to an existing table, so add it explicitly and tolerate the
-        // duplicate-column error when the column is already present.
-        if let Err(error) =
-            transaction.execute("ALTER TABLE app_sessions ADD COLUMN base_ref TEXT", [])
-            && !is_duplicate_column(&error)
-        {
-            return Err(error.into());
-        }
+        // columns to an existing table, so columns introduced after a table
+        // shipped are added here. Each add is idempotent, which keeps repeated
+        // opens and forward migration from older databases working.
+        add_column_if_missing(&transaction, "app_sessions", "base_ref", "TEXT")?;
+        add_column_if_missing(&transaction, "app_sessions", "repository_root", "TEXT")?;
+        add_column_if_missing(&transaction, "app_sessions", "kind", "TEXT")?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
         Ok(())
@@ -348,10 +372,27 @@ impl Storage {
 }
 
 /// Whether a rusqlite error reports a duplicate column name.
-///
-/// Used to make the `base_ref` migration idempotent across repeated opens.
 fn is_duplicate_column(error: &rusqlite::Error) -> bool {
     error.to_string().contains("duplicate column name")
+}
+
+/// Add a column to an existing table unless it is already present.
+///
+/// Used to migrate databases created by earlier schema versions in place, and
+/// to keep repeated opens of an already-migrated database working.
+fn add_column_if_missing(
+    transaction: &rusqlite::Transaction<'_>,
+    table: &str,
+    column: &str,
+    declaration: &str,
+) -> Result<()> {
+    let statement = format!("ALTER TABLE {table} ADD COLUMN {column} {declaration}");
+    if let Err(error) = transaction.execute(&statement, [])
+        && !is_duplicate_column(&error)
+    {
+        return Err(error.into());
+    }
+    Ok(())
 }
 
 fn metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMetadata> {
@@ -359,12 +400,14 @@ fn metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMetadat
         id: row.get(0)?,
         sdk_session_id: row.get(1)?,
         project_path: row.get(2)?,
-        title: row.get(3)?,
-        model: row.get(4)?,
-        mode: row.get(5)?,
-        base_ref: row.get(6)?,
-        created_at: row.get(7)?,
-        updated_at: row.get(8)?,
+        repository_root: row.get(3)?,
+        title: row.get(4)?,
+        kind: SessionKind::from_str_or_default(row.get::<_, Option<String>>(5)?.as_deref()),
+        model: row.get(6)?,
+        mode: row.get(7)?,
+        base_ref: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
     })
 }
 
@@ -381,7 +424,9 @@ mod tests {
             id: "app-session".to_owned(),
             sdk_session_id: "sdk-session".to_owned(),
             project_path: "/tmp/project".to_owned(),
+            repository_root: None,
             title: "Recovered session".to_owned(),
+            kind: SessionKind::Project,
             model: Some("test-model".to_owned()),
             mode: Some("interactive".to_owned()),
             base_ref: Some("main".to_owned()),

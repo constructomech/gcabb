@@ -147,12 +147,108 @@ pub struct ContextWindowOption {
     pub max_tokens: Option<u64>,
 }
 
+/// Where a new session runs.
+///
+/// A worktree gives the session its own checkout so parallel sessions in one
+/// repository cannot fight over the working tree or the checked-out branch.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLocation {
+    /// A new linked worktree, created for this session.
+    #[default]
+    NewWorktree,
+    /// The repository already on disk, shared with everything else using it.
+    LocalRepository,
+}
+
+impl SessionLocation {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NewWorktree => "New worktree",
+            Self::LocalRepository => "Local repository",
+        }
+    }
+
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::NewWorktree => "Creates a separate copy for this session",
+            Self::LocalRepository => "Works in the repository already on your machine",
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NewWorktree => "new-worktree",
+            Self::LocalRepository => "local-repository",
+        }
+    }
+
+    #[must_use]
+    pub fn from_str_or_default(value: &str) -> Self {
+        match value {
+            "local-repository" => Self::LocalRepository,
+            _ => Self::NewWorktree,
+        }
+    }
+}
+
+/// Whether a session is attached to a repository or is a standalone chat.
+///
+/// Chats have no project, no worktree, and therefore no changes view. They
+/// exist so the app can be used for questions and planning that are not tied
+/// to a checkout.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    #[default]
+    Project,
+    Chat,
+}
+
+impl SessionKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Chat => "chat",
+        }
+    }
+
+    #[must_use]
+    pub fn from_str_or_default(value: Option<&str>) -> Self {
+        match value {
+            Some("chat") => Self::Chat,
+            _ => Self::Project,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_chat(self) -> bool {
+        matches!(self, Self::Chat)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionMetadata {
     pub id: String,
     pub sdk_session_id: String,
+    /// Working directory the CLI runs in — the session's worktree.
     pub project_path: String,
+    /// Repository the session belongs to, used to group sessions by project.
+    ///
+    /// A repository has one main checkout and any number of worktrees. Sessions
+    /// live in worktrees but belong to the repository, so grouping by the
+    /// worktree path would show one "project" per worktree instead of one per
+    /// repository. `None` for sessions recorded before this was tracked; those
+    /// fall back to grouping by `project_path`.
+    #[serde(default)]
+    pub repository_root: Option<String>,
     pub title: String,
+    #[serde(default)]
+    pub kind: SessionKind,
     pub model: Option<String>,
     pub mode: Option<String>,
     /// Git ref the changes view compares against.
@@ -163,6 +259,22 @@ pub struct SessionMetadata {
     pub base_ref: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl SessionMetadata {
+    /// Project this session groups under.
+    #[must_use]
+    pub fn project_key(&self) -> &str {
+        self.repository_root
+            .as_deref()
+            .unwrap_or(&self.project_path)
+    }
+
+    /// Whether this session is a standalone chat with no repository.
+    #[must_use]
+    pub const fn is_chat(&self) -> bool {
+        self.kind.is_chat()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -564,7 +676,9 @@ mod tests {
             id: "app-session".to_owned(),
             sdk_session_id: "sdk-session".to_owned(),
             project_path: "/tmp/project".to_owned(),
+            repository_root: None,
             title: "Test".to_owned(),
+            kind: SessionKind::Project,
             model: None,
             mode: None,
             base_ref: None,
@@ -1088,6 +1202,73 @@ mod tests {
                 "{id:?} should be satisfied"
             );
         }
+    }
+
+    #[test]
+    fn sessions_group_by_repository_not_by_worktree() {
+        // Worktrees of one repository must collapse into a single project.
+        // Grouping by worktree path produced one "project" per worktree, named
+        // after the generated branch directory.
+        let mut worktree_a = metadata();
+        worktree_a.project_path = "/worktrees/feature-a".to_owned();
+        worktree_a.repository_root = Some("/src/gcabb".to_owned());
+
+        let mut worktree_b = metadata();
+        worktree_b.project_path = "/worktrees/feature-b".to_owned();
+        worktree_b.repository_root = Some("/src/gcabb".to_owned());
+
+        assert_eq!(worktree_a.project_key(), worktree_b.project_key());
+        assert_eq!(worktree_a.project_key(), "/src/gcabb");
+    }
+
+    #[test]
+    fn sessions_without_a_repository_fall_back_to_their_worktree() {
+        let mut legacy = metadata();
+        legacy.repository_root = None;
+        legacy.project_path = "/worktrees/legacy".to_owned();
+        assert_eq!(legacy.project_key(), "/worktrees/legacy");
+    }
+
+    #[test]
+    fn optional_capabilities_are_not_reported_as_blocking() {
+        // An absent MCP server or skill tool is worth surfacing, but it does
+        // not stop the edit-command-diff loop, so it must not be counted as
+        // blocking in the headline badge.
+        let mut report = CapabilityReport::default();
+        for id in [
+            CapabilityId::FileRead,
+            CapabilityId::FileWrite,
+            CapabilityId::Search,
+            CapabilityId::Shell,
+            CapabilityId::Changes,
+        ] {
+            report.set(Capability {
+                id,
+                status: CapabilityStatus::Available,
+                detail: String::new(),
+                evidence: Vec::new(),
+            });
+        }
+        report.set(Capability {
+            id: CapabilityId::GithubMcp,
+            status: CapabilityStatus::Unavailable,
+            detail: "no MCP configured".to_owned(),
+            evidence: Vec::new(),
+        });
+
+        assert!(report.blocking().is_empty());
+        assert!(report.is_self_hosting_ready());
+        // It still shows up as degraded so the panel can explain it.
+        assert_eq!(report.degraded().len(), 1);
+
+        report.set(Capability {
+            id: CapabilityId::Shell,
+            status: CapabilityStatus::Unavailable,
+            detail: "no shell tool".to_owned(),
+            evidence: Vec::new(),
+        });
+        assert_eq!(report.blocking().len(), 1);
+        assert!(!report.is_self_hosting_ready());
     }
 
     #[test]

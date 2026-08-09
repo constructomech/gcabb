@@ -11,7 +11,7 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use app_model::{CapabilityId, CapabilityStatus, ChangeStage, TerminalState};
+use app_model::{CapabilityId, CapabilityStatus, ChangeStage, SessionKind, TerminalState};
 use copilot_provider::{AgentProvider, CopilotProvider};
 use diagnostics::MemoryDiagnostics;
 use session_manager::{CreateSessionRequest, SessionManager};
@@ -57,11 +57,14 @@ async fn manager_with(provider: Arc<FakeProvider>) -> SessionManager {
 fn request(path: &Path) -> CreateSessionRequest {
     CreateSessionRequest {
         project_path: path.to_owned(),
+        repository_root: None,
         title: "Phase 3 capability".to_owned(),
+        kind: SessionKind::Project,
         model: None,
         mode: Some("interactive".to_owned()),
         reasoning_effort: None,
         base_ref: Some("main".to_owned()),
+        context_tier: None,
     }
 }
 
@@ -423,6 +426,178 @@ async fn non_git_session_directory_reports_changes_unavailable() {
             .map(|capability| capability.status),
         Some(CapabilityStatus::Available)
     );
+}
+
+/// Regression: the changes base must be the repository's default branch, not
+/// the session's own branch. Comparing a worktree against the branch it has
+/// checked out reports no changes at all, which is what the UI showed.
+#[tokio::test]
+async fn changes_base_is_the_default_branch_not_the_session_branch() {
+    let project = worktree();
+    let path = project.path();
+    git(path, &["checkout", "-b", "session-branch"]);
+    fs::write(path.join("work.txt"), "session work\n").expect("write");
+    git(path, &["add", "work.txt"]);
+    git(path, &["commit", "-m", "session work"]);
+
+    let provider = Arc::new(FakeProvider::default());
+    let manager = manager_with(provider).await;
+
+    // Base recorded as the session's own branch: nothing is reported.
+    let mut same_branch = request(path);
+    same_branch.base_ref = Some("session-branch".to_owned());
+    let session = manager
+        .create_session(same_branch)
+        .await
+        .expect("session created");
+    assert!(
+        session.snapshot().changes.is_empty(),
+        "a branch compared against itself has no changes"
+    );
+
+    // Base recorded as the repository default: the work shows up.
+    let session = manager
+        .create_session(request(path))
+        .await
+        .expect("session created");
+    let changes = session.snapshot().changes.clone();
+    assert_eq!(changes.base_label.as_deref(), Some("main"));
+    assert_eq!(changes.branch.as_deref(), Some("session-branch"));
+    assert!(
+        changes.file("work.txt").is_some(),
+        "committed session work must appear against the default branch"
+    );
+}
+
+/// Exit criterion for worktree sessions: deleting a session must not leave
+/// its checkout, its git registration, or its branch behind.
+#[tokio::test]
+async fn deleting_a_worktree_session_reclaims_the_worktree() {
+    let project = worktree();
+    let repository = project.path();
+    let roots = tempdir().expect("tempdir");
+    let session_worktree = roots.path().join("gcabb-session");
+    git_service::GitService::new(repository)
+        .create_worktree(&session_worktree, "gcabb/session", "main")
+        .expect("worktree created");
+    assert!(session_worktree.exists());
+
+    let provider = Arc::new(FakeProvider::default());
+    let storage = Arc::new(Storage::open_in_memory().expect("storage"));
+    let diagnostics = Arc::new(MemoryDiagnostics::default());
+    let manager = SessionManager::new(provider, storage, diagnostics);
+    manager.start().await.expect("manager starts");
+
+    let mut request = request(&session_worktree);
+    request.repository_root = Some(repository.to_string_lossy().into_owned());
+    let session = manager.create_session(request).await.expect("session");
+    let id = session.id().to_owned();
+
+    let deletion = manager
+        .delete_session(&id, Some(roots.path()))
+        .await
+        .expect("session deleted");
+
+    match deletion.worktree {
+        Some(app_worktree @ session_manager::WorktreeOutcome::Removed { .. }) => {
+            let session_manager::WorktreeOutcome::Removed { branch_removed, .. } = app_worktree
+            else {
+                unreachable!()
+            };
+            assert!(branch_removed, "an unmodified branch should be removed");
+        }
+        other => panic!("expected the worktree to be removed, got {other:?}"),
+    }
+    assert!(!session_worktree.exists(), "the checkout is gone");
+    // Git must not still list it, or `git worktree add` would refuse the path.
+    let listed = std::process::Command::new("git")
+        .arg("-C")
+        .arg(repository)
+        .args(["worktree", "list", "--porcelain"])
+        .output()
+        .expect("git runs");
+    let listed = String::from_utf8_lossy(&listed.stdout);
+    assert!(
+        !listed.contains("gcabb-session"),
+        "the worktree registration is pruned: {listed}"
+    );
+    assert!(!git_service::GitService::new(repository).branch_exists("gcabb/session"));
+}
+
+/// Uncommitted work must never be destroyed by deleting a session.
+#[tokio::test]
+async fn deleting_a_dirty_worktree_session_preserves_the_work() {
+    let project = worktree();
+    let repository = project.path();
+    let roots = tempdir().expect("tempdir");
+    let session_worktree = roots.path().join("gcabb-dirty");
+    git_service::GitService::new(repository)
+        .create_worktree(&session_worktree, "gcabb/dirty", "main")
+        .expect("worktree created");
+    fs::write(
+        session_worktree.join("unsaved.txt"),
+        "work in progress
+",
+    )
+    .expect("write");
+
+    let provider = Arc::new(FakeProvider::default());
+    let storage = Arc::new(Storage::open_in_memory().expect("storage"));
+    let diagnostics = Arc::new(MemoryDiagnostics::default());
+    let manager = SessionManager::new(provider, storage, diagnostics);
+    manager.start().await.expect("manager starts");
+    let mut request = request(&session_worktree);
+    request.repository_root = Some(repository.to_string_lossy().into_owned());
+    let session = manager.create_session(request).await.expect("session");
+    let id = session.id().to_owned();
+
+    let deletion = manager
+        .delete_session(&id, Some(roots.path()))
+        .await
+        .expect("session deleted");
+
+    assert!(
+        matches!(
+            deletion.worktree,
+            Some(session_manager::WorktreeOutcome::PreservedWithChanges { .. })
+        ),
+        "got {:?}",
+        deletion.worktree
+    );
+    assert!(session_worktree.join("unsaved.txt").exists());
+    // The user is told, so a preserved worktree is not silently orphaned.
+    assert!(
+        deletion
+            .worktree
+            .and_then(|outcome| outcome.notice())
+            .is_some_and(|notice| notice.contains("uncommitted"))
+    );
+}
+
+/// A session running in the developer's own checkout must never be removed.
+#[tokio::test]
+async fn deleting_a_local_repository_session_leaves_the_checkout_alone() {
+    let project = worktree();
+    let repository = project.path();
+    let roots = tempdir().expect("tempdir");
+
+    let provider = Arc::new(FakeProvider::default());
+    let storage = Arc::new(Storage::open_in_memory().expect("storage"));
+    let diagnostics = Arc::new(MemoryDiagnostics::default());
+    let manager = SessionManager::new(provider, storage, diagnostics);
+    manager.start().await.expect("manager starts");
+    let mut request = request(repository);
+    request.repository_root = Some(repository.to_string_lossy().into_owned());
+    let session = manager.create_session(request).await.expect("session");
+    let id = session.id().to_owned();
+
+    let deletion = manager
+        .delete_session(&id, Some(roots.path()))
+        .await
+        .expect("session deleted");
+
+    assert!(deletion.worktree.is_none(), "nothing to reclaim");
+    assert!(repository.join("README.md").exists(), "checkout untouched");
 }
 
 /// Poll a session's snapshot until `predicate` holds.

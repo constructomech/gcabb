@@ -41,7 +41,7 @@ Phase 2 provides an end-to-end native session workflow:
 - Worktree branch and Copilot process-health indicators.
 - SQLite-backed selected-session restoration.
 
-Phase 3 adds the self-hosting loop:
+Phase 3a adds the self-hosting loop:
 
 - Runtime tool discovery through the SDK, projected into per-session
   capability state instead of assumed.
@@ -57,6 +57,14 @@ inventory of tools GCABB inherits from Copilot CLI.
 
 ```sh
 source "$HOME/.cargo/env"
+cargo run -p gcabb-desktop
+```
+
+On fish, source the shell-specific file instead, or add Cargo to `PATH` once
+with `fish_add_path "$HOME/.cargo/bin"`:
+
+```fish
+source "$HOME/.cargo/env.fish"
 cargo run -p gcabb-desktop
 ```
 

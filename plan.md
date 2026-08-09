@@ -448,11 +448,15 @@ Exit criteria:
 - Ordinary coding sessions can be completed without opening Copilot CLI.
 - Session switching does not pause unrelated background work.
 
-### Phase 3: Self-Hosting MVP (2-3 weeks)
+### Phase 3a: Self-Hosting Foundations (2-3 weeks)
 
-Status: implemented; hardening continues with later phases. See
-[docs/phase-3](docs/phase-3/README.md) and the verified runtime inventory in
+Status: implemented. See [docs/phase-3](docs/phase-3/README.md) and the
+verified runtime inventory in
 [docs/phase-3/tool-surface.md](docs/phase-3/tool-surface.md).
+
+Phase 3a closes the mechanical loop: the agent can inspect, edit, run commands,
+and produce a reviewable diff inside GCABB. It deliberately stops short of
+making that work *observable*, which Phase 3b addresses.
 
 Make GCABB capable of developing GCABB. Prefer capabilities inherited from the
 official Copilot CLI runtime over app-specific reimplementations, and prove each
@@ -502,9 +506,57 @@ Exit criteria:
 - The changes view accurately shows committed, staged, and unstaged changes
   against the session's recorded base.
 
+### Phase 3b: Self-Hosting Parity (1-2 weeks)
+
+Status: next.
+
+Phase 3a proved GCABB can *perform* the self-hosting loop. Dogfooding GCABB to
+build GCABB then exposed a different problem: the work is not observable, and
+the feedback channel a UI project depends on is missing. These gaps were found
+by running a full development session against GCABB's own repository and asking
+which parts of that session GCABB could not have supported.
+
+The ordering below is by whether the gap blocks self-hosting outright.
+
+- Render tool activity in the transcript. `ToolActivity::invocations` is
+  already projected, correlated, and tested, but nothing displays it, so a
+  session shows prose and terminals while the actual work — reads, searches,
+  edits and their diffs — is invisible. This is the single largest gap between
+  GCABB's stated goal of showing what the agent is doing and what it shows.
+- Accept image attachments on the composer and pass them to the runtime. The
+  `+` control is currently an inert placeholder. Screenshots are the primary
+  way UI defects are reported, so without this GCABB cannot be used to develop
+  its own interface.
+- Give the user per-shell control. `stop_bash` exists in the runtime and
+  `TerminalSession` already models a cancelled state, but no UI reaches either,
+  so a runaway command can only be stopped by cancelling the whole session.
+  This completes the Phase 3a exit criterion about cancelling commands.
+- Nest subagent activity under the task that spawned it. Events already carry
+  `agentId` and `parentToolCallId`; delegated work currently appears as an
+  unexplained pause.
+- Reconcile the discovered tool surface with what sessions actually offer. A
+  live `tools.list` returned neither `sql` nor `session_store_sql` nor
+  `web_search`, so capabilities that development workflows use may be absent
+  without the UI saying so. Determine whether this is model-scoped and report
+  it in the capabilities panel either way.
+- Keep composer controls consistent between the home and session composers,
+  including thinking level and context window, so selecting a session never
+  silently drops a control.
+
+Exit criteria:
+
+- A developer can watch a session edit files and run commands without leaving
+  GCABB, including the diff each edit produced.
+- A screenshot can be attached to a prompt and reaches the model.
+- A single running command can be stopped from the UI without cancelling the
+  session or disturbing other sessions.
+- Subagent work is attributable to the task that requested it.
+- Any capability the runtime does not provide is visible in the capabilities
+  panel rather than surfacing as an unexplained failure.
+
 ### Phase 4: Tagged Releases and Auto-Update (1-2 weeks)
 
-Turn the Phase 3 self-hosting build into a repeatable dogfooding loop without
+Turn the Phase 3a self-hosting build into a repeatable dogfooding loop without
 making release engineering a prerequisite for the Self-Hosting MVP itself.
 
 - Define the application version in one authoritative location and expose it in
@@ -531,7 +583,7 @@ Exit criteria:
 
 - Pushing a version tag produces a versioned Windows GitHub Release and valid
   update metadata without manual packaging.
-- A Phase 3 installation can discover, verify, download, and apply the next
+- A Phase 3a installation can discover, verify, download, and apply the next
   tagged prerelease, then resume its existing projects and sessions.
 - Invalid signatures, interrupted downloads, incompatible updates, and failed
   replacement leave the installed client runnable and provide a recovery path.
@@ -543,7 +595,7 @@ Exit criteria:
 - Correlate SDK, hook, task, fleet, terminal, Git, file, MCP, and skill events.
 - Add latency breakdowns, capability diagnostics, and redacted diagnostic
   export.
-- Link command and file activity to the Phase 3 terminal output and changes
+- Link command and file activity to the Phase 3a terminal output and changes
   view.
 
 Exit criteria:
@@ -556,11 +608,11 @@ Exit criteria:
 
 ### Phase 6: Terminal and Changes Hardening (3-4 weeks)
 
-- Upgrade Phase 3 command output into the native virtualized GPUI terminal with
+- Upgrade Phase 3a command output into the native virtualized GPUI terminal with
   PTYs, ANSI/VT parsing, bounded scrollback, attach/detach, interactive input,
   resize, process-tree control, and persistence.
 - Add user-created terminals and reusable terminal sessions.
-- Expand the Phase 3 changes view with repository/ref discovery, selectable
+- Expand the Phase 3a changes view with repository/ref discovery, selectable
   bases, merge-base calculation, persisted base selection, and activity links.
 - Add virtualized split/unified diffs, syntax highlighting, context expansion,
   and defined handling for renames, binaries, submodules, deleted files, and
@@ -638,7 +690,7 @@ release may require another 4-6 engineer-weeks.
 The largest near-term uncertainty is whether CLI-owned shell, GitHub MCP, and
 skill capabilities retain full behavior through SDK-created sessions. The
 largest later uncertainty is the amount of native terminal and diff hardening
-needed beyond the Phase 3 self-hosting surfaces.
+needed beyond the Phase 3a and 3b self-hosting surfaces.
 
 ## UX Inputs Needed
 

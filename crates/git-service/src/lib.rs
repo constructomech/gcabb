@@ -105,6 +105,70 @@ impl GitService {
         }
     }
 
+    /// Create a linked worktree at `path` on a new branch.
+    ///
+    /// A session worktree gives the agent its own checkout, so parallel
+    /// sessions in one repository cannot fight over the working tree or the
+    /// checked-out branch. The branch is created from `base_ref`.
+    ///
+    /// Returns the branch that was created.
+    pub fn create_worktree(&self, path: &Path, branch: &str, base_ref: &str) -> Result<String> {
+        let path_string = path.to_string_lossy().into_owned();
+        // Resolve the base first so a missing ref fails here with a clear
+        // error rather than leaving a half-created worktree behind.
+        let base = self
+            .merge_base(base_ref)
+            .unwrap_or_else(|_| base_ref.to_owned());
+        self.run(&["worktree", "add", "-b", branch, &path_string, &base])?;
+        Ok(branch.to_owned())
+    }
+
+    /// Whether `branch` already exists in this repository.
+    #[must_use]
+    pub fn branch_exists(&self, branch: &str) -> bool {
+        self.run(&[
+            "rev-parse",
+            "--verify",
+            "--quiet",
+            &format!("refs/heads/{branch}"),
+        ])
+        .is_ok_and(|value| !value.trim().is_empty())
+    }
+
+    /// Whether this worktree has no staged, unstaged, or untracked changes.
+    #[must_use]
+    pub fn is_clean(&self) -> bool {
+        self.run(&["status", "--porcelain=v1", "--untracked-files=all"])
+            .is_ok_and(|output| output.trim().is_empty())
+    }
+
+    /// Remove a linked worktree and prune its registration.
+    ///
+    /// Refuses when the worktree still contains work, so deleting a session
+    /// cannot silently destroy uncommitted changes. Callers should surface the
+    /// refusal rather than forcing it.
+    pub fn remove_worktree(&self, path: &Path) -> Result<()> {
+        let path_string = path.to_string_lossy().into_owned();
+        self.run(&["worktree", "remove", &path_string])?;
+        // Prune leaves the administrative files consistent even when the
+        // directory was already gone.
+        let _ = self.run(&["worktree", "prune"]);
+        Ok(())
+    }
+
+    /// Delete a branch only when it has been merged into `base_ref`.
+    ///
+    /// Unmerged work keeps its branch, so a deleted session never takes
+    /// commits with it.
+    pub fn delete_branch_if_merged(&self, branch: &str) -> Result<bool> {
+        if !self.branch_exists(branch) {
+            return Ok(false);
+        }
+        // `-d` refuses to delete a branch with unmerged commits, which is the
+        // safety property we want, so a refusal is a result and not an error.
+        Ok(self.run(&["branch", "-d", branch]).is_ok())
+    }
+
     /// Build the complete changes view against `base_ref`.
     ///
     /// `base_ref` may be a branch, tag, or commit. The comparison is made
@@ -475,6 +539,48 @@ mod tests {
         let totals = view.totals();
         let summed: u32 = view.files.iter().map(|file| file.stats.insertions).sum();
         assert_eq!(totals.insertions, summed);
+    }
+
+    #[test]
+    fn creates_a_session_worktree_on_a_new_branch() {
+        let dir = repo();
+        let path = dir.path();
+        // The worktree must live outside the repository, but still inside a
+        // temporary directory so the test leaves nothing behind.
+        let outside = tempfile::tempdir().expect("tempdir");
+        let worktree = outside.path().join("session-worktree");
+        let service = GitService::new(path);
+
+        assert!(!service.branch_exists("session/one"));
+        service
+            .create_worktree(&worktree, "session/one", "main")
+            .expect("worktree created");
+
+        assert!(worktree.join("base.txt").exists(), "checkout is populated");
+        assert!(service.branch_exists("session/one"));
+
+        // The worktree is its own checkout on its own branch, so the two do
+        // not share a working tree.
+        let session = GitService::new(&worktree);
+        assert_eq!(session.current_branch().unwrap(), "session/one");
+        assert_eq!(GitService::new(path).current_branch().unwrap(), "main");
+    }
+
+    #[test]
+    fn worktree_changes_compare_against_the_base_branch() {
+        let dir = repo();
+        let path = dir.path();
+        let outside = tempfile::tempdir().expect("tempdir");
+        let worktree = outside.path().join("session-worktree");
+        let service = GitService::new(path);
+        service
+            .create_worktree(&worktree, "session/two", "main")
+            .expect("worktree created");
+
+        fs::write(worktree.join("new.txt"), "from session\n").expect("write");
+        let view = GitService::new(&worktree).changes("main", "now".to_owned());
+        assert!(view.error.is_none(), "unexpected error: {:?}", view.error);
+        assert!(view.file("new.txt").is_some());
     }
 
     #[test]

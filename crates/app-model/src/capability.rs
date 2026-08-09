@@ -110,12 +110,39 @@ impl CapabilityReport {
     }
 
     /// Capabilities that would block the self-hosting loop.
+    ///
+    /// Scoped to the capabilities the loop actually requires. An absent MCP
+    /// server or skill tool is worth showing in the capabilities panel, but it
+    /// does not stop a developer editing, running commands, and reviewing
+    /// diffs, so it must not be reported as blocking.
     #[must_use]
     pub fn blocking(&self) -> Vec<&Capability> {
         self.capabilities
             .iter()
-            .filter(|capability| capability.is_blocking())
+            .filter(|capability| Self::is_required(capability.id) && capability.is_blocking())
             .collect()
+    }
+
+    /// Capabilities in a non-available state, whether required or not.
+    #[must_use]
+    pub fn degraded(&self) -> Vec<&Capability> {
+        self.capabilities
+            .iter()
+            .filter(|capability| capability.status != CapabilityStatus::Available)
+            .collect()
+    }
+
+    /// Whether a capability is required for the self-hosting loop.
+    #[must_use]
+    pub const fn is_required(id: CapabilityId) -> bool {
+        matches!(
+            id,
+            CapabilityId::FileRead
+                | CapabilityId::FileWrite
+                | CapabilityId::Search
+                | CapabilityId::Shell
+                | CapabilityId::Changes
+        )
     }
 
     #[must_use]

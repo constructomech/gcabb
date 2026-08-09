@@ -150,7 +150,7 @@ duplicates output the UI already displayed.
 The SDK exposes `SessionFsProvider`, which routes all per-session filesystem
 operations (`readFile`, `writeFile`, `appendFile`, `exists`, `stat`, `mkdir`,
 `readdir`, `readdirWithTypes`, `rm`, `rename`, plus SQLite) through host code.
-Phase 3 does not use it: setting the session working directory is sufficient to
+Phase 3a does not use it: setting the session working directory is sufficient to
 satisfy the worktree requirement, and intercepting file I/O would make GCABB
 responsible for semantics the runtime already implements correctly. It remains
 the natural mechanism for a future sandboxing or remote-worktree feature.

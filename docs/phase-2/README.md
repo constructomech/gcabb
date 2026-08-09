@@ -57,7 +57,7 @@ The reducer:
 - Coalesces `assistant.message_delta` by `messageId`.
 - Replaces streaming content with the authoritative `assistant.message`.
 - Excludes events carrying `agentId` or `parentToolCallId` from the root
-  transcript, preserving them for Phase 3 nested activity UI.
+  transcript, preserving them for Phase 3b nested activity UI.
 
 ## Controls and lifecycle
 
