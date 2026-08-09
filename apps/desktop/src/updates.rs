@@ -21,6 +21,136 @@ use updater::{AvailableUpdate, UpdateStatus, Updater};
 /// Repository that releases are published to.
 const RELEASE_REPOSITORY: &str = "constructomech/gcabb";
 
+/// Overrides the release discovery endpoint.
+///
+/// Redirecting discovery is safe because discovery confers no trust: a manifest
+/// from any endpoint still has to carry a valid signature from the key compiled
+/// into this build. That separation is what makes the update loop testable
+/// against a local stub feed without weakening it.
+const API_BASE_ENV: &str = "GCABB_UPDATE_API_BASE";
+
+/// Builds an updater for the running installation.
+fn build_updater(build: &BuildStamp, data_dir: &Path) -> Result<Updater, String> {
+    let http = Arc::new(ReqwestClient::new().map_err(|error| error.to_string())?);
+    let layout = InstallLayout::for_running_executable().map_err(|error| error.to_string())?;
+
+    let mut source = GitHubReleaseSource::new(Box::new(Arc::clone(&http)), RELEASE_REPOSITORY);
+    if let Ok(base) = std::env::var(API_BASE_ENV) {
+        tracing::warn!(base, "update discovery is pointed at an override endpoint");
+        source = source.with_api_base(base);
+    }
+
+    Ok(Updater::new(
+        build.clone(),
+        TrustStore::embedded(),
+        layout,
+        Arc::new(source),
+        http,
+        UpdateSettings::load(data_dir),
+    ))
+}
+
+/// Exit code reported when a headless run found nothing to do.
+pub const EXIT_NOTHING_TO_DO: i32 = 2;
+
+/// Runs the whole update loop without a window and reports what happened.
+///
+/// This exists so the loop can be exercised on each target platform in CI. The
+/// swap semantics that differ between platforms — replacing an executable while
+/// it is running — cannot be verified by a unit test, and driving the GUI on
+/// three operating systems to check them is not practical.
+///
+/// Returns a process exit code: 0 applied, 1 failed, 2 nothing to do.
+pub fn run_headless(build: &BuildStamp, data_dir: &Path, apply_update: bool) -> i32 {
+    let runtime = match tokio::runtime::Builder::new_current_thread()
+        .enable_all()
+        .build()
+    {
+        Ok(runtime) => runtime,
+        Err(error) => {
+            eprintln!("could not start the update runtime: {error}");
+            return 1;
+        }
+    };
+
+    let updater = match build_updater(build, data_dir) {
+        Ok(updater) => updater,
+        Err(error) => {
+            eprintln!("{error}");
+            return 1;
+        }
+    };
+
+    // An explicit request, so the automatic-check preference does not apply.
+    let status = match runtime.block_on(updater.check(false)) {
+        Ok(status) => status,
+        Err(error) => {
+            eprintln!("update check failed: {error}");
+            return 1;
+        }
+    };
+
+    let available = match status {
+        UpdateStatus::Available(available) => *available,
+        UpdateStatus::UpToDate => {
+            println!("up to date at {}", build.version);
+            return EXIT_NOTHING_TO_DO;
+        }
+        UpdateStatus::Deferred(version) => {
+            println!("{version} is available but was deferred");
+            return EXIT_NOTHING_TO_DO;
+        }
+        UpdateStatus::Disabled(reason) => {
+            println!("updates unavailable: {}", reason.message());
+            return EXIT_NOTHING_TO_DO;
+        }
+        UpdateStatus::Blocked(reason) => {
+            println!("update not applicable: {reason}");
+            return EXIT_NOTHING_TO_DO;
+        }
+    };
+
+    println!(
+        "update available: {} -> {}",
+        build.version, available.manifest.version
+    );
+    if !apply_update {
+        return 0;
+    }
+
+    // Reported in coarse steps: a byte-level log of a quarter-gigabyte
+    // download would bury everything else in a CI log.
+    let last_decile = std::sync::Mutex::new(u64::MAX);
+    let progress: ProgressCallback = Arc::new(move |received, total| {
+        let Some(total) = total.filter(|total| *total > 0) else {
+            return;
+        };
+        let decile = received.saturating_mul(10) / total;
+        let mut last = match last_decile.lock() {
+            Ok(last) => last,
+            Err(poisoned) => poisoned.into_inner(),
+        };
+        if decile != *last {
+            *last = decile;
+            eprintln!("downloading… {}%", decile * 10);
+        }
+    });
+    let staged = match runtime.block_on(updater.stage(&available, progress)) {
+        Ok(staged) => staged,
+        Err(error) => {
+            eprintln!("staging failed: {error}");
+            return 1;
+        }
+    };
+    if let Err(error) = updater.apply(&staged) {
+        eprintln!("applying failed: {error}");
+        return 1;
+    }
+
+    println!("applied {}", available.manifest.version);
+    0
+}
+
 /// What the user asked the updater to do.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum UpdateRequest {
@@ -182,33 +312,15 @@ fn run_worker(
         }
     };
 
-    let http = match ReqwestClient::new() {
-        Ok(client) => Arc::new(client),
+    // Shared with the headless path so there is only one way an updater is
+    // built, and the tested path is the shipped one.
+    let mut updater = match build_updater(build, data_dir) {
+        Ok(updater) => updater,
         Err(error) => {
-            let _ = events.send(UpdateEvent::Failed(error.to_string()));
+            let _ = events.send(UpdateEvent::Unavailable(error));
             return;
         }
     };
-    let layout = match InstallLayout::for_running_executable() {
-        Ok(layout) => layout,
-        Err(error) => {
-            let _ = events.send(UpdateEvent::Unavailable(error.to_string()));
-            return;
-        }
-    };
-    let source = Arc::new(GitHubReleaseSource::new(
-        Box::new(Arc::clone(&http)),
-        RELEASE_REPOSITORY,
-    ));
-
-    let mut updater = Updater::new(
-        build.clone(),
-        TrustStore::embedded(),
-        layout,
-        source,
-        http,
-        UpdateSettings::load(data_dir),
-    );
 
     // The offered update is held here so Install does not have to check again
     // and risk acting on a different release than the one the user was shown.

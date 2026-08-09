@@ -5503,11 +5503,83 @@ fn resolve_build_identity() -> BuildStamp {
     build
 }
 
+/// How the binary was asked to run.
+enum Invocation {
+    /// Open the application window.
+    Desktop,
+    /// Print the build identity and exit.
+    Version,
+    /// Report whether an update is available and exit.
+    CheckUpdate,
+    /// Apply an available update and exit.
+    ApplyUpdate,
+    Help,
+    Unknown(String),
+}
+
+fn invocation() -> Invocation {
+    match std::env::args().nth(1).as_deref() {
+        None => Invocation::Desktop,
+        Some("--version" | "-V") => Invocation::Version,
+        Some("--check-update") => Invocation::CheckUpdate,
+        Some("--apply-update") => Invocation::ApplyUpdate,
+        Some("--help" | "-h") => Invocation::Help,
+        Some(other) => Invocation::Unknown(other.to_owned()),
+    }
+}
+
+const USAGE: &str = "\
+GCABB
+
+Usage:
+  gcabb-desktop                 Open the application
+  gcabb-desktop --version       Print the build identity
+  gcabb-desktop --check-update  Report whether an update is available
+  gcabb-desktop --apply-update  Download, verify, and apply an available update
+  gcabb-desktop --help          Show this message
+
+Exit codes for the update commands:
+  0  an update is available, or was applied
+  1  the check or the update failed
+  2  nothing to do
+";
+
 fn main() {
     if let Err(error) = init_tracing("gcabb=info") {
         eprintln!("failed to initialize structured tracing: {error}");
     }
     let build = resolve_build_identity();
+
+    // The update commands run the same code the window drives, so CI can
+    // exercise the loop on each platform without driving a GUI.
+    match invocation() {
+        Invocation::Desktop => {}
+        Invocation::Version => {
+            println!("{}", build.display());
+            return;
+        }
+        Invocation::Help => {
+            print!("{USAGE}");
+            return;
+        }
+        Invocation::Unknown(argument) => {
+            eprintln!("unrecognised argument {argument}\n");
+            print!("{USAGE}");
+            std::process::exit(1);
+        }
+        Invocation::CheckUpdate | Invocation::ApplyUpdate => {
+            let apply = matches!(invocation(), Invocation::ApplyUpdate);
+            let code = match data_directory() {
+                Ok(data_dir) => updates::run_headless(&build, &data_dir, apply),
+                Err(error) => {
+                    eprintln!("{error}");
+                    1
+                }
+            };
+            std::process::exit(code);
+        }
+    }
+
     let window_title = format!("GCABB {}", build.display());
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let branch = git_branch(&project_root);

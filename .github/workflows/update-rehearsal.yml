@@ -1,0 +1,63 @@
+name: Update rehearsal
+
+# Replacing a running executable is the one part of the update path whose
+# behaviour differs per operating system, and no unit test can reach it. This
+# builds two real GCABB versions, signs a release, serves it from localhost,
+# and makes the installed build update itself — on each platform GCABB ships to.
+#
+# It is a separate workflow because it builds the desktop app twice per
+# platform, which is far too slow to run on every pull request. It runs when the
+# update path itself changes, on main, and on demand.
+on:
+  push:
+    branches: [main]
+  pull_request:
+    paths:
+      - "crates/updater/**"
+      - "apps/desktop/src/updates.rs"
+      - "apps/release-tool/**"
+      - "scripts/update-rehearsal.sh"
+      - ".github/workflows/update-rehearsal.yml"
+      - ".github/workflows/release.yml"
+  workflow_dispatch:
+
+concurrency:
+  group: update-rehearsal-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  rehearse:
+    name: Self-update on ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    # A failure on one platform must not hide the result on the others, since
+    # the whole point is comparing per-platform swap behaviour.
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-2022]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            clang cmake mold libasound2-dev libfontconfig-dev libwayland-dev \
+            libxkbcommon-x11-dev libssl-dev libzstd-dev libvulkan-dev \
+            libgit2-dev libstdc++-12-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: rehearsal-${{ matrix.os }}
+
+      - name: Rehearse the update loop
+        shell: bash
+        run: scripts/update-rehearsal.sh

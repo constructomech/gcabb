@@ -81,6 +81,11 @@ impl DiagnosticsSink for MemoryDiagnostics {
 /// # Errors
 ///
 /// Returns an error when another global subscriber has already been installed.
+/// Installs the structured tracing subscriber.
+///
+/// Logs go to stderr so that stdout stays reserved for a command's actual
+/// output. Without this, `--version` and the update commands interleave log
+/// lines with the value a caller is trying to read.
 pub fn init_tracing(
     default_filter: &str,
 ) -> Result<(), Box<dyn std::error::Error + Send + Sync + 'static>> {
@@ -89,6 +94,7 @@ pub fn init_tracing(
             EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(default_filter)),
         )
         .with_target(false)
+        .with_writer(std::io::stderr)
         .try_init()
 }
 

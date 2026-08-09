@@ -1,0 +1,74 @@
+name: CI
+
+# There was no CI before Phase 4, so the release workflow was the first thing to
+# discover a broken build — on a tag, which is the worst place to find out.
+on:
+  push:
+    branches: [main]
+  pull_request:
+  workflow_dispatch:
+
+concurrency:
+  group: ci-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+
+jobs:
+  lint:
+    name: Format and lint
+    runs-on: ubuntu-22.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            clang cmake mold libasound2-dev libfontconfig-dev libwayland-dev \
+            libxkbcommon-x11-dev libssl-dev libzstd-dev libvulkan-dev \
+            libgit2-dev libstdc++-12-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+          components: clippy, rustfmt
+
+      - uses: Swatinem/rust-cache@v2
+
+      - run: cargo fmt --all -- --check
+      - run: cargo clippy --workspace --all-targets -- -D warnings
+
+  test:
+    name: Test ${{ matrix.os }}
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-22.04, macos-14, windows-2022]
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux build dependencies
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install --no-install-recommends -y \
+            clang cmake mold libasound2-dev libfontconfig-dev libwayland-dev \
+            libxkbcommon-x11-dev libssl-dev libzstd-dev libvulkan-dev \
+            libgit2-dev libstdc++-12-dev
+
+      - uses: dtolnay/rust-toolchain@master
+        with:
+          toolchain: "1.95"
+
+      - uses: Swatinem/rust-cache@v2
+        with:
+          key: ${{ matrix.os }}
+
+      # Building on every platform here is what keeps the release workflow's
+      # dependency list honest: a missing system library fails on a pull
+      # request rather than on a tag.
+      - run: cargo build --workspace --locked
+      - run: cargo test --workspace --locked

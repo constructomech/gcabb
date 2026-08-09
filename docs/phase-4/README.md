@@ -144,36 +144,7 @@ git push origin main --tags
 The workflow does the rest. `--locked` is used for release builds so the
 published binary is built from the committed lockfile.
 
-## Verifying without publishing
-
-The update path is the part of a release that cannot be fixed by a later
-release, so it is covered by tests that run the real code end to end against a
-stubbed release feed:
-
-```sh
-cargo test -p updater
-```
-
-`crates/updater/tests/update_loop.rs` drives discovery, verification, download,
-staging, application, and rollback, and proves the adversarial cases stop before
-the installation is touched:
-
-- a manifest altered after signing (download URL repointed) is rejected;
-- a truncated artifact is rejected;
-- a signature from an untrusted key is rejected even when it claims a trusted
-  key id;
-- an installation already on the newest release reports up to date;
-- a deferred version is not offered again;
-- an applied update can be rolled back.
-
-The banner itself is covered by the desktop interaction tests, which click the
-real buttons in a rendered window:
-
-```sh
-cargo test -p gcabb-desktop
-```
-
-The release tooling can also be exercised locally:
+## Exercising the release tooling by hand
 
 ```sh
 cargo run -p gcabb-release -- keygen
@@ -189,33 +160,86 @@ cargo run -p gcabb-release -- verify --input dist/update-manifest.json \
   --public-key ...
 ```
 
-## The update prompt
+`verify` is the same check CI runs before publishing, and it exits non-zero on
+a tampered manifest.
 
-A release build checks once at startup, honouring the automatic-check setting.
-When an update is offered, a banner appears above the session view:
+## How this is tested
 
-| State | Banner |
-| --- | --- |
-| Checking | "Checking for updates…" |
-| Offered | "GCABB *x.y.z* is available", first line of the notes, **Update** / **Later** |
-| Downloading | "Downloading update… *n*%" |
-| Applied | "GCABB *x.y.z* is installed and starts on restart", **Restart** |
-| Failed | "Update failed: *reason*", **Dismiss** |
+The update path is the one part of a release that cannot be fixed by a later
+release: a client that rejects good updates, or accepts bad ones, is not
+reachable by shipping again. It is tested in four layers.
 
-**Later** defers that specific version, so a newer one is still offered.
-**Restart** starts the replacement build before this process exits, so a failure
-to launch is reported while there is still a window to report it in.
+**1. Logic, in unit tests.** Channel rules, version comparison, manifest
+evaluation, signature and hash verification, archive extraction, and the
+settings round trip.
 
-States that are not actionable never take up space: a background check that
-finds nothing, and a build that cannot update at all (developer build, no
-signing key, read-only install), leave no banner. The latter is logged instead,
-since it is a normal deployment rather than an error.
+```sh
+cargo test -p updater
+```
 
-Update work runs on its own thread with its own Tokio runtime rather than on the
-session service. An update check is unrelated to session state, must not queue
-behind a long-running agent command, and must keep working when the provider has
-failed to start — which is exactly when a user is most likely to want a newer
-build.
+**2. The whole loop, against a stubbed feed.** `crates/updater/tests/update_loop.rs`
+drives the real code through discovery, verification, download, staging,
+application, and rollback, and proves the adversarial cases stop before the
+installation is touched:
+
+- a manifest altered after signing (download URL repointed) is rejected;
+- a truncated artifact is rejected;
+- a signature from an untrusted key is rejected even when it claims a trusted
+  key id;
+- an installation already on the newest release reports up to date;
+- a deferred version is not offered again;
+- an applied update can be rolled back.
+
+**3. The prompt, in the rendered window.** The desktop interaction tests click
+the real Update, Dismiss, and Restart buttons and assert what the banner shows.
+
+```sh
+cargo test -p gcabb-desktop
+```
+
+**4. A real self-update, on every platform.** The remaining risk is the part
+that differs per operating system — replacing an executable while it is
+running — which no unit test can reach and which is impractical to check by
+driving a GUI on three operating systems.
+
+`scripts/update-rehearsal.sh` closes that gap. It builds two real GCABB
+versions, signs a release with a throwaway key, serves it from localhost, and
+makes the installed build update itself:
+
+```sh
+scripts/update-rehearsal.sh          # add --keep to inspect the artifacts
+```
+
+It asserts the full lifecycle, not just the happy path:
+
+- the installed build reports the old version beforehand;
+- the update is discovered, verified, downloaded, and applied;
+- **the replaced installation runs and reports the new version** — the
+  assertion only a real swap on a real platform can satisfy;
+- the previous installation is still on disk immediately after the swap, so a
+  rollback is possible;
+- it is released once the new build has started, rather than kept forever;
+- a second check finds nothing to do.
+
+`.github/workflows/update-rehearsal.yml` runs this on Linux, macOS, and
+Windows. It is a separate workflow from CI because it builds the desktop app
+twice per platform, so it runs when the update path changes, on `main`, and on
+demand — not on every pull request.
+
+The headless commands that make this possible are also useful on their own:
+
+```sh
+gcabb-desktop --version        # build identity
+gcabb-desktop --check-update   # 0 available, 1 failed, 2 nothing to do
+gcabb-desktop --apply-update   # download, verify, apply
+```
+
+`GCABB_UPDATE_API_BASE` redirects release discovery, which is what lets the
+rehearsal point a real installed build at a local feed. Redirecting discovery
+is safe because discovery confers no trust: a manifest from any endpoint still
+has to carry a valid signature from the key compiled into the client. The
+separation between "where updates are found" and "what may be installed" is
+what makes the loop testable without weakening it.
 
 ## What Phase 4 does not do
 
@@ -231,6 +255,7 @@ in repository settings (see the key setup table above). The workflow fails
 loudly when the key or public-key variable is missing rather than publishing
 builds no client could verify, so this cannot be forgotten silently.
 
-Until a release exists there is nothing for an installed client to discover, so
-the tag-N to tag-N+1 exit criterion can only be met once the key is configured
-and the first tag is cut.
+Once the key is configured, cutting a prerelease tag proves the two things the
+rehearsal deliberately stubs out: that GitHub Actions can build and publish the
+real artifacts, and that a client can reach a real GitHub Release. Everything
+between those two points is already covered above.

@@ -120,6 +120,16 @@ developer checkout report channel `dev` and never update themselves, so
 See [`docs/phase-4/`](docs/phase-4/) for key setup, channel rules, and the
 rollback design.
 
+An installed build can also be driven from the command line, which is how the
+update loop is tested on each platform:
+
+```sh
+gcabb-desktop --version        # build identity
+gcabb-desktop --check-update   # 0 available, 1 failed, 2 nothing to do
+gcabb-desktop --apply-update   # download, verify, apply
+scripts/update-rehearsal.sh    # build two versions and self-update between them
+```
+
 ## Phase 0 probe
 
 The repository retains the executable SDK feasibility probe:
