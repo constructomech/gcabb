@@ -522,7 +522,9 @@ pub fn bind_text_input_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
         KeyBinding::new("enter", Submit, Some("TextInput")),
-        KeyBinding::new("cmd-v", Paste, Some("TextInput")),
-        KeyBinding::new("cmd-a", SelectAll, Some("TextInput")),
+        // `secondary` is cmd on macOS and ctrl everywhere else. Binding cmd
+        // directly meant paste was unreachable on Linux and Windows.
+        KeyBinding::new("secondary-v", Paste, Some("TextInput")),
+        KeyBinding::new("secondary-a", SelectAll, Some("TextInput")),
     ]);
 }

@@ -16,8 +16,8 @@ pub use tools::{
 };
 
 pub const DOMAIN_EVENT_VERSION: u16 = 1;
-/// Version 3 adds Phase 3 tool activity, capability, and changes projections.
-pub const SNAPSHOT_VERSION: u16 = 3;
+/// Version 4 records the attachments a user message was sent with.
+pub const SNAPSHOT_VERSION: u16 = 4;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -100,6 +100,62 @@ pub struct TranscriptMessage {
     /// reducer's sequence is monotonic and app-owned, unlike event timestamps.
     #[serde(default)]
     pub sequence: u64,
+    /// What was attached to this message, as the runtime echoed it back.
+    ///
+    /// Taken from the event rather than from composer state so the transcript
+    /// shows what the model actually received.
+    #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
+}
+
+/// An attachment recorded on a message in the transcript.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MessageAttachment {
+    pub display_name: String,
+    pub is_image: bool,
+}
+
+/// Read the attachments the runtime echoed back on a user message.
+fn message_attachments(event: &DomainEvent) -> Vec<MessageAttachment> {
+    let Some(attachments) = event.details.get("attachments").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    attachments
+        .iter()
+        .map(|attachment| {
+            let path = attachment.get("path").and_then(Value::as_str).unwrap_or("");
+            let display_name = attachment
+                .get("displayName")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map_or_else(
+                    || {
+                        std::path::Path::new(path)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("attachment")
+                            .to_owned()
+                    },
+                    str::to_owned,
+                );
+            // The runtime declares a MIME type only sometimes, so fall back to
+            // the extension rather than showing a generic file for a picture.
+            let is_image = attachment
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .is_some_and(|mime| mime.starts_with("image/"))
+                || {
+                    let lowered = path.to_lowercase();
+                    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]
+                        .iter()
+                        .any(|extension| lowered.ends_with(extension))
+                };
+            MessageAttachment {
+                display_name,
+                is_image,
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -669,7 +725,10 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                 .get("content")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if !content.is_empty() {
+            let attachments = message_attachments(event);
+            // A screenshot on its own is a complete message, so an empty body
+            // is only uninteresting when nothing came with it.
+            if !content.is_empty() || !attachments.is_empty() {
                 transcript.push(TranscriptMessage {
                     id: event.id.clone(),
                     role: TranscriptRole::User,
@@ -677,6 +736,7 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                     state: TranscriptState::Complete,
                     timestamp: event.timestamp.clone(),
                     sequence: event.sequence,
+                    attachments,
                 });
             }
         }
@@ -690,6 +750,7 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                     state: TranscriptState::Streaming,
                     timestamp: event.timestamp.clone(),
                     sequence: event.sequence,
+                    attachments: Vec::new(),
                 });
             }
         }
@@ -710,6 +771,7 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                     state: TranscriptState::Streaming,
                     timestamp: event.timestamp.clone(),
                     sequence: event.sequence,
+                    attachments: Vec::new(),
                 });
             }
         }
@@ -731,6 +793,7 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                     state: TranscriptState::Complete,
                     timestamp: event.timestamp.clone(),
                     sequence: event.sequence,
+                    attachments: Vec::new(),
                 });
             }
         }
@@ -1716,6 +1779,59 @@ mod tests {
         });
         assert_eq!(report.blocking().len(), 1);
         assert!(!report.is_self_hosting_ready());
+    }
+
+    /// An attachment is part of what was asked. A transcript that drops it
+    /// cannot be read back to understand the conversation, because the
+    /// question referred to something no longer shown.
+    #[test]
+    fn a_user_message_keeps_the_attachments_it_was_sent_with() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![json!({"id":"u","type":"user.message","data":{
+                "content":"what is wrong here",
+                "attachments":[{
+                    "type":"file",
+                    "displayName":"Pasted Image",
+                    "path":"/tmp/clipboard.png",
+                    "mimeType":"image/png"
+                }]
+            }})],
+        );
+
+        let message = state
+            .transcript
+            .iter()
+            .find(|message| message.role == TranscriptRole::User)
+            .expect("user message");
+        assert_eq!(message.attachments.len(), 1, "the attachment was dropped");
+        assert_eq!(message.attachments[0].display_name, "Pasted Image");
+        assert!(message.attachments[0].is_image);
+    }
+
+    /// An attachment with no text is still a message worth showing.
+    #[test]
+    fn an_attachment_only_message_is_kept() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![json!({"id":"u","type":"user.message","data":{
+                "content":"",
+                "attachments":[{
+                    "type":"file",
+                    "displayName":"Pasted Image",
+                    "path":"/tmp/clipboard.png"
+                }]
+            }})],
+        );
+
+        assert_eq!(
+            state.transcript.len(),
+            1,
+            "a message carrying only a screenshot vanished from the transcript"
+        );
+        assert_eq!(state.transcript[0].attachments.len(), 1);
     }
 
     /// A pasted screenshot has no path, so it must carry its own bytes.

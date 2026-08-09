@@ -3102,6 +3102,34 @@ impl SessionMvpView {
     fn transcript_message(message: &app_model::TranscriptMessage) -> impl IntoElement {
         let is_user = message.role == TranscriptRole::User;
         let speaker = if is_user { "You" } else { "Copilot" };
+        let attachments: Vec<_> = message
+            .attachments
+            .iter()
+            .map(|attachment| {
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(SUBTLE))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(if attachment.is_image { "IMG" } else { "FILE" }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(PRIMARY))
+                            .child(attachment.display_name.clone()),
+                    )
+            })
+            .collect();
         div()
             .id(SharedString::from(format!("message-{}", message.id)))
             .accessibility_id(message.id.clone())
@@ -3125,12 +3153,31 @@ impl SessionMvpView {
                             .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
                             .child(if is_user { "You" } else { "Copilot" }),
                     )
-                    .child(
-                        div()
-                            .mt_2()
-                            .text_color(rgb(PRIMARY))
-                            .child(message.content.clone()),
-                    )
+                    .when(!message.content.is_empty(), |bubble| {
+                        bubble.child(
+                            div()
+                                .mt_2()
+                                .text_color(rgb(PRIMARY))
+                                .child(message.content.clone()),
+                        )
+                    })
+                    // Shown after the text, mirroring the composer, so the
+                    // message reads back the way it was written.
+                    .when(!attachments.is_empty(), |bubble| {
+                        bubble.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "message-attachments-{}",
+                                    message.id
+                                )))
+                                .debug_selector(|| "message-attachments".to_owned())
+                                .mt_2()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .children(attachments),
+                        )
+                    })
                     .when(message.state == TranscriptState::Interrupted, |bubble| {
                         bubble.child(div().mt_1().text_xs().text_color(rgb(AMBER)).child(
                             "Interrupted — the model does not have this \
@@ -5759,6 +5806,68 @@ mod tests {
             });
         }
 
+        /// Paste was bound to cmd only, so on Linux and Windows the action
+        /// never fired and a pasted screenshot vanished without a trace.
+        #[gpui::test]
+        fn pasting_an_image_with_the_platform_shortcut_attaches_it(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            cx.update(|_, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image {
+                    format: gpui::ImageFormat::Png,
+                    bytes: vec![0x89, 0x50, 0x4E, 0x47],
+                    id: 1,
+                }));
+            });
+            view.update_in(cx, |view, window, cx| {
+                let handle = gpui::Focusable::focus_handle(view.composer.read(cx), cx);
+                window.focus(&handle, cx);
+            });
+            cx.run_until_parked();
+
+            cx.simulate_keystrokes("secondary-v");
+            cx.run_until_parked();
+
+            view.update(cx, |view, _| {
+                assert_eq!(
+                    view.draft_attachments.len(),
+                    1,
+                    "the platform paste shortcut did not reach the composer"
+                );
+                assert!(view.draft_attachments[0].is_image());
+            });
+        }
+
+        /// A sent attachment is part of what was asked, so the transcript must
+        /// still show it after the composer is cleared.
+        #[gpui::test]
+        fn a_sent_attachment_is_shown_in_the_transcript(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "m1".to_owned(),
+                    role: app_model::TranscriptRole::User,
+                    content: "what is wrong here".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: vec![app_model::MessageAttachment {
+                        display_name: "Pasted Image".to_owned(),
+                        is_image: true,
+                    }],
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("message-attachments").is_some(),
+                "the attachment vanished once the message was sent"
+            );
+        }
+
         /// Choosing a project returns the composer to project mode.
         #[gpui::test]
         fn choosing_a_project_leaves_chat_mode(cx: &mut TestAppContext) {
@@ -6082,6 +6191,7 @@ mod tests {
                         state: app_model::TranscriptState::Complete,
                         timestamp: "1".to_owned(),
                         sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
                     });
                 }
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
@@ -6151,6 +6261,7 @@ mod tests {
                         state: app_model::TranscriptState::Complete,
                         timestamp: "1".to_owned(),
                         sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
                     });
                 }
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
@@ -6212,6 +6323,7 @@ mod tests {
                         state: app_model::TranscriptState::Complete,
                         timestamp: "1".to_owned(),
                         sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
                     });
                 }
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
@@ -6268,6 +6380,7 @@ mod tests {
                         state: app_model::TranscriptState::Complete,
                         timestamp: "1".to_owned(),
                         sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
                     });
                 }
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
@@ -6380,6 +6493,7 @@ mod tests {
                         state: app_model::TranscriptState::Complete,
                         timestamp: "1".to_owned(),
                         sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
                     });
                 }
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
@@ -6430,6 +6544,7 @@ mod tests {
                     state: app_model::TranscriptState::Complete,
                     timestamp: "1".to_owned(),
                     sequence: 1,
+                    attachments: Vec::new(),
                 });
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
                 view.selected_session = Some("session-1".to_owned());

@@ -70,6 +70,18 @@ picked or dropped file travels as a path, and pasted bytes travel as an
 the impossible states unrepresentable — an attachment is one or the other, never
 both and never neither.
 
+Paste initially appeared not to work at all. The cause was not the image
+handling but the keybinding: paste was bound to `cmd-v`, so on Linux and
+Windows the action never fired and neither text nor images were pasted. It is
+now bound to `secondary-v`, which GPUI resolves to cmd on macOS and ctrl
+elsewhere.
+
+An attachment is part of what was asked, so the transcript records it. The
+record comes from the `attachments` the runtime echoes back on `user.message`
+rather than from composer state, so what is shown is what the model actually
+received. A message carrying only a screenshot is kept rather than discarded as
+empty, since the screenshot *is* the message.
+
 Identity distinguishes attachments for de-duplication, and the two cases differ
 on purpose. Picking or dropping the same file twice is one attachment, because
 it is one file. Pasting twice is two attachments, because someone who pastes
