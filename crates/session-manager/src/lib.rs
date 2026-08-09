@@ -7,8 +7,8 @@ use std::time::{SystemTime, UNIX_EPOCH};
 
 use app_model::{
     ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus, DomainEvent,
-    InteractionResponse, ProjectMetadata, SessionKind, SessionMetadata, SessionSnapshot,
-    SessionStatus, ToolCatalog,
+    InteractionResponse, ProjectMetadata, PromptAttachment, SessionKind, SessionMetadata,
+    SessionSnapshot, SessionStatus, ToolCatalog,
 };
 use copilot_provider::{
     AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderInteraction,
@@ -138,10 +138,20 @@ impl SessionHandle {
     }
 
     pub async fn send(&self, prompt: impl Into<String>) -> Result<String> {
+        self.send_with_attachments(prompt, Vec::new()).await
+    }
+
+    /// Send a prompt with files attached.
+    pub async fn send_with_attachments(
+        &self,
+        prompt: impl Into<String>,
+        attachments: Vec<PromptAttachment>,
+    ) -> Result<String> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(SessionCommand::Send {
                 prompt: prompt.into(),
+                attachments,
                 response: response_tx,
             })
             .await
@@ -774,6 +784,7 @@ impl SessionManager {
 enum SessionCommand {
     Send {
         prompt: String,
+        attachments: Vec<PromptAttachment>,
         response: oneshot::Sender<Result<String>>,
     },
     Lifecycle {
@@ -849,9 +860,13 @@ impl SessionActor {
                 }
                 command = self.commands.recv() => {
                     match command {
-                        Some(SessionCommand::Send { prompt, response }) => {
+                        Some(SessionCommand::Send {
+                            prompt,
+                            attachments,
+                            response,
+                        }) => {
                             let result = self.provider
-                                .send(&self.sdk_session_id, &prompt)
+                                .send(&self.sdk_session_id, &prompt, &attachments)
                                 .await
                                 .map_err(SessionManagerError::from);
                             let _ = response.send(result);
@@ -1269,6 +1284,35 @@ mod tests {
         assert_eq!(snapshot.activities.len(), 4);
         assert_eq!(snapshot.last_sequence, 4);
         assert_eq!(snapshot.status, SessionStatus::Idle);
+    }
+
+    /// Attachments must reach the runtime, not stop at the actor boundary.
+    #[tokio::test]
+    async fn attachments_reach_the_provider() {
+        let provider = Arc::new(FakeProvider::with_script(golden_events().unwrap()));
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider.clone(), storage, diagnostics);
+        manager.start().await.unwrap();
+        let handle = manager
+            .create_session(request(std::env::temp_dir()))
+            .await
+            .unwrap();
+
+        handle
+            .send_with_attachments(
+                "look at this",
+                vec![PromptAttachment::from_path(std::path::Path::new(
+                    "/tmp/shot.png",
+                ))],
+            )
+            .await
+            .unwrap();
+
+        let sent = provider.sent_attachments().await;
+        assert_eq!(sent.len(), 1, "exactly one send happened");
+        assert_eq!(sent[0].len(), 1, "the attachment never left the app");
+        assert_eq!(sent[0][0].path, "/tmp/shot.png");
     }
 
     #[tokio::test]

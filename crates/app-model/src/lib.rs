@@ -160,6 +160,43 @@ pub struct ContextWindowOption {
     pub max_tokens: Option<u64>,
 }
 
+/// A file attached to a prompt.
+///
+/// Screenshots are how interface defects get reported, so a session that
+/// cannot receive one cannot be used to work on a user interface.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct PromptAttachment {
+    /// Absolute path to the attached file.
+    pub path: String,
+    /// Label shown in the composer.
+    pub display_name: String,
+}
+
+impl PromptAttachment {
+    /// Build an attachment from a chosen path.
+    #[must_use]
+    pub fn from_path(path: &std::path::Path) -> Self {
+        let display_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment")
+            .to_owned();
+        Self {
+            path: path.to_string_lossy().into_owned(),
+            display_name,
+        }
+    }
+
+    /// Whether the file extension names an image the runtime can read.
+    #[must_use]
+    pub fn is_image(&self) -> bool {
+        let lowered = self.path.to_lowercase();
+        [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]
+            .iter()
+            .any(|extension| lowered.ends_with(extension))
+    }
+}
+
 /// Where a new session runs.
 ///
 /// A worktree gives the session its own checkout so parallel sessions in one

@@ -7,8 +7,8 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    ContextWindowOption, InteractionKind, InteractionResponse, ProjectMetadata, SessionKind,
-    SessionLocation, SessionSnapshot, SessionStatus, TranscriptRole, TranscriptState,
+    ContextWindowOption, InteractionKind, InteractionResponse, ProjectMetadata, PromptAttachment,
+    SessionKind, SessionLocation, SessionSnapshot, SessionStatus, TranscriptRole, TranscriptState,
 };
 use copilot_provider::{CopilotProvider, ProviderCompatibility};
 use diagnostics::{TracingDiagnostics, init_tracing};
@@ -106,6 +106,7 @@ enum ServiceCommand {
     Submit {
         app_session_id: Option<String>,
         prompt: String,
+        attachments: Vec<PromptAttachment>,
         project_path: PathBuf,
         model: Option<String>,
         mode: String,
@@ -396,6 +397,7 @@ async fn handle_service_command(
         ServiceCommand::Submit {
             app_session_id,
             prompt,
+            attachments,
             project_path,
             model,
             mode,
@@ -450,7 +452,7 @@ async fn handle_service_command(
                 .set_selected_session(Some(handle.id()))
                 .map_err(|error| error.to_string())?;
             handle
-                .send(prompt)
+                .send_with_attachments(prompt, attachments)
                 .await
                 .map_err(|error| error.to_string())?;
         }
@@ -794,6 +796,8 @@ struct SessionMvpView {
     composing_chat: bool,
     /// Where the next project session will run.
     draft_location: SessionLocation,
+    /// Files staged to travel with the next prompt.
+    draft_attachments: Vec<PromptAttachment>,
     /// Branch currently checked out in the selected project, refreshed when
     /// the selection changes so the composer never runs git per frame.
     project_branch: Option<String>,
@@ -931,6 +935,7 @@ impl SessionMvpView {
             chats_workspace,
             composing_chat: false,
             draft_location: SessionLocation::default(),
+            draft_attachments: Vec::new(),
             project_branch: None,
             transcript_scroll: gpui::ScrollHandle::new(),
             detail_scrolls: RefCell::new(HashMap::new()),
@@ -1107,6 +1112,7 @@ impl SessionMvpView {
     }
 
     fn submit_prompt(&mut self, prompt: String) {
+        let attachments = std::mem::take(&mut self.draft_attachments);
         self.action_error = None;
         let supported_efforts = self
             .draft_model
@@ -1127,6 +1133,7 @@ impl SessionMvpView {
         let _ = self.commands.send(ServiceCommand::Submit {
             app_session_id: self.selected_session.clone(),
             prompt,
+            attachments,
             project_path,
             model: self.draft_model.clone(),
             mode: self.draft_mode.clone(),
@@ -1664,10 +1671,109 @@ impl SessionMvpView {
         cx.notify();
     }
 
+    /// Chips for the files staged on the next prompt, each removable.
+    ///
+    /// Returns nothing when there is nothing attached so the composer keeps
+    /// its usual shape.
+    fn attachment_strip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.draft_attachments.is_empty() {
+            return None;
+        }
+        let chips: Vec<_> = self
+            .draft_attachments
+            .iter()
+            .map(|attachment| {
+                let path = attachment.path.clone();
+                let label = attachment.display_name.clone();
+                let icon = if attachment.is_image() { "IMG" } else { "FILE" };
+                div()
+                    .id(SharedString::from(format!("attachment-{path}")))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(SUBTLE))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(icon))
+                    .child(div().text_xs().text_color(rgb(PRIMARY)).child(label))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("remove-attachment-{path}")))
+                            .role(Role::Button)
+                            .aria_label("Remove attachment")
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("x")
+                            .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.remove_attachment(&path, cx);
+                            })),
+                    )
+            })
+            .collect();
+        Some(
+            div()
+                .id("attachment-strip")
+                .accessibility_id("attachment-strip")
+                .debug_selector(|| "attachment-strip".to_owned())
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .px_3()
+                .pb_2()
+                .children(chips),
+        )
+    }
+
+    /// Open a file chooser and attach what the user picks.
+    ///
+    /// Screenshots are the primary way interface defects get reported, so this
+    /// is the difference between a session that can work on the UI and one
+    /// that cannot.
+    fn pick_attachments(cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: None,
+        });
+        cx.spawn(async move |view, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                for path in paths {
+                    let attachment = PromptAttachment::from_path(&path);
+                    if !view
+                        .draft_attachments
+                        .iter()
+                        .any(|existing| existing.path == attachment.path)
+                    {
+                        view.draft_attachments.push(attachment);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Drop an attachment the user changed their mind about.
+    fn remove_attachment(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.draft_attachments
+            .retain(|attachment| attachment.path != path);
+        cx.notify();
+    }
+
     fn submit_composer(&mut self, cx: &mut Context<Self>) {
         let prompt = self.composer.read(cx).value();
         let prompt = prompt.trim();
-        if !prompt.is_empty() {
+        // An attachment alone is a complete message; a screenshot often says
+        // everything the user wants to say.
+        if !prompt.is_empty() || !self.draft_attachments.is_empty() {
             self.submit_prompt(prompt.to_owned());
             cx.notify();
         }
@@ -3582,6 +3688,7 @@ impl SessionMvpView {
             .rounded_lg()
             .shadow_lg()
             .child(self.composer.clone())
+            .children(self.attachment_strip(cx))
             .child(
                 div()
                     .flex()
@@ -3592,9 +3699,14 @@ impl SessionMvpView {
                     .child(
                         div()
                             .id("attachments-placeholder")
+                            .accessibility_id("attachments-placeholder")
+                            .role(Role::Button)
+                            .aria_label("Attach files")
                             .text_lg()
                             .text_color(rgb(MUTED))
-                            .child("+"),
+                            .child("+")
+                            .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
+                            .on_click(cx.listener(|_, _, _, cx| Self::pick_attachments(cx))),
                     )
                     .child(control_pill(
                         "mode",
@@ -3767,6 +3879,7 @@ impl SessionMvpView {
                     .border_color(rgb(BORDER))
                     .rounded_lg()
                     .child(self.composer.clone())
+                    .children(self.attachment_strip(cx))
                     .child(div().flex_1())
                     .child(
                         div()
@@ -3778,6 +3891,9 @@ impl SessionMvpView {
                             .child(
                                 div()
                                     .id("home-attachments-placeholder")
+                                    .accessibility_id("home-attachments-placeholder")
+                                    .role(Role::Button)
+                                    .aria_label("Attach files")
                                     .w(px(28.0))
                                     .h(px(28.0))
                                     .flex()
@@ -3786,7 +3902,11 @@ impl SessionMvpView {
                                     .rounded_md()
                                     .text_lg()
                                     .text_color(rgb(MUTED))
-                                    .child("+"),
+                                    .child("+")
+                                    .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
+                                    .on_click(
+                                        cx.listener(|_, _, _, cx| Self::pick_attachments(cx)),
+                                    ),
                             )
                             .child(control_pill(
                                 "mode",
@@ -5362,6 +5482,118 @@ mod tests {
             assert_eq!(project_path, std::path::PathBuf::from("/tmp/chats"));
             assert!(repository_root.is_none(), "a chat has no repository");
             assert!(base_ref.is_none(), "a chat has no changes base");
+        }
+
+        /// A staged attachment travels with the prompt it was staged on.
+        #[gpui::test]
+        fn submitting_carries_staged_attachments(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, _| {
+                view.draft_attachments
+                    .push(app_model::PromptAttachment::from_path(
+                        std::path::Path::new("/tmp/shot.png"),
+                    ));
+            });
+
+            view.update(cx, |view, _| view.submit_prompt("look".to_owned()));
+
+            let mut attachments = None;
+            while let Ok(command) = commands.try_recv() {
+                if let ServiceCommand::Submit {
+                    attachments: sent, ..
+                } = command
+                {
+                    attachments = Some(sent);
+                }
+            }
+            let attachments = attachments.expect("a submit command was sent");
+            assert_eq!(attachments.len(), 1, "the staged screenshot was dropped");
+            assert_eq!(attachments[0].path, "/tmp/shot.png");
+            assert_eq!(attachments[0].display_name, "shot.png");
+        }
+
+        /// Attachments belong to one prompt, not to every later prompt.
+        #[gpui::test]
+        fn attachments_do_not_repeat_on_the_next_prompt(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, _| {
+                view.draft_attachments
+                    .push(app_model::PromptAttachment::from_path(
+                        std::path::Path::new("/tmp/shot.png"),
+                    ));
+                view.submit_prompt("look".to_owned());
+                view.submit_prompt("and now".to_owned());
+            });
+
+            let mut sends = Vec::new();
+            while let Ok(command) = commands.try_recv() {
+                if let ServiceCommand::Submit { attachments, .. } = command {
+                    sends.push(attachments);
+                }
+            }
+            assert_eq!(sends.len(), 2, "both prompts were sent");
+            assert_eq!(sends[0].len(), 1);
+            assert!(
+                sends[1].is_empty(),
+                "the screenshot was resent with an unrelated follow-up"
+            );
+        }
+
+        /// An attachment on its own is a complete message.
+        #[gpui::test]
+        fn an_attachment_alone_can_be_submitted(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.draft_attachments
+                    .push(app_model::PromptAttachment::from_path(
+                        std::path::Path::new("/tmp/shot.png"),
+                    ));
+                view.submit_composer(cx);
+            });
+
+            let sent = std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, ServiceCommand::Submit { .. }));
+            assert!(sent, "an empty prompt with a screenshot sent nothing");
+        }
+
+        /// Removing an attachment takes it off the next prompt.
+        #[gpui::test]
+        fn removing_an_attachment_unstages_it(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.draft_attachments
+                    .push(app_model::PromptAttachment::from_path(
+                        std::path::Path::new("/tmp/shot.png"),
+                    ));
+                view.remove_attachment("/tmp/shot.png", cx);
+            });
+            view.update(cx, |view, _| {
+                assert!(view.draft_attachments.is_empty());
+            });
+        }
+
+        /// The chip strip only exists when something is attached.
+        #[gpui::test]
+        fn the_attachment_strip_appears_with_an_attachment(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds("attachment-strip").is_none(),
+                "the strip took up space with nothing attached"
+            );
+
+            view.update(cx, |view, cx| {
+                view.draft_attachments
+                    .push(app_model::PromptAttachment::from_path(
+                        std::path::Path::new("/tmp/shot.png"),
+                    ));
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds("attachment-strip").is_some(),
+                "the attached screenshot was never shown"
+            );
         }
 
         /// Choosing a project returns the composer to project mode.

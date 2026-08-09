@@ -4,8 +4,8 @@ use std::collections::HashMap;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 
 use app_model::{
-    InteractionRequest, InteractionResponse, SessionControls, ToolCatalog, ToolClass,
-    ToolDescriptor, ToolSource,
+    InteractionRequest, InteractionResponse, PromptAttachment, SessionControls, ToolCatalog,
+    ToolClass, ToolDescriptor, ToolSource,
 };
 use async_trait::async_trait;
 use copilot_provider::{
@@ -30,6 +30,7 @@ pub struct FakeProvider {
     fail_tool_discovery: AtomicBool,
     extra_tools: Mutex<Vec<String>>,
     omit_tools: Mutex<Vec<String>>,
+    sent_attachments: Mutex<Vec<Vec<PromptAttachment>>>,
 }
 
 impl FakeProvider {
@@ -63,6 +64,11 @@ impl FakeProvider {
     pub async fn omit_tools(&self, names: &[&str]) {
         let mut omit = self.omit_tools.lock().await;
         omit.extend(names.iter().map(|name| (*name).to_owned()));
+    }
+
+    /// Attachments carried by each send, in order.
+    pub async fn sent_attachments(&self) -> Vec<Vec<PromptAttachment>> {
+        self.sent_attachments.lock().await.clone()
     }
 
     async fn tool_names(&self) -> Vec<String> {
@@ -193,7 +199,16 @@ impl AgentProvider for FakeProvider {
         Ok(self.connect(sdk_session_id.to_owned()).await)
     }
 
-    async fn send(&self, sdk_session_id: &str, _prompt: &str) -> Result<String> {
+    async fn send(
+        &self,
+        sdk_session_id: &str,
+        _prompt: &str,
+        attachments: &[PromptAttachment],
+    ) -> Result<String> {
+        self.sent_attachments
+            .lock()
+            .await
+            .push(attachments.to_vec());
         let script = self.script.lock().await.clone();
         for event in script {
             self.emit(sdk_session_id, event).await?;
