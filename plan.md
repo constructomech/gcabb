@@ -508,7 +508,7 @@ Exit criteria:
 
 ### Phase 3b: Self-Hosting Parity (1-2 weeks)
 
-Status: next.
+Status: implemented, with one item revised against the runtime.
 
 Phase 3a proved GCABB can *perform* the self-hosting loop. Dogfooding GCABB to
 build GCABB then exposed a different problem: the work is not observable, and
@@ -527,10 +527,15 @@ The ordering below is by whether the gap blocks self-hosting outright.
   `+` control is currently an inert placeholder. Screenshots are the primary
   way UI defects are reported, so without this GCABB cannot be used to develop
   its own interface.
-- Give the user per-shell control. `stop_bash` exists in the runtime and
-  `TerminalSession` already models a cancelled state, but no UI reaches either,
-  so a runaway command can only be stopped by cancelling the whole session.
-  This completes the Phase 3a exit criterion about cancelling commands.
+- Give the user per-shell control. **Revised: not buildable as written.**
+  `stop_bash` is a tool the *model* calls, not a request a client can make; the
+  only client-side interruption the SDK exposes is a turn-wide abort. The
+  premise that "`stop_bash` exists in the runtime" conflated the model's tool
+  surface with the client's RPC surface. What the investigation did find was a
+  real defect: aborting left background shells displaying "running" forever,
+  because the runtime sends no completion event for shells it tears down. Abort
+  now settles them as cancelled. A true per-shell stop needs an RPC the runtime
+  does not currently offer.
 - Nest subagent activity under the task that spawned it. Events already carry
   `agentId` and `parentToolCallId`; delegated work currently appears as an
   unexplained pause.
@@ -553,6 +558,29 @@ Exit criteria:
 - Subagent work is attributable to the task that requested it.
 - Any capability the runtime does not provide is visible in the capabilities
   panel rather than surfacing as an unexplained failure.
+
+What shipped:
+
+- Tool activity is interleaved with messages in one timeline ordered by event
+  sequence, with per-entry scrollable detail blocks and subagent work nested
+  under the task that spawned it.
+- The transcript and every detail block have draggable scrollbars, and a scroll
+  gesture affects only the pane under the pointer.
+- Prompts carry file attachments, sent as paths so the runtime opens the file
+  itself. Attachments belong to the one prompt they were staged on.
+- Capability reporting was corrected in two ways found by reading a live
+  session's own report: `apply_patch` and `rg` were classified as unknown
+  tools, so the app claimed it could not edit or search while doing both; and a
+  chat was reported "blocked" for lacking a changes view it can never have.
+
+Still open, and deferred rather than done:
+
+- Detail blocks render in a proportional font, so commands, diffs, and columnar
+  output do not align.
+- Subagent nesting is exercised only with synthetic `subagent.started` events;
+  the field shape came from Phase 0 notes and has not been observed live.
+- Chats share one working directory, so concurrent chats can collide.
+- A true per-shell stop, if the runtime ever exposes one.
 
 ### Phase 4: Tagged Releases and Auto-Update (1-2 weeks)
 

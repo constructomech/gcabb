@@ -36,7 +36,8 @@ like a bug in GCABB rather than an accurate report of the model's context.
 ## Known gaps
 
 Phase 3a makes the loop work; it does not yet make it observable. Dogfooding
-GCABB against its own repository surfaced these, tracked as Phase 3b:
+GCABB against its own repository surfaced these. They are addressed in Phase 3b
+— see `docs/phase-3b/README.md`.
 
 - Tool invocations are projected and tested but never rendered, so a session
   shows prose and terminals while the edits, reads, and searches are invisible.
@@ -55,8 +56,8 @@ for the capabilities the loop depends on:
 | Capability | Proven by |
 | --- | --- |
 | File inspection | a tool whose class reads files (`str_replace_editor`, or `view`) |
-| File editing | a tool whose class writes files (`str_replace_editor`, or `create`/`edit`) |
-| Code search | `ToolClass::Search` (`glob`, `grep`) |
+| File editing | a tool whose class writes files (`str_replace_editor`, or `create`/`edit`/`apply_patch`) |
+| Code search | `ToolClass::Search` (`glob`, `grep`, `rg`) |
 | Terminal commands | `ToolClass::Shell` (`bash`) |
 | GitHub MCP | any tool with an MCP source |
 | Skills | `ToolClass::Skill` (`skill`) |
