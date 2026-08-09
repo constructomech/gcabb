@@ -42,6 +42,25 @@ const RED: u32 = 0x00f8_5161;
 const COMPACT_WIDTH: f32 = 920.0;
 /// Vertical budget for the detail blocks inside one tool entry.
 const ENTRY_DETAIL_BUDGET: f32 = 480.0;
+/// Measured thumb geometry for a scrollable region.
+struct ScrollbarGeometry {
+    track_top: gpui::Pixels,
+    thumb_top: f32,
+    thumb: f32,
+    usable: f32,
+    scrollable: f32,
+}
+
+/// A scrollbar drag in progress.
+#[derive(Clone, Debug)]
+struct ScrollbarDrag {
+    /// Which scrollable region is being dragged.
+    id: String,
+    /// Distance from the top of the thumb to the grab point, so the thumb
+    /// keeps its position under the pointer instead of recentring on it.
+    grab_offset: f32,
+}
+
 /// Smallest usable scrollbar thumb.
 const MIN_THUMB_HEIGHT: f32 = 24.0;
 /// Scrollbar id for the conversation itself.
@@ -789,7 +808,7 @@ struct SessionMvpView {
     ///
     /// Tracked on the view rather than the thumb so a drag keeps working once
     /// the pointer leaves the narrow track, which is most of the time.
-    dragging_scrollbar: Option<String>,
+    dragging_scrollbar: Option<ScrollbarDrag>,
     /// Transcript length last auto-scrolled for, so the view follows new
     /// output without fighting a user who has scrolled up to read.
     transcript_extent: (String, usize, usize),
@@ -2569,23 +2588,64 @@ impl SessionMvpView {
     /// The handle reports its own viewport bounds in window coordinates, which
     /// is what lets a thumb anywhere on screen be dragged without the element
     /// having to measure itself.
-    fn drag_scrollbar_to(&self, id: &str, pointer_y: gpui::Pixels) {
+    fn drag_scrollbar_to(&self, id: &str, pointer_y: gpui::Pixels, grab_offset: f32) {
         let Some(handle) = self.scroll_handle(id) else {
             return;
         };
+        let Some(geometry) = Self::scrollbar_geometry(&handle) else {
+            return;
+        };
+        let local = f32::from(pointer_y - geometry.track_top) - grab_offset;
+        let fraction = (local / geometry.usable).clamp(0.0, 1.0);
+        handle.set_offset(gpui::point(
+            handle.offset().x,
+            px(-(fraction * geometry.scrollable)),
+        ));
+    }
+
+    /// Where a scrollable region's thumb currently sits.
+    fn scrollbar_geometry(handle: &gpui::ScrollHandle) -> Option<ScrollbarGeometry> {
         let bounds = handle.bounds();
         let track = f32::from(bounds.size.height);
         let scrollable = f32::from(handle.max_offset().y);
         if track <= 0.0 || scrollable <= 0.0 {
-            return;
+            return None;
         }
-        // Centre the thumb on the pointer, so the grab point tracks the
-        // cursor instead of jumping to the top of the thumb.
         let thumb = (track * (track / (track + scrollable))).max(MIN_THUMB_HEIGHT);
         let usable = (track - thumb).max(1.0);
-        let local = f32::from(pointer_y - bounds.origin.y) - thumb / 2.0;
-        let fraction = (local / usable).clamp(0.0, 1.0);
-        handle.set_offset(gpui::point(handle.offset().x, px(-(fraction * scrollable))));
+        let scrolled = (-f32::from(handle.offset().y) / scrollable).clamp(0.0, 1.0);
+        Some(ScrollbarGeometry {
+            track_top: bounds.origin.y,
+            thumb_top: scrolled * usable,
+            thumb,
+            usable,
+            scrollable,
+        })
+    }
+
+    /// Begin a scrollbar drag, remembering where the thumb was grabbed.
+    ///
+    /// Pressing the track jumps the thumb under the pointer; pressing the
+    /// thumb keeps it where it is so the content does not lurch on grab.
+    fn begin_scrollbar_drag(&mut self, id: &str, pointer_y: gpui::Pixels) {
+        let Some(handle) = self.scroll_handle(id) else {
+            return;
+        };
+        let grab_offset = Self::scrollbar_geometry(&handle).map_or(0.0, |geometry| {
+            let local = f32::from(pointer_y - geometry.track_top);
+            let within_thumb =
+                local >= geometry.thumb_top && local <= geometry.thumb_top + geometry.thumb;
+            if within_thumb {
+                local - geometry.thumb_top
+            } else {
+                geometry.thumb / 2.0
+            }
+        });
+        self.dragging_scrollbar = Some(ScrollbarDrag {
+            id: id.to_owned(),
+            grab_offset,
+        });
+        self.drag_scrollbar_to(id, pointer_y, grab_offset);
     }
 
     /// A scrollbar for a scrollable region, shown while the pointer is over it.
@@ -2609,6 +2669,7 @@ impl SessionMvpView {
         let scrolled_fraction = (-f32::from(handle.offset().y) / scrollable).clamp(0.0, 1.0);
         let thumb_top = scrolled_fraction * (1.0 - visible_fraction);
         let track_id = id.to_owned();
+        let thumb_id = id.to_owned();
 
         Some(
             div()
@@ -2626,8 +2687,7 @@ impl SessionMvpView {
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
-                        view.dragging_scrollbar = Some(track_id.clone());
-                        view.drag_scrollbar_to(&track_id, event.position.y);
+                        view.begin_scrollbar_drag(&track_id, event.position.y);
                         cx.notify();
                     }),
                 )
@@ -2642,13 +2702,32 @@ impl SessionMvpView {
                 )
                 .child(
                     div()
+                        // The thumb sits above the track and would otherwise
+                        // swallow presses meant for it, so it carries the same
+                        // handlers rather than relying on the track's.
+                        .id(SharedString::from(format!("{id}-thumb")))
                         .absolute()
                         .top(gpui::relative(thumb_top))
                         .right(px(2.0))
-                        .w(px(6.0))
+                        .w(px(8.0))
                         .h(gpui::relative(visible_fraction))
                         .rounded_full()
-                        .bg(rgb(BORDER)),
+                        .bg(rgb(BORDER))
+                        .hover(|style| style.bg(rgb(MUTED)).cursor_pointer())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
+                                view.begin_scrollbar_drag(&thumb_id, event.position.y);
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|view, _, _, cx| {
+                                view.dragging_scrollbar = None;
+                                cx.notify();
+                            }),
+                        ),
                 ),
         )
     }
@@ -4104,9 +4183,9 @@ impl Render for SessionMvpView {
             // Scrollbar drags are tracked at the window so the thumb keeps
             // following the pointer once it leaves the narrow track.
             .on_mouse_move(cx.listener(|view, event: &gpui::MouseMoveEvent, _, cx| {
-                if let Some(id) = view.dragging_scrollbar.clone() {
+                if let Some(drag) = view.dragging_scrollbar.clone() {
                     if event.pressed_button == Some(MouseButton::Left) {
-                        view.drag_scrollbar_to(&id, event.position.y);
+                        view.drag_scrollbar_to(&drag.id, event.position.y, drag.grab_offset);
                         cx.notify();
                     } else {
                         view.dragging_scrollbar = None;
@@ -5639,7 +5718,9 @@ mod tests {
             );
             view.read_with(cx, |view, _| {
                 assert_eq!(
-                    view.dragging_scrollbar.as_deref(),
+                    view.dragging_scrollbar
+                        .as_ref()
+                        .map(|drag| drag.id.as_str()),
                     Some(super::super::TRANSCRIPT_SCROLL_ID),
                     "the press should begin a drag"
                 );
@@ -5655,6 +5736,122 @@ mod tests {
             view.read_with(cx, |view, _| {
                 assert!(view.dragging_scrollbar.is_none());
             });
+        }
+
+        /// Regression: the thumb sits above the track and swallowed presses, so
+        /// it could only be grabbed by clicking the sliver of track beside it.
+        #[gpui::test]
+        fn the_scrollbar_thumb_itself_can_be_grabbed(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for index in 0..120 {
+                    state.transcript.push(app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content: format!("message {index} with enough text to take a line"),
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                    });
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            // Auto-follow leaves the thumb at the bottom of its track.
+            let handle = view.read_with(cx, |view, _| view.transcript_scroll.clone());
+            let geometry = super::super::SessionMvpView::scrollbar_geometry(&handle)
+                .expect("the transcript should be scrollable");
+            let track = cx.debug_bounds("scrollbar").expect("scrollbar rendered");
+
+            // Press the middle of the thumb itself, not the track beside it.
+            let thumb_middle =
+                geometry.track_top + gpui::px(geometry.thumb_top + geometry.thumb / 2.0);
+            cx.simulate_mouse_down(
+                gpui::point(track.center().x, thumb_middle),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(
+                    view.dragging_scrollbar.is_some(),
+                    "pressing the thumb must start a drag"
+                );
+            });
+
+            // Grabbing the middle of the thumb must not move the content; the
+            // grab point is preserved rather than recentred on the pointer.
+            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let expected = -(geometry.thumb_top / geometry.usable * geometry.scrollable);
+            assert!(
+                (f32::from(after) - expected).abs() < 2.0,
+                "grabbing the thumb should not lurch: {after:?} vs {expected}"
+            );
+        }
+
+        /// Regression: the drag recentred the thumb on the pointer, so grabbing
+        /// it anywhere but the exact middle made the content jump before the
+        /// drag had moved at all.
+        #[gpui::test]
+        fn grabbing_the_thumb_off_centre_does_not_jump(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for index in 0..120 {
+                    state.transcript.push(app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content: format!("message {index} with enough text to take a line"),
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                    });
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            // Move off the bottom so the thumb has room either side of it.
+            view.update(cx, |view, _| {
+                view.drag_scrollbar_to(
+                    super::super::TRANSCRIPT_SCROLL_ID,
+                    view.transcript_scroll.bounds().origin.y + gpui::px(200.0),
+                    0.0,
+                );
+            });
+            cx.run_until_parked();
+
+            let before = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let handle = view.read_with(cx, |view, _| view.transcript_scroll.clone());
+            let geometry =
+                super::super::SessionMvpView::scrollbar_geometry(&handle).expect("scrollable");
+            let track = cx.debug_bounds("scrollbar").expect("scrollbar rendered");
+
+            // Press near the top edge of the thumb rather than its centre.
+            let near_thumb_top = geometry.track_top + gpui::px(geometry.thumb_top + 2.0);
+            cx.simulate_mouse_down(
+                gpui::point(track.center().x, near_thumb_top),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            cx.run_until_parked();
+
+            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert!(
+                (f32::from(after) - f32::from(before)).abs() < 4.0,
+                "pressing the thumb must not move the content: {before:?} -> {after:?}"
+            );
         }
 
         /// Regression: command output was clipped inside a tool entry, so the
