@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
@@ -38,6 +40,11 @@ const BLUE: u32 = 0x0058_a6ff;
 const AMBER: u32 = 0x00d2_9900;
 const RED: u32 = 0x00f8_5161;
 const COMPACT_WIDTH: f32 = 920.0;
+/// Vertical budget for the detail blocks inside one tool entry.
+const ENTRY_DETAIL_BUDGET: f32 = 480.0;
+/// The command never takes more than a third of that budget, so output — the
+/// part worth reading — always gets the majority.
+const COMMAND_BLOCK_HEIGHT: f32 = ENTRY_DETAIL_BUDGET / 3.0;
 
 /// Desktop-environment application identifier. On Wayland this becomes the
 /// `xdg_toplevel` app ID and on X11 the `WM_CLASS`; both are used to match the
@@ -764,6 +771,9 @@ struct SessionMvpView {
     project_branch: Option<String>,
     /// Scroll position of the transcript.
     transcript_scroll: gpui::ScrollHandle,
+    /// Scroll positions of the detail blocks inside tool entries, keyed by
+    /// block id so each keeps its position across renders.
+    detail_scrolls: RefCell<HashMap<String, gpui::ScrollHandle>>,
     /// Transcript length last auto-scrolled for, so the view follows new
     /// output without fighting a user who has scrolled up to read.
     transcript_extent: (String, usize, usize),
@@ -883,6 +893,7 @@ impl SessionMvpView {
             draft_location: SessionLocation::default(),
             project_branch: None,
             transcript_scroll: gpui::ScrollHandle::new(),
+            detail_scrolls: RefCell::new(HashMap::new()),
             transcript_extent: (String::new(), 0, 0),
             restore_failures: Vec::new(),
             updates: service.updates,
@@ -2514,6 +2525,81 @@ impl SessionMvpView {
             )
     }
 
+    /// A bounded, scrollable block of detail inside a tool entry.
+    ///
+    /// Commands, diffs, and output are frequently taller than any sensible
+    /// entry. Clipping them hid the interesting part; scrolling keeps the
+    /// entry compact while leaving the whole thing reachable.
+    ///
+    /// The block consumes its own wheel events so scrolling inside it does not
+    /// also scroll the transcript behind it, and draws a thumb on hover
+    /// because there is no platform scrollbar behind an overflow container.
+    fn detail_block(&self, id: &str, content: String, max_height: f32) -> impl IntoElement {
+        let handle = self
+            .detail_scrolls
+            .borrow_mut()
+            .entry(id.to_owned())
+            .or_default()
+            .clone();
+
+        // Thumb geometry from the handle: the visible fraction sets its
+        // height, the scrolled fraction sets its position.
+        let scrollable = f32::from(handle.max_offset().y);
+        let content_height = max_height + scrollable;
+        let visible_fraction = (max_height / content_height).clamp(0.05, 1.0);
+        let scrolled_fraction = if scrollable > 0.0 {
+            (-f32::from(handle.offset().y) / scrollable).clamp(0.0, 1.0)
+        } else {
+            0.0
+        };
+        let thumb_height = (max_height * visible_fraction).max(24.0);
+        let thumb_top = (max_height - thumb_height) * scrolled_fraction;
+        let group = SharedString::from(format!("scroll-{id}"));
+        let needs_thumb = scrollable > 1.0;
+
+        div()
+            .id(SharedString::from(format!("{id}-frame")))
+            .group(group.clone())
+            .relative()
+            .mt_1()
+            .w_full()
+            .child(
+                div()
+                    .id(SharedString::from(id.to_owned()))
+                    .debug_selector(|| "tool-detail".to_owned())
+                    .track_scroll(&handle)
+                    .max_h(px(max_height))
+                    .w_full()
+                    .overflow_y_scroll()
+                    // Without this the transcript scrolls too, so reading a
+                    // command's output dragged the whole conversation along.
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(PANEL))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(content),
+            )
+            .when(needs_thumb, |frame| {
+                frame.child(
+                    div()
+                        .absolute()
+                        .top(px(thumb_top))
+                        .right(px(2.0))
+                        .w(px(6.0))
+                        .h(px(thumb_height))
+                        .rounded_full()
+                        .bg(rgb(BORDER))
+                        // Only shown while the pointer is over this block, so
+                        // resting entries stay quiet.
+                        .opacity(0.0)
+                        .group_hover(group, |style| style.opacity(1.0)),
+                )
+            })
+    }
+
     /// A tool call in the timeline, with its nested subagent work.
     ///
     /// This is what makes a session observable: without it the transcript
@@ -2521,6 +2607,7 @@ impl SessionMvpView {
     /// commands it actually ran stay invisible.
     #[allow(clippy::too_many_lines)]
     fn tool_entry(
+        &self,
         invocation: &app_model::ToolInvocation,
         children: &[&app_model::ToolInvocation],
     ) -> impl IntoElement {
@@ -2640,24 +2727,24 @@ impl SessionMvpView {
                         entry.child(div().text_xs().text_color(rgb(RED)).child(error))
                     })
                     .when_some(detail, |entry, detail| {
-                        entry.child(detail_block(
-                            format!("tool-detail-{}", invocation.call_id),
+                        entry.child(self.detail_block(
+                            &format!("tool-detail-{}", invocation.call_id),
                             detail,
-                            160.0,
+                            COMMAND_BLOCK_HEIGHT,
                         ))
                     })
                     .when_some(diff, |entry, diff| {
-                        entry.child(detail_block(
-                            format!("tool-diff-{}", invocation.call_id),
+                        entry.child(self.detail_block(
+                            &format!("tool-diff-{}", invocation.call_id),
                             diff,
-                            220.0,
+                            ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
                         ))
                     })
                     .when_some(output, |entry, output| {
-                        entry.child(detail_block(
-                            format!("tool-output-{}", invocation.call_id),
+                        entry.child(self.detail_block(
+                            &format!("tool-output-{}", invocation.call_id),
                             output,
-                            180.0,
+                            ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
                         ))
                     })
                     .when(!nested.is_empty(), |entry| {
@@ -2776,7 +2863,7 @@ impl SessionMvpView {
                         .snapshot
                         .tool_activity
                         .children_of(&invocation.call_id);
-                    Self::tool_entry(invocation, &children).into_any_element()
+                    self.tool_entry(invocation, &children).into_any_element()
                 }
             })
             .collect::<Vec<_>>();
@@ -4087,28 +4174,6 @@ impl Render for SessionMvpView {
     }
 }
 
-/// A bounded, scrollable block of detail inside a tool entry.
-///
-/// Commands, diffs, and output are frequently taller than any sensible entry.
-/// Clipping them hid the interesting part; scrolling keeps the entry compact
-/// while leaving the whole thing reachable.
-fn detail_block(id: String, content: String, max_height: f32) -> impl IntoElement {
-    div()
-        .id(SharedString::from(id))
-        .debug_selector(|| "tool-detail".to_owned())
-        .mt_1()
-        .max_h(px(max_height))
-        .w_full()
-        .overflow_y_scroll()
-        .px_2()
-        .py_1()
-        .rounded_md()
-        .bg(rgb(PANEL))
-        .text_xs()
-        .text_color(rgb(MUTED))
-        .child(content)
-}
-
 /// Trailing slice of terminal output kept for display.
 ///
 /// Phase 3 renders a bounded tail; Phase 6 replaces this with the virtualized
@@ -5272,6 +5337,109 @@ mod tests {
             });
         }
 
+        /// The command block is capped at a third of the entry budget, so a
+        /// long script cannot crowd out the output worth reading.
+        #[test]
+        fn command_block_is_capped_at_a_third_of_the_entry() {
+            assert!(
+                (super::super::COMMAND_BLOCK_HEIGHT - super::super::ENTRY_DETAIL_BUDGET / 3.0)
+                    .abs()
+                    < f32::EPSILON
+            );
+            let output_height =
+                super::super::ENTRY_DETAIL_BUDGET - super::super::COMMAND_BLOCK_HEIGHT;
+            assert!(
+                output_height > super::super::COMMAND_BLOCK_HEIGHT * 1.9,
+                "output should get the majority of the budget"
+            );
+        }
+
+        /// Regression: scrolling a tool's output also scrolled the transcript
+        /// behind it, dragging the whole conversation along.
+        #[gpui::test]
+        fn scrolling_output_does_not_scroll_the_transcript(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                let mut sequence = 0;
+                let mut apply =
+                    |raw: &serde_json::Value, state: &mut app_model::SessionSnapshot| {
+                        sequence += 1;
+                        state.apply(app_model::DomainEvent::from_sdk_event_for(
+                            "session-1",
+                            sequence,
+                            raw,
+                        ));
+                    };
+                // Enough messages that the transcript itself can scroll.
+                for index in 0..60 {
+                    apply(
+                        &serde_json::json!({"id": format!("u{index}"), "type":"user.message",
+                            "data":{"content": format!("message {index}")}}),
+                        &mut state,
+                    );
+                }
+                apply(
+                    &serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"bash",
+                                "arguments":{"command":"seq 1 500"},
+                                "shellToolInfo":{"displayCommand":"seq 1 500",
+                                                 "hasWriteFileRedirection":false,
+                                                 "possiblePaths":[]}}}),
+                    &mut state,
+                );
+                let output = (1..=500)
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                apply(
+                    &serde_json::json!({"id":"p","type":"tool.execution_partial_result",
+                        "data":{"toolCallId":"c1","partialOutput": output}}),
+                    &mut state,
+                );
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let wheel = |position, cx: &mut VisualTestContext| {
+                cx.simulate_event(gpui::ScrollWheelEvent {
+                    position,
+                    delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(120.0))),
+                    modifiers: Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                });
+                cx.run_until_parked();
+            };
+
+            // Control: over the transcript itself, the wheel must scroll it.
+            // Without this the assertion below could pass on a transcript that
+            // never scrolls at all.
+            let transcript = cx.debug_bounds("transcript").expect("transcript rendered");
+            let before = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            wheel(
+                gpui::point(transcript.center().x, transcript.origin.y + gpui::px(8.0)),
+                cx,
+            );
+            let after_transcript = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert_ne!(
+                before, after_transcript,
+                "the control case must scroll the transcript"
+            );
+
+            // Over a tool entry's output, only the block moves.
+            let block = cx
+                .debug_bounds("tool-detail")
+                .expect("output block rendered");
+            wheel(block.center(), cx);
+            let after_block = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert_eq!(
+                after_transcript, after_block,
+                "the transcript must not move when scrolling inside a tool entry"
+            );
+        }
+
         /// Regression: command output was clipped inside a tool entry, so the
         /// end of a long run was unreachable.
         #[gpui::test]
@@ -5316,9 +5484,11 @@ mod tests {
             let bounds = cx
                 .debug_bounds("tool-detail")
                 .expect("output block rendered");
-            // A clipped block stays put; a scrollable one moves.
+            // The block is bounded, so 500 lines of output cannot stretch the
+            // entry to the height of the conversation.
+            let budget = super::super::ENTRY_DETAIL_BUDGET - super::super::COMMAND_BLOCK_HEIGHT;
             assert!(
-                bounds.size.height <= gpui::px(180.0),
+                bounds.size.height <= gpui::px(budget),
                 "the entry stays compact, got {:?}",
                 bounds.size.height
             );
