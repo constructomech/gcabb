@@ -82,8 +82,10 @@ impl ToolClass {
         match tool_name {
             "str_replace_editor" => Self::FileEditor,
             "view" => Self::FileRead,
-            "create" | "edit" | "write" => Self::FileWrite,
-            "grep" | "glob" => Self::Search,
+            // `apply_patch` is how this runtime actually edits files; omitting
+            // it made the app report that it could not write files at all.
+            "create" | "edit" | "write" | "apply_patch" | "multi_edit" => Self::FileWrite,
+            "grep" | "glob" | "rg" | "ripgrep" => Self::Search,
             "bash" | "powershell" | "local_shell" => Self::Shell,
             "read_bash" | "stop_bash" | "list_bash" => Self::ShellControl,
             "web_fetch" | "web_search" | "fetch_copilot_cli_documentation" => Self::Web,
@@ -111,6 +113,22 @@ impl ToolClass {
     #[must_use]
     pub const fn writes_files(self) -> bool {
         matches!(self, Self::FileWrite | Self::FileEditor)
+    }
+}
+
+#[cfg(test)]
+mod classification_tests {
+    use super::ToolClass;
+
+    /// Observed live: this runtime edits files with `apply_patch` and searches
+    /// with `rg`. Classifying them as `Other` made the app report that it
+    /// could not write files while it was writing files.
+    #[test]
+    fn the_tools_this_runtime_actually_ships_are_classified() {
+        assert_eq!(ToolClass::classify("apply_patch"), ToolClass::FileWrite);
+        assert!(ToolClass::classify("apply_patch").writes_files());
+        assert_eq!(ToolClass::classify("rg"), ToolClass::Search);
+        assert_eq!(ToolClass::classify("grep"), ToolClass::Search);
     }
 }
 

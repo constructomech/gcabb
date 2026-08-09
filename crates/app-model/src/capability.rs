@@ -8,6 +8,7 @@
 
 use serde::{Deserialize, Serialize};
 
+use crate::SessionKind;
 use crate::tools::{ToolCatalog, ToolClass};
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -117,9 +118,21 @@ impl CapabilityReport {
     /// diffs, so it must not be reported as blocking.
     #[must_use]
     pub fn blocking(&self) -> Vec<&Capability> {
+        self.blocking_for(SessionKind::Project)
+    }
+
+    /// Blocking capabilities, judged against what the session is trying to do.
+    ///
+    /// A chat has no checkout, so an unavailable changes view is not a failure
+    /// it suffered -- it is a thing it never asked for. Reporting it as
+    /// blocked told the user something was broken when nothing was.
+    #[must_use]
+    pub fn blocking_for(&self, kind: SessionKind) -> Vec<&Capability> {
         self.capabilities
             .iter()
-            .filter(|capability| Self::is_required(capability.id) && capability.is_blocking())
+            .filter(|capability| {
+                Self::is_required_for(capability.id, kind) && capability.is_blocking()
+            })
             .collect()
     }
 
@@ -135,14 +148,21 @@ impl CapabilityReport {
     /// Whether a capability is required for the self-hosting loop.
     #[must_use]
     pub const fn is_required(id: CapabilityId) -> bool {
-        matches!(
-            id,
+        Self::is_required_for(id, SessionKind::Project)
+    }
+
+    /// Whether a capability is required for a session of this kind.
+    #[must_use]
+    pub const fn is_required_for(id: CapabilityId, kind: SessionKind) -> bool {
+        match id {
             CapabilityId::FileRead
-                | CapabilityId::FileWrite
-                | CapabilityId::Search
-                | CapabilityId::Shell
-                | CapabilityId::Changes
-        )
+            | CapabilityId::FileWrite
+            | CapabilityId::Search
+            | CapabilityId::Shell => true,
+            // Reviewing a diff needs a checkout to diff against.
+            CapabilityId::Changes => matches!(kind, SessionKind::Project),
+            _ => false,
+        }
     }
 
     #[must_use]

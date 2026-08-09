@@ -1664,6 +1664,53 @@ mod tests {
         assert!(!report.is_self_hosting_ready());
     }
 
+    /// A chat has no checkout, so an absent changes view is not a defect it
+    /// suffered. Counting it as blocked told the user something was broken
+    /// when the session was working exactly as designed.
+    #[test]
+    fn a_chat_is_not_blocked_by_having_no_changes_view() {
+        let mut report = CapabilityReport::default();
+        for id in [
+            CapabilityId::FileRead,
+            CapabilityId::FileWrite,
+            CapabilityId::Search,
+            CapabilityId::Shell,
+        ] {
+            report.set(Capability {
+                id,
+                status: CapabilityStatus::Available,
+                detail: String::new(),
+                evidence: Vec::new(),
+            });
+        }
+        report.set(Capability {
+            id: CapabilityId::Changes,
+            status: CapabilityStatus::Unavailable,
+            detail: "Chats are not attached to a repository.".to_owned(),
+            evidence: Vec::new(),
+        });
+
+        assert!(
+            report.blocking_for(SessionKind::Chat).is_empty(),
+            "a chat was reported blocked for lacking a repository it never had"
+        );
+        // The same report on a project session is a genuine problem.
+        assert_eq!(report.blocking_for(SessionKind::Project).len(), 1);
+    }
+
+    /// A missing shell blocks any session, chat or not.
+    #[test]
+    fn a_chat_is_still_blocked_by_a_missing_shell() {
+        let mut report = CapabilityReport::default();
+        report.set(Capability {
+            id: CapabilityId::Shell,
+            status: CapabilityStatus::Unavailable,
+            detail: "no shell tool".to_owned(),
+            evidence: Vec::new(),
+        });
+        assert_eq!(report.blocking_for(SessionKind::Chat).len(), 1);
+    }
+
     #[test]
     fn failed_discovery_leaves_capabilities_unknown_with_the_reason() {
         let catalog = ToolCatalog {

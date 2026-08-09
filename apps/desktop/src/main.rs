@@ -4550,7 +4550,11 @@ fn changes_badge(session: Option<&SessionProjection>) -> String {
         |session| {
             let changed = session.snapshot.changes.files.len();
             let terminals = session.snapshot.tool_activity.active_terminals().len();
-            let blocking = session.snapshot.capabilities.blocking().len();
+            let blocking = session
+                .snapshot
+                .capabilities
+                .blocking_for(session.snapshot.metadata.kind)
+                .len();
             let mut parts = vec![format!("{changed} changed")];
             if terminals > 0 {
                 parts.push(format!("{terminals} running"));
