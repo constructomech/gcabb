@@ -762,6 +762,11 @@ struct SessionMvpView {
     /// Branch currently checked out in the selected project, refreshed when
     /// the selection changes so the composer never runs git per frame.
     project_branch: Option<String>,
+    /// Scroll position of the transcript.
+    transcript_scroll: gpui::ScrollHandle,
+    /// Transcript length last auto-scrolled for, so the view follows new
+    /// output without fighting a user who has scrolled up to read.
+    transcript_extent: (String, usize, usize),
     restore_failures: Vec<RestoreFailure>,
     updates: Receiver<ServiceUpdate>,
     commands: Sender<ServiceCommand>,
@@ -787,6 +792,7 @@ struct SessionMvpView {
 }
 
 impl SessionMvpView {
+    #[allow(clippy::too_many_lines)]
     fn new(
         service: AppService,
         project_root: PathBuf,
@@ -876,6 +882,8 @@ impl SessionMvpView {
             composing_chat: false,
             draft_location: SessionLocation::default(),
             project_branch: None,
+            transcript_scroll: gpui::ScrollHandle::new(),
+            transcript_extent: (String::new(), 0, 0),
             restore_failures: Vec::new(),
             updates: service.updates,
             commands,
@@ -1105,6 +1113,36 @@ impl SessionMvpView {
                 || "No project".to_owned(),
                 |project| project.name.clone(),
             )
+    }
+
+    /// Keep the newest output in view as it arrives.
+    ///
+    /// Only scrolls when the transcript actually grew, so a user who has
+    /// scrolled up to read earlier output is not yanked back to the bottom on
+    /// every frame. Switching sessions also scrolls, so a session never opens
+    /// showing the middle of a conversation.
+    fn follow_transcript_tail(&mut self) {
+        let Some(session) = self.selected() else {
+            return;
+        };
+        let extent = (
+            session.snapshot.metadata.id.clone(),
+            session.snapshot.transcript.len(),
+            session
+                .snapshot
+                .transcript
+                .last()
+                .map_or(0, |message| message.content.len()),
+        );
+        if extent == self.transcript_extent {
+            return;
+        }
+        let switched_session = extent.0 != self.transcript_extent.0;
+        let grew = extent.1 > self.transcript_extent.1 || extent.2 > self.transcript_extent.2;
+        self.transcript_extent = extent;
+        if switched_session || grew {
+            self.transcript_scroll.scroll_to_bottom();
+        }
     }
 
     /// Branch shown beside the location pill.
@@ -2509,67 +2547,71 @@ impl SessionMvpView {
                         ),
                 );
         };
-        let messages = session
-            .snapshot
-            .transcript
-            .iter()
-            .rev()
-            .take(60)
-            .rev()
-            .map(|message| {
-                let is_user = message.role == TranscriptRole::User;
-                let speaker = if is_user { "You" } else { "Copilot" };
-                div()
-                    .id(SharedString::from(format!("message-{}", message.id)))
-                    .accessibility_id(message.id.clone())
-                    .role(Role::ListItem)
-                    .aria_label(format!("{speaker}: {}", message.content))
-                    .flex()
-                    .w_full()
-                    .justify_end()
-                    .when(!is_user, gpui::Styled::justify_start)
-                    .child(
-                        div()
-                            .max_w(px(760.0))
-                            .p_3()
-                            .rounded_lg()
-                            .bg(if is_user { rgb(ELEVATED) } else { rgb(PANEL) })
-                            .border_1()
-                            .border_color(rgb(BORDER))
-                            .child(
+        // The whole conversation is rendered now that the transcript scrolls;
+        // capping it would put a wall part-way up the scrollback. Phase 6
+        // replaces this with the virtualized list.
+        let messages = session.snapshot.transcript.iter().map(|message| {
+            let is_user = message.role == TranscriptRole::User;
+            let speaker = if is_user { "You" } else { "Copilot" };
+            div()
+                .id(SharedString::from(format!("message-{}", message.id)))
+                .accessibility_id(message.id.clone())
+                .role(Role::ListItem)
+                .aria_label(format!("{speaker}: {}", message.content))
+                .flex()
+                .w_full()
+                .justify_end()
+                .when(!is_user, gpui::Styled::justify_start)
+                .child(
+                    div()
+                        .max_w(px(760.0))
+                        .p_3()
+                        .rounded_lg()
+                        .bg(if is_user { rgb(ELEVATED) } else { rgb(PANEL) })
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
+                                .child(if is_user { "You" } else { "Copilot" }),
+                        )
+                        .child(
+                            div()
+                                .mt_2()
+                                .text_color(rgb(PRIMARY))
+                                .child(message.content.clone()),
+                        )
+                        .when(message.state == TranscriptState::Interrupted, |bubble| {
+                            bubble.child(div().mt_1().text_xs().text_color(rgb(AMBER)).child(
+                                "Interrupted — the model does not have this \
+                                             in its context",
+                            ))
+                        })
+                        .when(message.state == TranscriptState::Streaming, |bubble| {
+                            bubble.child(
                                 div()
+                                    .mt_1()
                                     .text_xs()
-                                    .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
-                                    .child(if is_user { "You" } else { "Copilot" }),
+                                    .text_color(rgb(MUTED))
+                                    .child("Streaming..."),
                             )
-                            .child(
-                                div()
-                                    .mt_2()
-                                    .text_color(rgb(PRIMARY))
-                                    .child(message.content.clone()),
-                            )
-                            .when(message.state == TranscriptState::Streaming, |bubble| {
-                                bubble.child(
-                                    div()
-                                        .mt_1()
-                                        .text_xs()
-                                        .text_color(rgb(MUTED))
-                                        .child("Streaming..."),
-                                )
-                            }),
-                    )
-            });
+                        }),
+                )
+        });
         div()
             .id("transcript")
+            .debug_selector(|| "transcript".to_owned())
             .role(Role::List)
             .aria_label("Conversation")
+            .track_scroll(&self.transcript_scroll)
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
             .p_5()
             .gap_3()
-            .overflow_hidden()
+            .overflow_y_scroll()
             .children(messages)
     }
 
@@ -3602,6 +3644,7 @@ impl SessionMvpView {
 impl Render for SessionMvpView {
     #[allow(clippy::too_many_lines)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
+        self.follow_transcript_tail();
         let (provider_status, provider_color) = self.provider_status();
         let compact = compact_layout(f32::from(window.viewport_size().width));
         let show_sidebar = self.sidebar_open;
@@ -4976,6 +5019,89 @@ mod tests {
                 assert!(view.targets_chat());
                 assert_eq!(view.composer_project_label(), "Chat");
             });
+        }
+
+        /// Regression: the transcript clipped its overflow, so a long
+        /// conversation ran off the bottom of the window with no way to reach
+        /// it. It must scroll, and follow new output as it arrives.
+        #[gpui::test]
+        fn transcript_scrolls_and_follows_new_output(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for index in 0..80 {
+                    state.transcript.push(app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content: format!("message {index} with enough text to take a line"),
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                    });
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            // Auto-follow leaves the view at the tail, so scroll back up.
+            let before = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert!(
+                before < gpui::px(0.0),
+                "the transcript should be scrolled to the newest output, got {before:?}"
+            );
+            // A wheel event over the transcript must move it. A clipped
+            // container swallows the event and the offset stays put.
+            let bounds = cx.debug_bounds("transcript").expect("transcript rendered");
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: bounds.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(400.0))),
+                modifiers: Modifiers::none(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert!(
+                after > before,
+                "scrolling up must move the transcript: {before:?} -> {after:?}"
+            );
+
+            // Every message is rendered, so scrolling up reaches the start.
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected().unwrap().snapshot.transcript.len(), 80);
+            });
+        }
+
+        /// Switching sessions and receiving new output both scroll to the tail,
+        /// but an unchanged transcript does not, so reading is not interrupted.
+        #[gpui::test]
+        fn transcript_only_follows_when_it_grows(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "m0".to_owned(),
+                    role: app_model::TranscriptRole::Assistant,
+                    content: "first".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            // The first render adopts the session and records its extent.
+            let extent = view.read_with(cx, |view, _| view.transcript_extent.clone());
+            assert_eq!(extent.0, "session-1");
+            assert_eq!(extent.1, 1);
+
+            // Re-rendering without new output leaves the recorded extent alone.
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+            let unchanged = view.read_with(cx, |view, _| view.transcript_extent.clone());
+            assert_eq!(unchanged, extent);
         }
 
         /// Regression: selecting a chat repointed the project selection at the

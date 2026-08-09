@@ -18,6 +18,21 @@ GCABB can complete the edit-command-result-diff loop on its own repository:
 See [tool-surface.md](tool-surface.md) for the verified inventory of what the
 runtime provides and how it compares to other harnesses.
 
+## Transcript
+
+The transcript scrolls and follows new output as it streams, returning to the
+tail when a session is opened or when output grows. It deliberately does not
+scroll when the transcript is unchanged, so reading earlier output is not
+interrupted by re-renders. The whole conversation is rendered; Phase 6 replaces
+this with a virtualized list.
+
+Output that was streaming when a turn was cancelled is marked **interrupted**
+rather than left looking like ordinary conversation. The runtime only writes an
+`assistant.message` when a turn completes, so cancelled output never enters the
+session history and the model cannot see it on the next turn. Showing it
+unmarked made a later "I don't have the earlier part of the story" question look
+like a bug in GCABB rather than an accurate report of the model's context.
+
 ## Known gaps
 
 Phase 3a makes the loop work; it does not yet make it observable. Dogfooding

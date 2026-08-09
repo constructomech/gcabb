@@ -78,6 +78,13 @@ pub enum TranscriptRole {
 pub enum TranscriptState {
     Streaming,
     Complete,
+    /// Streaming stopped before the runtime committed the message.
+    ///
+    /// The partial text stays on screen because the user saw it, but the
+    /// runtime never wrote an `assistant.message` for it, so the model cannot
+    /// see it on the next turn. Marking it keeps the transcript honest about
+    /// what is actually in context.
+    Interrupted,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -423,6 +430,9 @@ impl SessionSnapshot {
             SessionStatus::Waiting
         };
         project_transcript(&mut self.transcript, &event);
+        if is_abort(&event) {
+            mark_streaming_interrupted(&mut self.transcript);
+        }
         tools::project(&mut self.tool_activity, &event);
         if self.status == SessionStatus::Failed {
             self.last_error = Some(event.summary.clone());
@@ -579,6 +589,22 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
             }
         }
         _ => {}
+    }
+}
+
+/// Whether an event ends the current turn without completing it.
+fn is_abort(event: &DomainEvent) -> bool {
+    event.source_type == "abort"
+        || (event.source_type == "session.idle" && event.state == ActivityState::Cancelled)
+}
+
+/// Mark any still-streaming assistant message as interrupted.
+fn mark_streaming_interrupted(transcript: &mut [TranscriptMessage]) {
+    for message in transcript
+        .iter_mut()
+        .filter(|message| message.state == TranscriptState::Streaming)
+    {
+        message.state = TranscriptState::Interrupted;
     }
 }
 
@@ -1146,6 +1172,56 @@ mod tests {
             CapabilityStatus::Unavailable
         );
         assert!(!report.is_self_hosting_ready());
+    }
+
+    /// Cancelling mid-stream leaves partial text on screen that the runtime
+    /// never committed, so the next turn cannot see it. The transcript must
+    /// say so rather than showing it as ordinary conversation.
+    #[test]
+    fn aborting_marks_streaming_output_as_interrupted() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"u","type":"user.message","data":{"content":"write a story"}}),
+                json!({"id":"s","type":"assistant.message_start","data":{"messageId":"m"}}),
+                json!({"id":"d","type":"assistant.message_delta",
+                       "data":{"messageId":"m","deltaContent":"# The Ascendance"}}),
+                json!({"id":"a","type":"abort","data":{"reason":"user_initiated"}}),
+            ],
+        );
+
+        let message = state
+            .transcript
+            .iter()
+            .find(|message| message.role == TranscriptRole::Assistant)
+            .expect("assistant message");
+        assert_eq!(message.state, TranscriptState::Interrupted);
+        // The text the user saw is kept; only its status changes.
+        assert_eq!(message.content, "# The Ascendance");
+    }
+
+    /// A completed message must not be relabelled by a later cancellation.
+    #[test]
+    fn aborting_does_not_touch_completed_messages() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"u","type":"user.message","data":{"content":"hi"}}),
+                json!({"id":"s","type":"assistant.message_start","data":{"messageId":"m"}}),
+                json!({"id":"f","type":"assistant.message",
+                       "data":{"messageId":"m","content":"hello"}}),
+                json!({"id":"a","type":"abort","data":{"reason":"user_initiated"}}),
+            ],
+        );
+
+        let message = state
+            .transcript
+            .iter()
+            .find(|message| message.role == TranscriptRole::Assistant)
+            .expect("assistant message");
+        assert_eq!(message.state, TranscriptState::Complete);
     }
 
     #[test]
