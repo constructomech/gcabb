@@ -42,6 +42,10 @@ const RED: u32 = 0x00f8_5161;
 const COMPACT_WIDTH: f32 = 920.0;
 /// Vertical budget for the detail blocks inside one tool entry.
 const ENTRY_DETAIL_BUDGET: f32 = 480.0;
+/// Smallest usable scrollbar thumb.
+const MIN_THUMB_HEIGHT: f32 = 24.0;
+/// Scrollbar id for the conversation itself.
+const TRANSCRIPT_SCROLL_ID: &str = "transcript";
 /// The command never takes more than a third of that budget, so output — the
 /// part worth reading — always gets the majority.
 const COMMAND_BLOCK_HEIGHT: f32 = ENTRY_DETAIL_BUDGET / 3.0;
@@ -774,6 +778,18 @@ struct SessionMvpView {
     /// Scroll positions of the detail blocks inside tool entries, keyed by
     /// block id so each keeps its position across renders.
     detail_scrolls: RefCell<HashMap<String, gpui::ScrollHandle>>,
+    /// Scrollable extent the transcript last rendered with.
+    ///
+    /// Scrollbar geometry is only knowable after a layout pass, and the window
+    /// now repaints only when something changed, so a static transcript would
+    /// never come back to draw its scrollbar. Noticing the extent change asks
+    /// for exactly one more frame.
+    transcript_extent_px: f32,
+    /// Scrollbar currently being dragged, if any.
+    ///
+    /// Tracked on the view rather than the thumb so a drag keeps working once
+    /// the pointer leaves the narrow track, which is most of the time.
+    dragging_scrollbar: Option<String>,
     /// Transcript length last auto-scrolled for, so the view follows new
     /// output without fighting a user who has scrolled up to read.
     transcript_extent: (String, usize, usize),
@@ -894,6 +910,8 @@ impl SessionMvpView {
             project_branch: None,
             transcript_scroll: gpui::ScrollHandle::new(),
             detail_scrolls: RefCell::new(HashMap::new()),
+            transcript_extent_px: 0.0,
+            dragging_scrollbar: None,
             transcript_extent: (String::new(), 0, 0),
             restore_failures: Vec::new(),
             updates: service.updates,
@@ -1124,6 +1142,18 @@ impl SessionMvpView {
                 || "No project".to_owned(),
                 |project| project.name.clone(),
             )
+    }
+
+    /// Ask for another frame when the transcript's scrollable extent changes.
+    ///
+    /// The scrollbar can only be sized once a layout pass has measured the
+    /// content, so the frame that first grows the transcript cannot draw it.
+    fn note_transcript_extent(&mut self, cx: &mut Context<Self>) {
+        let extent = f32::from(self.transcript_scroll.max_offset().y);
+        if (extent - self.transcript_extent_px).abs() > f32::EPSILON {
+            self.transcript_extent_px = extent;
+            cx.notify();
+        }
     }
 
     /// Keep the newest output in view as it arrives.
@@ -2525,6 +2555,104 @@ impl SessionMvpView {
             )
     }
 
+    /// The scroll handle behind a scrollbar id.
+    fn scroll_handle(&self, id: &str) -> Option<gpui::ScrollHandle> {
+        if id == TRANSCRIPT_SCROLL_ID {
+            return Some(self.transcript_scroll.clone());
+        }
+        self.detail_scrolls.borrow().get(id).cloned()
+    }
+
+    /// Move a scrollable region so the pointer position maps to a position in
+    /// its content.
+    ///
+    /// The handle reports its own viewport bounds in window coordinates, which
+    /// is what lets a thumb anywhere on screen be dragged without the element
+    /// having to measure itself.
+    fn drag_scrollbar_to(&self, id: &str, pointer_y: gpui::Pixels) {
+        let Some(handle) = self.scroll_handle(id) else {
+            return;
+        };
+        let bounds = handle.bounds();
+        let track = f32::from(bounds.size.height);
+        let scrollable = f32::from(handle.max_offset().y);
+        if track <= 0.0 || scrollable <= 0.0 {
+            return;
+        }
+        // Centre the thumb on the pointer, so the grab point tracks the
+        // cursor instead of jumping to the top of the thumb.
+        let thumb = (track * (track / (track + scrollable))).max(MIN_THUMB_HEIGHT);
+        let usable = (track - thumb).max(1.0);
+        let local = f32::from(pointer_y - bounds.origin.y) - thumb / 2.0;
+        let fraction = (local / usable).clamp(0.0, 1.0);
+        handle.set_offset(gpui::point(handle.offset().x, px(-(fraction * scrollable))));
+    }
+
+    /// A scrollbar for a scrollable region, shown while the pointer is over it.
+    ///
+    /// GPUI has no scrollbar element, so this draws the track and thumb and
+    /// wires the drag itself.
+    fn scrollbar(
+        id: &str,
+        handle: &gpui::ScrollHandle,
+        group: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        let scrollable = f32::from(handle.max_offset().y);
+        let viewport = f32::from(handle.bounds().size.height);
+        if scrollable <= 1.0 || viewport <= 0.0 {
+            return None;
+        }
+        // Fractions rather than pixels, so the track can stretch to whatever
+        // height the container ends up with.
+        let visible_fraction = (viewport / (viewport + scrollable)).clamp(0.05, 1.0);
+        let scrolled_fraction = (-f32::from(handle.offset().y) / scrollable).clamp(0.0, 1.0);
+        let thumb_top = scrolled_fraction * (1.0 - visible_fraction);
+        let track_id = id.to_owned();
+
+        Some(
+            div()
+                .id(SharedString::from(format!("{id}-scrollbar")))
+                .debug_selector(|| "scrollbar".to_owned())
+                .occlude()
+                .absolute()
+                .top_0()
+                .bottom_0()
+                .right_0()
+                .w(px(12.0))
+                .opacity(0.0)
+                .group_hover(group, |style| style.opacity(1.0))
+                // Pressing anywhere on the track jumps there and starts a drag.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
+                        view.dragging_scrollbar = Some(track_id.clone());
+                        view.drag_scrollbar_to(&track_id, event.position.y);
+                        cx.notify();
+                    }),
+                )
+                // The track occludes what is behind it, so a release over the
+                // track never reaches the window handler.
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|view, _, _, cx| {
+                        view.dragging_scrollbar = None;
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        .absolute()
+                        .top(gpui::relative(thumb_top))
+                        .right(px(2.0))
+                        .w(px(6.0))
+                        .h(gpui::relative(visible_fraction))
+                        .rounded_full()
+                        .bg(rgb(BORDER)),
+                ),
+        )
+    }
+
     /// A bounded, scrollable block of detail inside a tool entry.
     ///
     /// Commands, diffs, and output are frequently taller than any sensible
@@ -2534,7 +2662,13 @@ impl SessionMvpView {
     /// The block consumes its own wheel events so scrolling inside it does not
     /// also scroll the transcript behind it, and draws a thumb on hover
     /// because there is no platform scrollbar behind an overflow container.
-    fn detail_block(&self, id: &str, content: String, max_height: f32) -> impl IntoElement {
+    fn detail_block(
+        &self,
+        id: &str,
+        content: String,
+        max_height: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let handle = self
             .detail_scrolls
             .borrow_mut()
@@ -2542,24 +2676,12 @@ impl SessionMvpView {
             .or_default()
             .clone();
 
-        // Thumb geometry from the handle: the visible fraction sets its
-        // height, the scrolled fraction sets its position.
-        let scrollable = f32::from(handle.max_offset().y);
-        let content_height = max_height + scrollable;
-        let visible_fraction = (max_height / content_height).clamp(0.05, 1.0);
-        let scrolled_fraction = if scrollable > 0.0 {
-            (-f32::from(handle.offset().y) / scrollable).clamp(0.0, 1.0)
-        } else {
-            0.0
-        };
-        let thumb_height = (max_height * visible_fraction).max(24.0);
-        let thumb_top = (max_height - thumb_height) * scrolled_fraction;
         let group = SharedString::from(format!("scroll-{id}"));
-        let needs_thumb = scrollable > 1.0;
+        let scrollbar = Self::scrollbar(id, &handle, group.clone(), cx);
 
         div()
             .id(SharedString::from(format!("{id}-frame")))
-            .group(group.clone())
+            .group(group)
             .relative()
             .mt_1()
             .w_full()
@@ -2582,22 +2704,7 @@ impl SessionMvpView {
                     .text_color(rgb(MUTED))
                     .child(content),
             )
-            .when(needs_thumb, |frame| {
-                frame.child(
-                    div()
-                        .absolute()
-                        .top(px(thumb_top))
-                        .right(px(2.0))
-                        .w(px(6.0))
-                        .h(px(thumb_height))
-                        .rounded_full()
-                        .bg(rgb(BORDER))
-                        // Only shown while the pointer is over this block, so
-                        // resting entries stay quiet.
-                        .opacity(0.0)
-                        .group_hover(group, |style| style.opacity(1.0)),
-                )
-            })
+            .children(scrollbar)
     }
 
     /// A tool call in the timeline, with its nested subagent work.
@@ -2610,6 +2717,7 @@ impl SessionMvpView {
         &self,
         invocation: &app_model::ToolInvocation,
         children: &[&app_model::ToolInvocation],
+        cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let (status, status_color) = match invocation.state {
             app_model::InvocationState::Running => ("running", GREEN),
@@ -2731,6 +2839,7 @@ impl SessionMvpView {
                             &format!("tool-detail-{}", invocation.call_id),
                             detail,
                             COMMAND_BLOCK_HEIGHT,
+                            cx,
                         ))
                     })
                     .when_some(diff, |entry, diff| {
@@ -2738,6 +2847,7 @@ impl SessionMvpView {
                             &format!("tool-diff-{}", invocation.call_id),
                             diff,
                             ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
+                            cx,
                         ))
                     })
                     .when_some(output, |entry, output| {
@@ -2745,6 +2855,7 @@ impl SessionMvpView {
                             &format!("tool-output-{}", invocation.call_id),
                             output,
                             ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
+                            cx,
                         ))
                     })
                     .when(!nested.is_empty(), |entry| {
@@ -2814,7 +2925,7 @@ impl SessionMvpView {
             )
     }
 
-    fn transcript(&self) -> impl IntoElement {
+    fn transcript(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(session) = self.selected() else {
             return div()
                 .id("empty-session")
@@ -2863,24 +2974,44 @@ impl SessionMvpView {
                         .snapshot
                         .tool_activity
                         .children_of(&invocation.call_id);
-                    self.tool_entry(invocation, &children).into_any_element()
+                    self.tool_entry(invocation, &children, cx)
+                        .into_any_element()
                 }
             })
             .collect::<Vec<_>>();
+        let group = SharedString::from("scroll-transcript");
+        let scrollbar = Self::scrollbar(
+            TRANSCRIPT_SCROLL_ID,
+            &self.transcript_scroll,
+            group.clone(),
+            cx,
+        );
+
         div()
-            .id("transcript")
-            .debug_selector(|| "transcript".to_owned())
-            .role(Role::List)
-            .aria_label("Conversation")
-            .track_scroll(&self.transcript_scroll)
+            .id("transcript-frame")
+            .group(group)
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
-            .p_5()
-            .gap_3()
-            .overflow_y_scroll()
-            .children(entries)
+            .child(
+                div()
+                    .id("transcript")
+                    .debug_selector(|| "transcript".to_owned())
+                    .role(Role::List)
+                    .aria_label("Conversation")
+                    .track_scroll(&self.transcript_scroll)
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .p_5()
+                    .gap_3()
+                    .overflow_y_scroll()
+                    .children(entries),
+            )
+            .children(scrollbar)
     }
 
     /// Phase 3 inspector: changes, terminals, and capability state.
@@ -3913,6 +4044,7 @@ impl Render for SessionMvpView {
     #[allow(clippy::too_many_lines)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_transcript_tail();
+        self.note_transcript_extent(cx);
         let (provider_status, provider_color) = self.provider_status();
         let compact = compact_layout(f32::from(window.viewport_size().width));
         let show_sidebar = self.sidebar_open;
@@ -3969,6 +4101,24 @@ impl Render for SessionMvpView {
             .size_full()
             .bg(rgb(BACKGROUND))
             .text_color(rgb(PRIMARY))
+            // Scrollbar drags are tracked at the window so the thumb keeps
+            // following the pointer once it leaves the narrow track.
+            .on_mouse_move(cx.listener(|view, event: &gpui::MouseMoveEvent, _, cx| {
+                if let Some(id) = view.dragging_scrollbar.clone() {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        view.drag_scrollbar_to(&id, event.position.y);
+                        cx.notify();
+                    } else {
+                        view.dragging_scrollbar = None;
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _, _, _| {
+                    view.dragging_scrollbar = None;
+                }),
+            )
             .when(show_sidebar, |root| root.child(self.sidebar(compact, cx)))
             .child(
                 div()
@@ -4085,7 +4235,7 @@ impl Render for SessionMvpView {
                                 .flex()
                                 .flex_1()
                                 .min_h_0()
-                                .child(self.transcript())
+                                .child(self.transcript(cx))
                                 .when_some(
                                     if self.panel_open {
                                         self.side_panel(cx)
@@ -5438,6 +5588,73 @@ mod tests {
                 after_transcript, after_block,
                 "the transcript must not move when scrolling inside a tool entry"
             );
+        }
+
+        /// Regression: the thumb was drawn but inert, so the wheel was the only
+        /// way to move a scrollable region.
+        #[gpui::test]
+        fn dragging_the_transcript_scrollbar_scrolls_it(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for index in 0..120 {
+                    state.transcript.push(app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content: format!("message {index} with enough text to take a line"),
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                    });
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            // Scrollbar geometry needs a measured layout, so give it the
+            // follow-up frame the extent change requests.
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            // Auto-follow leaves the view at the bottom.
+            let bottom = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert!(bottom < gpui::px(0.0));
+
+            // Press near the top of the track: the content should jump up.
+            let track = cx.debug_bounds("scrollbar").expect("scrollbar rendered");
+            let track_x = track.center().x;
+            let near_top = track.origin.y + gpui::px(10.0);
+            cx.simulate_mouse_down(
+                gpui::point(track_x, near_top),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            cx.run_until_parked();
+
+            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert!(
+                after > bottom,
+                "dragging the scrollbar must scroll: {bottom:?} -> {after:?}"
+            );
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.dragging_scrollbar.as_deref(),
+                    Some(super::super::TRANSCRIPT_SCROLL_ID),
+                    "the press should begin a drag"
+                );
+            });
+
+            // Releasing ends the drag so later moves do not keep scrolling.
+            cx.simulate_mouse_up(
+                gpui::point(track_x, near_top),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(view.dragging_scrollbar.is_none());
+            });
         }
 
         /// Regression: command output was clipped inside a tool entry, so the
