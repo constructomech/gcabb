@@ -82,6 +82,18 @@ rather than from composer state, so what is shown is what the model actually
 received. A message carrying only a screenshot is kept rather than discarded as
 empty, since the screenshot *is* the message.
 
+Clicking an image chip opens it full size, in the composer and in the
+transcript alike. A chip that shows only a filename is a poor record of what
+was discussed, since the picture was the point.
+
+The preview takes focus when it opens. That is not decoration: a click leaves
+focus wherever it was, and the Escape binding is dispatched through the focus
+path, so without it Escape was dead precisely when a user would reach for it.
+The test that caught this clicks a chip and then presses Escape. An earlier
+test that opened the preview programmatically and pressed Escape passed against
+the broken build, because opening it by hand left focus somewhere that happened
+to work.
+
 Identity distinguishes attachments for de-duplication, and the two cases differ
 on purpose. Picking or dropping the same file twice is one attachment, because
 it is one file. Pasting twice is two attachments, because someone who pastes

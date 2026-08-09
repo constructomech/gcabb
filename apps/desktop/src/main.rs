@@ -15,10 +15,10 @@ use diagnostics::{TracingDiagnostics, init_tracing};
 use git_service::GitService;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, ExternalPaths, Focusable, InteractiveElement,
-    IntoElement, KeyBinding, MouseButton, ParentElement, PathPromptOptions, Render, Role,
-    SharedString, StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowBounds,
-    WindowOptions, actions, div, px, rgb, size,
+    App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, PathPromptOptions,
+    Render, Role, SharedString, StatefulInteractiveElement, Styled, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, actions, div, px, rgb, size,
 };
 use session_manager::{
     CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, WorktreeOutcome,
@@ -80,6 +80,58 @@ const COMMAND_BLOCK_HEIGHT: f32 = ENTRY_DETAIL_BUDGET / 3.0;
 const APP_ID: &str = "com.constructomech.gcabb";
 
 actions!(gcabb, [DismissPopup, FocusNext, FocusPrevious]);
+
+/// An image shown full size over the session.
+#[derive(Clone)]
+struct ImagePreview {
+    title: String,
+    source: PreviewSource,
+}
+
+/// Where the pixels for a preview come from.
+///
+/// A file on disk is loaded by path so the bytes are not held twice. A pasted
+/// image has no file yet, so its decoded bytes are kept until the runtime
+/// echoes back a path for it.
+#[derive(Clone)]
+enum PreviewSource {
+    Path(PathBuf),
+    Bytes(std::sync::Arc<gpui::Image>),
+}
+
+/// Build a preview for an attachment staged in the composer.
+fn draft_preview(attachment: &PromptAttachment) -> Option<ImagePreview> {
+    if !attachment.is_image() {
+        return None;
+    }
+    let title = attachment.display_name().to_owned();
+    if let Some(path) = attachment.path() {
+        return Some(ImagePreview {
+            title,
+            source: PreviewSource::Path(PathBuf::from(path)),
+        });
+    }
+    Some(ImagePreview {
+        title,
+        source: PreviewSource::Bytes(std::sync::Arc::new(gpui::Image {
+            format: image_format_for(attachment.mime_type()?)?,
+            bytes: attachment.image_bytes()?,
+            id: 0,
+        })),
+    })
+}
+
+/// Map a MIME type onto the format gpui needs to decode it.
+fn image_format_for(mime_type: &str) -> Option<gpui::ImageFormat> {
+    match mime_type {
+        "image/png" => Some(gpui::ImageFormat::Png),
+        "image/jpeg" => Some(gpui::ImageFormat::Jpeg),
+        "image/webp" => Some(gpui::ImageFormat::Webp),
+        "image/gif" => Some(gpui::ImageFormat::Gif),
+        "image/bmp" => Some(gpui::ImageFormat::Bmp),
+        _ => None,
+    }
+}
 enum ServiceUpdate {
     Ready {
         compatibility: ProviderCompatibility,
@@ -798,6 +850,10 @@ struct SessionMvpView {
     draft_location: SessionLocation,
     /// Files staged to travel with the next prompt.
     draft_attachments: Vec<PromptAttachment>,
+    /// The image being shown full size, if any.
+    image_preview: Option<ImagePreview>,
+    /// Focus for the preview, so Escape reaches it however it was opened.
+    image_preview_focus: FocusHandle,
     /// Branch currently checked out in the selected project, refreshed when
     /// the selection changes so the composer never runs git per frame.
     project_branch: Option<String>,
@@ -940,6 +996,8 @@ impl SessionMvpView {
             composing_chat: false,
             draft_location: SessionLocation::default(),
             draft_attachments: Vec::new(),
+            image_preview: None,
+            image_preview_focus: cx.focus_handle(),
             project_branch: None,
             transcript_scroll: gpui::ScrollHandle::new(),
             detail_scrolls: RefCell::new(HashMap::new()),
@@ -1690,8 +1748,15 @@ impl SessionMvpView {
                 let identity = attachment.identity();
                 let label = attachment.display_name().to_owned();
                 let icon = if attachment.is_image() { "IMG" } else { "FILE" };
+                let preview = draft_preview(attachment);
                 div()
                     .id(SharedString::from(format!("attachment-{identity}")))
+                    .when_some(preview, |chip, preview| {
+                        chip.hover(|style| style.border_color(rgb(BLUE)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.open_image_preview(preview.clone(), window, cx);
+                            }))
+                    })
                     .flex()
                     .items_center()
                     .gap_2()
@@ -1729,6 +1794,89 @@ impl SessionMvpView {
                 .px_3()
                 .pb_2()
                 .children(chips),
+        )
+    }
+
+    /// Show an attachment full size.
+    ///
+    /// Takes focus so Escape closes it. A click on a chip leaves focus
+    /// wherever it was, which left Escape dead exactly when a user would
+    /// reach for it.
+    fn open_image_preview(
+        &mut self,
+        preview: ImagePreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.image_preview = Some(preview);
+        window.focus(&self.image_preview_focus, cx);
+        cx.notify();
+    }
+
+    /// Close the preview, if one is open.
+    fn dismiss_image_preview(&mut self, cx: &mut Context<Self>) {
+        if self.image_preview.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The full-size image overlay.
+    fn image_preview_overlay(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let preview = self.image_preview.as_ref()?;
+        let title = preview.title.clone();
+        let image: gpui::Img = match &preview.source {
+            PreviewSource::Path(path) => gpui::img(path.clone()),
+            PreviewSource::Bytes(image) => gpui::img(image.clone()),
+        };
+        Some(
+            div()
+                .id("image-preview")
+                .accessibility_id("image-preview")
+                .track_focus(&self.image_preview_focus)
+                .debug_selector(|| "image-preview".to_owned())
+                .role(Role::Dialog)
+                .aria_label(format!("Preview of {title}"))
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .bg(gpui::rgba(0x0000_00d8))
+                // Anywhere outside the picture closes it, which is what a
+                // lightbox trains people to expect.
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|view, _, _, cx| view.dismiss_image_preview(cx)),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(PRIMARY))
+                        .child(title.clone()),
+                )
+                .child(
+                    div()
+                        .id("image-preview-frame")
+                        .max_w(px(1100.0))
+                        .max_h(px(760.0))
+                        .p_2()
+                        .rounded_lg()
+                        .bg(rgb(PANEL))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .shadow_lg()
+                        // Clicking the picture itself must not dismiss it.
+                        .occlude()
+                        .child(image.max_w(px(1080.0)).max_h(px(720.0))),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("Click anywhere or press Escape to close"),
+                ),
         )
     }
 
@@ -3099,14 +3247,31 @@ impl SessionMvpView {
     }
 
     /// One conversation message.
-    fn transcript_message(message: &app_model::TranscriptMessage) -> impl IntoElement {
-        let is_user = message.role == TranscriptRole::User;
-        let speaker = if is_user { "You" } else { "Copilot" };
-        let attachments: Vec<_> = message
+    /// Chips for what a message was sent with, clickable when previewable.
+    fn message_attachment_chips(
+        message: &app_model::TranscriptMessage,
+        cx: &mut Context<Self>,
+    ) -> Vec<impl IntoElement> {
+        message
             .attachments
             .iter()
-            .map(|attachment| {
+            .enumerate()
+            .map(|(index, attachment)| {
+                // Only an image backed by a file the runtime kept can be
+                // shown; a name alone is not enough to load pixels.
+                let preview = attachment
+                    .is_image
+                    .then(|| attachment.path.clone())
+                    .flatten()
+                    .map(|path| ImagePreview {
+                        title: attachment.display_name.clone(),
+                        source: PreviewSource::Path(PathBuf::from(path)),
+                    });
                 div()
+                    .id(SharedString::from(format!(
+                        "message-attachment-{}-{index}",
+                        message.id
+                    )))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -3116,6 +3281,12 @@ impl SessionMvpView {
                     .bg(rgb(SUBTLE))
                     .border_1()
                     .border_color(rgb(BORDER))
+                    .when_some(preview, |chip, preview| {
+                        chip.hover(|style| style.border_color(rgb(BLUE)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.open_image_preview(preview.clone(), window, cx);
+                            }))
+                    })
                     .child(
                         div()
                             .text_xs()
@@ -3129,7 +3300,16 @@ impl SessionMvpView {
                             .child(attachment.display_name.clone()),
                     )
             })
-            .collect();
+            .collect()
+    }
+
+    fn transcript_message(
+        message: &app_model::TranscriptMessage,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_user = message.role == TranscriptRole::User;
+        let speaker = if is_user { "You" } else { "Copilot" };
+        let attachments = Self::message_attachment_chips(message, cx);
         div()
             .id(SharedString::from(format!("message-{}", message.id)))
             .accessibility_id(message.id.clone())
@@ -3238,7 +3418,7 @@ impl SessionMvpView {
             .into_iter()
             .map(|entry| match entry {
                 app_model::TimelineEntry::Message(message) => {
-                    Self::transcript_message(message).into_any_element()
+                    Self::transcript_message(message, cx).into_any_element()
                 }
                 app_model::TimelineEntry::Tool(invocation) => {
                     let children = session
@@ -4385,6 +4565,7 @@ impl Render for SessionMvpView {
             .on_action(cx.listener(|view, _: &DismissPopup, _, cx| {
                 view.dismiss_control_menu(cx);
                 view.dismiss_session_menu(cx);
+                view.dismiss_image_preview(cx);
                 if view.renaming_session.is_some() {
                     view.cancel_rename(cx);
                 }
@@ -4611,6 +4792,7 @@ impl Render for SessionMvpView {
             })
             .when_some(self.session_context_menu(cx), gpui::ParentElement::child)
             .when_some(self.rename_dialog(cx), gpui::ParentElement::child)
+            .when_some(self.image_preview_overlay(cx), gpui::ParentElement::child)
             .when_some(self.interaction_dialog(cx), |root, dialog| {
                 root.child(dialog)
             })
@@ -4973,6 +5155,20 @@ fn timestamp() -> String {
     )
 }
 
+/// Install every key binding the app responds to.
+///
+/// Shared with the interaction tests so they exercise the bindings the app
+/// actually ships. Tests that installed their own bindings once let a
+/// macOS-only paste shortcut reach Linux users unnoticed.
+fn bind_app_keys(cx: &mut App) {
+    bind_text_input_keys(cx);
+    cx.bind_keys([
+        KeyBinding::new("escape", DismissPopup, None),
+        KeyBinding::new("tab", FocusNext, None),
+        KeyBinding::new("shift-tab", FocusPrevious, None),
+    ]);
+}
+
 fn main() {
     if let Err(error) = init_tracing("gcabb=info") {
         eprintln!("failed to initialize structured tracing: {error}");
@@ -4986,18 +5182,13 @@ fn main() {
     let chats_workspace = chats_directory(&project_root);
 
     gpui_platform::application().run(move |cx: &mut App| {
-        bind_text_input_keys(cx);
-        cx.bind_keys([KeyBinding::new("escape", DismissPopup, None)]);
+        bind_app_keys(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
         })
         .detach();
-        cx.bind_keys([
-            KeyBinding::new("tab", FocusNext, None),
-            KeyBinding::new("shift-tab", FocusPrevious, None),
-        ]);
         let bounds = Bounds::centered(None, size(px(1280.0), px(860.0)), cx);
         let service = service;
         let project_root = project_root.clone();
@@ -5381,7 +5572,7 @@ mod tests {
             std::sync::mpsc::Receiver<ServiceCommand>,
         ) {
             let (service, commands) = AppService::for_test();
-            cx.update(ui_components::bind_text_input_keys);
+            cx.update(super::super::bind_app_keys);
             let (view, cx) = cx.add_window_view(|_, cx| {
                 let mut view = SessionMvpView::new(
                     service,
@@ -5837,6 +6028,183 @@ mod tests {
             });
         }
 
+        /// Clicking an image chip in the transcript shows the picture.
+        #[gpui::test]
+        fn clicking_a_transcript_image_opens_a_preview(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "m1".to_owned(),
+                    role: app_model::TranscriptRole::User,
+                    content: "look".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: vec![app_model::MessageAttachment {
+                        display_name: "Pasted Image".to_owned(),
+                        is_image: true,
+                        path: Some("/tmp/clipboard.png".to_owned()),
+                    }],
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let chip = cx
+                .debug_bounds("message-attachments")
+                .expect("the attachment chip rendered");
+            cx.simulate_click(chip.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("image-preview").is_some(),
+                "clicking the image chip did not open a preview"
+            );
+        }
+
+        /// The real sequence: click a chip, then press Escape. If opening the
+        /// preview leaves focus outside the action's dispatch path, Escape is
+        /// dead exactly when the user is most likely to reach for it.
+        #[gpui::test]
+        fn escape_closes_a_preview_opened_by_clicking(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "m1".to_owned(),
+                    role: app_model::TranscriptRole::User,
+                    content: "look".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: vec![app_model::MessageAttachment {
+                        display_name: "Pasted Image".to_owned(),
+                        is_image: true,
+                        path: Some("/tmp/clipboard.png".to_owned()),
+                    }],
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let chip = cx
+                .debug_bounds("message-attachments")
+                .expect("the attachment chip rendered");
+            cx.simulate_click(chip.center(), Modifiers::none());
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("image-preview").is_some());
+
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds("image-preview").is_none(),
+                "escape did nothing after opening the preview by click"
+            );
+        }
+
+        /// The preview closes without needing a specific target to hit.
+        #[gpui::test]
+        fn the_image_preview_closes_on_escape(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update_in(cx, |view, window, cx| {
+                view.open_image_preview(
+                    super::super::ImagePreview {
+                        title: "Pasted Image".to_owned(),
+                        source: super::super::PreviewSource::Path(std::path::PathBuf::from(
+                            "/tmp/clipboard.png",
+                        )),
+                    },
+                    window,
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("image-preview").is_some());
+
+            // Focus the composer first, mirroring a user who was typing.
+            view.update_in(cx, |view, window, cx| {
+                let handle = gpui::Focusable::focus_handle(view.composer.read(cx), cx);
+                window.focus(&handle, cx);
+            });
+            cx.run_until_parked();
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds("image-preview").is_none(),
+                "escape left the preview open"
+            );
+        }
+
+        /// A non-image attachment has nothing to preview.
+        #[gpui::test]
+        fn a_non_image_attachment_does_not_open_a_preview(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "m1".to_owned(),
+                    role: app_model::TranscriptRole::User,
+                    content: "look".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: vec![app_model::MessageAttachment {
+                        display_name: "notes.txt".to_owned(),
+                        is_image: false,
+                        path: Some("/tmp/notes.txt".to_owned()),
+                    }],
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let chip = cx
+                .debug_bounds("message-attachments")
+                .expect("the attachment chip rendered");
+            cx.simulate_click(chip.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("image-preview").is_none(),
+                "a text file was opened as a picture"
+            );
+        }
+
+        /// A pasted image has no path yet, so its bytes must drive the preview.
+        #[gpui::test]
+        fn a_pasted_image_previews_from_its_bytes(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            // A one-pixel PNG, so the decode has something real to work with.
+            let png: Vec<u8> = vec![
+                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
+                0x44, 0x52,
+            ];
+            view.update(cx, |view, cx| {
+                view.attach_pasted_images(
+                    &[super::super::PastedImage {
+                        bytes: png,
+                        mime_type: "image/png".to_owned(),
+                    }],
+                    cx,
+                );
+            });
+            view.update(cx, |view, _| {
+                let preview = super::super::draft_preview(&view.draft_attachments[0])
+                    .expect("a pasted image can be previewed");
+                assert!(
+                    matches!(preview.source, super::super::PreviewSource::Bytes(_)),
+                    "a pasted image must preview from its bytes, having no path"
+                );
+            });
+        }
+
         /// A sent attachment is part of what was asked, so the transcript must
         /// still show it after the composer is cleared.
         #[gpui::test]
@@ -5854,6 +6222,7 @@ mod tests {
                     attachments: vec![app_model::MessageAttachment {
                         display_name: "Pasted Image".to_owned(),
                         is_image: true,
+                        path: None,
                     }],
                 });
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];

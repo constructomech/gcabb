@@ -113,6 +113,13 @@ pub struct TranscriptMessage {
 pub struct MessageAttachment {
     pub display_name: String,
     pub is_image: bool,
+    /// Where the runtime stored the attachment, when it said.
+    ///
+    /// Needed to show the image itself rather than only its name. The runtime
+    /// copies pasted images into its own workspace, so this path is the one
+    /// that outlives the composer.
+    #[serde(default)]
+    pub path: Option<String>,
 }
 
 /// Read the attachments the runtime echoed back on a user message.
@@ -153,6 +160,7 @@ fn message_attachments(event: &DomainEvent) -> Vec<MessageAttachment> {
             MessageAttachment {
                 display_name,
                 is_image,
+                path: (!path.is_empty()).then(|| path.to_owned()),
             }
         })
         .collect()
@@ -289,6 +297,37 @@ impl PromptAttachment {
             Self::Image {
                 data, display_name, ..
             } => format!("{display_name}:{}", data.len()),
+        }
+    }
+
+    /// The decoded bytes of a pasted image, if this is one.
+    ///
+    /// Kept here so base64 stays an encoding detail of the model rather than
+    /// something the UI has to know about.
+    #[must_use]
+    pub fn image_bytes(&self) -> Option<Vec<u8>> {
+        use base64::Engine as _;
+        match self {
+            Self::Image { data, .. } => base64::engine::general_purpose::STANDARD.decode(data).ok(),
+            Self::File { .. } => None,
+        }
+    }
+
+    /// The declared MIME type, for attachments that have one.
+    #[must_use]
+    pub fn mime_type(&self) -> Option<&str> {
+        match self {
+            Self::Image { mime_type, .. } => Some(mime_type),
+            Self::File { .. } => None,
+        }
+    }
+
+    /// The path this attachment lives at, for attachments backed by a file.
+    #[must_use]
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::File { path, .. } => Some(path),
+            Self::Image { .. } => None,
         }
     }
 
