@@ -584,11 +584,10 @@ Still open, and deferred rather than done:
 
 ### Phase 4: Tagged Releases and Auto-Update (1-2 weeks)
 
-Status: release pipeline, signing, and update client implemented; see
-[docs/phase-4](docs/phase-4/README.md). Two items remain, both sequenced after
-Phase 3 merges: the in-app update prompt, which lands in the session view Phase
-3 is currently rewriting, and the first real tagged release, which also
-requires the signing key to be configured in repository settings.
+Status: implemented. See [docs/phase-4](docs/phase-4/README.md). The release
+pipeline, signing, update client, and in-app update prompt are in place. The
+remaining step is configuring the signing key and cutting the first tag, which
+is what proves the loop end to end.
 
 Turn the Phase 3a self-hosting build into a repeatable dogfooding loop without
 making release engineering a prerequisite for the Self-Hosting MVP itself.

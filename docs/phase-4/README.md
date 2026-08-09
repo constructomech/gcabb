@@ -166,6 +166,13 @@ the installation is touched:
 - a deferred version is not offered again;
 - an applied update can be rolled back.
 
+The banner itself is covered by the desktop interaction tests, which click the
+real buttons in a rendered window:
+
+```sh
+cargo test -p gcabb-desktop
+```
+
 The release tooling can also be exercised locally:
 
 ```sh
@@ -182,6 +189,34 @@ cargo run -p gcabb-release -- verify --input dist/update-manifest.json \
   --public-key ...
 ```
 
+## The update prompt
+
+A release build checks once at startup, honouring the automatic-check setting.
+When an update is offered, a banner appears above the session view:
+
+| State | Banner |
+| --- | --- |
+| Checking | "Checking for updates…" |
+| Offered | "GCABB *x.y.z* is available", first line of the notes, **Update** / **Later** |
+| Downloading | "Downloading update… *n*%" |
+| Applied | "GCABB *x.y.z* is installed and starts on restart", **Restart** |
+| Failed | "Update failed: *reason*", **Dismiss** |
+
+**Later** defers that specific version, so a newer one is still offered.
+**Restart** starts the replacement build before this process exits, so a failure
+to launch is reported while there is still a window to report it in.
+
+States that are not actionable never take up space: a background check that
+finds nothing, and a build that cannot update at all (developer build, no
+signing key, read-only install), leave no banner. The latter is logged instead,
+since it is a normal deployment rather than an error.
+
+Update work runs on its own thread with its own Tokio runtime rather than on the
+session service. An update check is unrelated to session state, must not queue
+behind a long-running agent command, and must keep working when the provider has
+failed to start — which is exactly when a user is most likely to want a newer
+build.
+
 ## What Phase 4 does not do
 
 Portable archives, not native installers. Production OS code signing,
@@ -191,18 +226,11 @@ trust or swap logic.
 
 ## Remaining work
 
-Two items are deliberately sequenced after Phase 3 merges.
-
-**The in-app update prompt.** `Updater` exposes everything the UI needs —
-`check`, `stage` with progress, `apply`, `settings_mut` for deferral and
-opt-out, and a `disabled_reason` that explains why an install is not updating.
-What is missing is the banner and Update button. That code lands in the session
-view's struct and render path, which is where Phase 3 has its largest changes,
-so building it now would create an avoidable merge conflict for no functional
-gain: the loop cannot be exercised end to end until a real release exists
-anyway.
-
 **The first tagged release.** Before a tag is pushed, the signing key must exist
 in repository settings (see the key setup table above). The workflow fails
 loudly when the key or public-key variable is missing rather than publishing
 builds no client could verify, so this cannot be forgotten silently.
+
+Until a release exists there is nothing for an installed client to discover, so
+the tag-N to tag-N+1 exit criterion can only be met once the key is configured
+and the first tag is cut.
