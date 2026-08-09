@@ -4,8 +4,20 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+pub mod capability;
+pub mod changes;
+pub mod tools;
+
+pub use capability::{Capability, CapabilityId, CapabilityReport, CapabilityStatus};
+pub use changes::{ChangeStage, ChangeStatus, ChangedFile, ChangesView, DiffStats};
+pub use tools::{
+    InvocationState, TerminalSession, TerminalState, ToolActivity, ToolCatalog, ToolClass,
+    ToolDescriptor, ToolInvocation, ToolSource,
+};
+
 pub const DOMAIN_EVENT_VERSION: u16 = 1;
-pub const SNAPSHOT_VERSION: u16 = 1;
+/// Version 3 adds Phase 3 tool activity, capability, and changes projections.
+pub const SNAPSHOT_VERSION: u16 = 3;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -66,6 +78,13 @@ pub enum TranscriptRole {
 pub enum TranscriptState {
     Streaming,
     Complete,
+    /// Streaming stopped before the runtime committed the message.
+    ///
+    /// The partial text stays on screen because the user saw it, but the
+    /// runtime never wrote an `assistant.message` for it, so the model cannot
+    /// see it on the next turn. Marking it keeps the transcript honest about
+    /// what is actually in context.
+    Interrupted,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -135,16 +154,134 @@ pub struct ContextWindowOption {
     pub max_tokens: Option<u64>,
 }
 
+/// Where a new session runs.
+///
+/// A worktree gives the session its own checkout so parallel sessions in one
+/// repository cannot fight over the working tree or the checked-out branch.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLocation {
+    /// A new linked worktree, created for this session.
+    #[default]
+    NewWorktree,
+    /// The repository already on disk, shared with everything else using it.
+    LocalRepository,
+}
+
+impl SessionLocation {
+    #[must_use]
+    pub const fn label(self) -> &'static str {
+        match self {
+            Self::NewWorktree => "New worktree",
+            Self::LocalRepository => "Local repository",
+        }
+    }
+
+    #[must_use]
+    pub const fn description(self) -> &'static str {
+        match self {
+            Self::NewWorktree => "Creates a separate copy for this session",
+            Self::LocalRepository => "Works in the repository already on your machine",
+        }
+    }
+
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::NewWorktree => "new-worktree",
+            Self::LocalRepository => "local-repository",
+        }
+    }
+
+    #[must_use]
+    pub fn from_str_or_default(value: &str) -> Self {
+        match value {
+            "local-repository" => Self::LocalRepository,
+            _ => Self::NewWorktree,
+        }
+    }
+}
+
+/// Whether a session is attached to a repository or is a standalone chat.
+///
+/// Chats have no project, no worktree, and therefore no changes view. They
+/// exist so the app can be used for questions and planning that are not tied
+/// to a checkout.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionKind {
+    #[default]
+    Project,
+    Chat,
+}
+
+impl SessionKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Project => "project",
+            Self::Chat => "chat",
+        }
+    }
+
+    #[must_use]
+    pub fn from_str_or_default(value: Option<&str>) -> Self {
+        match value {
+            Some("chat") => Self::Chat,
+            _ => Self::Project,
+        }
+    }
+
+    #[must_use]
+    pub const fn is_chat(self) -> bool {
+        matches!(self, Self::Chat)
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionMetadata {
     pub id: String,
     pub sdk_session_id: String,
+    /// Working directory the CLI runs in — the session's worktree.
     pub project_path: String,
+    /// Repository the session belongs to, used to group sessions by project.
+    ///
+    /// A repository has one main checkout and any number of worktrees. Sessions
+    /// live in worktrees but belong to the repository, so grouping by the
+    /// worktree path would show one "project" per worktree instead of one per
+    /// repository. `None` for sessions recorded before this was tracked; those
+    /// fall back to grouping by `project_path`.
+    #[serde(default)]
+    pub repository_root: Option<String>,
     pub title: String,
+    #[serde(default)]
+    pub kind: SessionKind,
     pub model: Option<String>,
     pub mode: Option<String>,
+    /// Git ref the changes view compares against.
+    ///
+    /// Recorded once at session creation so the comparison stays stable even
+    /// if the base branch moves on. Phase 6 makes this user-selectable.
+    #[serde(default)]
+    pub base_ref: Option<String>,
     pub created_at: String,
     pub updated_at: String,
+}
+
+impl SessionMetadata {
+    /// Project this session groups under.
+    #[must_use]
+    pub fn project_key(&self) -> &str {
+        self.repository_root
+            .as_deref()
+            .unwrap_or(&self.project_path)
+    }
+
+    /// Whether this session is a standalone chat with no repository.
+    #[must_use]
+    pub const fn is_chat(&self) -> bool {
+        self.kind.is_chat()
+    }
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -218,6 +355,18 @@ pub struct SessionSnapshot {
     pub pending_interactions: Vec<InteractionRequest>,
     #[serde(default)]
     pub controls: SessionControls,
+    /// Tools the runtime advertises for this session, proven via `tools.list`.
+    #[serde(default)]
+    pub tool_catalog: ToolCatalog,
+    /// Projected tool invocations and shellId-keyed terminals.
+    #[serde(default)]
+    pub tool_activity: ToolActivity,
+    /// Capability status for the inherited runtime features Phase 3 needs.
+    #[serde(default)]
+    pub capabilities: CapabilityReport,
+    /// Worktree changes against the session's recorded base.
+    #[serde(default)]
+    pub changes: ChangesView,
     pub last_error: Option<String>,
     #[serde(skip)]
     seen_event_ids: HashSet<String>,
@@ -240,6 +389,10 @@ impl SessionSnapshot {
             transcript: Vec::new(),
             pending_interactions: Vec::new(),
             controls,
+            tool_catalog: ToolCatalog::default(),
+            tool_activity: ToolActivity::default(),
+            capabilities: CapabilityReport::default(),
+            changes: ChangesView::default(),
             last_error: None,
             seen_event_ids: HashSet::new(),
         }
@@ -251,6 +404,7 @@ impl SessionSnapshot {
             .iter()
             .map(|event| event.id.clone())
             .collect();
+        self.tool_activity.restore_indexes();
     }
 
     pub fn apply(&mut self, event: DomainEvent) -> ApplyOutcome {
@@ -276,6 +430,10 @@ impl SessionSnapshot {
             SessionStatus::Waiting
         };
         project_transcript(&mut self.transcript, &event);
+        if is_abort(&event) {
+            mark_streaming_interrupted(&mut self.transcript);
+        }
+        tools::project(&mut self.tool_activity, &event);
         if self.status == SessionStatus::Failed {
             self.last_error = Some(event.summary.clone());
         }
@@ -434,6 +592,22 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
     }
 }
 
+/// Whether an event ends the current turn without completing it.
+fn is_abort(event: &DomainEvent) -> bool {
+    event.source_type == "abort"
+        || (event.source_type == "session.idle" && event.state == ActivityState::Cancelled)
+}
+
+/// Mark any still-streaming assistant message as interrupted.
+fn mark_streaming_interrupted(transcript: &mut [TranscriptMessage]) {
+    for message in transcript
+        .iter_mut()
+        .filter(|message| message.state == TranscriptState::Streaming)
+    {
+        message.state = TranscriptState::Interrupted;
+    }
+}
+
 fn message_id(event: &DomainEvent) -> String {
     event
         .details
@@ -528,9 +702,12 @@ mod tests {
             id: "app-session".to_owned(),
             sdk_session_id: "sdk-session".to_owned(),
             project_path: "/tmp/project".to_owned(),
+            repository_root: None,
             title: "Test".to_owned(),
+            kind: SessionKind::Project,
             model: None,
             mode: None,
+            base_ref: None,
             created_at: "2026-08-06T12:00:00Z".to_owned(),
             updated_at: "2026-08-06T12:00:00Z".to_owned(),
         }
@@ -685,5 +862,500 @@ mod tests {
         assert!(snapshot.transcript.is_empty());
         assert!(snapshot.pending_interactions.is_empty());
         assert_eq!(snapshot.controls, SessionControls::default());
+    }
+
+    #[test]
+    fn phase_two_snapshots_gain_phase_three_defaults() {
+        let snapshot: SessionSnapshot = serde_json::from_value(json!({
+            "version": 2,
+            "metadata": metadata(),
+            "status": "idle",
+            "last_sequence": 0,
+            "activities": [],
+            "transcript": [],
+            "pending_interactions": [],
+            "controls": SessionControls::default(),
+            "last_error": null
+        }))
+        .unwrap();
+
+        assert_eq!(snapshot.tool_catalog, ToolCatalog::default());
+        assert!(snapshot.tool_activity.invocations.is_empty());
+        assert!(snapshot.capabilities.capabilities.is_empty());
+        assert!(snapshot.changes.is_empty());
+        assert!(snapshot.metadata.base_ref.is_none());
+    }
+
+    /// Build the event sequence a `bash` call produces.
+    fn shell_events(call_id: &str, shell_id: &str, exit_code: i64) -> Vec<Value> {
+        vec![
+            json!({
+                "id": format!("{call_id}-start"),
+                "type": "tool.execution_start",
+                "timestamp": "1",
+                "data": {
+                    "toolCallId": call_id,
+                    "toolName": "bash",
+                    "arguments": {"command": "cargo test", "shellId": shell_id},
+                    "shellToolInfo": {
+                        "displayCommand": "cargo test",
+                        "hasWriteFileRedirection": false,
+                        "possiblePaths": ["src/lib.rs"]
+                    }
+                }
+            }),
+            json!({
+                "id": format!("{call_id}-partial"),
+                "type": "tool.execution_partial_result",
+                "timestamp": "2",
+                "data": {"toolCallId": call_id, "partialOutput": "running tests\n"}
+            }),
+            json!({
+                "id": format!("{call_id}-complete"),
+                "type": "tool.execution_complete",
+                "timestamp": "3",
+                "data": {
+                    "toolCallId": call_id,
+                    "success": exit_code == 0,
+                    "result": {
+                        "content": "done",
+                        "contents": [{
+                            "type": "shell_exit",
+                            "shellId": shell_id,
+                            "exitCode": exit_code,
+                            "cwd": "/repo",
+                            "outputPreview": "running tests\n"
+                        }]
+                    }
+                }
+            }),
+        ]
+    }
+
+    fn apply_all(state: &mut SessionSnapshot, events: Vec<Value>) {
+        for (index, raw) in events.into_iter().enumerate() {
+            let sequence = state.last_sequence + 1 + index as u64;
+            let event = DomainEvent::from_sdk_event_for("app-session", sequence, &raw);
+            assert_eq!(state.apply(event), ApplyOutcome::Applied);
+        }
+    }
+
+    #[test]
+    fn shell_tools_project_into_a_terminal_keyed_by_shell_id() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(&mut state, shell_events("call-1", "shell-a", 0));
+
+        let terminal = state
+            .tool_activity
+            .terminal("shell-a")
+            .expect("terminal exists");
+        assert_eq!(terminal.command.as_deref(), Some("cargo test"));
+        assert_eq!(terminal.exit_code, Some(0));
+        assert_eq!(terminal.state, TerminalState::Exited);
+        assert_eq!(terminal.output, "running tests\n");
+        assert_eq!(terminal.tool_call_ids, vec!["call-1".to_owned()]);
+
+        let invocation = state
+            .tool_activity
+            .invocation("call-1")
+            .expect("invocation exists");
+        assert_eq!(invocation.class, ToolClass::Shell);
+        assert_eq!(invocation.state, InvocationState::Succeeded);
+        assert_eq!(invocation.shell_id.as_deref(), Some("shell-a"));
+    }
+
+    /// The core Phase 3 shell contract: a terminal outlives the tool call that
+    /// created it, so `read_bash` against the same shell appends to the
+    /// terminal the UI is already showing rather than creating a new one.
+    #[test]
+    fn read_bash_appends_to_the_existing_terminal_rather_than_creating_one() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(&mut state, shell_events("call-1", "shell-a", 0));
+
+        apply_all(
+            &mut state,
+            vec![
+                json!({
+                    "id": "call-2-start",
+                    "type": "tool.execution_start",
+                    "timestamp": "4",
+                    "data": {
+                        "toolCallId": "call-2",
+                        "toolName": "read_bash",
+                        "arguments": {"shellId": "shell-a"}
+                    }
+                }),
+                json!({
+                    "id": "call-2-partial",
+                    "type": "tool.execution_partial_result",
+                    "timestamp": "5",
+                    "data": {"toolCallId": "call-2", "partialOutput": "more output\n"}
+                }),
+            ],
+        );
+
+        assert_eq!(
+            state.tool_activity.terminals.len(),
+            1,
+            "read_bash must not create a second terminal for the same shell"
+        );
+        let terminal = state.tool_activity.terminal("shell-a").expect("terminal");
+        assert_eq!(terminal.output, "running tests\nmore output\n");
+        assert_eq!(
+            terminal.tool_call_ids,
+            vec!["call-1".to_owned(), "call-2".to_owned()]
+        );
+        // The shell already reported exit; a later read must not resurrect it.
+        assert_eq!(terminal.state, TerminalState::Exited);
+    }
+
+    #[test]
+    fn failed_tools_are_surfaced_with_structured_errors() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({
+                    "id": "edit-start",
+                    "type": "tool.execution_start",
+                    "timestamp": "1",
+                    "data": {
+                        "toolCallId": "edit-1",
+                        "toolName": "edit",
+                        "arguments": {"path": "/repo/src/lib.rs"}
+                    }
+                }),
+                json!({
+                    "id": "edit-complete",
+                    "type": "tool.execution_complete",
+                    "timestamp": "2",
+                    "data": {
+                        "toolCallId": "edit-1",
+                        "success": false,
+                        "error": {"code": "ENOENT", "message": "file not found"}
+                    }
+                }),
+            ],
+        );
+
+        let failures = state.tool_activity.failures();
+        assert_eq!(failures.len(), 1);
+        assert_eq!(failures[0].error_code.as_deref(), Some("ENOENT"));
+        assert_eq!(failures[0].error_message.as_deref(), Some("file not found"));
+        assert_eq!(failures[0].class, ToolClass::FileWrite);
+    }
+
+    #[test]
+    fn edit_diffs_are_retained_for_the_changes_view() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({
+                    "id": "edit-start",
+                    "type": "tool.execution_start",
+                    "timestamp": "1",
+                    "data": {
+                        "toolCallId": "edit-1",
+                        "toolName": "edit",
+                        "arguments": {"path": "src/lib.rs"}
+                    }
+                }),
+                json!({
+                    "id": "edit-complete",
+                    "type": "tool.execution_complete",
+                    "timestamp": "2",
+                    "data": {
+                        "toolCallId": "edit-1",
+                        "success": true,
+                        "result": {
+                            "content": "edited",
+                            "detailedContent": "@@ -1 +1 @@\n-old\n+new\n"
+                        }
+                    }
+                }),
+            ],
+        );
+
+        let invocation = state
+            .tool_activity
+            .invocation("edit-1")
+            .expect("invocation");
+        assert!(invocation.diff().is_some_and(|diff| diff.contains("+new")));
+        assert_eq!(invocation.file_path(), Some("src/lib.rs"));
+        assert_eq!(
+            state.tool_activity.mutated_paths(),
+            vec!["src/lib.rs".to_owned()]
+        );
+    }
+
+    #[test]
+    fn tool_activity_survives_snapshot_round_trip() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(&mut state, shell_events("call-1", "shell-a", 0));
+
+        let encoded = serde_json::to_value(&state).unwrap();
+        let mut restored: SessionSnapshot = serde_json::from_value(encoded).unwrap();
+        restored.restore_indexes();
+
+        // Indexes are rebuilt, so lookups work after recovery.
+        assert!(restored.tool_activity.terminal("shell-a").is_some());
+        assert!(restored.tool_activity.invocation("call-1").is_some());
+    }
+
+    #[test]
+    fn subagent_tool_calls_are_tracked_and_attributed() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![json!({
+                "id": "nested-start",
+                "type": "tool.execution_start",
+                "timestamp": "1",
+                "agentId": "agent-7",
+                "data": {
+                    "toolCallId": "nested-1",
+                    "toolName": "grep",
+                    "arguments": {"pattern": "fn main"}
+                }
+            })],
+        );
+
+        let invocation = state
+            .tool_activity
+            .invocation("nested-1")
+            .expect("nested invocation is tracked");
+        // Nested tool calls stay out of the root transcript but must remain
+        // visible as activity so the UI can nest them under their subagent.
+        assert_eq!(invocation.agent_id.as_deref(), Some("agent-7"));
+        assert!(state.transcript.is_empty());
+    }
+
+    #[test]
+    fn mcp_tools_are_classified_by_source() {
+        let catalog = ToolCatalog {
+            tools: vec![
+                ToolDescriptor {
+                    name: "view".to_owned(),
+                    namespaced_name: None,
+                    description: "read".to_owned(),
+                    source: ToolSource::Builtin,
+                    class: ToolClass::FileRead,
+                },
+                ToolDescriptor {
+                    name: "search_code".to_owned(),
+                    namespaced_name: Some("github/search_code".to_owned()),
+                    description: "search".to_owned(),
+                    source: ToolSource::Mcp {
+                        server: "github".to_owned(),
+                    },
+                    class: ToolClass::Other,
+                },
+            ],
+            discovered_at: Some("now".to_owned()),
+            error: None,
+        };
+
+        let report = CapabilityReport::from_catalog(&catalog);
+        assert_eq!(
+            report.get(CapabilityId::FileRead).unwrap().status,
+            CapabilityStatus::Available
+        );
+        assert_eq!(
+            report.get(CapabilityId::GithubMcp).unwrap().status,
+            CapabilityStatus::Available
+        );
+        // No shell tool was advertised, so the capability must report as
+        // unavailable rather than silently assumed present.
+        assert_eq!(
+            report.get(CapabilityId::Shell).unwrap().status,
+            CapabilityStatus::Unavailable
+        );
+        assert!(!report.is_self_hosting_ready());
+    }
+
+    /// Cancelling mid-stream leaves partial text on screen that the runtime
+    /// never committed, so the next turn cannot see it. The transcript must
+    /// say so rather than showing it as ordinary conversation.
+    #[test]
+    fn aborting_marks_streaming_output_as_interrupted() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"u","type":"user.message","data":{"content":"write a story"}}),
+                json!({"id":"s","type":"assistant.message_start","data":{"messageId":"m"}}),
+                json!({"id":"d","type":"assistant.message_delta",
+                       "data":{"messageId":"m","deltaContent":"# The Ascendance"}}),
+                json!({"id":"a","type":"abort","data":{"reason":"user_initiated"}}),
+            ],
+        );
+
+        let message = state
+            .transcript
+            .iter()
+            .find(|message| message.role == TranscriptRole::Assistant)
+            .expect("assistant message");
+        assert_eq!(message.state, TranscriptState::Interrupted);
+        // The text the user saw is kept; only its status changes.
+        assert_eq!(message.content, "# The Ascendance");
+    }
+
+    /// A completed message must not be relabelled by a later cancellation.
+    #[test]
+    fn aborting_does_not_touch_completed_messages() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"u","type":"user.message","data":{"content":"hi"}}),
+                json!({"id":"s","type":"assistant.message_start","data":{"messageId":"m"}}),
+                json!({"id":"f","type":"assistant.message",
+                       "data":{"messageId":"m","content":"hello"}}),
+                json!({"id":"a","type":"abort","data":{"reason":"user_initiated"}}),
+            ],
+        );
+
+        let message = state
+            .transcript
+            .iter()
+            .find(|message| message.role == TranscriptRole::Assistant)
+            .expect("assistant message");
+        assert_eq!(message.state, TranscriptState::Complete);
+    }
+
+    #[test]
+    fn combined_editor_tool_satisfies_both_read_and_write_capabilities() {
+        // The runtime exposes file editing to the model as a single
+        // `str_replace_editor` tool rather than the CLI's `view`/`create`/`edit`
+        // aliases, so one tool must evidence both capabilities.
+        let catalog = ToolCatalog {
+            tools: vec![
+                ToolDescriptor {
+                    name: "str_replace_editor".to_owned(),
+                    namespaced_name: None,
+                    description: "edit files".to_owned(),
+                    source: ToolSource::Builtin,
+                    class: ToolClass::classify("str_replace_editor"),
+                },
+                ToolDescriptor {
+                    name: "grep".to_owned(),
+                    namespaced_name: None,
+                    description: "search".to_owned(),
+                    source: ToolSource::Builtin,
+                    class: ToolClass::classify("grep"),
+                },
+                ToolDescriptor {
+                    name: "bash".to_owned(),
+                    namespaced_name: None,
+                    description: "shell".to_owned(),
+                    source: ToolSource::Builtin,
+                    class: ToolClass::classify("bash"),
+                },
+            ],
+            discovered_at: Some("now".to_owned()),
+            error: None,
+        };
+
+        assert_eq!(
+            ToolClass::classify("str_replace_editor"),
+            ToolClass::FileEditor
+        );
+        assert!(ToolClass::FileEditor.reads_files());
+        assert!(ToolClass::FileEditor.writes_files());
+        assert!(ToolClass::FileEditor.mutates_worktree());
+
+        let report = CapabilityReport::from_catalog(&catalog);
+        for id in [
+            CapabilityId::FileRead,
+            CapabilityId::FileWrite,
+            CapabilityId::Search,
+            CapabilityId::Shell,
+        ] {
+            assert_eq!(
+                report.get(id).unwrap().status,
+                CapabilityStatus::Available,
+                "{id:?} should be satisfied"
+            );
+        }
+    }
+
+    #[test]
+    fn sessions_group_by_repository_not_by_worktree() {
+        // Worktrees of one repository must collapse into a single project.
+        // Grouping by worktree path produced one "project" per worktree, named
+        // after the generated branch directory.
+        let mut worktree_a = metadata();
+        worktree_a.project_path = "/worktrees/feature-a".to_owned();
+        worktree_a.repository_root = Some("/src/gcabb".to_owned());
+
+        let mut worktree_b = metadata();
+        worktree_b.project_path = "/worktrees/feature-b".to_owned();
+        worktree_b.repository_root = Some("/src/gcabb".to_owned());
+
+        assert_eq!(worktree_a.project_key(), worktree_b.project_key());
+        assert_eq!(worktree_a.project_key(), "/src/gcabb");
+    }
+
+    #[test]
+    fn sessions_without_a_repository_fall_back_to_their_worktree() {
+        let mut legacy = metadata();
+        legacy.repository_root = None;
+        legacy.project_path = "/worktrees/legacy".to_owned();
+        assert_eq!(legacy.project_key(), "/worktrees/legacy");
+    }
+
+    #[test]
+    fn optional_capabilities_are_not_reported_as_blocking() {
+        // An absent MCP server or skill tool is worth surfacing, but it does
+        // not stop the edit-command-diff loop, so it must not be counted as
+        // blocking in the headline badge.
+        let mut report = CapabilityReport::default();
+        for id in [
+            CapabilityId::FileRead,
+            CapabilityId::FileWrite,
+            CapabilityId::Search,
+            CapabilityId::Shell,
+            CapabilityId::Changes,
+        ] {
+            report.set(Capability {
+                id,
+                status: CapabilityStatus::Available,
+                detail: String::new(),
+                evidence: Vec::new(),
+            });
+        }
+        report.set(Capability {
+            id: CapabilityId::GithubMcp,
+            status: CapabilityStatus::Unavailable,
+            detail: "no MCP configured".to_owned(),
+            evidence: Vec::new(),
+        });
+
+        assert!(report.blocking().is_empty());
+        assert!(report.is_self_hosting_ready());
+        // It still shows up as degraded so the panel can explain it.
+        assert_eq!(report.degraded().len(), 1);
+
+        report.set(Capability {
+            id: CapabilityId::Shell,
+            status: CapabilityStatus::Unavailable,
+            detail: "no shell tool".to_owned(),
+            evidence: Vec::new(),
+        });
+        assert_eq!(report.blocking().len(), 1);
+        assert!(!report.is_self_hosting_ready());
+    }
+
+    #[test]
+    fn failed_discovery_leaves_capabilities_unknown_with_the_reason() {
+        let catalog = ToolCatalog {
+            error: Some("transport closed".to_owned()),
+            ..ToolCatalog::default()
+        };
+        let report = CapabilityReport::from_catalog(&catalog);
+        let file_read = report.get(CapabilityId::FileRead).unwrap();
+        assert_eq!(file_read.status, CapabilityStatus::Unknown);
+        assert!(file_read.detail.contains("transport closed"));
     }
 }

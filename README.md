@@ -41,13 +41,51 @@ Phase 2 provides an end-to-end native session workflow:
 - Worktree branch and Copilot process-health indicators.
 - SQLite-backed selected-session restoration.
 
+Phase 3a adds the self-hosting loop:
+
+- Runtime tool discovery through the SDK, projected into per-session
+  capability state instead of assumed.
+- A session inspector with changes, terminals, and capability tabs.
+- A changes view covering committed, staged, unstaged, and untracked changes
+  against the session's recorded base.
+- Terminal state keyed by the runtime's shell id, so output from later
+  `read_bash` calls appends to the terminal already on screen.
+
+See [docs/phase-3](docs/phase-3/README.md) for details and
+[docs/phase-3/tool-surface.md](docs/phase-3/tool-surface.md) for the verified
+inventory of tools GCABB inherits from Copilot CLI.
+
 ```sh
 source "$HOME/.cargo/env"
 cargo run -p gcabb-desktop
 ```
 
+On fish, source the shell-specific file instead, or add Cargo to `PATH` once
+with `fish_add_path "$HOME/.cargo/bin"`:
+
+```fish
+source "$HOME/.cargo/env.fish"
+cargo run -p gcabb-desktop
+```
+
 Set `GCABB_DATA_DIR` to isolate the application database during development.
 Without it, GCABB uses the operating system's local application-data directory.
+
+### Developing GCABB inside GCABB
+
+Building GCABB from a GCABB session must not target the executable that session
+is running from; on Windows the link step fails outright. The self-development
+scripts redirect Cargo to a per-worktree target directory:
+
+```sh
+./scripts/self-dev.sh test
+```
+
+```powershell
+./scripts/self-dev.ps1 test
+```
+
+Both accept `build`, `test`, `clippy`, `fmt`, and `run`.
 
 On Linux, install the desktop entry once so the taskbar and window titlebar can
 resolve the application icon. Windows embeds its icon in the executable and
