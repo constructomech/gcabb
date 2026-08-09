@@ -45,6 +45,7 @@ const ENTRY_DETAIL_BUDGET: f32 = 480.0;
 /// Measured thumb geometry for a scrollable region.
 struct ScrollbarGeometry {
     track_top: gpui::Pixels,
+    track: f32,
     thumb_top: f32,
     thumb: f32,
     usable: f32,
@@ -63,6 +64,10 @@ struct ScrollbarDrag {
 
 /// Smallest usable scrollbar thumb.
 const MIN_THUMB_HEIGHT: f32 = 24.0;
+/// Scrollbar track width; wide enough to aim at without crowding content.
+const SCROLLBAR_WIDTH: f32 = 14.0;
+/// Thumb width, leaving a small margin inside the track.
+const THUMB_WIDTH: f32 = 10.0;
 /// Scrollbar id for the conversation itself.
 const TRANSCRIPT_SCROLL_ID: &str = "transcript";
 /// The command never takes more than a third of that budget, so output — the
@@ -2616,6 +2621,7 @@ impl SessionMvpView {
         let scrolled = (-f32::from(handle.offset().y) / scrollable).clamp(0.0, 1.0);
         Some(ScrollbarGeometry {
             track_top: bounds.origin.y,
+            track,
             thumb_top: scrolled * usable,
             thumb,
             usable,
@@ -2658,16 +2664,12 @@ impl SessionMvpView {
         group: SharedString,
         cx: &mut Context<Self>,
     ) -> Option<impl IntoElement> {
-        let scrollable = f32::from(handle.max_offset().y);
-        let viewport = f32::from(handle.bounds().size.height);
-        if scrollable <= 1.0 || viewport <= 0.0 {
-            return None;
-        }
-        // Fractions rather than pixels, so the track can stretch to whatever
-        // height the container ends up with.
-        let visible_fraction = (viewport / (viewport + scrollable)).clamp(0.05, 1.0);
-        let scrolled_fraction = (-f32::from(handle.offset().y) / scrollable).clamp(0.0, 1.0);
-        let thumb_top = scrolled_fraction * (1.0 - visible_fraction);
+        // Drawn from the same geometry the drag hit-tests against. Computing
+        // the two separately let them disagree — different clamps, and one
+        // measured against the track while the other measured against the
+        // viewport — so a press on the visible thumb was classified as a press
+        // on bare track and jumped the content instead of grabbing.
+        let geometry = Self::scrollbar_geometry(handle)?;
         let track_id = id.to_owned();
         let thumb_id = id.to_owned();
 
@@ -2678,12 +2680,12 @@ impl SessionMvpView {
                 .occlude()
                 .absolute()
                 .top_0()
-                .bottom_0()
                 .right_0()
-                .w(px(12.0))
+                .w(px(SCROLLBAR_WIDTH))
+                .h(px(geometry.track))
                 .opacity(0.0)
                 .group_hover(group, |style| style.opacity(1.0))
-                // Pressing anywhere on the track jumps there and starts a drag.
+                // Pressing bare track jumps the thumb there and starts a drag.
                 .on_mouse_down(
                     MouseButton::Left,
                     cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
@@ -2706,11 +2708,12 @@ impl SessionMvpView {
                         // swallow presses meant for it, so it carries the same
                         // handlers rather than relying on the track's.
                         .id(SharedString::from(format!("{id}-thumb")))
+                        .debug_selector(|| "scrollbar-thumb".to_owned())
                         .absolute()
-                        .top(gpui::relative(thumb_top))
+                        .top(px(geometry.thumb_top))
                         .right(px(2.0))
-                        .w(px(8.0))
-                        .h(gpui::relative(visible_fraction))
+                        .w(px(THUMB_WIDTH))
+                        .h(px(geometry.thumb))
                         .rounded_full()
                         .bg(rgb(BORDER))
                         .hover(|style| style.bg(rgb(MUTED)).cursor_pointer())
@@ -5793,6 +5796,64 @@ mod tests {
             assert!(
                 (f32::from(after) - expected).abs() < 2.0,
                 "grabbing the thumb should not lurch: {after:?} vs {expected}"
+            );
+        }
+
+        /// Regression: the thumb was drawn from one calculation and hit-tested
+        /// against another, so pressing the visible thumb was often treated as
+        /// pressing bare track. Where it is drawn must be where it is grabbed.
+        #[gpui::test]
+        fn the_drawn_thumb_matches_the_grabbable_thumb(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                // Enough content that the thumb is small, which is where the
+                // two calculations diverged.
+                for index in 0..400 {
+                    state.transcript.push(app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content: format!("message {index} with enough text to take a line"),
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                    });
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            let handle = view.read_with(cx, |view, _| view.transcript_scroll.clone());
+            let geometry = super::super::SessionMvpView::scrollbar_geometry(&handle)
+                .expect("the transcript should be scrollable");
+            let drawn = cx.debug_bounds("scrollbar-thumb").expect("thumb rendered");
+
+            let drawn_top = f32::from(drawn.origin.y - geometry.track_top);
+            assert!(
+                (drawn_top - geometry.thumb_top).abs() < 1.0,
+                "thumb drawn at {drawn_top} but grabbable at {}",
+                geometry.thumb_top
+            );
+            assert!(
+                (f32::from(drawn.size.height) - geometry.thumb).abs() < 1.0,
+                "thumb drawn {:?} tall but grabbable {} tall",
+                drawn.size.height,
+                geometry.thumb
+            );
+
+            // Pressing the drawn thumb's middle must therefore grab it, not
+            // jump the content.
+            let before = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            cx.simulate_mouse_down(drawn.center(), MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert!(
+                (f32::from(after) - f32::from(before)).abs() < 4.0,
+                "pressing the drawn thumb must grab it: {before:?} -> {after:?}"
             );
         }
 
