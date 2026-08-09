@@ -1873,6 +1873,58 @@ mod tests {
         assert_eq!(state.transcript[0].attachments.len(), 1);
     }
 
+    /// Observed live: the runtime echoes an attachment back in the form it
+    /// was sent. A blob comes back as a blob, with no path, so nothing can be
+    /// loaded from it later. This is why pasted images must be sent as files.
+    #[test]
+    fn a_blob_attachment_comes_back_without_a_path() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![json!({"id":"u","type":"user.message","data":{
+                "content":"look",
+                "attachments":[{
+                    "type":"blob",
+                    "displayName":"Pasted image 1",
+                    "mimeType":"image/png",
+                    "data":"iVBORw=="
+                }]
+            }})],
+        );
+
+        let attachment = &state.transcript[0].attachments[0];
+        assert!(attachment.is_image, "a PNG blob is still an image");
+        assert!(
+            attachment.path.is_none(),
+            "a blob has no path, so it cannot be shown again"
+        );
+    }
+
+    /// A file attachment echoes back with the path it was sent with, which is
+    /// what makes it possible to show the picture again later.
+    #[test]
+    fn a_file_attachment_comes_back_with_its_path() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![json!({"id":"u","type":"user.message","data":{
+                "content":"look",
+                "attachments":[{
+                    "type":"file",
+                    "displayName":"Pasted image 1",
+                    "path":"/tmp/gcabb/attachments/abc-clipboard.png"
+                }]
+            }})],
+        );
+
+        let attachment = &state.transcript[0].attachments[0];
+        assert!(attachment.is_image);
+        assert_eq!(
+            attachment.path.as_deref(),
+            Some("/tmp/gcabb/attachments/abc-clipboard.png")
+        );
+    }
+
     /// A pasted screenshot has no path, so it must carry its own bytes.
     #[test]
     fn a_pasted_image_carries_its_bytes_not_a_path() {

@@ -844,6 +844,8 @@ struct SessionMvpView {
     launch_workspace: PathBuf,
     /// Working directory chats run in, since chats have no repository.
     chats_workspace: PathBuf,
+    /// Where pasted images are written so they can be referenced by path.
+    attachments_root: Option<PathBuf>,
     /// Whether the composer will start a chat rather than a project session.
     composing_chat: bool,
     /// Where the next project session will run.
@@ -908,6 +910,7 @@ impl SessionMvpView {
         project_root: PathBuf,
         branch: String,
         chats_workspace: PathBuf,
+        attachments_root: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
         let commands = service.commands;
@@ -993,6 +996,7 @@ impl SessionMvpView {
             workspace_root: project_root.clone(),
             launch_workspace: project_root,
             chats_workspace,
+            attachments_root,
             composing_chat: false,
             draft_location: SessionLocation::default(),
             draft_attachments: Vec::new(),
@@ -1885,14 +1889,23 @@ impl SessionMvpView {
     /// A pasted screenshot has no path, so it is carried as bytes. Each paste
     /// is a distinct attachment: someone who pastes twice meant two images.
     fn attach_pasted_images(&mut self, images: &[PastedImage], cx: &mut Context<Self>) {
+        let directory = self.attachments_root.clone();
         for image in images {
             let index = self.draft_attachments.len() + 1;
-            self.draft_attachments
-                .push(PromptAttachment::from_image_bytes(
-                    &image.bytes,
-                    image.mime_type.clone(),
-                    index,
-                ));
+            // Written to disk and sent as a file, matching what a picked or
+            // dropped image does. Sending bytes inline instead meant the
+            // runtime echoed back a blob with no path, so the transcript could
+            // never show the picture again -- and a copy of those bytes was
+            // persisted in the event log and in every later snapshot.
+            let attachment = directory
+                .as_deref()
+                .and_then(|directory| {
+                    write_pasted_image(directory, &image.bytes, &image.mime_type, index)
+                })
+                .unwrap_or_else(|| {
+                    PromptAttachment::from_image_bytes(&image.bytes, image.mime_type.clone(), index)
+                });
+            self.draft_attachments.push(attachment);
         }
         cx.notify();
     }
@@ -5076,6 +5089,44 @@ fn chats_directory(fallback: &Path) -> PathBuf {
     path
 }
 
+/// Where pasted images are kept.
+///
+/// Deliberately not the session worktree: files written there would appear in
+/// the changes view and could be committed by accident. The runtime references
+/// an attached file in place rather than copying it, so this has to outlive the
+/// composer for the transcript to still show the picture later.
+fn attachments_directory() -> Option<PathBuf> {
+    let base = std::env::var_os("GCABB_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::data_local_dir().map(|dir| dir.join("gcabb")))?;
+    let path = base.join("attachments");
+    std::fs::create_dir_all(&path).ok()?;
+    Some(path)
+}
+
+/// Write a pasted image to disk so it can be referenced by path.
+fn write_pasted_image(
+    directory: &Path,
+    bytes: &[u8],
+    mime_type: &str,
+    index: usize,
+) -> Option<PromptAttachment> {
+    let extension = match mime_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        _ => return None,
+    };
+    let path = directory.join(format!("{}-clipboard.{extension}", uuid::Uuid::new_v4()));
+    std::fs::write(&path, bytes).ok()?;
+    Some(PromptAttachment::File {
+        path: path.to_string_lossy().into_owned(),
+        display_name: format!("Pasted image {index}"),
+    })
+}
+
 fn prepare_data_directory(path: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(path)
         .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
@@ -5208,7 +5259,14 @@ fn main() {
                 },
                 move |_, cx| {
                     cx.new(|cx| {
-                        SessionMvpView::new(service, project_root, branch, chats_workspace, cx)
+                        SessionMvpView::new(
+                            service,
+                            project_root,
+                            branch,
+                            chats_workspace,
+                            attachments_directory(),
+                            cx,
+                        )
                     })
                 },
             )
@@ -5571,6 +5629,21 @@ mod tests {
             &mut VisualTestContext,
             std::sync::mpsc::Receiver<ServiceCommand>,
         ) {
+            let (view, cx, commands, _) = setup_with_attachments(cx);
+            (view, cx, commands)
+        }
+
+        /// Same view, plus a temporary directory for pasted images.
+        fn setup_with_attachments(
+            cx: &mut TestAppContext,
+        ) -> (
+            gpui::Entity<SessionMvpView>,
+            &mut VisualTestContext,
+            std::sync::mpsc::Receiver<ServiceCommand>,
+            tempfile::TempDir,
+        ) {
+            let attachments = tempfile::tempdir().expect("temp dir");
+            let attachments_root = attachments.path().to_owned();
             let (service, commands) = AppService::for_test();
             cx.update(super::super::bind_app_keys);
             let (view, cx) = cx.add_window_view(|_, cx| {
@@ -5579,6 +5652,7 @@ mod tests {
                     std::path::PathBuf::from("/tmp/project"),
                     "main".to_owned(),
                     std::path::PathBuf::from("/tmp/chats"),
+                    Some(attachments_root),
                     cx,
                 );
                 view.selected_project = std::path::PathBuf::from("/tmp/project");
@@ -5588,7 +5662,7 @@ mod tests {
                 view
             });
             cx.run_until_parked();
-            (view, cx, commands)
+            (view, cx, commands, attachments)
         }
 
         /// Regression: the right-click that opens the menu releases after the
@@ -6177,19 +6251,58 @@ mod tests {
             );
         }
 
-        /// A pasted image has no path yet, so its bytes must drive the preview.
+        /// The bug this replaces: pasted images were sent as inline blobs, and
+        /// the runtime echoes an attachment back in the form it was sent. A
+        /// blob has no path, so the transcript could never show the picture
+        /// again. The earlier test fabricated a path that pasted images never
+        /// actually receive, so it passed against a broken build.
         #[gpui::test]
-        fn a_pasted_image_previews_from_its_bytes(cx: &mut TestAppContext) {
-            let (view, cx, _commands) = setup(cx);
-            // A one-pixel PNG, so the decode has something real to work with.
-            let png: Vec<u8> = vec![
-                0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A, 0x00, 0x00, 0x00, 0x0D, 0x49, 0x48,
-                0x44, 0x52,
-            ];
+        fn a_pasted_image_is_written_to_disk_and_sent_as_a_file(cx: &mut TestAppContext) {
+            let (view, cx, commands, _attachments) = setup_with_attachments(cx);
+            let png: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
             view.update(cx, |view, cx| {
                 view.attach_pasted_images(
                     &[super::super::PastedImage {
-                        bytes: png,
+                        bytes: png.clone(),
+                        mime_type: "image/png".to_owned(),
+                    }],
+                    cx,
+                );
+                view.submit_prompt("look".to_owned());
+            });
+
+            let mut sent = None;
+            while let Ok(command) = commands.try_recv() {
+                if let ServiceCommand::Submit { attachments, .. } = command {
+                    sent = Some(attachments);
+                }
+            }
+            let sent = sent.expect("a submit command was sent");
+            assert_eq!(sent.len(), 1);
+            let path = sent[0]
+                .path()
+                .expect("a pasted image must be sent as a file, not an inline blob");
+            assert_eq!(
+                std::fs::read(path).expect("the image was written to disk"),
+                png,
+                "the file does not hold the pasted bytes"
+            );
+            assert!(
+                std::path::Path::new(path)
+                    .extension()
+                    .is_some_and(|extension| extension == "png"),
+                "the extension names the format"
+            );
+        }
+
+        /// A pasted image is previewable from the composer before it is sent.
+        #[gpui::test]
+        fn a_pasted_image_can_be_previewed_before_sending(cx: &mut TestAppContext) {
+            let (view, cx, _commands, _attachments) = setup_with_attachments(cx);
+            view.update(cx, |view, cx| {
+                view.attach_pasted_images(
+                    &[super::super::PastedImage {
+                        bytes: vec![0x89, 0x50, 0x4E, 0x47],
                         mime_type: "image/png".to_owned(),
                     }],
                     cx,
@@ -6198,10 +6311,10 @@ mod tests {
             view.update(cx, |view, _| {
                 let preview = super::super::draft_preview(&view.draft_attachments[0])
                     .expect("a pasted image can be previewed");
-                assert!(
-                    matches!(preview.source, super::super::PreviewSource::Bytes(_)),
-                    "a pasted image must preview from its bytes, having no path"
-                );
+                assert!(matches!(
+                    preview.source,
+                    super::super::PreviewSource::Path(_)
+                ));
             });
         }
 

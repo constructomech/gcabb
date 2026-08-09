@@ -82,6 +82,19 @@ rather than from composer state, so what is shown is what the model actually
 received. A message carrying only a screenshot is kept rather than discarded as
 empty, since the screenshot *is* the message.
 
+Pasted images are written to disk under the app data directory and sent as
+files, the same as a picked or dropped image. Sending the bytes inline seemed
+reasonable -- there is no file, so send what there is -- but the runtime echoes
+an attachment back *in the form it was sent*. A blob comes back a blob, with no
+path, so nothing could load the picture afterwards. Every one of those base64
+payloads was also persisted in the event log and copied into every subsequent
+snapshot.
+
+They are not written into the session worktree: files there would appear in the
+changes view and could be committed by accident. The runtime references an
+attached file in place rather than copying it, so the file has to outlive the
+composer for the transcript to still show the picture.
+
 Clicking an image chip opens it full size, in the composer and in the
 transcript alike. A chip that shows only a filename is a poor record of what
 was discussed, since the picture was the point.
@@ -155,4 +168,9 @@ have found it. Where a defect is structural, the fix should be structural too.
 - Subagent nesting is exercised only with synthetic `subagent.started` events.
   The field shape came from Phase 0 notes and has not been observed live.
 - Chats share one working directory, so concurrent chats can collide.
+- Pasted image files are never cleaned up. They accumulate under the app data
+  directory for the life of the installation.
+- `SessionSnapshot::activities` keeps every event, and a snapshot is rewritten
+  as events arrive, so storage grows with the square of a session's length. One
+  local database reached 499 MB, with single snapshots over 5 MB.
 - A true per-shell stop, if the runtime ever exposes an RPC for it.
