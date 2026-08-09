@@ -7,7 +7,7 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
     ContextWindowOption, InteractionKind, InteractionRequest, InteractionResponse, ModelOption,
-    SessionControls, ToolCatalog, ToolClass, ToolDescriptor, ToolSource,
+    PromptAttachment, SessionControls, ToolCatalog, ToolClass, ToolDescriptor, ToolSource,
 };
 use async_trait::async_trait;
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
@@ -105,7 +105,12 @@ pub trait AgentProvider: Send + Sync {
         sdk_session_id: &str,
         request: SessionRequest,
     ) -> Result<ProviderSession>;
-    async fn send(&self, sdk_session_id: &str, prompt: &str) -> Result<String>;
+    async fn send(
+        &self,
+        sdk_session_id: &str,
+        prompt: &str,
+        attachments: &[PromptAttachment],
+    ) -> Result<String>;
     async fn cancel(&self, sdk_session_id: &str) -> Result<()>;
     async fn history(&self, sdk_session_id: &str) -> Result<Vec<Value>>;
     async fn controls(&self, sdk_session_id: &str) -> Result<SessionControls>;
@@ -561,10 +566,45 @@ impl AgentProvider for CopilotProvider {
         Ok(self.register(session, interactions).await)
     }
 
-    async fn send(&self, sdk_session_id: &str, prompt: &str) -> Result<String> {
+    async fn send(
+        &self,
+        sdk_session_id: &str,
+        prompt: &str,
+        attachments: &[PromptAttachment],
+    ) -> Result<String> {
+        let mut options = github_copilot_sdk::MessageOptions::from(prompt.to_owned());
+        if !attachments.is_empty() {
+            // Paths rather than inlined bytes: the runtime reads the file
+            // itself, so a large screenshot never crosses the RPC boundary.
+            options = options.with_attachments(
+                attachments
+                    .iter()
+                    .map(|attachment| match attachment {
+                        PromptAttachment::File { path, display_name } => {
+                            github_copilot_sdk::Attachment::File {
+                                path: PathBuf::from(path),
+                                display_name: Some(display_name.clone()),
+                                line_range: None,
+                            }
+                        }
+                        // A pasted image has no file to point at, so the bytes
+                        // themselves travel.
+                        PromptAttachment::Image {
+                            data,
+                            mime_type,
+                            display_name,
+                        } => github_copilot_sdk::Attachment::Blob {
+                            data: data.clone(),
+                            mime_type: mime_type.clone(),
+                            display_name: Some(display_name.clone()),
+                        },
+                    })
+                    .collect(),
+            );
+        }
         self.session(sdk_session_id)
             .await?
-            .send(prompt)
+            .send(options)
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))
     }

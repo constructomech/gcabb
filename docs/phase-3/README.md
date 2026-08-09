@@ -23,7 +23,7 @@ runtime provides and how it compares to other harnesses.
 The transcript scrolls and follows new output as it streams, returning to the
 tail when a session is opened or when output grows. It deliberately does not
 scroll when the transcript is unchanged, so reading earlier output is not
-interrupted by re-renders. The whole conversation is rendered; Phase 6 replaces
+interrupted by re-renders. The whole conversation is rendered; Phase 7 replaces
 this with a virtualized list.
 
 Output that was streaming when a turn was cancelled is marked **interrupted**
@@ -36,7 +36,8 @@ like a bug in GCABB rather than an accurate report of the model's context.
 ## Known gaps
 
 Phase 3a makes the loop work; it does not yet make it observable. Dogfooding
-GCABB against its own repository surfaced these, tracked as Phase 3b:
+GCABB against its own repository surfaced these. They are addressed in Phase 3b
+— see `docs/phase-3b/README.md`.
 
 - Tool invocations are projected and tested but never rendered, so a session
   shows prose and terminals while the edits, reads, and searches are invisible.
@@ -55,8 +56,8 @@ for the capabilities the loop depends on:
 | Capability | Proven by |
 | --- | --- |
 | File inspection | a tool whose class reads files (`str_replace_editor`, or `view`) |
-| File editing | a tool whose class writes files (`str_replace_editor`, or `create`/`edit`) |
-| Code search | `ToolClass::Search` (`glob`, `grep`) |
+| File editing | a tool whose class writes files (`str_replace_editor`, or `create`/`edit`/`apply_patch`) |
+| Code search | `ToolClass::Search` (`glob`, `grep`, `rg`) |
 | Terminal commands | `ToolClass::Shell` (`bash`) |
 | GitHub MCP | any tool with an MCP source |
 | Skills | `ToolClass::Skill` (`skill`) |
@@ -186,5 +187,5 @@ worked around silently:
   tool names.
 - Events that arrive after `session.idle` move the projected session status
   back to `Running`, so status is not a reliable completion signal. This is
-  existing Phase 2 projection behaviour; the timeline work in Phase 5 is the
+  existing Phase 2 projection behaviour; the timeline work in Phase 6 is the
   right place to give turn completion an explicit lifecycle.

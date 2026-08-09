@@ -1,5 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
+use std::collections::HashSet;
 use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
@@ -10,7 +11,7 @@ use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 5;
+const SCHEMA_VERSION: i64 = 6;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -121,9 +122,38 @@ impl Storage {
     /// `ON DELETE CASCADE`, and foreign keys are enabled, so the event log and
     /// snapshots go with it. The CLI runtime's own session state under
     /// `~/.copilot` is owned by the runtime and is deliberately left alone.
+    /// Reclaim space freed by deletions.
+    ///
+    /// `SQLite` keeps deleted pages for reuse, so a deleted session's space is
+    /// not returned to the filesystem without this.
+    pub fn vacuum(&self) -> Result<()> {
+        self.connection()?.execute_batch("VACUUM;")?;
+        Ok(())
+    }
+
+    /// Event ids already recorded for a session.
+    ///
+    /// The event log is the record of what was seen, so history reconciliation
+    /// asks it rather than carrying a copy of the log inside the snapshot.
+    pub fn event_ids(&self, session_id: &str) -> Result<HashSet<String>> {
+        let connection = self.connection()?;
+        let mut statement =
+            connection.prepare("SELECT event_id FROM domain_events WHERE session_id = ?1")?;
+        let rows = statement.query_map([session_id], |row| row.get::<_, String>(0))?;
+        rows.collect::<std::result::Result<HashSet<_>, _>>()
+            .map_err(Into::into)
+    }
+
     pub fn delete_session(&self, session_id: &str) -> Result<()> {
-        self.connection()?
-            .execute("DELETE FROM app_sessions WHERE id = ?1", [session_id])?;
+        let connection = self.connection()?;
+        // Diagnostics are not session-scoped by schema -- session_id is
+        // nullable, so there is no foreign key to cascade from -- and were
+        // being orphaned by every delete.
+        connection.execute(
+            "DELETE FROM diagnostics WHERE session_id = ?1",
+            [session_id],
+        )?;
+        connection.execute("DELETE FROM app_sessions WHERE id = ?1", [session_id])?;
         Ok(())
     }
 
@@ -209,8 +239,18 @@ impl Storage {
         Ok(affected == 1)
     }
 
+    /// Replace a session's snapshot.
+    ///
+    /// Only the newest snapshot is ever read, so older ones are removed rather
+    /// than accumulated. Keeping every snapshot made storage grow with the
+    /// square of a session's length.
     pub fn write_snapshot(&self, snapshot: &SessionSnapshot) -> Result<()> {
-        self.connection()?.execute(
+        let connection = self.connection()?;
+        connection.execute(
+            "DELETE FROM snapshots WHERE session_id = ?1 AND sequence <> ?2",
+            params![snapshot.metadata.id, snapshot.last_sequence],
+        )?;
+        connection.execute(
             "INSERT INTO snapshots (session_id, sequence, snapshot_version, payload)
              VALUES (?1, ?2, ?3, ?4)
              ON CONFLICT(session_id, sequence) DO UPDATE SET
@@ -359,8 +399,24 @@ impl Storage {
         add_column_if_missing(&transaction, "app_sessions", "base_ref", "TEXT")?;
         add_column_if_missing(&transaction, "app_sessions", "repository_root", "TEXT")?;
         add_column_if_missing(&transaction, "app_sessions", "kind", "TEXT")?;
+        // Earlier builds kept every snapshot a session ever wrote, and each
+        // one embedded the whole event log. Only the newest is ever read, so
+        // the rest are discarded on open. One database shrank from 499 MB to
+        // 13 MB here.
+        let pruned = transaction.execute(
+            "DELETE FROM snapshots
+             WHERE (session_id, sequence) NOT IN (
+                SELECT session_id, max(sequence) FROM snapshots GROUP BY session_id
+             )",
+            [],
+        )?;
         transaction.pragma_update(None, "user_version", SCHEMA_VERSION)?;
         transaction.commit()?;
+        // Outside the transaction: VACUUM cannot run inside one, and without
+        // it the pages freed above stay allocated to the file.
+        if pruned > 0 {
+            connection.execute_batch("VACUUM;")?;
+        }
         Ok(())
     }
 
@@ -478,8 +534,169 @@ mod tests {
         let recovered = storage.recover_session("app-session").unwrap();
         assert_eq!(recovered.replayed_events, 1);
         assert_eq!(recovered.state.last_sequence, 2);
-        assert_eq!(recovered.state.activities.len(), 2);
+        // The event log, not the snapshot, is where the events live.
+        assert_eq!(storage.event_ids("app-session").unwrap().len(), 2);
         assert_eq!(recovered.state.status, app_model::SessionStatus::Idle);
+    }
+
+    /// A session keeps one snapshot, not one per event. Retaining every
+    /// snapshot made storage grow with the square of a session's length:
+    /// one real database reached 499 MB of snapshots over 5.5 MB of events.
+    #[test]
+    fn a_session_keeps_only_its_latest_snapshot() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_session(&metadata()).unwrap();
+        let mut snapshot = SessionSnapshot::new(metadata());
+        for sequence in 1..=5 {
+            let event = event(sequence, "assistant.turn_start");
+            storage.append_event(&event).unwrap();
+            assert_eq!(snapshot.apply(event), app_model::ApplyOutcome::Applied);
+            storage.write_snapshot(&snapshot).unwrap();
+        }
+
+        let rows: u64 = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT count(*) FROM snapshots WHERE session_id = 'app-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        assert_eq!(
+            rows, 1,
+            "every snapshot was kept instead of just the latest"
+        );
+
+        // The one kept must be the newest, or recovery would replay from a
+        // stale point and rebuild state that was already computed.
+        let recovered = storage.recover_session("app-session").unwrap();
+        assert_eq!(recovered.state.last_sequence, 5);
+        assert_eq!(recovered.replayed_events, 0);
+    }
+
+    /// The event log is the record of what happened; the snapshot is a
+    /// projection of it. Storing the events inside the snapshot duplicated
+    /// the log and accounted for 99% of every snapshot written.
+    #[test]
+    fn a_snapshot_does_not_carry_the_event_log() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_session(&metadata()).unwrap();
+        let mut snapshot = SessionSnapshot::new(metadata());
+        for sequence in 1..=3 {
+            let event = event(sequence, "assistant.turn_start");
+            storage.append_event(&event).unwrap();
+            assert_eq!(snapshot.apply(event), app_model::ApplyOutcome::Applied);
+        }
+        storage.write_snapshot(&snapshot).unwrap();
+
+        let payload: String = storage
+            .connection()
+            .unwrap()
+            .query_row(
+                "SELECT payload FROM snapshots WHERE session_id = 'app-session'",
+                [],
+                |row| row.get(0),
+            )
+            .unwrap();
+        let stored: serde_json::Value = serde_json::from_str(&payload).unwrap();
+        assert!(
+            stored.get("activities").is_none(),
+            "the snapshot still carries a copy of the event log"
+        );
+
+        // Recovery must still work: state comes from the snapshot, and the
+        // events after it are replayed from the log.
+        let recovered = storage.recover_session("app-session").unwrap();
+        assert_eq!(recovered.state.last_sequence, 3);
+        assert_eq!(recovered.replayed_events, 0);
+    }
+
+    /// Deleting a session must not leave its rows behind. Events and
+    /// snapshots cascade, but diagnostics have no foreign key to cascade
+    /// from, so they were orphaned by every delete.
+    #[test]
+    fn deleting_a_session_removes_everything_belonging_to_it() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_session(&metadata()).unwrap();
+        let mut snapshot = SessionSnapshot::new(metadata());
+        let event = event(1, "assistant.turn_start");
+        storage.append_event(&event).unwrap();
+        assert_eq!(snapshot.apply(event), app_model::ApplyOutcome::Applied);
+        storage.write_snapshot(&snapshot).unwrap();
+        storage
+            .record_diagnostic(&DiagnosticEvent {
+                timestamp: "1".to_owned(),
+                category: "session".to_owned(),
+                operation: "test".to_owned(),
+                elapsed_ms: None,
+                session_id: Some("app-session".to_owned()),
+                success: true,
+                details: serde_json::Value::Null,
+            })
+            .unwrap();
+
+        storage.delete_session("app-session").unwrap();
+
+        let count = |table: &str| -> u64 {
+            storage
+                .connection()
+                .unwrap()
+                .query_row(
+                    &format!("SELECT count(*) FROM {table} WHERE session_id = 'app-session'"),
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap()
+        };
+        assert_eq!(count("domain_events"), 0, "events outlived the session");
+        assert_eq!(count("snapshots"), 0, "snapshots outlived the session");
+        assert_eq!(
+            count("diagnostics"),
+            0,
+            "diagnostics outlived the session they describe"
+        );
+    }
+
+    /// A database written by an earlier build carries every snapshot a
+    /// session ever wrote. Opening it discards all but the newest, which is
+    /// the only one that is ever read.
+    #[test]
+    fn opening_an_old_database_prunes_superseded_snapshots() {
+        let directory = tempfile::tempdir().unwrap();
+        let path = directory.path().join("gcabb.db");
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage.upsert_session(&metadata()).unwrap();
+            let connection = storage.connection().unwrap();
+            for sequence in 1..=4 {
+                connection
+                    .execute(
+                        "INSERT INTO snapshots (session_id, sequence, snapshot_version, payload)
+                         VALUES ('app-session', ?1, 1, '{}')",
+                        [sequence],
+                    )
+                    .unwrap();
+            }
+        }
+
+        let storage = Storage::open(&path).unwrap();
+        let remaining: Vec<u64> = {
+            let connection = storage.connection().unwrap();
+            let mut statement = connection
+                .prepare("SELECT sequence FROM snapshots WHERE session_id = 'app-session'")
+                .unwrap();
+            statement
+                .query_map([], |row| row.get::<_, u64>(0))
+                .unwrap()
+                .collect::<std::result::Result<Vec<_>, _>>()
+                .unwrap()
+        };
+        assert_eq!(
+            remaining,
+            vec![4],
+            "superseded snapshots survived the upgrade"
+        );
     }
 
     #[test]

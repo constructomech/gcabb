@@ -16,8 +16,9 @@ pub use tools::{
 };
 
 pub const DOMAIN_EVENT_VERSION: u16 = 1;
-/// Version 3 adds Phase 3 tool activity, capability, and changes projections.
-pub const SNAPSHOT_VERSION: u16 = 3;
+/// Version 5 drops the embedded event log, which duplicated `domain_events`
+/// and made every snapshot grow with the length of the session.
+pub const SNAPSHOT_VERSION: u16 = 5;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -94,6 +95,76 @@ pub struct TranscriptMessage {
     pub content: String,
     pub state: TranscriptState,
     pub timestamp: String,
+    /// Event sequence this message first appeared at.
+    ///
+    /// Interleaving messages with tool calls needs a total order, and the
+    /// reducer's sequence is monotonic and app-owned, unlike event timestamps.
+    #[serde(default)]
+    pub sequence: u64,
+    /// What was attached to this message, as the runtime echoed it back.
+    ///
+    /// Taken from the event rather than from composer state so the transcript
+    /// shows what the model actually received.
+    #[serde(default)]
+    pub attachments: Vec<MessageAttachment>,
+}
+
+/// An attachment recorded on a message in the transcript.
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct MessageAttachment {
+    pub display_name: String,
+    pub is_image: bool,
+    /// Where the runtime stored the attachment, when it said.
+    ///
+    /// Needed to show the image itself rather than only its name. The runtime
+    /// copies pasted images into its own workspace, so this path is the one
+    /// that outlives the composer.
+    #[serde(default)]
+    pub path: Option<String>,
+}
+
+/// Read the attachments the runtime echoed back on a user message.
+fn message_attachments(event: &DomainEvent) -> Vec<MessageAttachment> {
+    let Some(attachments) = event.details.get("attachments").and_then(Value::as_array) else {
+        return Vec::new();
+    };
+    attachments
+        .iter()
+        .map(|attachment| {
+            let path = attachment.get("path").and_then(Value::as_str).unwrap_or("");
+            let display_name = attachment
+                .get("displayName")
+                .and_then(Value::as_str)
+                .filter(|name| !name.is_empty())
+                .map_or_else(
+                    || {
+                        std::path::Path::new(path)
+                            .file_name()
+                            .and_then(|name| name.to_str())
+                            .unwrap_or("attachment")
+                            .to_owned()
+                    },
+                    str::to_owned,
+                );
+            // The runtime declares a MIME type only sometimes, so fall back to
+            // the extension rather than showing a generic file for a picture.
+            let is_image = attachment
+                .get("mimeType")
+                .and_then(Value::as_str)
+                .is_some_and(|mime| mime.starts_with("image/"))
+                || {
+                    let lowered = path.to_lowercase();
+                    [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]
+                        .iter()
+                        .any(|extension| lowered.ends_with(extension))
+                };
+            MessageAttachment {
+                display_name,
+                is_image,
+                path: (!path.is_empty()).then(|| path.to_owned()),
+            }
+        })
+        .collect()
 }
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -152,6 +223,128 @@ pub struct ModelOption {
 pub struct ContextWindowOption {
     pub tier: String,
     pub max_tokens: Option<u64>,
+}
+
+/// Something attached to a prompt.
+///
+/// Screenshots are how interface defects get reported, so a session that
+/// cannot receive one cannot be used to work on a user interface. A chosen or
+/// dropped file is referenced by path, so the runtime opens it and the bytes
+/// never cross the RPC boundary. A pasted image has no path to reference, so
+/// it travels as bytes.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PromptAttachment {
+    /// A file on disk, referenced by path.
+    File {
+        /// Absolute path to the attached file.
+        path: String,
+        /// Label shown in the composer.
+        display_name: String,
+    },
+    /// Raw image bytes, typically pasted from the clipboard.
+    Image {
+        /// Base64-encoded image data.
+        data: String,
+        /// MIME type of the data.
+        mime_type: String,
+        /// Label shown in the composer.
+        display_name: String,
+    },
+}
+
+impl PromptAttachment {
+    /// Build an attachment from a chosen or dropped path.
+    #[must_use]
+    pub fn from_path(path: &std::path::Path) -> Self {
+        let display_name = path
+            .file_name()
+            .and_then(|name| name.to_str())
+            .unwrap_or("attachment")
+            .to_owned();
+        Self::File {
+            path: path.to_string_lossy().into_owned(),
+            display_name,
+        }
+    }
+
+    /// Build an attachment from image bytes with no backing file.
+    #[must_use]
+    pub fn from_image_bytes(bytes: &[u8], mime_type: impl Into<String>, index: usize) -> Self {
+        use base64::Engine as _;
+        Self::Image {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            mime_type: mime_type.into(),
+            display_name: format!("Pasted image {index}"),
+        }
+    }
+
+    /// Label shown in the composer.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        match self {
+            Self::File { display_name, .. } | Self::Image { display_name, .. } => display_name,
+        }
+    }
+
+    /// A value that distinguishes this attachment from another.
+    ///
+    /// Two picks of the same file are the same attachment, but two pastes are
+    /// not: a user who pastes twice meant to attach two images.
+    #[must_use]
+    pub fn identity(&self) -> String {
+        match self {
+            Self::File { path, .. } => path.clone(),
+            Self::Image {
+                data, display_name, ..
+            } => format!("{display_name}:{}", data.len()),
+        }
+    }
+
+    /// The decoded bytes of a pasted image, if this is one.
+    ///
+    /// Kept here so base64 stays an encoding detail of the model rather than
+    /// something the UI has to know about.
+    #[must_use]
+    pub fn image_bytes(&self) -> Option<Vec<u8>> {
+        use base64::Engine as _;
+        match self {
+            Self::Image { data, .. } => base64::engine::general_purpose::STANDARD.decode(data).ok(),
+            Self::File { .. } => None,
+        }
+    }
+
+    /// The declared MIME type, for attachments that have one.
+    #[must_use]
+    pub fn mime_type(&self) -> Option<&str> {
+        match self {
+            Self::Image { mime_type, .. } => Some(mime_type),
+            Self::File { .. } => None,
+        }
+    }
+
+    /// The path this attachment lives at, for attachments backed by a file.
+    #[must_use]
+    pub fn path(&self) -> Option<&str> {
+        match self {
+            Self::File { path, .. } => Some(path),
+            Self::Image { .. } => None,
+        }
+    }
+
+    /// Whether this attachment is an image.
+    #[must_use]
+    pub fn is_image(&self) -> bool {
+        match self {
+            Self::Image { .. } => true,
+            Self::File { path, .. } => {
+                let lowered = path.to_lowercase();
+                [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]
+                    .iter()
+                    .any(|extension| lowered.ends_with(extension))
+            }
+        }
+    }
 }
 
 /// Where a new session runs.
@@ -348,7 +541,6 @@ pub struct SessionSnapshot {
     pub metadata: SessionMetadata,
     pub status: SessionStatus,
     pub last_sequence: u64,
-    pub activities: Vec<DomainEvent>,
     #[serde(default)]
     pub transcript: Vec<TranscriptMessage>,
     #[serde(default)]
@@ -385,7 +577,6 @@ impl SessionSnapshot {
             metadata,
             status: SessionStatus::Starting,
             last_sequence: 0,
-            activities: Vec::new(),
             transcript: Vec::new(),
             pending_interactions: Vec::new(),
             controls,
@@ -398,15 +589,19 @@ impl SessionSnapshot {
         }
     }
 
+    /// Rebuild the indexes that are derived rather than stored.
+    ///
+    /// Event ids are not among them: the event log is the record of which
+    /// events were seen, so `seen_event_ids` covers only what this instance
+    /// has applied since it was created.
     pub fn restore_indexes(&mut self) {
-        self.seen_event_ids = self
-            .activities
-            .iter()
-            .map(|event| event.id.clone())
-            .collect();
         self.tool_activity.restore_indexes();
     }
 
+    #[allow(
+        clippy::needless_pass_by_value,
+        reason = "an applied event is consumed conceptually; taking it by value keeps callers from reusing it"
+    )]
     pub fn apply(&mut self, event: DomainEvent) -> ApplyOutcome {
         if event.session_id != self.metadata.id {
             return ApplyOutcome::WrongSession;
@@ -432,14 +627,37 @@ impl SessionSnapshot {
         project_transcript(&mut self.transcript, &event);
         if is_abort(&event) {
             mark_streaming_interrupted(&mut self.transcript);
+            tools::mark_running_terminals_cancelled(&mut self.tool_activity, &event.timestamp);
         }
         tools::project(&mut self.tool_activity, &event);
         if self.status == SessionStatus::Failed {
             self.last_error = Some(event.summary.clone());
         }
         self.seen_event_ids.insert(event.id.clone());
-        self.activities.push(event);
         ApplyOutcome::Applied
+    }
+
+    /// Messages and root-agent tool calls in the order they happened.
+    ///
+    /// Subagent calls are excluded here and reached through
+    /// [`ToolActivity::children_of`], so delegated work appears beneath the
+    /// task that requested it rather than flattened into the main thread.
+    #[must_use]
+    pub fn timeline(&self) -> Vec<TimelineEntry<'_>> {
+        let mut entries: Vec<TimelineEntry<'_>> = self
+            .transcript
+            .iter()
+            .map(TimelineEntry::Message)
+            .chain(
+                self.tool_activity
+                    .root_invocations()
+                    .into_iter()
+                    .map(TimelineEntry::Tool),
+            )
+            .collect();
+        // Sequence is monotonic per session, so this is a stable total order.
+        entries.sort_by_key(TimelineEntry::sequence);
+        entries
     }
 
     #[must_use]
@@ -466,6 +684,27 @@ impl SessionSnapshot {
             self.status = SessionStatus::Running;
         }
         self.pending_interactions.len() != original_len
+    }
+}
+
+/// One item in the session timeline.
+///
+/// The transcript alone shows only what the agent *said*; the timeline
+/// interleaves what it *did*, which is the difference between watching a
+/// session and watching a black box.
+#[derive(Clone, Copy, Debug)]
+pub enum TimelineEntry<'a> {
+    Message(&'a TranscriptMessage),
+    Tool(&'a ToolInvocation),
+}
+
+impl TimelineEntry<'_> {
+    #[must_use]
+    pub const fn sequence(&self) -> u64 {
+        match self {
+            Self::Message(message) => message.sequence,
+            Self::Tool(invocation) => invocation.sequence,
+        }
     }
 }
 
@@ -527,13 +766,18 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                 .get("content")
                 .and_then(Value::as_str)
                 .unwrap_or_default();
-            if !content.is_empty() {
+            let attachments = message_attachments(event);
+            // A screenshot on its own is a complete message, so an empty body
+            // is only uninteresting when nothing came with it.
+            if !content.is_empty() || !attachments.is_empty() {
                 transcript.push(TranscriptMessage {
                     id: event.id.clone(),
                     role: TranscriptRole::User,
                     content: content.to_owned(),
                     state: TranscriptState::Complete,
                     timestamp: event.timestamp.clone(),
+                    sequence: event.sequence,
+                    attachments,
                 });
             }
         }
@@ -546,6 +790,8 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                     content: String::new(),
                     state: TranscriptState::Streaming,
                     timestamp: event.timestamp.clone(),
+                    sequence: event.sequence,
+                    attachments: Vec::new(),
                 });
             }
         }
@@ -565,6 +811,8 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                     content: delta.to_owned(),
                     state: TranscriptState::Streaming,
                     timestamp: event.timestamp.clone(),
+                    sequence: event.sequence,
+                    attachments: Vec::new(),
                 });
             }
         }
@@ -585,6 +833,8 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                     content: content.to_owned(),
                     state: TranscriptState::Complete,
                     timestamp: event.timestamp.clone(),
+                    sequence: event.sequence,
+                    attachments: Vec::new(),
                 });
             }
         }
@@ -1174,6 +1424,179 @@ mod tests {
         assert!(!report.is_self_hosting_ready());
     }
 
+    /// The timeline is what makes a session observable: messages and the tool
+    /// calls between them, in the order they happened.
+    #[test]
+    fn timeline_interleaves_messages_and_tool_calls() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"u","type":"user.message","data":{"content":"fix the bug"}}),
+                json!({"id":"t1","type":"tool.execution_start",
+                       "data":{"toolCallId":"c1","toolName":"grep",
+                               "arguments":{"pattern":"fn main"}}}),
+                json!({"id":"t1c","type":"tool.execution_complete",
+                       "data":{"toolCallId":"c1","success":true}}),
+                json!({"id":"t2","type":"tool.execution_start",
+                       "data":{"toolCallId":"c2","toolName":"str_replace_editor",
+                               "arguments":{"path":"src/lib.rs"}}}),
+                json!({"id":"t2c","type":"tool.execution_complete",
+                       "data":{"toolCallId":"c2","success":true,
+                               "result":{"detailedContent":"@@ -1 +1 @@\n-old\n+new"}}}),
+                json!({"id":"a","type":"assistant.message",
+                       "data":{"messageId":"m","content":"fixed"}}),
+            ],
+        );
+
+        let timeline = state.timeline();
+        let shape: Vec<&str> = timeline
+            .iter()
+            .map(|entry| match entry {
+                TimelineEntry::Message(_) => "message",
+                TimelineEntry::Tool(_) => "tool",
+            })
+            .collect();
+        assert_eq!(shape, ["message", "tool", "tool", "message"]);
+
+        // Ordering is by sequence, so the entries stay in causal order.
+        let sequences: Vec<u64> = timeline.iter().map(TimelineEntry::sequence).collect();
+        let mut sorted = sequences.clone();
+        sorted.sort_unstable();
+        assert_eq!(sequences, sorted);
+
+        // The edit carries its diff, which is what makes it reviewable.
+        let TimelineEntry::Tool(edit) = timeline[2] else {
+            panic!("expected a tool entry");
+        };
+        assert_eq!(edit.verb(), "Edit");
+        assert_eq!(edit.summary(), "src/lib.rs");
+        assert!(edit.diff().is_some_and(|diff| diff.contains("+new")));
+    }
+
+    /// A multi-line command must not become a multi-line header; it filled the
+    /// window with one tool call.
+    #[test]
+    fn multiline_commands_get_a_single_line_header() {
+        let mut state = SessionSnapshot::new(metadata());
+        let script = "python3 -c \"\na,b=0,1\nfor i in range(100):\n    print(a)\n\"";
+        apply_all(
+            &mut state,
+            vec![json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"bash",
+                                "arguments":{"command": script},
+                                "shellToolInfo":{"displayCommand": script,
+                                                 "hasWriteFileRedirection":false,
+                                                 "possiblePaths":[]}}})],
+        );
+
+        let invocation = state.tool_activity.invocation("c1").expect("invocation");
+        let header = invocation.summary_line();
+        assert_eq!(
+            header.lines().count(),
+            1,
+            "header must be one line: {header}"
+        );
+        assert!(header.starts_with("python3 -c"));
+        // The rest stays available for the scrollable detail block.
+        let detail = invocation.multiline_summary().expect("detail");
+        assert!(detail.contains("range(100)"));
+    }
+
+    /// A single-line target needs no detail block.
+    #[test]
+    fn single_line_targets_have_no_detail_block() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"str_replace_editor",
+                                "arguments":{"path":"src/lib.rs"}}})],
+        );
+        let invocation = state.tool_activity.invocation("c1").expect("invocation");
+        assert_eq!(invocation.summary_line(), "src/lib.rs");
+        assert!(invocation.multiline_summary().is_none());
+    }
+
+    /// Very long single-line targets are truncated rather than wrapped.
+    #[test]
+    fn long_targets_are_truncated_in_the_header() {
+        let mut state = SessionSnapshot::new(metadata());
+        let long = "x".repeat(400);
+        apply_all(
+            &mut state,
+            vec![json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"grep",
+                                "arguments":{"pattern": long}}})],
+        );
+        let header = state
+            .tool_activity
+            .invocation("c1")
+            .expect("invocation")
+            .summary_line();
+        assert!(
+            header.chars().count() <= 121,
+            "got {} chars",
+            header.chars().count()
+        );
+        assert!(header.ends_with('…'));
+    }
+
+    /// Delegated work belongs under the task that asked for it, not flattened
+    /// into the main thread.
+    #[test]
+    fn subagent_calls_nest_under_their_task() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"t","type":"tool.execution_start",
+                       "data":{"toolCallId":"task-1","toolName":"task",
+                               "arguments":{"description":"survey harnesses"}}}),
+                json!({"id":"sa","type":"subagent.started",
+                       "data":{"agentId":"agent-7","parentToolCallId":"task-1"}}),
+                json!({"id":"n","type":"tool.execution_start","agentId":"agent-7",
+                       "data":{"toolCallId":"nested-1","toolName":"grep",
+                               "arguments":{"pattern":"tools.list"}}}),
+            ],
+        );
+
+        // The root timeline shows the task, not the subagent's own calls.
+        let timeline = state.timeline();
+        assert_eq!(timeline.len(), 1);
+        let TimelineEntry::Tool(task) = timeline[0] else {
+            panic!("expected the task entry");
+        };
+        assert_eq!(task.call_id, "task-1");
+
+        let children = state.tool_activity.children_of("task-1");
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].call_id, "nested-1");
+        assert_eq!(children[0].summary(), "tools.list");
+    }
+
+    /// An unrelated task must not adopt another task's subagent work.
+    #[test]
+    fn subagent_calls_only_nest_under_their_own_task() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"t1","type":"tool.execution_start",
+                       "data":{"toolCallId":"task-1","toolName":"task","arguments":{}}}),
+                json!({"id":"t2","type":"tool.execution_start",
+                       "data":{"toolCallId":"task-2","toolName":"task","arguments":{}}}),
+                json!({"id":"sa","type":"subagent.started",
+                       "data":{"agentId":"agent-7","parentToolCallId":"task-2"}}),
+                json!({"id":"n","type":"tool.execution_start","agentId":"agent-7",
+                       "data":{"toolCallId":"nested-1","toolName":"grep","arguments":{}}}),
+            ],
+        );
+
+        assert!(state.tool_activity.children_of("task-1").is_empty());
+        assert_eq!(state.tool_activity.children_of("task-2").len(), 1);
+    }
+
     /// Cancelling mid-stream leaves partial text on screen that the runtime
     /// never committed, so the next turn cannot see it. The transcript must
     /// say so rather than showing it as ordinary conversation.
@@ -1199,6 +1622,58 @@ mod tests {
         assert_eq!(message.state, TranscriptState::Interrupted);
         // The text the user saw is kept; only its status changes.
         assert_eq!(message.content, "# The Ascendance");
+    }
+
+    /// Cancelling tears down the shells the turn started, but the runtime
+    /// reports no completion for them. A terminal left showing "running"
+    /// reads as work still in flight when nothing is running at all.
+    #[test]
+    fn aborting_marks_running_terminals_cancelled() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"t","type":"tool.execution_start",
+                       "data":{"toolCallId":"c1","toolName":"bash",
+                               "arguments":{"command":"sleep 900","shellId":"shell-1"}}}),
+                json!({"id":"a","type":"abort","data":{"reason":"user_initiated"}}),
+            ],
+        );
+
+        let terminal = state
+            .tool_activity
+            .terminal("shell-1")
+            .expect("the shell was tracked");
+        assert_eq!(terminal.state, crate::tools::TerminalState::Cancelled);
+        assert!(
+            state.tool_activity.active_terminals().is_empty(),
+            "a cancelled shell still counted as active work"
+        );
+    }
+
+    /// A shell that already exited keeps its exit, not a cancellation.
+    #[test]
+    fn aborting_does_not_relabel_finished_terminals() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"t","type":"tool.execution_start",
+                       "data":{"toolCallId":"c1","toolName":"bash",
+                               "arguments":{"command":"echo hi","shellId":"shell-1"}}}),
+                json!({"id":"d","type":"tool.execution_complete",
+                       "data":{"toolCallId":"c1","toolName":"bash","success":true,
+                               "result":{"contents":[
+                                   {"type":"shell_exit","shellId":"shell-1","exitCode":0}]}}}),
+                json!({"id":"a","type":"abort","data":{"reason":"user_initiated"}}),
+            ],
+        );
+
+        let terminal = state
+            .tool_activity
+            .terminal("shell-1")
+            .expect("the shell was tracked");
+        assert_eq!(terminal.state, crate::tools::TerminalState::Exited);
     }
 
     /// A completed message must not be relabelled by a later cancellation.
@@ -1345,6 +1820,184 @@ mod tests {
         });
         assert_eq!(report.blocking().len(), 1);
         assert!(!report.is_self_hosting_ready());
+    }
+
+    /// An attachment is part of what was asked. A transcript that drops it
+    /// cannot be read back to understand the conversation, because the
+    /// question referred to something no longer shown.
+    #[test]
+    fn a_user_message_keeps_the_attachments_it_was_sent_with() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![json!({"id":"u","type":"user.message","data":{
+                "content":"what is wrong here",
+                "attachments":[{
+                    "type":"file",
+                    "displayName":"Pasted Image",
+                    "path":"/tmp/clipboard.png",
+                    "mimeType":"image/png"
+                }]
+            }})],
+        );
+
+        let message = state
+            .transcript
+            .iter()
+            .find(|message| message.role == TranscriptRole::User)
+            .expect("user message");
+        assert_eq!(message.attachments.len(), 1, "the attachment was dropped");
+        assert_eq!(message.attachments[0].display_name, "Pasted Image");
+        assert!(message.attachments[0].is_image);
+    }
+
+    /// An attachment with no text is still a message worth showing.
+    #[test]
+    fn an_attachment_only_message_is_kept() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![json!({"id":"u","type":"user.message","data":{
+                "content":"",
+                "attachments":[{
+                    "type":"file",
+                    "displayName":"Pasted Image",
+                    "path":"/tmp/clipboard.png"
+                }]
+            }})],
+        );
+
+        assert_eq!(
+            state.transcript.len(),
+            1,
+            "a message carrying only a screenshot vanished from the transcript"
+        );
+        assert_eq!(state.transcript[0].attachments.len(), 1);
+    }
+
+    /// Observed live: the runtime echoes an attachment back in the form it
+    /// was sent. A blob comes back as a blob, with no path, so nothing can be
+    /// loaded from it later. This is why pasted images must be sent as files.
+    #[test]
+    fn a_blob_attachment_comes_back_without_a_path() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![json!({"id":"u","type":"user.message","data":{
+                "content":"look",
+                "attachments":[{
+                    "type":"blob",
+                    "displayName":"Pasted image 1",
+                    "mimeType":"image/png",
+                    "data":"iVBORw=="
+                }]
+            }})],
+        );
+
+        let attachment = &state.transcript[0].attachments[0];
+        assert!(attachment.is_image, "a PNG blob is still an image");
+        assert!(
+            attachment.path.is_none(),
+            "a blob has no path, so it cannot be shown again"
+        );
+    }
+
+    /// A file attachment echoes back with the path it was sent with, which is
+    /// what makes it possible to show the picture again later.
+    #[test]
+    fn a_file_attachment_comes_back_with_its_path() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![json!({"id":"u","type":"user.message","data":{
+                "content":"look",
+                "attachments":[{
+                    "type":"file",
+                    "displayName":"Pasted image 1",
+                    "path":"/tmp/gcabb/attachments/abc-clipboard.png"
+                }]
+            }})],
+        );
+
+        let attachment = &state.transcript[0].attachments[0];
+        assert!(attachment.is_image);
+        assert_eq!(
+            attachment.path.as_deref(),
+            Some("/tmp/gcabb/attachments/abc-clipboard.png")
+        );
+    }
+
+    /// A pasted screenshot has no path, so it must carry its own bytes.
+    #[test]
+    fn a_pasted_image_carries_its_bytes_not_a_path() {
+        let attachment =
+            PromptAttachment::from_image_bytes(&[0x89, 0x50, 0x4E, 0x47], "image/png", 1);
+        let PromptAttachment::Image {
+            data,
+            mime_type,
+            display_name,
+        } = &attachment
+        else {
+            panic!("a pasted image must not become a file reference");
+        };
+        assert_eq!(data, "iVBORw==");
+        assert_eq!(mime_type, "image/png");
+        assert_eq!(display_name, "Pasted image 1");
+        assert!(attachment.is_image());
+    }
+
+    /// A file is judged an image by extension, since it has no declared type.
+    #[test]
+    fn a_chosen_file_is_recognized_as_an_image_by_extension() {
+        assert!(PromptAttachment::from_path(std::path::Path::new("/tmp/Shot.PNG")).is_image());
+        assert!(!PromptAttachment::from_path(std::path::Path::new("/tmp/notes.txt")).is_image());
+    }
+
+    /// A chat has no checkout, so an absent changes view is not a defect it
+    /// suffered. Counting it as blocked told the user something was broken
+    /// when the session was working exactly as designed.
+    #[test]
+    fn a_chat_is_not_blocked_by_having_no_changes_view() {
+        let mut report = CapabilityReport::default();
+        for id in [
+            CapabilityId::FileRead,
+            CapabilityId::FileWrite,
+            CapabilityId::Search,
+            CapabilityId::Shell,
+        ] {
+            report.set(Capability {
+                id,
+                status: CapabilityStatus::Available,
+                detail: String::new(),
+                evidence: Vec::new(),
+            });
+        }
+        report.set(Capability {
+            id: CapabilityId::Changes,
+            status: CapabilityStatus::Unavailable,
+            detail: "Chats are not attached to a repository.".to_owned(),
+            evidence: Vec::new(),
+        });
+
+        assert!(
+            report.blocking_for(SessionKind::Chat).is_empty(),
+            "a chat was reported blocked for lacking a repository it never had"
+        );
+        // The same report on a project session is a genuine problem.
+        assert_eq!(report.blocking_for(SessionKind::Project).len(), 1);
+    }
+
+    /// A missing shell blocks any session, chat or not.
+    #[test]
+    fn a_chat_is_still_blocked_by_a_missing_shell() {
+        let mut report = CapabilityReport::default();
+        report.set(Capability {
+            id: CapabilityId::Shell,
+            status: CapabilityStatus::Unavailable,
+            detail: "no shell tool".to_owned(),
+            evidence: Vec::new(),
+        });
+        assert_eq!(report.blocking_for(SessionKind::Chat).len(), 1);
     }
 
     #[test]

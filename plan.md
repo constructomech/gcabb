@@ -508,7 +508,7 @@ Exit criteria:
 
 ### Phase 3b: Self-Hosting Parity (1-2 weeks)
 
-Status: next.
+Status: implemented, with one item revised against the runtime.
 
 Phase 3a proved GCABB can *perform* the self-hosting loop. Dogfooding GCABB to
 build GCABB then exposed a different problem: the work is not observable, and
@@ -527,10 +527,15 @@ The ordering below is by whether the gap blocks self-hosting outright.
   `+` control is currently an inert placeholder. Screenshots are the primary
   way UI defects are reported, so without this GCABB cannot be used to develop
   its own interface.
-- Give the user per-shell control. `stop_bash` exists in the runtime and
-  `TerminalSession` already models a cancelled state, but no UI reaches either,
-  so a runaway command can only be stopped by cancelling the whole session.
-  This completes the Phase 3a exit criterion about cancelling commands.
+- Give the user per-shell control. **Revised: not buildable as written.**
+  `stop_bash` is a tool the *model* calls, not a request a client can make; the
+  only client-side interruption the SDK exposes is a turn-wide abort. The
+  premise that "`stop_bash` exists in the runtime" conflated the model's tool
+  surface with the client's RPC surface. What the investigation did find was a
+  real defect: aborting left background shells displaying "running" forever,
+  because the runtime sends no completion event for shells it tears down. Abort
+  now settles them as cancelled. A true per-shell stop needs an RPC the runtime
+  does not currently offer.
 - Nest subagent activity under the task that spawned it. Events already carry
   `agentId` and `parentToolCallId`; delegated work currently appears as an
   unexplained pause.
@@ -553,6 +558,29 @@ Exit criteria:
 - Subagent work is attributable to the task that requested it.
 - Any capability the runtime does not provide is visible in the capabilities
   panel rather than surfacing as an unexplained failure.
+
+What shipped:
+
+- Tool activity is interleaved with messages in one timeline ordered by event
+  sequence, with per-entry scrollable detail blocks and subagent work nested
+  under the task that spawned it.
+- The transcript and every detail block have draggable scrollbars, and a scroll
+  gesture affects only the pane under the pointer.
+- Prompts carry file attachments, sent as paths so the runtime opens the file
+  itself. Attachments belong to the one prompt they were staged on.
+- Capability reporting was corrected in two ways found by reading a live
+  session's own report: `apply_patch` and `rg` were classified as unknown
+  tools, so the app claimed it could not edit or search while doing both; and a
+  chat was reported "blocked" for lacking a changes view it can never have.
+
+Still open, and deferred rather than done:
+
+- Detail blocks render in a proportional font, so commands, diffs, and columnar
+  output do not align. Addressed in Phase 5, which introduces a monospace font.
+- Subagent nesting is exercised only with synthetic `subagent.started` events;
+  the field shape came from Phase 0 notes and has not been observed live.
+- Chats share one working directory, so concurrent chats can collide.
+- A true per-shell stop, if the runtime ever exposes one.
 
 ### Phase 4: Tagged Releases and Auto-Update (1-2 weeks)
 
@@ -588,7 +616,55 @@ Exit criteria:
 - Invalid signatures, interrupted downloads, incompatible updates, and failed
   replacement leave the installed client runnable and provide a recovery path.
 
-### Phase 5: Operability and Visibility (2 weeks)
+### Phase 5: Rich Text Rendering (1-2 weeks)
+
+Status: planned.
+
+Assistant replies are markdown, and GCABB shows them as their source: a reply
+reads `**Hardware issue detected:**` rather than emphasising the phrase, and
+lists, headings, and code blocks arrive as literal punctuation. Everything the
+model writes to be read is currently harder to read than it would be in a
+terminal.
+
+Zed's `markdown` crate is **GPL-3.0-or-later** and cannot be used or copied
+here: GCABB is MIT, and depending on it would force the whole application to
+become GPL. This is not merely a licence header to review; it rules out reading
+that implementation for guidance as well. The other Zed crates GCABB depends on
+(`gpui`, `gpui_platform`, `gpui_linux`) are Apache-2.0 and unaffected.
+
+Parsing therefore uses `pulldown-cmark`, which is MIT and depends only on
+`bitflags` and `memchr`, with default features off so the HTML renderer is not
+pulled in. Rendering is GCABB's own, built on primitives GPUI already provides:
+a `TextRun` carries font weight, style, family, background, underline, and
+strikethrough, which is the whole of inline markdown within one wrapped
+`StyledText`, and block elements are ordinary divs of the kind the transcript
+already builds.
+
+- Render headings, paragraphs, bullet and numbered lists, fenced and inline
+  code, block quotes, horizontal rules, links, and inline emphasis.
+- Render partial markdown sanely while a reply streams. The parser sees
+  unclosed fences and half-written emphasis on nearly every frame, so the
+  rendering must not flicker between interpretations as text arrives.
+- Adopt a monospace font for code, which the application currently sets nowhere.
+  This also closes the Phase 3b gap where tool detail blocks render commands,
+  diffs, and columnar output in a proportional font that does not align.
+- Keep the source text recoverable, so a reply can still be copied as the
+  markdown that was written rather than as flattened prose.
+- Defer tables and inline images; neither is needed to read a reply, and both
+  add layout work disproportionate to that benefit.
+
+Exit criteria:
+
+- A reply containing headings, lists, emphasis, and code reads as formatted text
+  rather than as markdown source.
+- Markdown renders correctly while streaming and does not change interpretation
+  once the reply completes.
+- Code and command output render in a monospace font, in both assistant replies
+  and tool detail blocks.
+- No GPL-licensed code or derivation enters the project; the dependency added
+  for parsing is MIT.
+
+### Phase 6: Operability and Visibility (2 weeks)
 
 - Add the activity timeline, agent tree, filters, inspector, and
   duration/status display.
@@ -606,7 +682,7 @@ Exit criteria:
 - Diagnostic exports explain capability discovery without exposing credentials,
   prompts, repository content, or sensitive tool arguments.
 
-### Phase 6: Terminal and Changes Hardening (3-4 weeks)
+### Phase 7: Terminal and Changes Hardening (3-4 weeks)
 
 - Upgrade Phase 3a command output into the native virtualized GPUI terminal with
   PTYs, ANSI/VT parsing, bounded scrollback, attach/detach, interactive input,
@@ -629,7 +705,7 @@ Exit criteria:
 - Results match Git across committed and uncommitted changes, including the
   documented edge cases.
 
-### Phase 7: Product Hardening and Cross-Platform Distribution (2-3 weeks)
+### Phase 8: Product Hardening and Cross-Platform Distribution (2-3 weeks)
 
 - Production OS code signing and installer polish.
 - Extend the Phase 4 release and update pipeline to macOS and Linux.
@@ -691,6 +767,12 @@ The largest near-term uncertainty is whether CLI-owned shell, GitHub MCP, and
 skill capabilities retain full behavior through SDK-created sessions. The
 largest later uncertainty is the amount of native terminal and diff hardening
 needed beyond the Phase 3a and 3b self-hosting surfaces.
+
+Rendering work carries a licensing constraint rather than a technical one:
+Zed's markdown and terminal crates are GPL-3.0-or-later, so the Apache-2.0
+`gpui` foundation is reusable but those higher-level crates are not. Phases 5
+and 7 must build on permissively licensed parsers rather than adapting Zed's,
+and estimates assume that.
 
 ## UX Inputs Needed
 

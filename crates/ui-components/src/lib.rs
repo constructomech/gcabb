@@ -4,11 +4,11 @@ use std::{
 };
 
 use gpui::{
-    App, Bounds, ClickEvent, Context, CursorStyle, Element, ElementId, ElementInputHandler, Entity,
-    EntityInputHandler, EventEmitter, FocusHandle, Focusable, GlobalElementId, IntoElement,
-    LayoutId, PaintQuad, Pixels, Render, Role, ShapedLine, SharedString, Style, Task, TextAlign,
-    TextRun, UTF16Selection, Window, actions, div, fill, point, prelude::*, px, relative, rgb,
-    size,
+    App, Bounds, ClickEvent, ClipboardEntry, Context, CursorStyle, Element, ElementId,
+    ElementInputHandler, Entity, EntityInputHandler, EventEmitter, FocusHandle, Focusable,
+    GlobalElementId, IntoElement, LayoutId, PaintQuad, Pixels, Render, Role, ShapedLine,
+    SharedString, Style, Task, TextAlign, TextRun, UTF16Selection, Window, actions, div, fill,
+    point, prelude::*, px, relative, rgb, size,
 };
 
 actions!(text_input, [Backspace, Submit, Paste, SelectAll]);
@@ -19,6 +19,22 @@ const CURSOR_BLINK_TICK: Duration = Duration::from_millis(50);
 #[derive(Clone, Debug)]
 pub struct InputSubmitted {
     pub text: String,
+}
+
+/// Images pasted into the input.
+///
+/// The input owns no attachment state, so it reports the paste and lets the
+/// composer decide what to do with it.
+#[derive(Clone, Debug)]
+pub struct ImagesPasted {
+    pub images: Vec<PastedImage>,
+}
+
+/// One image lifted off the clipboard.
+#[derive(Clone, Debug)]
+pub struct PastedImage {
+    pub bytes: Vec<u8>,
+    pub mime_type: String,
 }
 
 pub struct TextInput {
@@ -137,7 +153,31 @@ impl TextInput {
     }
 
     fn paste(&mut self, _: &Paste, window: &mut Window, cx: &mut Context<Self>) {
-        if let Some(text) = cx.read_from_clipboard().and_then(|item| item.text()) {
+        let Some(item) = cx.read_from_clipboard() else {
+            return;
+        };
+
+        // A screenshot is the usual reason to paste into a composer, so images
+        // are reported rather than silently discarded. One clipboard item can
+        // hold both text and an image, so both are handled.
+        let images: Vec<PastedImage> = item
+            .entries()
+            .iter()
+            .filter_map(|entry| match entry {
+                ClipboardEntry::Image(image) => Some(PastedImage {
+                    bytes: image.bytes.clone(),
+                    mime_type: image.format.mime_type().to_owned(),
+                }),
+                _ => None,
+            })
+            .collect();
+        if !images.is_empty() {
+            cx.emit(ImagesPasted { images });
+        }
+
+        if let Some(text) = item.text()
+            && !text.is_empty()
+        {
             self.replace_text_in_range(None, &text, window, cx);
         }
     }
@@ -202,6 +242,7 @@ impl TextInput {
 }
 
 impl EventEmitter<InputSubmitted> for TextInput {}
+impl EventEmitter<ImagesPasted> for TextInput {}
 
 impl EntityInputHandler for TextInput {
     fn text_for_range(
@@ -481,7 +522,9 @@ pub fn bind_text_input_keys(cx: &mut App) {
     cx.bind_keys([
         KeyBinding::new("backspace", Backspace, Some("TextInput")),
         KeyBinding::new("enter", Submit, Some("TextInput")),
-        KeyBinding::new("cmd-v", Paste, Some("TextInput")),
-        KeyBinding::new("cmd-a", SelectAll, Some("TextInput")),
+        // `secondary` is cmd on macOS and ctrl everywhere else. Binding cmd
+        // directly meant paste was unreachable on Linux and Windows.
+        KeyBinding::new("secondary-v", Paste, Some("TextInput")),
+        KeyBinding::new("secondary-a", SelectAll, Some("TextInput")),
     ]);
 }

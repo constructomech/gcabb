@@ -1,14 +1,14 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::{HashMap, HashSet};
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
 use app_model::{
     ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus, DomainEvent,
-    InteractionResponse, ProjectMetadata, SessionKind, SessionMetadata, SessionSnapshot,
-    SessionStatus, ToolCatalog,
+    InteractionResponse, ProjectMetadata, PromptAttachment, SessionKind, SessionMetadata,
+    SessionSnapshot, SessionStatus, ToolCatalog,
 };
 use copilot_provider::{
     AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderInteraction,
@@ -78,6 +78,24 @@ impl WorktreeOutcome {
 pub struct SessionDeletion {
     pub id: String,
     pub worktree: Option<WorktreeOutcome>,
+    /// Attachment files removed with the session.
+    pub attachments_removed: usize,
+    /// Whether the runtime's own state directory was removed.
+    pub runtime_state_removed: bool,
+}
+
+/// Directories a session's files may live under.
+///
+/// Passed in rather than discovered so nothing is ever deleted from a location
+/// the caller did not name.
+#[derive(Clone, Debug, Default)]
+pub struct SessionRoots {
+    /// Where GCABB creates worktrees.
+    pub worktrees: Option<PathBuf>,
+    /// Where GCABB writes pasted images.
+    pub attachments: Option<PathBuf>,
+    /// Where the runtime keeps its per-session state.
+    pub runtime_state: Option<PathBuf>,
 }
 
 #[derive(Clone, Debug)]
@@ -138,10 +156,20 @@ impl SessionHandle {
     }
 
     pub async fn send(&self, prompt: impl Into<String>) -> Result<String> {
+        self.send_with_attachments(prompt, Vec::new()).await
+    }
+
+    /// Send a prompt with files attached.
+    pub async fn send_with_attachments(
+        &self,
+        prompt: impl Into<String>,
+        attachments: Vec<PromptAttachment>,
+    ) -> Result<String> {
         let (response_tx, response_rx) = oneshot::channel();
         self.command_tx
             .send(SessionCommand::Send {
                 prompt: prompt.into(),
+                attachments,
                 response: response_tx,
             })
             .await
@@ -471,13 +499,22 @@ impl SessionManager {
     pub async fn delete_session(
         &self,
         app_session_id: &str,
-        worktrees_root: Option<&Path>,
+        roots: &SessionRoots,
     ) -> Result<SessionDeletion> {
         let metadata = self
             .storage
             .list_sessions()?
             .into_iter()
             .find(|metadata| metadata.id == app_session_id);
+
+        // Read the attachment paths before the rows are deleted, since the
+        // snapshot is the only record of which files this session referenced.
+        let attachments = self
+            .storage
+            .recover_session(app_session_id)
+            .ok()
+            .map(|recovered| attachment_paths(&recovered.state))
+            .unwrap_or_default();
 
         if let Ok(handle) = self.session(app_session_id).await {
             let _ = handle.disconnect().await;
@@ -487,13 +524,33 @@ impl SessionManager {
             self.set_selected_session(None)?;
         }
         self.storage.delete_session(app_session_id)?;
+        // Space is not returned to the filesystem otherwise, which is how a
+        // database of deleted sessions stays as large as it ever was.
+        if let Err(error) = self.storage.vacuum() {
+            self.diagnostics.record(DiagnosticEvent {
+                timestamp: timestamp(),
+                category: "storage".to_owned(),
+                operation: "vacuum".to_owned(),
+                elapsed_ms: None,
+                session_id: Some(app_session_id.to_owned()),
+                success: false,
+                details: serde_json::json!({ "error": error.to_string() }),
+            });
+        }
+
+        let attachments_removed = remove_attachments(&attachments, roots.attachments.as_deref());
+        let runtime_state_removed = metadata.as_ref().is_some_and(|metadata| {
+            remove_runtime_state(&metadata.sdk_session_id, roots.runtime_state.as_deref())
+        });
 
         let worktree = metadata
             .as_ref()
-            .and_then(|metadata| Self::reclaim_worktree(metadata, worktrees_root));
+            .and_then(|metadata| Self::reclaim_worktree(metadata, roots.worktrees.as_deref()));
         Ok(SessionDeletion {
             id: app_session_id.to_owned(),
             worktree,
+            attachments_removed,
+            runtime_state_removed,
         })
     }
 
@@ -774,6 +831,7 @@ impl SessionManager {
 enum SessionCommand {
     Send {
         prompt: String,
+        attachments: Vec<PromptAttachment>,
         response: oneshot::Sender<Result<String>>,
     },
     Lifecycle {
@@ -849,9 +907,13 @@ impl SessionActor {
                 }
                 command = self.commands.recv() => {
                     match command {
-                        Some(SessionCommand::Send { prompt, response }) => {
+                        Some(SessionCommand::Send {
+                            prompt,
+                            attachments,
+                            response,
+                        }) => {
                             let result = self.provider
-                                .send(&self.sdk_session_id, &prompt)
+                                .send(&self.sdk_session_id, &prompt, &attachments)
                                 .await
                                 .map_err(SessionManagerError::from);
                             let _ = response.send(result);
@@ -1084,16 +1146,59 @@ impl SessionActor {
     }
 }
 
+/// Attachment paths recorded across a session's transcript.
+fn attachment_paths(state: &SessionSnapshot) -> Vec<PathBuf> {
+    state
+        .transcript
+        .iter()
+        .flat_map(|message| message.attachments.iter())
+        .filter_map(|attachment| attachment.path.as_ref())
+        .map(PathBuf::from)
+        .collect()
+}
+
+/// Delete a session's pasted images.
+///
+/// Only files inside the managed attachments directory are removed. A user who
+/// attached a picture from their own folder must still have it afterwards, so
+/// anything outside that directory is left alone.
+fn remove_attachments(paths: &[PathBuf], attachments_root: Option<&Path>) -> usize {
+    let Some(root) = attachments_root else {
+        return 0;
+    };
+    paths
+        .iter()
+        .filter(|path| path.starts_with(root))
+        .filter(|path| std::fs::remove_file(path).is_ok())
+        .count()
+}
+
+/// Delete the runtime's own state directory for a session.
+///
+/// Keyed by the id the runtime assigned, and confined to the directory the
+/// caller named, so a malformed id cannot reach outside it.
+fn remove_runtime_state(sdk_session_id: &str, runtime_state_root: Option<&Path>) -> bool {
+    let Some(root) = runtime_state_root else {
+        return false;
+    };
+    if sdk_session_id.is_empty() || sdk_session_id.contains(['/', '\\']) {
+        return false;
+    }
+    let directory = root.join(sdk_session_id);
+    if !directory.starts_with(root) || !directory.is_dir() {
+        return false;
+    }
+    std::fs::remove_dir_all(&directory).is_ok()
+}
+
 fn reconcile_history(
     storage: &Storage,
     state: &mut SessionSnapshot,
     history: Vec<Value>,
 ) -> Result<()> {
-    let mut seen = state
-        .activities
-        .iter()
-        .map(|event| event.id.clone())
-        .collect::<HashSet<_>>();
+    // The event log is the record of what was seen; the snapshot no longer
+    // carries a copy of it.
+    let mut seen = storage.event_ids(&state.metadata.id)?;
     for raw in history {
         let Some(event_id) = raw.get("id").and_then(Value::as_str) else {
             continue;
@@ -1266,9 +1371,100 @@ mod tests {
             .unwrap();
 
         let snapshot = snapshots.borrow().clone();
-        assert_eq!(snapshot.activities.len(), 4);
+        assert_eq!(snapshot.last_sequence, 4);
         assert_eq!(snapshot.last_sequence, 4);
         assert_eq!(snapshot.status, SessionStatus::Idle);
+    }
+
+    /// Attachments must reach the runtime, not stop at the actor boundary.
+    #[tokio::test]
+    async fn attachments_reach_the_provider() {
+        let provider = Arc::new(FakeProvider::with_script(golden_events().unwrap()));
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider.clone(), storage, diagnostics);
+        manager.start().await.unwrap();
+        let handle = manager
+            .create_session(request(std::env::temp_dir()))
+            .await
+            .unwrap();
+
+        handle
+            .send_with_attachments(
+                "look at this",
+                vec![PromptAttachment::from_path(std::path::Path::new(
+                    "/tmp/shot.png",
+                ))],
+            )
+            .await
+            .unwrap();
+
+        let sent = provider.sent_attachments().await;
+        assert_eq!(sent.len(), 1, "exactly one send happened");
+        assert_eq!(sent[0].len(), 1, "the attachment never left the app");
+        assert_eq!(sent[0][0].identity(), "/tmp/shot.png");
+    }
+
+    /// A pasted image belongs to the session, so it goes when the session
+    /// goes. A picture the user attached from their own folder does not:
+    /// deleting a session must never delete the user's files.
+    #[test]
+    fn only_managed_attachments_are_deleted() {
+        let managed = tempdir().unwrap();
+        let personal = tempdir().unwrap();
+        let pasted = managed.path().join("abc-clipboard.png");
+        let owned = personal.path().join("holiday.jpg");
+        std::fs::write(&pasted, b"pasted").unwrap();
+        std::fs::write(&owned, b"precious").unwrap();
+
+        let removed = remove_attachments(&[pasted.clone(), owned.clone()], Some(managed.path()));
+
+        assert_eq!(removed, 1);
+        assert!(!pasted.exists(), "the pasted image was left behind");
+        assert!(
+            owned.exists(),
+            "deleting a session deleted a file the user owns"
+        );
+    }
+
+    /// The runtime's own state directory is removed with the session.
+    #[test]
+    fn runtime_state_is_removed_with_the_session() {
+        let root = tempdir().unwrap();
+        let directory = root.path().join("sdk-session-1");
+        std::fs::create_dir_all(&directory).unwrap();
+        std::fs::write(directory.join("events.jsonl"), b"{}").unwrap();
+
+        assert!(remove_runtime_state("sdk-session-1", Some(root.path())));
+        assert!(!directory.exists());
+    }
+
+    /// A session id is used to build a path, so it must not be able to name
+    /// somewhere else.
+    #[test]
+    fn a_traversing_session_id_cannot_escape_the_state_root() {
+        let root = tempdir().unwrap();
+        let outside = root.path().parent().unwrap().join("gcabb-escape-probe");
+        std::fs::create_dir_all(&outside).unwrap();
+
+        assert!(!remove_runtime_state(
+            "../gcabb-escape-probe",
+            Some(root.path())
+        ));
+        assert!(outside.exists(), "a session id escaped the state root");
+        std::fs::remove_dir_all(&outside).ok();
+    }
+
+    /// Nothing is deleted from a location the caller did not name.
+    #[test]
+    fn no_roots_means_nothing_is_deleted() {
+        let managed = tempdir().unwrap();
+        let file = managed.path().join("abc-clipboard.png");
+        std::fs::write(&file, b"pasted").unwrap();
+
+        assert_eq!(remove_attachments(std::slice::from_ref(&file), None), 0);
+        assert!(file.exists());
+        assert!(!remove_runtime_state("sdk-session-1", None));
     }
 
     #[tokio::test]
@@ -1302,7 +1498,7 @@ mod tests {
         assert!(report.failed.is_empty());
         assert_eq!(report.restored.len(), 1);
         let restored = restored_manager.session(&app_session_id).await.unwrap();
-        assert_eq!(restored.snapshot().activities.len(), 4);
+        assert_eq!(restored.snapshot().last_sequence, 4);
         assert_eq!(restored.snapshot().last_sequence, 4);
     }
 
@@ -1504,7 +1700,10 @@ mod tests {
         manager.set_selected_session(Some(&id)).unwrap();
         handle.send("hello").await.unwrap();
 
-        manager.delete_session(&id, None).await.unwrap();
+        manager
+            .delete_session(&id, &SessionRoots::default())
+            .await
+            .unwrap();
 
         assert!(storage.list_sessions().unwrap().is_empty());
         assert!(manager.sessions().await.is_empty());

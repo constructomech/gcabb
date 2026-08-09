@@ -1,3 +1,5 @@
+use std::cell::RefCell;
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
@@ -5,25 +7,26 @@ use std::thread;
 use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    ContextWindowOption, InteractionKind, InteractionResponse, ProjectMetadata, SessionKind,
-    SessionLocation, SessionSnapshot, SessionStatus, TranscriptRole, TranscriptState,
+    ContextWindowOption, InteractionKind, InteractionResponse, ProjectMetadata, PromptAttachment,
+    SessionKind, SessionLocation, SessionSnapshot, SessionStatus, TranscriptRole, TranscriptState,
 };
 use copilot_provider::{CopilotProvider, ProviderCompatibility};
 use diagnostics::{TracingDiagnostics, init_tracing};
 use git_service::GitService;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, MouseButton, ParentElement, PathPromptOptions, Render, Role, SharedString,
-    StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    actions, div, px, rgb, size,
+    App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable,
+    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, PathPromptOptions,
+    Render, Role, SharedString, StatefulInteractiveElement, Styled, TitlebarOptions, Window,
+    WindowBounds, WindowOptions, actions, div, px, rgb, size,
 };
 use session_manager::{
-    CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, WorktreeOutcome,
+    CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, SessionRoots,
+    WorktreeOutcome,
 };
 use storage::Storage;
 use tokio::sync::watch;
-use ui_components::{InputSubmitted, TextInput, bind_text_input_keys};
+use ui_components::{ImagesPasted, InputSubmitted, PastedImage, TextInput, bind_text_input_keys};
 
 const BACKGROUND: u32 = 0x000d_1117;
 const SIDEBAR: u32 = 0x0016_1b22;
@@ -38,6 +41,39 @@ const BLUE: u32 = 0x0058_a6ff;
 const AMBER: u32 = 0x00d2_9900;
 const RED: u32 = 0x00f8_5161;
 const COMPACT_WIDTH: f32 = 920.0;
+/// Vertical budget for the detail blocks inside one tool entry.
+const ENTRY_DETAIL_BUDGET: f32 = 480.0;
+/// Measured thumb geometry for a scrollable region.
+struct ScrollbarGeometry {
+    track_top: gpui::Pixels,
+    track: f32,
+    thumb_top: f32,
+    thumb: f32,
+    usable: f32,
+    scrollable: f32,
+}
+
+/// A scrollbar drag in progress.
+#[derive(Clone, Debug)]
+struct ScrollbarDrag {
+    /// Which scrollable region is being dragged.
+    id: String,
+    /// Distance from the top of the thumb to the grab point, so the thumb
+    /// keeps its position under the pointer instead of recentring on it.
+    grab_offset: f32,
+}
+
+/// Smallest usable scrollbar thumb.
+const MIN_THUMB_HEIGHT: f32 = 24.0;
+/// Scrollbar track width; wide enough to aim at without crowding content.
+const SCROLLBAR_WIDTH: f32 = 14.0;
+/// Thumb width, leaving a small margin inside the track.
+const THUMB_WIDTH: f32 = 10.0;
+/// Scrollbar id for the conversation itself.
+const TRANSCRIPT_SCROLL_ID: &str = "transcript";
+/// The command never takes more than a third of that budget, so output — the
+/// part worth reading — always gets the majority.
+const COMMAND_BLOCK_HEIGHT: f32 = ENTRY_DETAIL_BUDGET / 3.0;
 
 /// Desktop-environment application identifier. On Wayland this becomes the
 /// `xdg_toplevel` app ID and on X11 the `WM_CLASS`; both are used to match the
@@ -45,6 +81,58 @@ const COMPACT_WIDTH: f32 = 920.0;
 const APP_ID: &str = "com.constructomech.gcabb";
 
 actions!(gcabb, [DismissPopup, FocusNext, FocusPrevious]);
+
+/// An image shown full size over the session.
+#[derive(Clone)]
+struct ImagePreview {
+    title: String,
+    source: PreviewSource,
+}
+
+/// Where the pixels for a preview come from.
+///
+/// A file on disk is loaded by path so the bytes are not held twice. A pasted
+/// image has no file yet, so its decoded bytes are kept until the runtime
+/// echoes back a path for it.
+#[derive(Clone)]
+enum PreviewSource {
+    Path(PathBuf),
+    Bytes(std::sync::Arc<gpui::Image>),
+}
+
+/// Build a preview for an attachment staged in the composer.
+fn draft_preview(attachment: &PromptAttachment) -> Option<ImagePreview> {
+    if !attachment.is_image() {
+        return None;
+    }
+    let title = attachment.display_name().to_owned();
+    if let Some(path) = attachment.path() {
+        return Some(ImagePreview {
+            title,
+            source: PreviewSource::Path(PathBuf::from(path)),
+        });
+    }
+    Some(ImagePreview {
+        title,
+        source: PreviewSource::Bytes(std::sync::Arc::new(gpui::Image {
+            format: image_format_for(attachment.mime_type()?)?,
+            bytes: attachment.image_bytes()?,
+            id: 0,
+        })),
+    })
+}
+
+/// Map a MIME type onto the format gpui needs to decode it.
+fn image_format_for(mime_type: &str) -> Option<gpui::ImageFormat> {
+    match mime_type {
+        "image/png" => Some(gpui::ImageFormat::Png),
+        "image/jpeg" => Some(gpui::ImageFormat::Jpeg),
+        "image/webp" => Some(gpui::ImageFormat::Webp),
+        "image/gif" => Some(gpui::ImageFormat::Gif),
+        "image/bmp" => Some(gpui::ImageFormat::Bmp),
+        _ => None,
+    }
+}
 enum ServiceUpdate {
     Ready {
         compatibility: ProviderCompatibility,
@@ -71,6 +159,7 @@ enum ServiceCommand {
     Submit {
         app_session_id: Option<String>,
         prompt: String,
+        attachments: Vec<PromptAttachment>,
         project_path: PathBuf,
         model: Option<String>,
         mode: String,
@@ -183,7 +272,11 @@ impl AppService {
                     diagnostics.clone(),
                 ));
                 let manager = Arc::new(SessionManager::new(provider, storage, diagnostics));
-                let worktrees = worktrees_root();
+                let session_roots = SessionRoots {
+                    worktrees: Some(worktrees_root()),
+                    attachments: attachments_directory(),
+                    runtime_state: runtime_state_root(),
+                };
                 // Projects are configured by the user, not inferred from the
                 // launch directory. Auto-registering the launch repository
                 // would silently re-add a project the user had removed.
@@ -236,7 +329,7 @@ impl AppService {
                     match command {
                         ServiceCommand::DeleteSession { app_session_id } => {
                             match runtime
-                                .block_on(manager.delete_session(&app_session_id, Some(&worktrees)))
+                                .block_on(manager.delete_session(&app_session_id, &session_roots))
                             {
                                 Ok(deletion) => {
                                     let _ =
@@ -283,9 +376,11 @@ impl AppService {
                         }
                         command => {
                             let is_submit = matches!(&command, ServiceCommand::Submit { .. });
-                            match runtime
-                                .block_on(handle_service_command(&manager, command, &worktrees))
-                            {
+                            match runtime.block_on(handle_service_command(
+                                &manager,
+                                command,
+                                &session_roots.worktrees.clone().unwrap_or_default(),
+                            )) {
                                 Ok(Some(handle)) => {
                                     let _ = update_tx.send(ServiceUpdate::SessionAdded(handle));
                                     if is_submit {
@@ -361,6 +456,7 @@ async fn handle_service_command(
         ServiceCommand::Submit {
             app_session_id,
             prompt,
+            attachments,
             project_path,
             model,
             mode,
@@ -415,7 +511,7 @@ async fn handle_service_command(
                 .set_selected_session(Some(handle.id()))
                 .map_err(|error| error.to_string())?;
             handle
-                .send(prompt)
+                .send_with_attachments(prompt, attachments)
                 .await
                 .map_err(|error| error.to_string())?;
         }
@@ -620,6 +716,15 @@ fn worktree_path(
 ///
 /// Kept beside the application database so it follows `GCABB_DATA_DIR` during
 /// development and never lands inside a repository.
+/// Where the runtime keeps per-session state, keyed by its own session id.
+///
+/// Deleting a session leaves this behind otherwise; one machine had 114 MB
+/// across 69 directories for sessions that no longer existed.
+fn runtime_state_root() -> Option<PathBuf> {
+    let path = dirs::home_dir()?.join(".copilot").join("session-state");
+    path.is_dir().then_some(path)
+}
+
 fn worktrees_root() -> PathBuf {
     if let Some(path) = std::env::var_os("GCABB_DATA_DIR") {
         return PathBuf::from(path).join("worktrees");
@@ -755,15 +860,38 @@ struct SessionMvpView {
     launch_workspace: PathBuf,
     /// Working directory chats run in, since chats have no repository.
     chats_workspace: PathBuf,
+    /// Where pasted images are written so they can be referenced by path.
+    attachments_root: Option<PathBuf>,
     /// Whether the composer will start a chat rather than a project session.
     composing_chat: bool,
     /// Where the next project session will run.
     draft_location: SessionLocation,
+    /// Files staged to travel with the next prompt.
+    draft_attachments: Vec<PromptAttachment>,
+    /// The image being shown full size, if any.
+    image_preview: Option<ImagePreview>,
+    /// Focus for the preview, so Escape reaches it however it was opened.
+    image_preview_focus: FocusHandle,
     /// Branch currently checked out in the selected project, refreshed when
     /// the selection changes so the composer never runs git per frame.
     project_branch: Option<String>,
     /// Scroll position of the transcript.
     transcript_scroll: gpui::ScrollHandle,
+    /// Scroll positions of the detail blocks inside tool entries, keyed by
+    /// block id so each keeps its position across renders.
+    detail_scrolls: RefCell<HashMap<String, gpui::ScrollHandle>>,
+    /// Scrollable extent the transcript last rendered with.
+    ///
+    /// Scrollbar geometry is only knowable after a layout pass, and the window
+    /// now repaints only when something changed, so a static transcript would
+    /// never come back to draw its scrollbar. Noticing the extent change asks
+    /// for exactly one more frame.
+    transcript_extent_px: f32,
+    /// Scrollbar currently being dragged, if any.
+    ///
+    /// Tracked on the view rather than the thumb so a drag keeps working once
+    /// the pointer leaves the narrow track, which is most of the time.
+    dragging_scrollbar: Option<ScrollbarDrag>,
     /// Transcript length last auto-scrolled for, so the view follows new
     /// output without fighting a user who has scrolled up to read.
     transcript_extent: (String, usize, usize),
@@ -798,6 +926,7 @@ impl SessionMvpView {
         project_root: PathBuf,
         branch: String,
         chats_workspace: PathBuf,
+        attachments_root: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
         let commands = service.commands;
@@ -833,6 +962,10 @@ impl SessionMvpView {
         cx.subscribe(&composer, |view, _, event: &InputSubmitted, cx| {
             view.submit_prompt(event.text.clone());
             cx.notify();
+        })
+        .detach();
+        cx.subscribe(&composer, |view, _, event: &ImagesPasted, cx| {
+            view.attach_pasted_images(&event.images, cx);
         })
         .detach();
         let interaction_input =
@@ -879,10 +1012,17 @@ impl SessionMvpView {
             workspace_root: project_root.clone(),
             launch_workspace: project_root,
             chats_workspace,
+            attachments_root,
             composing_chat: false,
             draft_location: SessionLocation::default(),
+            draft_attachments: Vec::new(),
+            image_preview: None,
+            image_preview_focus: cx.focus_handle(),
             project_branch: None,
             transcript_scroll: gpui::ScrollHandle::new(),
+            detail_scrolls: RefCell::new(HashMap::new()),
+            transcript_extent_px: 0.0,
+            dragging_scrollbar: None,
             transcript_extent: (String::new(), 0, 0),
             restore_failures: Vec::new(),
             updates: service.updates,
@@ -1054,6 +1194,7 @@ impl SessionMvpView {
     }
 
     fn submit_prompt(&mut self, prompt: String) {
+        let attachments = std::mem::take(&mut self.draft_attachments);
         self.action_error = None;
         let supported_efforts = self
             .draft_model
@@ -1074,6 +1215,7 @@ impl SessionMvpView {
         let _ = self.commands.send(ServiceCommand::Submit {
             app_session_id: self.selected_session.clone(),
             prompt,
+            attachments,
             project_path,
             model: self.draft_model.clone(),
             mode: self.draft_mode.clone(),
@@ -1113,6 +1255,18 @@ impl SessionMvpView {
                 || "No project".to_owned(),
                 |project| project.name.clone(),
             )
+    }
+
+    /// Ask for another frame when the transcript's scrollable extent changes.
+    ///
+    /// The scrollbar can only be sized once a layout pass has measured the
+    /// content, so the frame that first grows the transcript cannot draw it.
+    fn note_transcript_extent(&mut self, cx: &mut Context<Self>) {
+        let extent = f32::from(self.transcript_scroll.max_offset().y);
+        if (extent - self.transcript_extent_px).abs() > f32::EPSILON {
+            self.transcript_extent_px = extent;
+            cx.notify();
+        }
     }
 
     /// Keep the newest output in view as it arrives.
@@ -1599,10 +1753,240 @@ impl SessionMvpView {
         cx.notify();
     }
 
+    /// Chips for the files staged on the next prompt, each removable.
+    ///
+    /// Returns nothing when there is nothing attached so the composer keeps
+    /// its usual shape.
+    fn attachment_strip(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.draft_attachments.is_empty() {
+            return None;
+        }
+        let chips: Vec<_> = self
+            .draft_attachments
+            .iter()
+            .map(|attachment| {
+                let identity = attachment.identity();
+                let label = attachment.display_name().to_owned();
+                let icon = if attachment.is_image() { "IMG" } else { "FILE" };
+                let preview = draft_preview(attachment);
+                div()
+                    .id(SharedString::from(format!("attachment-{identity}")))
+                    .when_some(preview, |chip, preview| {
+                        chip.hover(|style| style.border_color(rgb(BLUE)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.open_image_preview(preview.clone(), window, cx);
+                            }))
+                    })
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(SUBTLE))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(icon))
+                    .child(div().text_xs().text_color(rgb(PRIMARY)).child(label))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("remove-attachment-{identity}")))
+                            .role(Role::Button)
+                            .aria_label("Remove attachment")
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("x")
+                            .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.remove_attachment(&identity, cx);
+                            })),
+                    )
+            })
+            .collect();
+        Some(
+            div()
+                .id("attachment-strip")
+                .accessibility_id("attachment-strip")
+                .debug_selector(|| "attachment-strip".to_owned())
+                .flex()
+                .flex_wrap()
+                .gap_2()
+                .px_3()
+                .pb_2()
+                .children(chips),
+        )
+    }
+
+    /// Show an attachment full size.
+    ///
+    /// Takes focus so Escape closes it. A click on a chip leaves focus
+    /// wherever it was, which left Escape dead exactly when a user would
+    /// reach for it.
+    fn open_image_preview(
+        &mut self,
+        preview: ImagePreview,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        self.image_preview = Some(preview);
+        window.focus(&self.image_preview_focus, cx);
+        cx.notify();
+    }
+
+    /// Close the preview, if one is open.
+    fn dismiss_image_preview(&mut self, cx: &mut Context<Self>) {
+        if self.image_preview.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    /// The full-size image overlay.
+    fn image_preview_overlay(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let preview = self.image_preview.as_ref()?;
+        let title = preview.title.clone();
+        let image: gpui::Img = match &preview.source {
+            PreviewSource::Path(path) => gpui::img(path.clone()),
+            PreviewSource::Bytes(image) => gpui::img(image.clone()),
+        };
+        Some(
+            div()
+                .id("image-preview")
+                .accessibility_id("image-preview")
+                .track_focus(&self.image_preview_focus)
+                .debug_selector(|| "image-preview".to_owned())
+                .role(Role::Dialog)
+                .aria_label(format!("Preview of {title}"))
+                .absolute()
+                .inset_0()
+                .flex()
+                .flex_col()
+                .items_center()
+                .justify_center()
+                .gap_3()
+                .bg(gpui::rgba(0x0000_00d8))
+                // Anywhere outside the picture closes it, which is what a
+                // lightbox trains people to expect.
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|view, _, _, cx| view.dismiss_image_preview(cx)),
+                )
+                .child(
+                    div()
+                        .text_sm()
+                        .text_color(rgb(PRIMARY))
+                        .child(title.clone()),
+                )
+                .child(
+                    div()
+                        .id("image-preview-frame")
+                        .max_w(px(1100.0))
+                        .max_h(px(760.0))
+                        .p_2()
+                        .rounded_lg()
+                        .bg(rgb(PANEL))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .shadow_lg()
+                        // Clicking the picture itself must not dismiss it.
+                        .occlude()
+                        .child(image.max_w(px(1080.0)).max_h(px(720.0))),
+                )
+                .child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("Click anywhere or press Escape to close"),
+                ),
+        )
+    }
+
+    /// Stage images pasted into the composer.
+    ///
+    /// A pasted screenshot has no path, so it is carried as bytes. Each paste
+    /// is a distinct attachment: someone who pastes twice meant two images.
+    fn attach_pasted_images(&mut self, images: &[PastedImage], cx: &mut Context<Self>) {
+        let directory = self.attachments_root.clone();
+        for image in images {
+            let index = self.draft_attachments.len() + 1;
+            // Written to disk and sent as a file, matching what a picked or
+            // dropped image does. Sending bytes inline instead meant the
+            // runtime echoed back a blob with no path, so the transcript could
+            // never show the picture again -- and a copy of those bytes was
+            // persisted in the event log and in every later snapshot.
+            let attachment = directory
+                .as_deref()
+                .and_then(|directory| {
+                    write_pasted_image(directory, &image.bytes, &image.mime_type, index)
+                })
+                .unwrap_or_else(|| {
+                    PromptAttachment::from_image_bytes(&image.bytes, image.mime_type.clone(), index)
+                });
+            self.draft_attachments.push(attachment);
+        }
+        cx.notify();
+    }
+
+    /// Stage files dropped onto the composer.
+    fn attach_dropped_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        for path in paths {
+            let attachment = PromptAttachment::from_path(path);
+            if !self
+                .draft_attachments
+                .iter()
+                .any(|existing| existing.identity() == attachment.identity())
+            {
+                self.draft_attachments.push(attachment);
+            }
+        }
+        cx.notify();
+    }
+
+    /// Open a file chooser and attach what the user picks.
+    ///
+    /// Screenshots are the primary way interface defects get reported, so this
+    /// is the difference between a session that can work on the UI and one
+    /// that cannot.
+    fn pick_attachments(cx: &mut Context<Self>) {
+        let paths = cx.prompt_for_paths(gpui::PathPromptOptions {
+            files: true,
+            directories: false,
+            multiple: true,
+            prompt: None,
+        });
+        cx.spawn(async move |view, cx| {
+            let Ok(Ok(Some(paths))) = paths.await else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                for path in paths {
+                    let attachment = PromptAttachment::from_path(&path);
+                    if !view
+                        .draft_attachments
+                        .iter()
+                        .any(|existing| existing.identity() == attachment.identity())
+                    {
+                        view.draft_attachments.push(attachment);
+                    }
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    /// Drop an attachment the user changed their mind about.
+    fn remove_attachment(&mut self, identity: &str, cx: &mut Context<Self>) {
+        self.draft_attachments
+            .retain(|attachment| attachment.identity() != identity);
+        cx.notify();
+    }
+
     fn submit_composer(&mut self, cx: &mut Context<Self>) {
         let prompt = self.composer.read(cx).value();
         let prompt = prompt.trim();
-        if !prompt.is_empty() {
+        // An attachment alone is a complete message; a screenshot often says
+        // everything the user wants to say.
+        if !prompt.is_empty() || !self.draft_attachments.is_empty() {
             self.submit_prompt(prompt.to_owned());
             cx.notify();
         }
@@ -2514,7 +2898,514 @@ impl SessionMvpView {
             )
     }
 
-    fn transcript(&self) -> impl IntoElement {
+    /// The scroll handle behind a scrollbar id.
+    fn scroll_handle(&self, id: &str) -> Option<gpui::ScrollHandle> {
+        if id == TRANSCRIPT_SCROLL_ID {
+            return Some(self.transcript_scroll.clone());
+        }
+        self.detail_scrolls.borrow().get(id).cloned()
+    }
+
+    /// Move a scrollable region so the pointer position maps to a position in
+    /// its content.
+    ///
+    /// The handle reports its own viewport bounds in window coordinates, which
+    /// is what lets a thumb anywhere on screen be dragged without the element
+    /// having to measure itself.
+    fn drag_scrollbar_to(&self, id: &str, pointer_y: gpui::Pixels, grab_offset: f32) {
+        let Some(handle) = self.scroll_handle(id) else {
+            return;
+        };
+        let Some(geometry) = Self::scrollbar_geometry(&handle) else {
+            return;
+        };
+        let local = f32::from(pointer_y - geometry.track_top) - grab_offset;
+        let fraction = (local / geometry.usable).clamp(0.0, 1.0);
+        handle.set_offset(gpui::point(
+            handle.offset().x,
+            px(-(fraction * geometry.scrollable)),
+        ));
+    }
+
+    /// Where a scrollable region's thumb currently sits.
+    fn scrollbar_geometry(handle: &gpui::ScrollHandle) -> Option<ScrollbarGeometry> {
+        let bounds = handle.bounds();
+        let track = f32::from(bounds.size.height);
+        let scrollable = f32::from(handle.max_offset().y);
+        if track <= 0.0 || scrollable <= 0.0 {
+            return None;
+        }
+        let thumb = (track * (track / (track + scrollable))).max(MIN_THUMB_HEIGHT);
+        let usable = (track - thumb).max(1.0);
+        let scrolled = (-f32::from(handle.offset().y) / scrollable).clamp(0.0, 1.0);
+        Some(ScrollbarGeometry {
+            track_top: bounds.origin.y,
+            track,
+            thumb_top: scrolled * usable,
+            thumb,
+            usable,
+            scrollable,
+        })
+    }
+
+    /// Begin a scrollbar drag, remembering where the thumb was grabbed.
+    ///
+    /// Pressing the track jumps the thumb under the pointer; pressing the
+    /// thumb keeps it where it is so the content does not lurch on grab.
+    fn begin_scrollbar_drag(&mut self, id: &str, pointer_y: gpui::Pixels) {
+        let Some(handle) = self.scroll_handle(id) else {
+            return;
+        };
+        let grab_offset = Self::scrollbar_geometry(&handle).map_or(0.0, |geometry| {
+            let local = f32::from(pointer_y - geometry.track_top);
+            let within_thumb =
+                local >= geometry.thumb_top && local <= geometry.thumb_top + geometry.thumb;
+            if within_thumb {
+                local - geometry.thumb_top
+            } else {
+                geometry.thumb / 2.0
+            }
+        });
+        self.dragging_scrollbar = Some(ScrollbarDrag {
+            id: id.to_owned(),
+            grab_offset,
+        });
+        self.drag_scrollbar_to(id, pointer_y, grab_offset);
+    }
+
+    /// A scrollbar for a scrollable region, shown while the pointer is over it.
+    ///
+    /// GPUI has no scrollbar element, so this draws the track and thumb and
+    /// wires the drag itself.
+    fn scrollbar(
+        id: &str,
+        handle: &gpui::ScrollHandle,
+        group: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        // Drawn from the same geometry the drag hit-tests against. Computing
+        // the two separately let them disagree — different clamps, and one
+        // measured against the track while the other measured against the
+        // viewport — so a press on the visible thumb was classified as a press
+        // on bare track and jumped the content instead of grabbing.
+        let geometry = Self::scrollbar_geometry(handle)?;
+        let track_id = id.to_owned();
+        let thumb_id = id.to_owned();
+
+        Some(
+            div()
+                .id(SharedString::from(format!("{id}-scrollbar")))
+                .debug_selector(|| "scrollbar".to_owned())
+                .occlude()
+                .absolute()
+                .top_0()
+                .right_0()
+                .w(px(SCROLLBAR_WIDTH))
+                .h(px(geometry.track))
+                .opacity(0.0)
+                .group_hover(group, |style| style.opacity(1.0))
+                // Pressing bare track jumps the thumb there and starts a drag.
+                .on_mouse_down(
+                    MouseButton::Left,
+                    cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
+                        view.begin_scrollbar_drag(&track_id, event.position.y);
+                        cx.notify();
+                    }),
+                )
+                // The track occludes what is behind it, so a release over the
+                // track never reaches the window handler.
+                .on_mouse_up(
+                    MouseButton::Left,
+                    cx.listener(|view, _, _, cx| {
+                        view.dragging_scrollbar = None;
+                        cx.notify();
+                    }),
+                )
+                .child(
+                    div()
+                        // The thumb sits above the track and would otherwise
+                        // swallow presses meant for it, so it carries the same
+                        // handlers rather than relying on the track's.
+                        .id(SharedString::from(format!("{id}-thumb")))
+                        .debug_selector(|| "scrollbar-thumb".to_owned())
+                        .absolute()
+                        .top(px(geometry.thumb_top))
+                        .right(px(2.0))
+                        .w(px(THUMB_WIDTH))
+                        .h(px(geometry.thumb))
+                        .rounded_full()
+                        .bg(rgb(BORDER))
+                        .hover(|style| style.bg(rgb(MUTED)).cursor_pointer())
+                        .on_mouse_down(
+                            MouseButton::Left,
+                            cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
+                                view.begin_scrollbar_drag(&thumb_id, event.position.y);
+                                cx.notify();
+                            }),
+                        )
+                        .on_mouse_up(
+                            MouseButton::Left,
+                            cx.listener(|view, _, _, cx| {
+                                view.dragging_scrollbar = None;
+                                cx.notify();
+                            }),
+                        ),
+                ),
+        )
+    }
+
+    /// A bounded, scrollable block of detail inside a tool entry.
+    ///
+    /// Commands, diffs, and output are frequently taller than any sensible
+    /// entry. Clipping them hid the interesting part; scrolling keeps the
+    /// entry compact while leaving the whole thing reachable.
+    ///
+    /// The block consumes its own wheel events so scrolling inside it does not
+    /// also scroll the transcript behind it, and draws a thumb on hover
+    /// because there is no platform scrollbar behind an overflow container.
+    fn detail_block(
+        &self,
+        id: &str,
+        content: String,
+        max_height: f32,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let handle = self
+            .detail_scrolls
+            .borrow_mut()
+            .entry(id.to_owned())
+            .or_default()
+            .clone();
+
+        let group = SharedString::from(format!("scroll-{id}"));
+        let scrollbar = Self::scrollbar(id, &handle, group.clone(), cx);
+
+        div()
+            .id(SharedString::from(format!("{id}-frame")))
+            .group(group)
+            .relative()
+            .mt_1()
+            .w_full()
+            .child(
+                div()
+                    .id(SharedString::from(id.to_owned()))
+                    .debug_selector(|| "tool-detail".to_owned())
+                    .track_scroll(&handle)
+                    .max_h(px(max_height))
+                    .w_full()
+                    .overflow_y_scroll()
+                    // Without this the transcript scrolls too, so reading a
+                    // command's output dragged the whole conversation along.
+                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(PANEL))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(content),
+            )
+            .children(scrollbar)
+    }
+
+    /// A tool call in the timeline, with its nested subagent work.
+    ///
+    /// This is what makes a session observable: without it the transcript
+    /// shows what the agent said while the reads, searches, edits, and
+    /// commands it actually ran stay invisible.
+    #[allow(clippy::too_many_lines)]
+    fn tool_entry(
+        &self,
+        invocation: &app_model::ToolInvocation,
+        children: &[&app_model::ToolInvocation],
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let (status, status_color) = match invocation.state {
+            app_model::InvocationState::Running => ("running", GREEN),
+            app_model::InvocationState::Succeeded => ("done", MUTED),
+            app_model::InvocationState::Failed => ("failed", RED),
+        };
+        let summary = invocation.summary_line();
+        let detail = invocation.multiline_summary();
+        let verb = invocation.verb();
+        let label = format!("{verb} {summary}");
+        let diff = invocation.diff().map(str::to_owned);
+        let error = invocation.error_message.clone();
+        // Command output is the tail, since the interesting part is the end.
+        // The block scrolls, so it can hold considerably more than the
+        // terminals panel preview.
+        let output = (invocation.class == app_model::ToolClass::Shell
+            && !invocation.output.is_empty())
+        .then(|| tail_lines(&invocation.output, 400));
+        let exit = invocation
+            .exit_code
+            .filter(|code| *code != 0)
+            .map(|code| format!("exit {code}"));
+        let nested: Vec<_> = children
+            .iter()
+            .map(|child| {
+                let child_status = match child.state {
+                    app_model::InvocationState::Running => GREEN,
+                    app_model::InvocationState::Succeeded => MUTED,
+                    app_model::InvocationState::Failed => RED,
+                };
+                div()
+                    .id(SharedString::from(format!("nested-{}", child.call_id)))
+                    .role(Role::ListItem)
+                    .aria_label(format!("{} {}", child.verb(), child.summary()))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(5.0))
+                            .h(px(5.0))
+                            .rounded_full()
+                            .bg(rgb(child_status)),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .overflow_hidden()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{} {}", child.verb(), child.summary())),
+                    )
+            })
+            .collect();
+
+        div()
+            .id(SharedString::from(format!("tool-{}", invocation.call_id)))
+            .debug_selector(|| "tool-entry".to_owned())
+            .accessibility_id(invocation.call_id.clone())
+            .role(Role::ListItem)
+            .aria_label(format!("{label} ({status})"))
+            .flex()
+            .w_full()
+            .justify_start()
+            .child(
+                div()
+                    .max_w(px(760.0))
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(SUBTLE))
+                    .border_1()
+                    .border_color(rgb(
+                        if invocation.state == app_model::InvocationState::Failed {
+                            RED
+                        } else {
+                            BORDER
+                        },
+                    ))
+                    .child(
+                        div()
+                            .flex()
+                            // Top aligned: a multi-line target must not push
+                            // the label to the vertical middle of the block.
+                            .items_start()
+                            .gap_2()
+                            .child(
+                                div()
+                                    .mt(px(5.0))
+                                    .w(px(6.0))
+                                    .h(px(6.0))
+                                    .rounded_full()
+                                    .bg(rgb(status_color)),
+                            )
+                            .child(div().text_xs().text_color(rgb(BLUE)).child(verb.to_owned()))
+                            .child(
+                                div()
+                                    .flex_1()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .text_xs()
+                                    .text_color(rgb(PRIMARY))
+                                    .child(summary),
+                            )
+                            .when_some(exit, |row, exit| {
+                                row.child(div().text_xs().text_color(rgb(RED)).child(exit))
+                            }),
+                    )
+                    .when_some(error, |entry, error| {
+                        entry.child(div().text_xs().text_color(rgb(RED)).child(error))
+                    })
+                    .when_some(detail, |entry, detail| {
+                        entry.child(self.detail_block(
+                            &format!("tool-detail-{}", invocation.call_id),
+                            detail,
+                            COMMAND_BLOCK_HEIGHT,
+                            cx,
+                        ))
+                    })
+                    .when_some(diff, |entry, diff| {
+                        entry.child(self.detail_block(
+                            &format!("tool-diff-{}", invocation.call_id),
+                            diff,
+                            ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
+                            cx,
+                        ))
+                    })
+                    .when_some(output, |entry, output| {
+                        entry.child(self.detail_block(
+                            &format!("tool-output-{}", invocation.call_id),
+                            output,
+                            ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
+                            cx,
+                        ))
+                    })
+                    .when(!nested.is_empty(), |entry| {
+                        entry.child(
+                            div()
+                                .mt_1()
+                                .pl_3()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .border_l_1()
+                                .border_color(rgb(BORDER))
+                                .children(nested),
+                        )
+                    }),
+            )
+    }
+
+    /// One conversation message.
+    /// Chips for what a message was sent with, clickable when previewable.
+    fn message_attachment_chips(
+        message: &app_model::TranscriptMessage,
+        cx: &mut Context<Self>,
+    ) -> Vec<impl IntoElement> {
+        message
+            .attachments
+            .iter()
+            .enumerate()
+            .map(|(index, attachment)| {
+                // Only an image backed by a file the runtime kept can be
+                // shown; a name alone is not enough to load pixels.
+                let preview = attachment
+                    .is_image
+                    .then(|| attachment.path.clone())
+                    .flatten()
+                    .map(|path| ImagePreview {
+                        title: attachment.display_name.clone(),
+                        source: PreviewSource::Path(PathBuf::from(path)),
+                    });
+                div()
+                    .id(SharedString::from(format!(
+                        "message-attachment-{}-{index}",
+                        message.id
+                    )))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .bg(rgb(SUBTLE))
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .when_some(preview, |chip, preview| {
+                        chip.hover(|style| style.border_color(rgb(BLUE)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, window, cx| {
+                                view.open_image_preview(preview.clone(), window, cx);
+                            }))
+                    })
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(if attachment.is_image { "IMG" } else { "FILE" }),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(PRIMARY))
+                            .child(attachment.display_name.clone()),
+                    )
+            })
+            .collect()
+    }
+
+    fn transcript_message(
+        message: &app_model::TranscriptMessage,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let is_user = message.role == TranscriptRole::User;
+        let speaker = if is_user { "You" } else { "Copilot" };
+        let attachments = Self::message_attachment_chips(message, cx);
+        div()
+            .id(SharedString::from(format!("message-{}", message.id)))
+            .accessibility_id(message.id.clone())
+            .role(Role::ListItem)
+            .aria_label(format!("{speaker}: {}", message.content))
+            .flex()
+            .w_full()
+            .justify_end()
+            .when(!is_user, gpui::Styled::justify_start)
+            .child(
+                div()
+                    .max_w(px(760.0))
+                    .p_3()
+                    .rounded_lg()
+                    .bg(if is_user { rgb(ELEVATED) } else { rgb(PANEL) })
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
+                            .child(if is_user { "You" } else { "Copilot" }),
+                    )
+                    .when(!message.content.is_empty(), |bubble| {
+                        bubble.child(
+                            div()
+                                .mt_2()
+                                .text_color(rgb(PRIMARY))
+                                .child(message.content.clone()),
+                        )
+                    })
+                    // Shown after the text, mirroring the composer, so the
+                    // message reads back the way it was written.
+                    .when(!attachments.is_empty(), |bubble| {
+                        bubble.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "message-attachments-{}",
+                                    message.id
+                                )))
+                                .debug_selector(|| "message-attachments".to_owned())
+                                .mt_2()
+                                .flex()
+                                .flex_wrap()
+                                .gap_2()
+                                .children(attachments),
+                        )
+                    })
+                    .when(message.state == TranscriptState::Interrupted, |bubble| {
+                        bubble.child(div().mt_1().text_xs().text_color(rgb(AMBER)).child(
+                            "Interrupted — the model does not have this \
+                                             in its context",
+                        ))
+                    })
+                    .when(message.state == TranscriptState::Streaming, |bubble| {
+                        bubble.child(
+                            div()
+                                .mt_1()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child("Streaming..."),
+                        )
+                    }),
+            )
+    }
+
+    fn transcript(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(session) = self.selected() else {
             return div()
                 .id("empty-session")
@@ -2550,69 +3441,57 @@ impl SessionMvpView {
         // The whole conversation is rendered now that the transcript scrolls;
         // capping it would put a wall part-way up the scrollback. Phase 6
         // replaces this with the virtualized list.
-        let messages = session.snapshot.transcript.iter().map(|message| {
-            let is_user = message.role == TranscriptRole::User;
-            let speaker = if is_user { "You" } else { "Copilot" };
-            div()
-                .id(SharedString::from(format!("message-{}", message.id)))
-                .accessibility_id(message.id.clone())
-                .role(Role::ListItem)
-                .aria_label(format!("{speaker}: {}", message.content))
-                .flex()
-                .w_full()
-                .justify_end()
-                .when(!is_user, gpui::Styled::justify_start)
-                .child(
-                    div()
-                        .max_w(px(760.0))
-                        .p_3()
-                        .rounded_lg()
-                        .bg(if is_user { rgb(ELEVATED) } else { rgb(PANEL) })
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
-                                .child(if is_user { "You" } else { "Copilot" }),
-                        )
-                        .child(
-                            div()
-                                .mt_2()
-                                .text_color(rgb(PRIMARY))
-                                .child(message.content.clone()),
-                        )
-                        .when(message.state == TranscriptState::Interrupted, |bubble| {
-                            bubble.child(div().mt_1().text_xs().text_color(rgb(AMBER)).child(
-                                "Interrupted — the model does not have this \
-                                             in its context",
-                            ))
-                        })
-                        .when(message.state == TranscriptState::Streaming, |bubble| {
-                            bubble.child(
-                                div()
-                                    .mt_1()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child("Streaming..."),
-                            )
-                        }),
-                )
-        });
+        let entries = session
+            .snapshot
+            .timeline()
+            .into_iter()
+            .map(|entry| match entry {
+                app_model::TimelineEntry::Message(message) => {
+                    Self::transcript_message(message, cx).into_any_element()
+                }
+                app_model::TimelineEntry::Tool(invocation) => {
+                    let children = session
+                        .snapshot
+                        .tool_activity
+                        .children_of(&invocation.call_id);
+                    self.tool_entry(invocation, &children, cx)
+                        .into_any_element()
+                }
+            })
+            .collect::<Vec<_>>();
+        let group = SharedString::from("scroll-transcript");
+        let scrollbar = Self::scrollbar(
+            TRANSCRIPT_SCROLL_ID,
+            &self.transcript_scroll,
+            group.clone(),
+            cx,
+        );
+
         div()
-            .id("transcript")
-            .debug_selector(|| "transcript".to_owned())
-            .role(Role::List)
-            .aria_label("Conversation")
-            .track_scroll(&self.transcript_scroll)
+            .id("transcript-frame")
+            .group(group)
+            .relative()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
-            .p_5()
-            .gap_3()
-            .overflow_y_scroll()
-            .children(messages)
+            .child(
+                div()
+                    .id("transcript")
+                    .debug_selector(|| "transcript".to_owned())
+                    .role(Role::List)
+                    .aria_label("Conversation")
+                    .track_scroll(&self.transcript_scroll)
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_h_0()
+                    .p_5()
+                    .gap_3()
+                    .overflow_y_scroll()
+                    .children(entries),
+            )
+            .children(scrollbar)
     }
 
     /// Phase 3 inspector: changes, terminals, and capability state.
@@ -3089,6 +3968,10 @@ impl SessionMvpView {
             .relative()
             .role(Role::Group)
             .aria_label("Message composer")
+            .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
+                view.attach_dropped_paths(paths.paths(), cx);
+            }))
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.border_color(rgb(BLUE)))
             .mx_auto()
             .mb_4()
             .w_full()
@@ -3101,6 +3984,7 @@ impl SessionMvpView {
             .rounded_lg()
             .shadow_lg()
             .child(self.composer.clone())
+            .children(self.attachment_strip(cx))
             .child(
                 div()
                     .flex()
@@ -3111,9 +3995,14 @@ impl SessionMvpView {
                     .child(
                         div()
                             .id("attachments-placeholder")
+                            .accessibility_id("attachments-placeholder")
+                            .role(Role::Button)
+                            .aria_label("Attach files")
                             .text_lg()
                             .text_color(rgb(MUTED))
-                            .child("+"),
+                            .child("+")
+                            .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
+                            .on_click(cx.listener(|_, _, _, cx| Self::pick_attachments(cx))),
                     )
                     .child(control_pill(
                         "mode",
@@ -3268,6 +4157,10 @@ impl SessionMvpView {
             .accessibility_id("home-composer")
             .role(Role::Group)
             .aria_label("Message composer")
+            .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
+                view.attach_dropped_paths(paths.paths(), cx);
+            }))
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.border_color(rgb(BLUE)))
             .relative()
             .w_full()
             .max_w(px(820.0))
@@ -3286,6 +4179,7 @@ impl SessionMvpView {
                     .border_color(rgb(BORDER))
                     .rounded_lg()
                     .child(self.composer.clone())
+                    .children(self.attachment_strip(cx))
                     .child(div().flex_1())
                     .child(
                         div()
@@ -3297,6 +4191,9 @@ impl SessionMvpView {
                             .child(
                                 div()
                                     .id("home-attachments-placeholder")
+                                    .accessibility_id("home-attachments-placeholder")
+                                    .role(Role::Button)
+                                    .aria_label("Attach files")
                                     .w(px(28.0))
                                     .h(px(28.0))
                                     .flex()
@@ -3305,7 +4202,11 @@ impl SessionMvpView {
                                     .rounded_md()
                                     .text_lg()
                                     .text_color(rgb(MUTED))
-                                    .child("+"),
+                                    .child("+")
+                                    .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
+                                    .on_click(
+                                        cx.listener(|_, _, _, cx| Self::pick_attachments(cx)),
+                                    ),
                             )
                             .child(control_pill(
                                 "mode",
@@ -3645,6 +4546,7 @@ impl Render for SessionMvpView {
     #[allow(clippy::too_many_lines)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.follow_transcript_tail();
+        self.note_transcript_extent(cx);
         let (provider_status, provider_color) = self.provider_status();
         let compact = compact_layout(f32::from(window.viewport_size().width));
         let show_sidebar = self.sidebar_open;
@@ -3692,6 +4594,7 @@ impl Render for SessionMvpView {
             .on_action(cx.listener(|view, _: &DismissPopup, _, cx| {
                 view.dismiss_control_menu(cx);
                 view.dismiss_session_menu(cx);
+                view.dismiss_image_preview(cx);
                 if view.renaming_session.is_some() {
                     view.cancel_rename(cx);
                 }
@@ -3701,6 +4604,24 @@ impl Render for SessionMvpView {
             .size_full()
             .bg(rgb(BACKGROUND))
             .text_color(rgb(PRIMARY))
+            // Scrollbar drags are tracked at the window so the thumb keeps
+            // following the pointer once it leaves the narrow track.
+            .on_mouse_move(cx.listener(|view, event: &gpui::MouseMoveEvent, _, cx| {
+                if let Some(drag) = view.dragging_scrollbar.clone() {
+                    if event.pressed_button == Some(MouseButton::Left) {
+                        view.drag_scrollbar_to(&drag.id, event.position.y, drag.grab_offset);
+                        cx.notify();
+                    } else {
+                        view.dragging_scrollbar = None;
+                    }
+                }
+            }))
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _, _, _| {
+                    view.dragging_scrollbar = None;
+                }),
+            )
             .when(show_sidebar, |root| root.child(self.sidebar(compact, cx)))
             .child(
                 div()
@@ -3817,7 +4738,7 @@ impl Render for SessionMvpView {
                                 .flex()
                                 .flex_1()
                                 .min_h_0()
-                                .child(self.transcript())
+                                .child(self.transcript(cx))
                                 .when_some(
                                     if self.panel_open {
                                         self.side_panel(cx)
@@ -3900,6 +4821,7 @@ impl Render for SessionMvpView {
             })
             .when_some(self.session_context_menu(cx), gpui::ParentElement::child)
             .when_some(self.rename_dialog(cx), gpui::ParentElement::child)
+            .when_some(self.image_preview_overlay(cx), gpui::ParentElement::child)
             .when_some(self.interaction_dialog(cx), |root, dialog| {
                 root.child(dialog)
             })
@@ -3911,12 +4833,16 @@ impl Render for SessionMvpView {
 /// Phase 3 renders a bounded tail; Phase 6 replaces this with the virtualized
 /// terminal and real scrollback.
 fn terminal_tail(output: &str) -> String {
-    const MAX_LINES: usize = 40;
+    tail_lines(output, 40)
+}
+
+/// The last `max_lines` lines of `output`.
+fn tail_lines(output: &str, max_lines: usize) -> String {
     let lines: Vec<&str> = output.lines().collect();
-    if lines.len() <= MAX_LINES {
+    if lines.len() <= max_lines {
         return output.to_owned();
     }
-    lines[lines.len() - MAX_LINES..].join("\n")
+    lines[lines.len() - max_lines..].join("\n")
 }
 
 /// Label for the inspector toggle, summarizing changed files at a glance.
@@ -3926,7 +4852,11 @@ fn changes_badge(session: Option<&SessionProjection>) -> String {
         |session| {
             let changed = session.snapshot.changes.files.len();
             let terminals = session.snapshot.tool_activity.active_terminals().len();
-            let blocking = session.snapshot.capabilities.blocking().len();
+            let blocking = session
+                .snapshot
+                .capabilities
+                .blocking_for(session.snapshot.metadata.kind)
+                .len();
             let mut parts = vec![format!("{changed} changed")];
             if terminals > 0 {
                 parts.push(format!("{terminals} running"));
@@ -4175,6 +5105,44 @@ fn chats_directory(fallback: &Path) -> PathBuf {
     path
 }
 
+/// Where pasted images are kept.
+///
+/// Deliberately not the session worktree: files written there would appear in
+/// the changes view and could be committed by accident. The runtime references
+/// an attached file in place rather than copying it, so this has to outlive the
+/// composer for the transcript to still show the picture later.
+fn attachments_directory() -> Option<PathBuf> {
+    let base = std::env::var_os("GCABB_DATA_DIR")
+        .map(PathBuf::from)
+        .or_else(|| dirs::data_local_dir().map(|dir| dir.join("gcabb")))?;
+    let path = base.join("attachments");
+    std::fs::create_dir_all(&path).ok()?;
+    Some(path)
+}
+
+/// Write a pasted image to disk so it can be referenced by path.
+fn write_pasted_image(
+    directory: &Path,
+    bytes: &[u8],
+    mime_type: &str,
+    index: usize,
+) -> Option<PromptAttachment> {
+    let extension = match mime_type {
+        "image/png" => "png",
+        "image/jpeg" => "jpg",
+        "image/webp" => "webp",
+        "image/gif" => "gif",
+        "image/bmp" => "bmp",
+        _ => return None,
+    };
+    let path = directory.join(format!("{}-clipboard.{extension}", uuid::Uuid::new_v4()));
+    std::fs::write(&path, bytes).ok()?;
+    Some(PromptAttachment::File {
+        path: path.to_string_lossy().into_owned(),
+        display_name: format!("Pasted image {index}"),
+    })
+}
+
 fn prepare_data_directory(path: &Path) -> Result<PathBuf, String> {
     std::fs::create_dir_all(path)
         .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
@@ -4254,6 +5222,20 @@ fn timestamp() -> String {
     )
 }
 
+/// Install every key binding the app responds to.
+///
+/// Shared with the interaction tests so they exercise the bindings the app
+/// actually ships. Tests that installed their own bindings once let a
+/// macOS-only paste shortcut reach Linux users unnoticed.
+fn bind_app_keys(cx: &mut App) {
+    bind_text_input_keys(cx);
+    cx.bind_keys([
+        KeyBinding::new("escape", DismissPopup, None),
+        KeyBinding::new("tab", FocusNext, None),
+        KeyBinding::new("shift-tab", FocusPrevious, None),
+    ]);
+}
+
 fn main() {
     if let Err(error) = init_tracing("gcabb=info") {
         eprintln!("failed to initialize structured tracing: {error}");
@@ -4267,18 +5249,13 @@ fn main() {
     let chats_workspace = chats_directory(&project_root);
 
     gpui_platform::application().run(move |cx: &mut App| {
-        bind_text_input_keys(cx);
-        cx.bind_keys([KeyBinding::new("escape", DismissPopup, None)]);
+        bind_app_keys(cx);
         cx.on_window_closed(|cx, _| {
             if cx.windows().is_empty() {
                 cx.quit();
             }
         })
         .detach();
-        cx.bind_keys([
-            KeyBinding::new("tab", FocusNext, None),
-            KeyBinding::new("shift-tab", FocusPrevious, None),
-        ]);
         let bounds = Bounds::centered(None, size(px(1280.0), px(860.0)), cx);
         let service = service;
         let project_root = project_root.clone();
@@ -4298,7 +5275,14 @@ fn main() {
                 },
                 move |_, cx| {
                     cx.new(|cx| {
-                        SessionMvpView::new(service, project_root, branch, chats_workspace, cx)
+                        SessionMvpView::new(
+                            service,
+                            project_root,
+                            branch,
+                            chats_workspace,
+                            attachments_directory(),
+                            cx,
+                        )
                     })
                 },
             )
@@ -4661,14 +5645,30 @@ mod tests {
             &mut VisualTestContext,
             std::sync::mpsc::Receiver<ServiceCommand>,
         ) {
+            let (view, cx, commands, _) = setup_with_attachments(cx);
+            (view, cx, commands)
+        }
+
+        /// Same view, plus a temporary directory for pasted images.
+        fn setup_with_attachments(
+            cx: &mut TestAppContext,
+        ) -> (
+            gpui::Entity<SessionMvpView>,
+            &mut VisualTestContext,
+            std::sync::mpsc::Receiver<ServiceCommand>,
+            tempfile::TempDir,
+        ) {
+            let attachments = tempfile::tempdir().expect("temp dir");
+            let attachments_root = attachments.path().to_owned();
             let (service, commands) = AppService::for_test();
-            cx.update(ui_components::bind_text_input_keys);
+            cx.update(super::super::bind_app_keys);
             let (view, cx) = cx.add_window_view(|_, cx| {
                 let mut view = SessionMvpView::new(
                     service,
                     std::path::PathBuf::from("/tmp/project"),
                     "main".to_owned(),
                     std::path::PathBuf::from("/tmp/chats"),
+                    Some(attachments_root),
                     cx,
                 );
                 view.selected_project = std::path::PathBuf::from("/tmp/project");
@@ -4678,7 +5678,7 @@ mod tests {
                 view
             });
             cx.run_until_parked();
-            (view, cx, commands)
+            (view, cx, commands, attachments)
         }
 
         /// Regression: the right-click that opens the menu releases after the
@@ -4860,6 +5860,512 @@ mod tests {
             assert!(base_ref.is_none(), "a chat has no changes base");
         }
 
+        /// A staged attachment travels with the prompt it was staged on.
+        #[gpui::test]
+        fn submitting_carries_staged_attachments(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, _| {
+                view.draft_attachments
+                    .push(app_model::PromptAttachment::from_path(
+                        std::path::Path::new("/tmp/shot.png"),
+                    ));
+            });
+
+            view.update(cx, |view, _| view.submit_prompt("look".to_owned()));
+
+            let mut attachments = None;
+            while let Ok(command) = commands.try_recv() {
+                if let ServiceCommand::Submit {
+                    attachments: sent, ..
+                } = command
+                {
+                    attachments = Some(sent);
+                }
+            }
+            let attachments = attachments.expect("a submit command was sent");
+            assert_eq!(attachments.len(), 1, "the staged screenshot was dropped");
+            assert_eq!(attachments[0].identity(), "/tmp/shot.png");
+            assert_eq!(attachments[0].display_name(), "shot.png");
+        }
+
+        /// Attachments belong to one prompt, not to every later prompt.
+        #[gpui::test]
+        fn attachments_do_not_repeat_on_the_next_prompt(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, _| {
+                view.draft_attachments
+                    .push(app_model::PromptAttachment::from_path(
+                        std::path::Path::new("/tmp/shot.png"),
+                    ));
+                view.submit_prompt("look".to_owned());
+                view.submit_prompt("and now".to_owned());
+            });
+
+            let mut sends = Vec::new();
+            while let Ok(command) = commands.try_recv() {
+                if let ServiceCommand::Submit { attachments, .. } = command {
+                    sends.push(attachments);
+                }
+            }
+            assert_eq!(sends.len(), 2, "both prompts were sent");
+            assert_eq!(sends[0].len(), 1);
+            assert!(
+                sends[1].is_empty(),
+                "the screenshot was resent with an unrelated follow-up"
+            );
+        }
+
+        /// An attachment on its own is a complete message.
+        #[gpui::test]
+        fn an_attachment_alone_can_be_submitted(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.draft_attachments
+                    .push(app_model::PromptAttachment::from_path(
+                        std::path::Path::new("/tmp/shot.png"),
+                    ));
+                view.submit_composer(cx);
+            });
+
+            let sent = std::iter::from_fn(|| commands.try_recv().ok())
+                .any(|command| matches!(command, ServiceCommand::Submit { .. }));
+            assert!(sent, "an empty prompt with a screenshot sent nothing");
+        }
+
+        /// Removing an attachment takes it off the next prompt.
+        #[gpui::test]
+        fn removing_an_attachment_unstages_it(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.draft_attachments
+                    .push(app_model::PromptAttachment::from_path(
+                        std::path::Path::new("/tmp/shot.png"),
+                    ));
+                view.remove_attachment("/tmp/shot.png", cx);
+            });
+            view.update(cx, |view, _| {
+                assert!(view.draft_attachments.is_empty());
+            });
+        }
+
+        /// The chip strip only exists when something is attached.
+        #[gpui::test]
+        fn the_attachment_strip_appears_with_an_attachment(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds("attachment-strip").is_none(),
+                "the strip took up space with nothing attached"
+            );
+
+            view.update(cx, |view, cx| {
+                view.draft_attachments
+                    .push(app_model::PromptAttachment::from_path(
+                        std::path::Path::new("/tmp/shot.png"),
+                    ));
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds("attachment-strip").is_some(),
+                "the attached screenshot was never shown"
+            );
+        }
+
+        /// A pasted screenshot has no path, so it must travel as bytes.
+        #[gpui::test]
+        fn pasting_an_image_stages_it_as_an_attachment(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.attach_pasted_images(
+                    &[super::super::PastedImage {
+                        bytes: vec![0x89, 0x50, 0x4E, 0x47],
+                        mime_type: "image/png".to_owned(),
+                    }],
+                    cx,
+                );
+                view.submit_prompt("what is wrong here".to_owned());
+            });
+
+            let mut attachments = None;
+            while let Ok(command) = commands.try_recv() {
+                if let ServiceCommand::Submit {
+                    attachments: sent, ..
+                } = command
+                {
+                    attachments = Some(sent);
+                }
+            }
+            let attachments = attachments.expect("a submit command was sent");
+            assert_eq!(attachments.len(), 1, "the pasted screenshot was dropped");
+            let app_model::PromptAttachment::Image {
+                mime_type, data, ..
+            } = &attachments[0]
+            else {
+                panic!("a pasted image must travel as bytes, not as a path");
+            };
+            assert_eq!(mime_type, "image/png");
+            // base64 of the PNG magic bytes, so the payload survived intact.
+            assert_eq!(data, "iVBORw==");
+        }
+
+        /// Two pastes mean two images, even when the bytes are identical.
+        #[gpui::test]
+        fn pasting_twice_stages_two_images(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let image = super::super::PastedImage {
+                bytes: vec![1, 2, 3],
+                mime_type: "image/png".to_owned(),
+            };
+            view.update(cx, |view, cx| {
+                view.attach_pasted_images(std::slice::from_ref(&image), cx);
+                view.attach_pasted_images(std::slice::from_ref(&image), cx);
+            });
+            view.update(cx, |view, _| {
+                assert_eq!(
+                    view.draft_attachments.len(),
+                    2,
+                    "the second paste was mistaken for a duplicate of the first"
+                );
+            });
+        }
+
+        /// Dropping files onto the composer stages them.
+        #[gpui::test]
+        fn dropping_files_stages_them(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.attach_dropped_paths(
+                    &[
+                        std::path::PathBuf::from("/tmp/one.png"),
+                        std::path::PathBuf::from("/tmp/two.png"),
+                    ],
+                    cx,
+                );
+            });
+            view.update(cx, |view, _| {
+                assert_eq!(view.draft_attachments.len(), 2);
+                assert_eq!(view.draft_attachments[0].display_name(), "one.png");
+            });
+        }
+
+        /// Dropping the same file twice attaches it once.
+        #[gpui::test]
+        fn dropping_the_same_file_twice_stages_it_once(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let paths = [std::path::PathBuf::from("/tmp/one.png")];
+            view.update(cx, |view, cx| {
+                view.attach_dropped_paths(&paths, cx);
+                view.attach_dropped_paths(&paths, cx);
+            });
+            view.update(cx, |view, _| {
+                assert_eq!(view.draft_attachments.len(), 1);
+            });
+        }
+
+        /// Removing one pasted image must not remove its identical twin.
+        #[gpui::test]
+        fn removing_one_pasted_image_keeps_the_other(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let image = super::super::PastedImage {
+                bytes: vec![1, 2, 3],
+                mime_type: "image/png".to_owned(),
+            };
+            view.update(cx, |view, cx| {
+                view.attach_pasted_images(std::slice::from_ref(&image), cx);
+                view.attach_pasted_images(std::slice::from_ref(&image), cx);
+                let first = view.draft_attachments[0].identity();
+                view.remove_attachment(&first, cx);
+            });
+            view.update(cx, |view, _| {
+                assert_eq!(
+                    view.draft_attachments.len(),
+                    1,
+                    "removing one image took its twin with it"
+                );
+                assert_eq!(view.draft_attachments[0].display_name(), "Pasted image 2");
+            });
+        }
+
+        /// Paste was bound to cmd only, so on Linux and Windows the action
+        /// never fired and a pasted screenshot vanished without a trace.
+        #[gpui::test]
+        fn pasting_an_image_with_the_platform_shortcut_attaches_it(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            cx.update(|_, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_image(&gpui::Image {
+                    format: gpui::ImageFormat::Png,
+                    bytes: vec![0x89, 0x50, 0x4E, 0x47],
+                    id: 1,
+                }));
+            });
+            view.update_in(cx, |view, window, cx| {
+                let handle = gpui::Focusable::focus_handle(view.composer.read(cx), cx);
+                window.focus(&handle, cx);
+            });
+            cx.run_until_parked();
+
+            cx.simulate_keystrokes("secondary-v");
+            cx.run_until_parked();
+
+            view.update(cx, |view, _| {
+                assert_eq!(
+                    view.draft_attachments.len(),
+                    1,
+                    "the platform paste shortcut did not reach the composer"
+                );
+                assert!(view.draft_attachments[0].is_image());
+            });
+        }
+
+        /// Clicking an image chip in the transcript shows the picture.
+        #[gpui::test]
+        fn clicking_a_transcript_image_opens_a_preview(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "m1".to_owned(),
+                    role: app_model::TranscriptRole::User,
+                    content: "look".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: vec![app_model::MessageAttachment {
+                        display_name: "Pasted Image".to_owned(),
+                        is_image: true,
+                        path: Some("/tmp/clipboard.png".to_owned()),
+                    }],
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let chip = cx
+                .debug_bounds("message-attachments")
+                .expect("the attachment chip rendered");
+            cx.simulate_click(chip.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("image-preview").is_some(),
+                "clicking the image chip did not open a preview"
+            );
+        }
+
+        /// The real sequence: click a chip, then press Escape. If opening the
+        /// preview leaves focus outside the action's dispatch path, Escape is
+        /// dead exactly when the user is most likely to reach for it.
+        #[gpui::test]
+        fn escape_closes_a_preview_opened_by_clicking(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "m1".to_owned(),
+                    role: app_model::TranscriptRole::User,
+                    content: "look".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: vec![app_model::MessageAttachment {
+                        display_name: "Pasted Image".to_owned(),
+                        is_image: true,
+                        path: Some("/tmp/clipboard.png".to_owned()),
+                    }],
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let chip = cx
+                .debug_bounds("message-attachments")
+                .expect("the attachment chip rendered");
+            cx.simulate_click(chip.center(), Modifiers::none());
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("image-preview").is_some());
+
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds("image-preview").is_none(),
+                "escape did nothing after opening the preview by click"
+            );
+        }
+
+        /// The preview closes without needing a specific target to hit.
+        #[gpui::test]
+        fn the_image_preview_closes_on_escape(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update_in(cx, |view, window, cx| {
+                view.open_image_preview(
+                    super::super::ImagePreview {
+                        title: "Pasted Image".to_owned(),
+                        source: super::super::PreviewSource::Path(std::path::PathBuf::from(
+                            "/tmp/clipboard.png",
+                        )),
+                    },
+                    window,
+                    cx,
+                );
+            });
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("image-preview").is_some());
+
+            // Focus the composer first, mirroring a user who was typing.
+            view.update_in(cx, |view, window, cx| {
+                let handle = gpui::Focusable::focus_handle(view.composer.read(cx), cx);
+                window.focus(&handle, cx);
+            });
+            cx.run_until_parked();
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds("image-preview").is_none(),
+                "escape left the preview open"
+            );
+        }
+
+        /// A non-image attachment has nothing to preview.
+        #[gpui::test]
+        fn a_non_image_attachment_does_not_open_a_preview(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "m1".to_owned(),
+                    role: app_model::TranscriptRole::User,
+                    content: "look".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: vec![app_model::MessageAttachment {
+                        display_name: "notes.txt".to_owned(),
+                        is_image: false,
+                        path: Some("/tmp/notes.txt".to_owned()),
+                    }],
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let chip = cx
+                .debug_bounds("message-attachments")
+                .expect("the attachment chip rendered");
+            cx.simulate_click(chip.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("image-preview").is_none(),
+                "a text file was opened as a picture"
+            );
+        }
+
+        /// The bug this replaces: pasted images were sent as inline blobs, and
+        /// the runtime echoes an attachment back in the form it was sent. A
+        /// blob has no path, so the transcript could never show the picture
+        /// again. The earlier test fabricated a path that pasted images never
+        /// actually receive, so it passed against a broken build.
+        #[gpui::test]
+        fn a_pasted_image_is_written_to_disk_and_sent_as_a_file(cx: &mut TestAppContext) {
+            let (view, cx, commands, _attachments) = setup_with_attachments(cx);
+            let png: Vec<u8> = vec![0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A];
+            view.update(cx, |view, cx| {
+                view.attach_pasted_images(
+                    &[super::super::PastedImage {
+                        bytes: png.clone(),
+                        mime_type: "image/png".to_owned(),
+                    }],
+                    cx,
+                );
+                view.submit_prompt("look".to_owned());
+            });
+
+            let mut sent = None;
+            while let Ok(command) = commands.try_recv() {
+                if let ServiceCommand::Submit { attachments, .. } = command {
+                    sent = Some(attachments);
+                }
+            }
+            let sent = sent.expect("a submit command was sent");
+            assert_eq!(sent.len(), 1);
+            let path = sent[0]
+                .path()
+                .expect("a pasted image must be sent as a file, not an inline blob");
+            assert_eq!(
+                std::fs::read(path).expect("the image was written to disk"),
+                png,
+                "the file does not hold the pasted bytes"
+            );
+            assert!(
+                std::path::Path::new(path)
+                    .extension()
+                    .is_some_and(|extension| extension == "png"),
+                "the extension names the format"
+            );
+        }
+
+        /// A pasted image is previewable from the composer before it is sent.
+        #[gpui::test]
+        fn a_pasted_image_can_be_previewed_before_sending(cx: &mut TestAppContext) {
+            let (view, cx, _commands, _attachments) = setup_with_attachments(cx);
+            view.update(cx, |view, cx| {
+                view.attach_pasted_images(
+                    &[super::super::PastedImage {
+                        bytes: vec![0x89, 0x50, 0x4E, 0x47],
+                        mime_type: "image/png".to_owned(),
+                    }],
+                    cx,
+                );
+            });
+            view.update(cx, |view, _| {
+                let preview = super::super::draft_preview(&view.draft_attachments[0])
+                    .expect("a pasted image can be previewed");
+                assert!(matches!(
+                    preview.source,
+                    super::super::PreviewSource::Path(_)
+                ));
+            });
+        }
+
+        /// A sent attachment is part of what was asked, so the transcript must
+        /// still show it after the composer is cleared.
+        #[gpui::test]
+        fn a_sent_attachment_is_shown_in_the_transcript(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "m1".to_owned(),
+                    role: app_model::TranscriptRole::User,
+                    content: "what is wrong here".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: vec![app_model::MessageAttachment {
+                        display_name: "Pasted Image".to_owned(),
+                        is_image: true,
+                        path: None,
+                    }],
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("message-attachments").is_some(),
+                "the attachment vanished once the message was sent"
+            );
+        }
+
         /// Choosing a project returns the composer to project mode.
         #[gpui::test]
         fn choosing_a_project_leaves_chat_mode(cx: &mut TestAppContext) {
@@ -5021,6 +6527,454 @@ mod tests {
             });
         }
 
+        /// Phase 3b: tool calls must be visible in the transcript, not just
+        /// the prose around them.
+        #[gpui::test]
+        fn tool_calls_render_in_the_transcript(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for (index, raw) in [
+                    serde_json::json!({"id":"u","type":"user.message",
+                        "data":{"content":"fix it"}}),
+                    serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"str_replace_editor",
+                                "arguments":{"path":"src/lib.rs"}}}),
+                    serde_json::json!({"id":"tc","type":"tool.execution_complete",
+                        "data":{"toolCallId":"c1","success":true,
+                                "result":{"detailedContent":"@@ -1 +1 @@\n-old\n+new"}}}),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    let event = app_model::DomainEvent::from_sdk_event_for(
+                        "session-1",
+                        u64::try_from(index).unwrap_or(0) + 1,
+                        &raw,
+                    );
+                    state.apply(event);
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("tool-entry").is_some(),
+                "the edit should be visible in the transcript"
+            );
+            view.read_with(cx, |view, _| {
+                let snapshot = &view.selected().unwrap().snapshot;
+                let timeline = snapshot.timeline();
+                assert_eq!(timeline.len(), 2, "one message and one tool call");
+            });
+        }
+
+        /// The command block is capped at a third of the entry budget, so a
+        /// long script cannot crowd out the output worth reading.
+        #[test]
+        fn command_block_is_capped_at_a_third_of_the_entry() {
+            assert!(
+                (super::super::COMMAND_BLOCK_HEIGHT - super::super::ENTRY_DETAIL_BUDGET / 3.0)
+                    .abs()
+                    < f32::EPSILON
+            );
+            let output_height =
+                super::super::ENTRY_DETAIL_BUDGET - super::super::COMMAND_BLOCK_HEIGHT;
+            assert!(
+                output_height > super::super::COMMAND_BLOCK_HEIGHT * 1.9,
+                "output should get the majority of the budget"
+            );
+        }
+
+        /// Regression: scrolling a tool's output also scrolled the transcript
+        /// behind it, dragging the whole conversation along.
+        #[gpui::test]
+        fn scrolling_output_does_not_scroll_the_transcript(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                let mut sequence = 0;
+                let mut apply =
+                    |raw: &serde_json::Value, state: &mut app_model::SessionSnapshot| {
+                        sequence += 1;
+                        state.apply(app_model::DomainEvent::from_sdk_event_for(
+                            "session-1",
+                            sequence,
+                            raw,
+                        ));
+                    };
+                // Enough messages that the transcript itself can scroll.
+                for index in 0..60 {
+                    apply(
+                        &serde_json::json!({"id": format!("u{index}"), "type":"user.message",
+                            "data":{"content": format!("message {index}")}}),
+                        &mut state,
+                    );
+                }
+                apply(
+                    &serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"bash",
+                                "arguments":{"command":"seq 1 500"},
+                                "shellToolInfo":{"displayCommand":"seq 1 500",
+                                                 "hasWriteFileRedirection":false,
+                                                 "possiblePaths":[]}}}),
+                    &mut state,
+                );
+                let output = (1..=500)
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                apply(
+                    &serde_json::json!({"id":"p","type":"tool.execution_partial_result",
+                        "data":{"toolCallId":"c1","partialOutput": output}}),
+                    &mut state,
+                );
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let wheel = |position, cx: &mut VisualTestContext| {
+                cx.simulate_event(gpui::ScrollWheelEvent {
+                    position,
+                    delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(120.0))),
+                    modifiers: Modifiers::none(),
+                    touch_phase: gpui::TouchPhase::Moved,
+                });
+                cx.run_until_parked();
+            };
+
+            // Control: over the transcript itself, the wheel must scroll it.
+            // Without this the assertion below could pass on a transcript that
+            // never scrolls at all.
+            let transcript = cx.debug_bounds("transcript").expect("transcript rendered");
+            let before = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            wheel(
+                gpui::point(transcript.center().x, transcript.origin.y + gpui::px(8.0)),
+                cx,
+            );
+            let after_transcript = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert_ne!(
+                before, after_transcript,
+                "the control case must scroll the transcript"
+            );
+
+            // Over a tool entry's output, only the block moves.
+            let block = cx
+                .debug_bounds("tool-detail")
+                .expect("output block rendered");
+            wheel(block.center(), cx);
+            let after_block = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert_eq!(
+                after_transcript, after_block,
+                "the transcript must not move when scrolling inside a tool entry"
+            );
+        }
+
+        /// Regression: the thumb was drawn but inert, so the wheel was the only
+        /// way to move a scrollable region.
+        #[gpui::test]
+        fn dragging_the_transcript_scrollbar_scrolls_it(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for index in 0..120 {
+                    state.transcript.push(app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content: format!("message {index} with enough text to take a line"),
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
+                    });
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            // Scrollbar geometry needs a measured layout, so give it the
+            // follow-up frame the extent change requests.
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            // Auto-follow leaves the view at the bottom.
+            let bottom = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert!(bottom < gpui::px(0.0));
+
+            // Press near the top of the track: the content should jump up.
+            let track = cx.debug_bounds("scrollbar").expect("scrollbar rendered");
+            let track_x = track.center().x;
+            let near_top = track.origin.y + gpui::px(10.0);
+            cx.simulate_mouse_down(
+                gpui::point(track_x, near_top),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            cx.run_until_parked();
+
+            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert!(
+                after > bottom,
+                "dragging the scrollbar must scroll: {bottom:?} -> {after:?}"
+            );
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.dragging_scrollbar
+                        .as_ref()
+                        .map(|drag| drag.id.as_str()),
+                    Some(super::super::TRANSCRIPT_SCROLL_ID),
+                    "the press should begin a drag"
+                );
+            });
+
+            // Releasing ends the drag so later moves do not keep scrolling.
+            cx.simulate_mouse_up(
+                gpui::point(track_x, near_top),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(view.dragging_scrollbar.is_none());
+            });
+        }
+
+        /// Regression: the thumb sits above the track and swallowed presses, so
+        /// it could only be grabbed by clicking the sliver of track beside it.
+        #[gpui::test]
+        fn the_scrollbar_thumb_itself_can_be_grabbed(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for index in 0..120 {
+                    state.transcript.push(app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content: format!("message {index} with enough text to take a line"),
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
+                    });
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            // Auto-follow leaves the thumb at the bottom of its track.
+            let handle = view.read_with(cx, |view, _| view.transcript_scroll.clone());
+            let geometry = super::super::SessionMvpView::scrollbar_geometry(&handle)
+                .expect("the transcript should be scrollable");
+            let track = cx.debug_bounds("scrollbar").expect("scrollbar rendered");
+
+            // Press the middle of the thumb itself, not the track beside it.
+            let thumb_middle =
+                geometry.track_top + gpui::px(geometry.thumb_top + geometry.thumb / 2.0);
+            cx.simulate_mouse_down(
+                gpui::point(track.center().x, thumb_middle),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(
+                    view.dragging_scrollbar.is_some(),
+                    "pressing the thumb must start a drag"
+                );
+            });
+
+            // Grabbing the middle of the thumb must not move the content; the
+            // grab point is preserved rather than recentred on the pointer.
+            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let expected = -(geometry.thumb_top / geometry.usable * geometry.scrollable);
+            assert!(
+                (f32::from(after) - expected).abs() < 2.0,
+                "grabbing the thumb should not lurch: {after:?} vs {expected}"
+            );
+        }
+
+        /// Regression: the thumb was drawn from one calculation and hit-tested
+        /// against another, so pressing the visible thumb was often treated as
+        /// pressing bare track. Where it is drawn must be where it is grabbed.
+        #[gpui::test]
+        fn the_drawn_thumb_matches_the_grabbable_thumb(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                // Enough content that the thumb is small, which is where the
+                // two calculations diverged.
+                for index in 0..400 {
+                    state.transcript.push(app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content: format!("message {index} with enough text to take a line"),
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
+                    });
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            let handle = view.read_with(cx, |view, _| view.transcript_scroll.clone());
+            let geometry = super::super::SessionMvpView::scrollbar_geometry(&handle)
+                .expect("the transcript should be scrollable");
+            let drawn = cx.debug_bounds("scrollbar-thumb").expect("thumb rendered");
+
+            let drawn_top = f32::from(drawn.origin.y - geometry.track_top);
+            assert!(
+                (drawn_top - geometry.thumb_top).abs() < 1.0,
+                "thumb drawn at {drawn_top} but grabbable at {}",
+                geometry.thumb_top
+            );
+            assert!(
+                (f32::from(drawn.size.height) - geometry.thumb).abs() < 1.0,
+                "thumb drawn {:?} tall but grabbable {} tall",
+                drawn.size.height,
+                geometry.thumb
+            );
+
+            // Pressing the drawn thumb's middle must therefore grab it, not
+            // jump the content.
+            let before = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            cx.simulate_mouse_down(drawn.center(), MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert!(
+                (f32::from(after) - f32::from(before)).abs() < 4.0,
+                "pressing the drawn thumb must grab it: {before:?} -> {after:?}"
+            );
+        }
+
+        /// Regression: the drag recentred the thumb on the pointer, so grabbing
+        /// it anywhere but the exact middle made the content jump before the
+        /// drag had moved at all.
+        #[gpui::test]
+        fn grabbing_the_thumb_off_centre_does_not_jump(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for index in 0..120 {
+                    state.transcript.push(app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content: format!("message {index} with enough text to take a line"),
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
+                    });
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            // Move off the bottom so the thumb has room either side of it.
+            view.update(cx, |view, _| {
+                view.drag_scrollbar_to(
+                    super::super::TRANSCRIPT_SCROLL_ID,
+                    view.transcript_scroll.bounds().origin.y + gpui::px(200.0),
+                    0.0,
+                );
+            });
+            cx.run_until_parked();
+
+            let before = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let handle = view.read_with(cx, |view, _| view.transcript_scroll.clone());
+            let geometry =
+                super::super::SessionMvpView::scrollbar_geometry(&handle).expect("scrollable");
+            let track = cx.debug_bounds("scrollbar").expect("scrollbar rendered");
+
+            // Press near the top edge of the thumb rather than its centre.
+            let near_thumb_top = geometry.track_top + gpui::px(geometry.thumb_top + 2.0);
+            cx.simulate_mouse_down(
+                gpui::point(track.center().x, near_thumb_top),
+                MouseButton::Left,
+                Modifiers::none(),
+            );
+            cx.run_until_parked();
+
+            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            assert!(
+                (f32::from(after) - f32::from(before)).abs() < 4.0,
+                "pressing the thumb must not move the content: {before:?} -> {after:?}"
+            );
+        }
+
+        /// Regression: command output was clipped inside a tool entry, so the
+        /// end of a long run was unreachable.
+        #[gpui::test]
+        fn tool_output_scrolls_inside_the_entry(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                let mut sequence = 0;
+                let mut apply =
+                    |raw: &serde_json::Value, state: &mut app_model::SessionSnapshot| {
+                        sequence += 1;
+                        state.apply(app_model::DomainEvent::from_sdk_event_for(
+                            "session-1",
+                            sequence,
+                            raw,
+                        ));
+                    };
+                apply(
+                    &serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"bash",
+                                "arguments":{"command":"seq 1 500"},
+                                "shellToolInfo":{"displayCommand":"seq 1 500",
+                                                 "hasWriteFileRedirection":false,
+                                                 "possiblePaths":[]}}}),
+                    &mut state,
+                );
+                let output = (1..=500)
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                apply(
+                    &serde_json::json!({"id":"p","type":"tool.execution_partial_result",
+                        "data":{"toolCallId":"c1","partialOutput": output}}),
+                    &mut state,
+                );
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let bounds = cx
+                .debug_bounds("tool-detail")
+                .expect("output block rendered");
+            // The block is bounded, so 500 lines of output cannot stretch the
+            // entry to the height of the conversation.
+            let budget = super::super::ENTRY_DETAIL_BUDGET - super::super::COMMAND_BLOCK_HEIGHT;
+            assert!(
+                bounds.size.height <= gpui::px(budget),
+                "the entry stays compact, got {:?}",
+                bounds.size.height
+            );
+        }
+
         /// Regression: the transcript clipped its overflow, so a long
         /// conversation ran off the bottom of the window with no way to reach
         /// it. It must scroll, and follow new output as it arrives.
@@ -5036,6 +6990,8 @@ mod tests {
                         content: format!("message {index} with enough text to take a line"),
                         state: app_model::TranscriptState::Complete,
                         timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
                     });
                 }
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
@@ -5085,6 +7041,8 @@ mod tests {
                     content: "first".to_owned(),
                     state: app_model::TranscriptState::Complete,
                     timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
                 });
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
                 view.selected_session = Some("session-1".to_owned());
