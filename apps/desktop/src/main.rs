@@ -15,17 +15,17 @@ use diagnostics::{TracingDiagnostics, init_tracing};
 use git_service::GitService;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, Focusable, InteractiveElement, IntoElement,
-    KeyBinding, MouseButton, ParentElement, PathPromptOptions, Render, Role, SharedString,
-    StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowBounds, WindowOptions,
-    actions, div, px, rgb, size,
+    App, AppContext, Bounds, Context, Entity, ExternalPaths, Focusable, InteractiveElement,
+    IntoElement, KeyBinding, MouseButton, ParentElement, PathPromptOptions, Render, Role,
+    SharedString, StatefulInteractiveElement, Styled, TitlebarOptions, Window, WindowBounds,
+    WindowOptions, actions, div, px, rgb, size,
 };
 use session_manager::{
     CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, WorktreeOutcome,
 };
 use storage::Storage;
 use tokio::sync::watch;
-use ui_components::{InputSubmitted, TextInput, bind_text_input_keys};
+use ui_components::{ImagesPasted, InputSubmitted, PastedImage, TextInput, bind_text_input_keys};
 
 const BACKGROUND: u32 = 0x000d_1117;
 const SIDEBAR: u32 = 0x0016_1b22;
@@ -889,6 +889,10 @@ impl SessionMvpView {
             cx.notify();
         })
         .detach();
+        cx.subscribe(&composer, |view, _, event: &ImagesPasted, cx| {
+            view.attach_pasted_images(&event.images, cx);
+        })
+        .detach();
         let interaction_input =
             cx.new(|cx| TextInput::new(cx, "interaction-input", "Type your response..."));
         cx.subscribe(&interaction_input, |view, _, event: &InputSubmitted, cx| {
@@ -1683,11 +1687,11 @@ impl SessionMvpView {
             .draft_attachments
             .iter()
             .map(|attachment| {
-                let path = attachment.path.clone();
-                let label = attachment.display_name.clone();
+                let identity = attachment.identity();
+                let label = attachment.display_name().to_owned();
                 let icon = if attachment.is_image() { "IMG" } else { "FILE" };
                 div()
-                    .id(SharedString::from(format!("attachment-{path}")))
+                    .id(SharedString::from(format!("attachment-{identity}")))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -1701,7 +1705,7 @@ impl SessionMvpView {
                     .child(div().text_xs().text_color(rgb(PRIMARY)).child(label))
                     .child(
                         div()
-                            .id(SharedString::from(format!("remove-attachment-{path}")))
+                            .id(SharedString::from(format!("remove-attachment-{identity}")))
                             .role(Role::Button)
                             .aria_label("Remove attachment")
                             .text_xs()
@@ -1709,7 +1713,7 @@ impl SessionMvpView {
                             .child("x")
                             .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
                             .on_click(cx.listener(move |view, _, _, cx| {
-                                view.remove_attachment(&path, cx);
+                                view.remove_attachment(&identity, cx);
                             })),
                     )
             })
@@ -1726,6 +1730,38 @@ impl SessionMvpView {
                 .pb_2()
                 .children(chips),
         )
+    }
+
+    /// Stage images pasted into the composer.
+    ///
+    /// A pasted screenshot has no path, so it is carried as bytes. Each paste
+    /// is a distinct attachment: someone who pastes twice meant two images.
+    fn attach_pasted_images(&mut self, images: &[PastedImage], cx: &mut Context<Self>) {
+        for image in images {
+            let index = self.draft_attachments.len() + 1;
+            self.draft_attachments
+                .push(PromptAttachment::from_image_bytes(
+                    &image.bytes,
+                    image.mime_type.clone(),
+                    index,
+                ));
+        }
+        cx.notify();
+    }
+
+    /// Stage files dropped onto the composer.
+    fn attach_dropped_paths(&mut self, paths: &[PathBuf], cx: &mut Context<Self>) {
+        for path in paths {
+            let attachment = PromptAttachment::from_path(path);
+            if !self
+                .draft_attachments
+                .iter()
+                .any(|existing| existing.identity() == attachment.identity())
+            {
+                self.draft_attachments.push(attachment);
+            }
+        }
+        cx.notify();
     }
 
     /// Open a file chooser and attach what the user picks.
@@ -1750,7 +1786,7 @@ impl SessionMvpView {
                     if !view
                         .draft_attachments
                         .iter()
-                        .any(|existing| existing.path == attachment.path)
+                        .any(|existing| existing.identity() == attachment.identity())
                     {
                         view.draft_attachments.push(attachment);
                     }
@@ -1762,9 +1798,9 @@ impl SessionMvpView {
     }
 
     /// Drop an attachment the user changed their mind about.
-    fn remove_attachment(&mut self, path: &str, cx: &mut Context<Self>) {
+    fn remove_attachment(&mut self, identity: &str, cx: &mut Context<Self>) {
         self.draft_attachments
-            .retain(|attachment| attachment.path != path);
+            .retain(|attachment| attachment.identity() != identity);
         cx.notify();
     }
 
@@ -3676,6 +3712,10 @@ impl SessionMvpView {
             .relative()
             .role(Role::Group)
             .aria_label("Message composer")
+            .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
+                view.attach_dropped_paths(paths.paths(), cx);
+            }))
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.border_color(rgb(BLUE)))
             .mx_auto()
             .mb_4()
             .w_full()
@@ -3861,6 +3901,10 @@ impl SessionMvpView {
             .accessibility_id("home-composer")
             .role(Role::Group)
             .aria_label("Message composer")
+            .on_drop(cx.listener(|view, paths: &ExternalPaths, _, cx| {
+                view.attach_dropped_paths(paths.paths(), cx);
+            }))
+            .drag_over::<ExternalPaths>(|style, _, _, _| style.border_color(rgb(BLUE)))
             .relative()
             .w_full()
             .max_w(px(820.0))
@@ -5512,8 +5556,8 @@ mod tests {
             }
             let attachments = attachments.expect("a submit command was sent");
             assert_eq!(attachments.len(), 1, "the staged screenshot was dropped");
-            assert_eq!(attachments[0].path, "/tmp/shot.png");
-            assert_eq!(attachments[0].display_name, "shot.png");
+            assert_eq!(attachments[0].identity(), "/tmp/shot.png");
+            assert_eq!(attachments[0].display_name(), "shot.png");
         }
 
         /// Attachments belong to one prompt, not to every later prompt.
@@ -5598,6 +5642,121 @@ mod tests {
                 cx.debug_bounds("attachment-strip").is_some(),
                 "the attached screenshot was never shown"
             );
+        }
+
+        /// A pasted screenshot has no path, so it must travel as bytes.
+        #[gpui::test]
+        fn pasting_an_image_stages_it_as_an_attachment(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.attach_pasted_images(
+                    &[super::super::PastedImage {
+                        bytes: vec![0x89, 0x50, 0x4E, 0x47],
+                        mime_type: "image/png".to_owned(),
+                    }],
+                    cx,
+                );
+                view.submit_prompt("what is wrong here".to_owned());
+            });
+
+            let mut attachments = None;
+            while let Ok(command) = commands.try_recv() {
+                if let ServiceCommand::Submit {
+                    attachments: sent, ..
+                } = command
+                {
+                    attachments = Some(sent);
+                }
+            }
+            let attachments = attachments.expect("a submit command was sent");
+            assert_eq!(attachments.len(), 1, "the pasted screenshot was dropped");
+            let app_model::PromptAttachment::Image {
+                mime_type, data, ..
+            } = &attachments[0]
+            else {
+                panic!("a pasted image must travel as bytes, not as a path");
+            };
+            assert_eq!(mime_type, "image/png");
+            // base64 of the PNG magic bytes, so the payload survived intact.
+            assert_eq!(data, "iVBORw==");
+        }
+
+        /// Two pastes mean two images, even when the bytes are identical.
+        #[gpui::test]
+        fn pasting_twice_stages_two_images(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let image = super::super::PastedImage {
+                bytes: vec![1, 2, 3],
+                mime_type: "image/png".to_owned(),
+            };
+            view.update(cx, |view, cx| {
+                view.attach_pasted_images(std::slice::from_ref(&image), cx);
+                view.attach_pasted_images(std::slice::from_ref(&image), cx);
+            });
+            view.update(cx, |view, _| {
+                assert_eq!(
+                    view.draft_attachments.len(),
+                    2,
+                    "the second paste was mistaken for a duplicate of the first"
+                );
+            });
+        }
+
+        /// Dropping files onto the composer stages them.
+        #[gpui::test]
+        fn dropping_files_stages_them(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.attach_dropped_paths(
+                    &[
+                        std::path::PathBuf::from("/tmp/one.png"),
+                        std::path::PathBuf::from("/tmp/two.png"),
+                    ],
+                    cx,
+                );
+            });
+            view.update(cx, |view, _| {
+                assert_eq!(view.draft_attachments.len(), 2);
+                assert_eq!(view.draft_attachments[0].display_name(), "one.png");
+            });
+        }
+
+        /// Dropping the same file twice attaches it once.
+        #[gpui::test]
+        fn dropping_the_same_file_twice_stages_it_once(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let paths = [std::path::PathBuf::from("/tmp/one.png")];
+            view.update(cx, |view, cx| {
+                view.attach_dropped_paths(&paths, cx);
+                view.attach_dropped_paths(&paths, cx);
+            });
+            view.update(cx, |view, _| {
+                assert_eq!(view.draft_attachments.len(), 1);
+            });
+        }
+
+        /// Removing one pasted image must not remove its identical twin.
+        #[gpui::test]
+        fn removing_one_pasted_image_keeps_the_other(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let image = super::super::PastedImage {
+                bytes: vec![1, 2, 3],
+                mime_type: "image/png".to_owned(),
+            };
+            view.update(cx, |view, cx| {
+                view.attach_pasted_images(std::slice::from_ref(&image), cx);
+                view.attach_pasted_images(std::slice::from_ref(&image), cx);
+                let first = view.draft_attachments[0].identity();
+                view.remove_attachment(&first, cx);
+            });
+            view.update(cx, |view, _| {
+                assert_eq!(
+                    view.draft_attachments.len(),
+                    1,
+                    "removing one image took its twin with it"
+                );
+                assert_eq!(view.draft_attachments[0].display_name(), "Pasted image 2");
+            });
         }
 
         /// Choosing a project returns the composer to project mode.

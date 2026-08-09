@@ -1312,7 +1312,7 @@ mod tests {
         let sent = provider.sent_attachments().await;
         assert_eq!(sent.len(), 1, "exactly one send happened");
         assert_eq!(sent[0].len(), 1, "the attachment never left the app");
-        assert_eq!(sent[0][0].path, "/tmp/shot.png");
+        assert_eq!(sent[0][0].identity(), "/tmp/shot.png");
     }
 
     #[tokio::test]

@@ -160,20 +160,36 @@ pub struct ContextWindowOption {
     pub max_tokens: Option<u64>,
 }
 
-/// A file attached to a prompt.
+/// Something attached to a prompt.
 ///
 /// Screenshots are how interface defects get reported, so a session that
-/// cannot receive one cannot be used to work on a user interface.
+/// cannot receive one cannot be used to work on a user interface. A chosen or
+/// dropped file is referenced by path, so the runtime opens it and the bytes
+/// never cross the RPC boundary. A pasted image has no path to reference, so
+/// it travels as bytes.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
-pub struct PromptAttachment {
-    /// Absolute path to the attached file.
-    pub path: String,
-    /// Label shown in the composer.
-    pub display_name: String,
+#[serde(tag = "kind", rename_all = "snake_case")]
+pub enum PromptAttachment {
+    /// A file on disk, referenced by path.
+    File {
+        /// Absolute path to the attached file.
+        path: String,
+        /// Label shown in the composer.
+        display_name: String,
+    },
+    /// Raw image bytes, typically pasted from the clipboard.
+    Image {
+        /// Base64-encoded image data.
+        data: String,
+        /// MIME type of the data.
+        mime_type: String,
+        /// Label shown in the composer.
+        display_name: String,
+    },
 }
 
 impl PromptAttachment {
-    /// Build an attachment from a chosen path.
+    /// Build an attachment from a chosen or dropped path.
     #[must_use]
     pub fn from_path(path: &std::path::Path) -> Self {
         let display_name = path
@@ -181,19 +197,57 @@ impl PromptAttachment {
             .and_then(|name| name.to_str())
             .unwrap_or("attachment")
             .to_owned();
-        Self {
+        Self::File {
             path: path.to_string_lossy().into_owned(),
             display_name,
         }
     }
 
-    /// Whether the file extension names an image the runtime can read.
+    /// Build an attachment from image bytes with no backing file.
+    #[must_use]
+    pub fn from_image_bytes(bytes: &[u8], mime_type: impl Into<String>, index: usize) -> Self {
+        use base64::Engine as _;
+        Self::Image {
+            data: base64::engine::general_purpose::STANDARD.encode(bytes),
+            mime_type: mime_type.into(),
+            display_name: format!("Pasted image {index}"),
+        }
+    }
+
+    /// Label shown in the composer.
+    #[must_use]
+    pub fn display_name(&self) -> &str {
+        match self {
+            Self::File { display_name, .. } | Self::Image { display_name, .. } => display_name,
+        }
+    }
+
+    /// A value that distinguishes this attachment from another.
+    ///
+    /// Two picks of the same file are the same attachment, but two pastes are
+    /// not: a user who pastes twice meant to attach two images.
+    #[must_use]
+    pub fn identity(&self) -> String {
+        match self {
+            Self::File { path, .. } => path.clone(),
+            Self::Image {
+                data, display_name, ..
+            } => format!("{display_name}:{}", data.len()),
+        }
+    }
+
+    /// Whether this attachment is an image.
     #[must_use]
     pub fn is_image(&self) -> bool {
-        let lowered = self.path.to_lowercase();
-        [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]
-            .iter()
-            .any(|extension| lowered.ends_with(extension))
+        match self {
+            Self::Image { .. } => true,
+            Self::File { path, .. } => {
+                let lowered = path.to_lowercase();
+                [".png", ".jpg", ".jpeg", ".gif", ".webp", ".bmp"]
+                    .iter()
+                    .any(|extension| lowered.ends_with(extension))
+            }
+        }
     }
 }
 
@@ -1662,6 +1716,32 @@ mod tests {
         });
         assert_eq!(report.blocking().len(), 1);
         assert!(!report.is_self_hosting_ready());
+    }
+
+    /// A pasted screenshot has no path, so it must carry its own bytes.
+    #[test]
+    fn a_pasted_image_carries_its_bytes_not_a_path() {
+        let attachment =
+            PromptAttachment::from_image_bytes(&[0x89, 0x50, 0x4E, 0x47], "image/png", 1);
+        let PromptAttachment::Image {
+            data,
+            mime_type,
+            display_name,
+        } = &attachment
+        else {
+            panic!("a pasted image must not become a file reference");
+        };
+        assert_eq!(data, "iVBORw==");
+        assert_eq!(mime_type, "image/png");
+        assert_eq!(display_name, "Pasted image 1");
+        assert!(attachment.is_image());
+    }
+
+    /// A file is judged an image by extension, since it has no declared type.
+    #[test]
+    fn a_chosen_file_is_recognized_as_an_image_by_extension() {
+        assert!(PromptAttachment::from_path(std::path::Path::new("/tmp/Shot.PNG")).is_image());
+        assert!(!PromptAttachment::from_path(std::path::Path::new("/tmp/notes.txt")).is_image());
     }
 
     /// A chat has no checkout, so an absent changes view is not a defect it

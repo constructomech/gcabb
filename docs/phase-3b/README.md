@@ -58,6 +58,23 @@ resend a screenshot and confuse the model about what is being asked. An
 attachment with no text is a complete message, since a screenshot frequently
 says everything the user wants to say.
 
+Three gestures stage an attachment, because a file picker is the least likely
+of them to be reached for. Pasting was the notable omission: the input's paste
+handler read only `item.text()`, so a pasted screenshot did nothing at all and
+gave no sign it had been seen. Dropping a file did nothing either, since no
+`on_drop` handler existed anywhere in the app.
+
+A pasted image has no path to reference, so `PromptAttachment` is an enum: a
+picked or dropped file travels as a path, and pasted bytes travel as an
+`Attachment::Blob`. Making it an enum rather than an optional-bytes field keeps
+the impossible states unrepresentable — an attachment is one or the other, never
+both and never neither.
+
+Identity distinguishes attachments for de-duplication, and the two cases differ
+on purpose. Picking or dropping the same file twice is one attachment, because
+it is one file. Pasting twice is two attachments, because someone who pastes
+twice meant to attach two images — even when the bytes are identical.
+
 ## Per-shell stop: revised
 
 Phase 3b asked for a control to stop one runaway command without cancelling the

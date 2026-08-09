@@ -579,10 +579,25 @@ impl AgentProvider for CopilotProvider {
             options = options.with_attachments(
                 attachments
                     .iter()
-                    .map(|attachment| github_copilot_sdk::Attachment::File {
-                        path: PathBuf::from(&attachment.path),
-                        display_name: Some(attachment.display_name.clone()),
-                        line_range: None,
+                    .map(|attachment| match attachment {
+                        PromptAttachment::File { path, display_name } => {
+                            github_copilot_sdk::Attachment::File {
+                                path: PathBuf::from(path),
+                                display_name: Some(display_name.clone()),
+                                line_range: None,
+                            }
+                        }
+                        // A pasted image has no file to point at, so the bytes
+                        // themselves travel.
+                        PromptAttachment::Image {
+                            data,
+                            mime_type,
+                            display_name,
+                        } => github_copilot_sdk::Attachment::Blob {
+                            data: data.clone(),
+                            mime_type: mime_type.clone(),
+                            display_name: Some(display_name.clone()),
+                        },
                     })
                     .collect(),
             );

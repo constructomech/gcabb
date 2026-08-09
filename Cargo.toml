@@ -26,6 +26,7 @@ version = "0.1.0"
 anyhow = "1.0.100"
 app-model = { path = "crates/app-model" }
 async-trait = "0.1.89"
+base64 = "0.22.1"
 clap = { version = "4.5.54", features = ["derive"] }
 copilot-provider = { path = "crates/copilot-provider" }
 diagnostics = { path = "crates/diagnostics" }
