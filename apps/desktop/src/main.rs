@@ -2529,15 +2529,18 @@ impl SessionMvpView {
             app_model::InvocationState::Succeeded => ("done", MUTED),
             app_model::InvocationState::Failed => ("failed", RED),
         };
-        let summary = invocation.summary();
+        let summary = invocation.summary_line();
+        let detail = invocation.multiline_summary();
         let verb = invocation.verb();
         let label = format!("{verb} {summary}");
         let diff = invocation.diff().map(str::to_owned);
         let error = invocation.error_message.clone();
-        // Shell output is the tail, since the interesting part is the end.
+        // Command output is the tail, since the interesting part is the end.
+        // The block scrolls, so it can hold considerably more than the
+        // terminals panel preview.
         let output = (invocation.class == app_model::ToolClass::Shell
             && !invocation.output.is_empty())
-        .then(|| terminal_tail(&invocation.output));
+        .then(|| tail_lines(&invocation.output, 400));
         let exit = invocation
             .exit_code
             .filter(|code| *code != 0)
@@ -2607,10 +2610,13 @@ impl SessionMvpView {
                     .child(
                         div()
                             .flex()
-                            .items_center()
+                            // Top aligned: a multi-line target must not push
+                            // the label to the vertical middle of the block.
+                            .items_start()
                             .gap_2()
                             .child(
                                 div()
+                                    .mt(px(5.0))
                                     .w(px(6.0))
                                     .h(px(6.0))
                                     .rounded_full()
@@ -2633,27 +2639,26 @@ impl SessionMvpView {
                     .when_some(error, |entry, error| {
                         entry.child(div().text_xs().text_color(rgb(RED)).child(error))
                     })
+                    .when_some(detail, |entry, detail| {
+                        entry.child(detail_block(
+                            format!("tool-detail-{}", invocation.call_id),
+                            detail,
+                            160.0,
+                        ))
+                    })
                     .when_some(diff, |entry, diff| {
-                        entry.child(
-                            div()
-                                .mt_1()
-                                .max_h(px(220.0))
-                                .overflow_hidden()
-                                .text_xs()
-                                .text_color(rgb(MUTED))
-                                .child(diff),
-                        )
+                        entry.child(detail_block(
+                            format!("tool-diff-{}", invocation.call_id),
+                            diff,
+                            220.0,
+                        ))
                     })
                     .when_some(output, |entry, output| {
-                        entry.child(
-                            div()
-                                .mt_1()
-                                .max_h(px(180.0))
-                                .overflow_hidden()
-                                .text_xs()
-                                .text_color(rgb(MUTED))
-                                .child(output),
-                        )
+                        entry.child(detail_block(
+                            format!("tool-output-{}", invocation.call_id),
+                            output,
+                            180.0,
+                        ))
                     })
                     .when(!nested.is_empty(), |entry| {
                         entry.child(
@@ -4082,17 +4087,43 @@ impl Render for SessionMvpView {
     }
 }
 
+/// A bounded, scrollable block of detail inside a tool entry.
+///
+/// Commands, diffs, and output are frequently taller than any sensible entry.
+/// Clipping them hid the interesting part; scrolling keeps the entry compact
+/// while leaving the whole thing reachable.
+fn detail_block(id: String, content: String, max_height: f32) -> impl IntoElement {
+    div()
+        .id(SharedString::from(id))
+        .debug_selector(|| "tool-detail".to_owned())
+        .mt_1()
+        .max_h(px(max_height))
+        .w_full()
+        .overflow_y_scroll()
+        .px_2()
+        .py_1()
+        .rounded_md()
+        .bg(rgb(PANEL))
+        .text_xs()
+        .text_color(rgb(MUTED))
+        .child(content)
+}
+
 /// Trailing slice of terminal output kept for display.
 ///
 /// Phase 3 renders a bounded tail; Phase 6 replaces this with the virtualized
 /// terminal and real scrollback.
 fn terminal_tail(output: &str) -> String {
-    const MAX_LINES: usize = 40;
+    tail_lines(output, 40)
+}
+
+/// The last `max_lines` lines of `output`.
+fn tail_lines(output: &str, max_lines: usize) -> String {
     let lines: Vec<&str> = output.lines().collect();
-    if lines.len() <= MAX_LINES {
+    if lines.len() <= max_lines {
         return output.to_owned();
     }
-    lines[lines.len() - MAX_LINES..].join("\n")
+    lines[lines.len() - max_lines..].join("\n")
 }
 
 /// Label for the inspector toggle, summarizing changed files at a glance.
@@ -5239,6 +5270,58 @@ mod tests {
                 let timeline = snapshot.timeline();
                 assert_eq!(timeline.len(), 2, "one message and one tool call");
             });
+        }
+
+        /// Regression: command output was clipped inside a tool entry, so the
+        /// end of a long run was unreachable.
+        #[gpui::test]
+        fn tool_output_scrolls_inside_the_entry(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                let mut sequence = 0;
+                let mut apply =
+                    |raw: &serde_json::Value, state: &mut app_model::SessionSnapshot| {
+                        sequence += 1;
+                        state.apply(app_model::DomainEvent::from_sdk_event_for(
+                            "session-1",
+                            sequence,
+                            raw,
+                        ));
+                    };
+                apply(
+                    &serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"bash",
+                                "arguments":{"command":"seq 1 500"},
+                                "shellToolInfo":{"displayCommand":"seq 1 500",
+                                                 "hasWriteFileRedirection":false,
+                                                 "possiblePaths":[]}}}),
+                    &mut state,
+                );
+                let output = (1..=500)
+                    .map(|n| n.to_string())
+                    .collect::<Vec<_>>()
+                    .join("\n");
+                apply(
+                    &serde_json::json!({"id":"p","type":"tool.execution_partial_result",
+                        "data":{"toolCallId":"c1","partialOutput": output}}),
+                    &mut state,
+                );
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let bounds = cx
+                .debug_bounds("tool-detail")
+                .expect("output block rendered");
+            // A clipped block stays put; a scrollable one moves.
+            assert!(
+                bounds.size.height <= gpui::px(180.0),
+                "the entry stays compact, got {:?}",
+                bounds.size.height
+            );
         }
 
         /// Regression: the transcript clipped its overflow, so a long

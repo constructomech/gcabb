@@ -1278,6 +1278,74 @@ mod tests {
         assert!(edit.diff().is_some_and(|diff| diff.contains("+new")));
     }
 
+    /// A multi-line command must not become a multi-line header; it filled the
+    /// window with one tool call.
+    #[test]
+    fn multiline_commands_get_a_single_line_header() {
+        let mut state = SessionSnapshot::new(metadata());
+        let script = "python3 -c \"\na,b=0,1\nfor i in range(100):\n    print(a)\n\"";
+        apply_all(
+            &mut state,
+            vec![json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"bash",
+                                "arguments":{"command": script},
+                                "shellToolInfo":{"displayCommand": script,
+                                                 "hasWriteFileRedirection":false,
+                                                 "possiblePaths":[]}}})],
+        );
+
+        let invocation = state.tool_activity.invocation("c1").expect("invocation");
+        let header = invocation.summary_line();
+        assert_eq!(
+            header.lines().count(),
+            1,
+            "header must be one line: {header}"
+        );
+        assert!(header.starts_with("python3 -c"));
+        // The rest stays available for the scrollable detail block.
+        let detail = invocation.multiline_summary().expect("detail");
+        assert!(detail.contains("range(100)"));
+    }
+
+    /// A single-line target needs no detail block.
+    #[test]
+    fn single_line_targets_have_no_detail_block() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"str_replace_editor",
+                                "arguments":{"path":"src/lib.rs"}}})],
+        );
+        let invocation = state.tool_activity.invocation("c1").expect("invocation");
+        assert_eq!(invocation.summary_line(), "src/lib.rs");
+        assert!(invocation.multiline_summary().is_none());
+    }
+
+    /// Very long single-line targets are truncated rather than wrapped.
+    #[test]
+    fn long_targets_are_truncated_in_the_header() {
+        let mut state = SessionSnapshot::new(metadata());
+        let long = "x".repeat(400);
+        apply_all(
+            &mut state,
+            vec![json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"grep",
+                                "arguments":{"pattern": long}}})],
+        );
+        let header = state
+            .tool_activity
+            .invocation("c1")
+            .expect("invocation")
+            .summary_line();
+        assert!(
+            header.chars().count() <= 121,
+            "got {} chars",
+            header.chars().count()
+        );
+        assert!(header.ends_with('…'));
+    }
+
     /// Delegated work belongs under the task that asked for it, not flattened
     /// into the main thread.
     #[test]

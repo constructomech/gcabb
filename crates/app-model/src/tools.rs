@@ -238,6 +238,32 @@ impl ToolInvocation {
         argument.unwrap_or_else(|| self.tool_name.clone())
     }
 
+    /// First line of the summary, for a single-line header.
+    ///
+    /// Commands are frequently multi-line scripts; putting the whole thing in
+    /// the header made one tool call fill the window.
+    #[must_use]
+    pub fn summary_line(&self) -> String {
+        let summary = self.summary();
+        let first = summary.lines().next().unwrap_or_default().trim().to_owned();
+        let truncated: String = first.chars().take(120).collect();
+        if truncated.len() < first.len() {
+            format!("{truncated}…")
+        } else if summary.lines().count() > 1 {
+            format!("{truncated} …")
+        } else {
+            truncated
+        }
+    }
+
+    /// The full summary when it spans more than one line, so the detail can be
+    /// shown in a scrollable block rather than the header.
+    #[must_use]
+    pub fn multiline_summary(&self) -> Option<String> {
+        let summary = self.summary();
+        (summary.lines().count() > 1).then_some(summary)
+    }
+
     /// A string argument by name, when present and non-empty.
     #[must_use]
     pub fn string_argument(&self, name: &str) -> Option<String> {
