@@ -88,9 +88,9 @@ scripts redirect Cargo to a per-worktree target directory:
 Both accept `build`, `test`, `clippy`, `fmt`, and `run`.
 
 On Linux, install the desktop entry once so the taskbar and window titlebar can
-resolve the application icon. Windows embeds its icon in the executable and
-macOS uses the app bundle, but Wayland and X11 match the window's application ID
-against an installed desktop entry instead.
+resolve the application icon. Windows embeds its icon in the executable, but
+Wayland and X11 match the window's application ID against an installed desktop
+entry instead.
 
 ```sh
 ./scripts/install-linux-desktop-entry.sh
@@ -105,17 +105,44 @@ Releases are tag-driven and cover Linux, macOS, and Windows. Pushing a `v*` tag
 builds every target, validates the workspace, signs update metadata, and
 publishes a single GitHub Release.
 
-On macOS, install the newest published release (including prereleases) with:
+Install the newest published release, including prereleases, with the command
+for your platform.
+
+### macOS
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/constructomech/gcabb/main/scripts/install-macos.sh | bash
 ~/Applications/GCABB/gcabb-desktop
 ```
 
-The script detects Apple Silicon or Intel, downloads the matching portable
-archive, and installs it in `~/Applications/GCABB`. The second command launches
-the installed application. Download the script first if you need to pass a
-specific tag or set `GCABB_INSTALL_DIR` to choose another location.
+The installer detects Apple Silicon or Intel and installs GCABB in
+`~/Applications/GCABB`.
+
+### Linux
+
+```sh
+curl -fsSL https://raw.githubusercontent.com/constructomech/gcabb/main/scripts/install-linux.sh | bash
+~/.local/bin/gcabb-desktop
+```
+
+The installer supports x86-64 Linux, installs GCABB in `~/.local/lib/gcabb`, and
+links the command into `~/.local/bin`.
+
+### Windows
+
+Run these commands in PowerShell:
+
+```powershell
+irm https://raw.githubusercontent.com/constructomech/gcabb/main/scripts/install-windows.ps1 | iex
+& "$env:LOCALAPPDATA\GCABB\gcabb-desktop.exe"
+```
+
+The installer supports x86-64 Windows, including x86-64 emulation on Windows
+ARM64, and installs GCABB in `%LOCALAPPDATA%\GCABB`.
+
+The second command in each block launches the installed application. To install
+a specific tag or choose another location, download the platform script and use
+its tag argument or `GCABB_INSTALL_DIR` setting.
 
 ```sh
 # The version is declared once, in [workspace.package] of the root Cargo.toml.
