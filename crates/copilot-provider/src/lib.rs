@@ -53,6 +53,8 @@ pub struct SessionRequest {
     pub mode: Option<String>,
     pub reasoning_effort: Option<String>,
     pub context_tier: Option<String>,
+    /// Automatically approve tool permissions for an isolated, GCABB-owned worktree.
+    pub auto_approve_tools: bool,
 }
 
 #[derive(Clone, Debug)]
@@ -135,6 +137,7 @@ pub trait AgentProvider: Send + Sync {
 #[derive(Clone)]
 struct InteractionBroker {
     sender: mpsc::Sender<ProviderInteraction>,
+    auto_approve_tools: bool,
 }
 
 impl InteractionBroker {
@@ -160,6 +163,12 @@ impl PermissionHandler for InteractionBroker {
         request_id: RequestId,
         data: PermissionRequestData,
     ) -> PermissionResult {
+        if self.auto_approve_tools
+            && !data.managed_settings_enabled
+            && data.managed_approval_required != Some(true)
+        {
+            return PermissionResult::approve_once();
+        }
         let request = InteractionRequest {
             id: request_id.to_string(),
             session_id: session_id.to_string(),
@@ -522,6 +531,7 @@ impl AgentProvider for CopilotProvider {
         let (interaction_tx, interactions) = mpsc::channel(16);
         let broker = Arc::new(InteractionBroker {
             sender: interaction_tx,
+            auto_approve_tools: request.auto_approve_tools,
         });
         let session = self
             .client()
@@ -549,6 +559,7 @@ impl AgentProvider for CopilotProvider {
         let (interaction_tx, interactions) = mpsc::channel(16);
         let broker = Arc::new(InteractionBroker {
             sender: interaction_tx,
+            auto_approve_tools: request.auto_approve_tools,
         });
         let session = self
             .client()
@@ -1020,9 +1031,67 @@ pub fn default_database_path(root: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
+    use github_copilot_sdk::rpc::PermissionDecision;
+    use github_copilot_sdk::{PermissionRequestData, RequestId, SessionId};
     use serde_json::json;
+    use tokio::sync::mpsc;
 
-    use super::{model_option, sdk_context_windows};
+    use super::{InteractionBroker, model_option, sdk_context_windows};
+
+    #[tokio::test]
+    async fn isolated_worktree_permissions_are_approved_without_prompting() {
+        let (sender, mut interactions) = mpsc::channel(1);
+        let broker = InteractionBroker {
+            sender,
+            auto_approve_tools: true,
+        };
+
+        let result = broker
+            .handle(
+                SessionId::from("session"),
+                RequestId::new("permission"),
+                PermissionRequestData::default(),
+            )
+            .await;
+
+        assert!(matches!(
+            result,
+            PermissionResult::Decision(PermissionDecision::ApproveOnce(_))
+        ));
+        assert!(interactions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn managed_permissions_still_require_explicit_approval() {
+        let (sender, mut interactions) = mpsc::channel(1);
+        let broker = InteractionBroker {
+            sender,
+            auto_approve_tools: true,
+        };
+        let task = tokio::spawn(async move {
+            broker
+                .handle(
+                    SessionId::from("session"),
+                    RequestId::new("permission"),
+                    PermissionRequestData {
+                        managed_approval_required: Some(true),
+                        ..PermissionRequestData::default()
+                    },
+                )
+                .await
+        });
+
+        let interaction = interactions.recv().await.expect("permission prompt");
+        interaction
+            .response
+            .send(app_model::InteractionResponse::Approve)
+            .expect("permission response accepted");
+        assert!(matches!(
+            task.await.expect("permission handler completed"),
+            PermissionResult::Decision(PermissionDecision::ApproveOnce(_))
+        ));
+    }
 
     #[test]
     fn model_metadata_reports_both_context_windows_when_long_context_is_priced() {
