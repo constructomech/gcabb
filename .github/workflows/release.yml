@@ -89,9 +89,6 @@ jobs:
           - os: macos-14
             target: aarch64-apple-darwin
             format: tar.gz
-          - os: macos-15-intel
-            target: x86_64-apple-darwin
-            format: tar.gz
           - os: windows-2022
             target: x86_64-pc-windows-msvc
             format: zip
@@ -111,8 +108,8 @@ jobs:
 
       - uses: dtolnay/rust-toolchain@master
         with:
-          # rust-toolchain.toml pins the version; the target is added here so
-          # cross-architecture macOS builds resolve.
+          # rust-toolchain.toml pins the version; install each release target
+          # explicitly so runner defaults cannot affect the build.
           toolchain: "1.95"
           targets: ${{ matrix.target }}
 

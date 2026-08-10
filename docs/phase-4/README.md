@@ -13,7 +13,7 @@ validated here, between tag N and tag N+1.
                                    ▼
                      .github/workflows/release.yml
                        ├─ prepare   derive version/channel, check tag == Cargo.toml
-                       ├─ build     linux + macOS (x64, arm64) + windows
+                       ├─ build     linux + macOS (arm64) + windows
                        ├─ validate  fmt, clippy, workspace tests
                        └─ publish   manifest ──► sign ──► verify ──► GitHub Release
                                    │

@@ -40,7 +40,10 @@ done
 
 case "$(uname -m)" in
   arm64 | aarch64) target="aarch64-apple-darwin" ;;
-  x86_64) target="x86_64-apple-darwin" ;;
+  x86_64)
+    echo "error: GCABB releases support Apple Silicon Macs only" >&2
+    exit 1
+    ;;
   *)
     echo "error: unsupported Mac architecture: $(uname -m)" >&2
     exit 1
