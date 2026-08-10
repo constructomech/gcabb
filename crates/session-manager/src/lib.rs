@@ -34,6 +34,11 @@ pub enum SessionManagerError {
     ActorClosed,
     #[error("session not found: {0}")]
     SessionNotFound(String),
+    #[error(
+        "saved session working directory does not exist or cannot be accessed: {0}. \
+         Restore the directory or delete this session."
+    )]
+    WorkingDirectoryUnavailable(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, SessionManagerError>;
@@ -721,12 +726,18 @@ impl SessionManager {
         let mut state = recovered.state;
         state.status = SessionStatus::Recovering;
         state.pending_interactions.clear();
+        let working_directory = PathBuf::from(&metadata.project_path);
+        if !working_directory.is_dir() {
+            return Err(SessionManagerError::WorkingDirectoryUnavailable(
+                working_directory,
+            ));
+        }
         let provider_session = self
             .provider
             .resume_session(
                 &metadata.sdk_session_id,
                 SessionRequest {
-                    working_directory: PathBuf::from(&metadata.project_path),
+                    working_directory,
                     model: metadata.model.clone(),
                     mode: metadata.mode.clone(),
                     reasoning_effort: state.controls.reasoning_effort.clone(),
@@ -1530,6 +1541,38 @@ mod tests {
         assert!(report.restored.is_empty());
         assert_eq!(report.failed.len(), 1);
         assert_eq!(diagnostics.events().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn missing_working_directory_is_reported_before_resume() {
+        let directory = tempdir().unwrap();
+        let missing = directory.path().join("deleted-worktree");
+        let provider = Arc::new(FakeProvider::default());
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let metadata = SessionMetadata {
+            id: "stale-session".to_owned(),
+            sdk_session_id: "stale-sdk-session".to_owned(),
+            project_path: missing.to_string_lossy().into_owned(),
+            repository_root: None,
+            title: "Deleted worktree".to_owned(),
+            kind: SessionKind::Project,
+            model: None,
+            mode: None,
+            base_ref: None,
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+        };
+        storage.upsert_session(&metadata).unwrap();
+        let manager = SessionManager::new(provider.clone(), storage, diagnostics);
+
+        let (_, report) = manager.start().await.unwrap();
+
+        assert!(report.restored.is_empty());
+        assert_eq!(report.failed.len(), 1);
+        assert!(report.failed[0].error.contains("working directory"));
+        assert!(report.failed[0].error.contains("delete this session"));
+        assert_eq!(provider.active_sessions().await, 0);
     }
 
     #[tokio::test]
