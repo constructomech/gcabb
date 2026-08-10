@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "apps/desktop",
+    "apps/release-tool",
     "apps/sdk-probe",
     "crates/app-model",
     "crates/copilot-provider",
@@ -11,6 +12,7 @@ members = [
     "crates/session-manager",
     "crates/storage",
     "crates/test-harness",
+    "crates/updater",
     "crates/ui-components",
     "crates/ztracing-compat",
 ]
@@ -47,6 +49,7 @@ tracing = "0.1.44"
 tracing-subscriber = { version = "0.3.22", features = ["env-filter", "fmt"] }
 uuid = { version = "1.24.0", features = ["serde", "v4"] }
 ui-components = { path = "crates/ui-components" }
+updater = { path = "crates/updater" }
 
 [patch."https://github.com/zed-industries/zed"]
 gpui_shared_string = { path = "crates/gpui-shared-string" }

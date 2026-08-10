@@ -27,6 +27,12 @@ use session_manager::{
 use storage::Storage;
 use tokio::sync::watch;
 use ui_components::{ImagesPasted, InputSubmitted, PastedImage, TextInput, bind_text_input_keys};
+use updater::install::InstallLayout;
+use updater::version::BuildStamp;
+
+mod updates;
+
+use updates::{UpdateRequest, UpdateService, UpdateUi};
 
 const BACKGROUND: u32 = 0x000d_1117;
 const SIDEBAR: u32 = 0x0016_1b22;
@@ -916,6 +922,10 @@ struct SessionMvpView {
     renaming_session: Option<String>,
     rename_input: Entity<TextInput>,
     action_error: Option<String>,
+    /// What the update banner is showing.
+    update_ui: UpdateUi,
+    /// Background update worker, absent for developer builds that never update.
+    update_service: Option<UpdateService>,
     _poll_task: gpui::Task<()>,
 }
 
@@ -992,7 +1002,8 @@ impl SessionMvpView {
                         // Both sides must run, so avoid short-circuiting here.
                         let updated = view.apply_service_updates(cx);
                         let refreshed = view.refresh_snapshots();
-                        if updated || refreshed {
+                        let banner_changed = view.apply_update_events();
+                        if updated || refreshed || banner_changed {
                             cx.notify();
                         }
                     })
@@ -1002,6 +1013,18 @@ impl SessionMvpView {
                 }
             }
         });
+
+        // A developer build never updates itself, so it gets no worker and no
+        // banner rather than a disabled one.
+        let build = BuildStamp::current();
+        let update_service = match (build.is_release(), data_directory()) {
+            (true, Ok(data_dir)) => {
+                let service = UpdateService::start(build, data_dir);
+                service.request(UpdateRequest::Check { automatic: true });
+                Some(service)
+            }
+            _ => None,
+        };
 
         Self {
             startup: StartupState::Starting,
@@ -1043,8 +1066,162 @@ impl SessionMvpView {
             renaming_session: None,
             rename_input,
             action_error: None,
+            update_ui: UpdateUi::default(),
+            update_service,
             _poll_task: poll_task,
         }
+    }
+
+    /// Message, accent colour, and optional detail line for the update banner.
+    fn update_banner_text(&self) -> Option<(String, u32, Option<String>)> {
+        let (message, accent) = match &self.update_ui {
+            UpdateUi::Hidden => return None,
+            UpdateUi::Checking => ("Checking for updates…".to_owned(), MUTED),
+            UpdateUi::Available { version, .. } => (format!("GCABB {version} is available"), BLUE),
+            UpdateUi::Downloading { .. } => (
+                self.update_ui.percent().map_or_else(
+                    || "Downloading update…".to_owned(),
+                    |percent| format!("Downloading update… {percent}%"),
+                ),
+                BLUE,
+            ),
+            UpdateUi::ReadyToRestart { version } => (
+                format!("GCABB {version} is installed and starts on restart"),
+                GREEN,
+            ),
+            UpdateUi::Failed(error) => (format!("Update failed: {error}"), RED),
+        };
+
+        // Release notes are shown as a short summary; the full text lives in
+        // the GitHub Release, and a banner is the wrong place for a changelog.
+        let summary = match &self.update_ui {
+            UpdateUi::Available { notes, .. } => notes
+                .lines()
+                .find(|line| !line.trim().is_empty() && !line.trim_start().starts_with('#'))
+                .map(|line| line.trim().to_owned()),
+            _ => None,
+        };
+
+        Some((message, accent, summary))
+    }
+
+    /// The update banner, when there is something to say about an update.
+    ///
+    /// Returns `None` in the common case so an install with nothing to report
+    /// spends no space on it.
+    fn update_banner(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let (message, accent, summary) = self.update_banner_text()?;
+
+        let banner = div()
+            .id("update-banner")
+            .debug_selector(|| "update-banner".to_owned())
+            .accessibility_id("update-banner")
+            .role(Role::Group)
+            .aria_label("Update")
+            .flex()
+            .items_center()
+            .gap_3()
+            .w_full()
+            .px_4()
+            .py_2()
+            .bg(rgb(ELEVATED))
+            .border_b_1()
+            .border_color(rgb(BORDER))
+            .child(
+                div()
+                    .w(px(8.0))
+                    .h(px(8.0))
+                    .rounded_full()
+                    .bg(rgb(accent))
+                    .flex_shrink_0(),
+            )
+            .child(
+                div()
+                    .flex()
+                    .flex_col()
+                    .flex_1()
+                    .min_w_0()
+                    .child(div().text_sm().text_color(rgb(PRIMARY)).child(message))
+                    .when_some(summary, |column, summary| {
+                        column.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .truncate()
+                                .child(summary),
+                        )
+                    }),
+            );
+
+        let banner = match &self.update_ui {
+            UpdateUi::Available { .. } => banner
+                .child(action_button("Update", BLUE, cx, |view| {
+                    view.request_update(UpdateRequest::Install);
+                }))
+                .child(action_button("Later", ELEVATED, cx, |view| {
+                    view.request_update(UpdateRequest::Defer);
+                })),
+            UpdateUi::ReadyToRestart { version } => {
+                banner.child(Self::restart_button(version.clone(), cx))
+            }
+            UpdateUi::Failed(_) => banner.child(action_button("Dismiss", ELEVATED, cx, |view| {
+                view.update_ui = UpdateUi::Hidden;
+            })),
+            _ => banner,
+        };
+
+        Some(banner.into_any_element())
+    }
+
+    /// Button that starts the replacement build and closes this one.
+    fn restart_button(version: String, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .id("update-restart")
+            .debug_selector(|| "update-restart".to_owned())
+            .accessibility_id("update-restart")
+            .role(Role::Button)
+            .aria_label("Restart")
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+            .px_4()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(GREEN))
+            .text_color(rgb(BACKGROUND))
+            .child("Restart")
+            .hover(|style| style.opacity(0.85).cursor_pointer())
+            .on_click(cx.listener(
+                move |view, _, _, cx| match updates::restart_into_updated_build(&version) {
+                    // The replacement is running, so this process can go.
+                    Ok(()) => cx.quit(),
+                    Err(error) => {
+                        view.update_ui = UpdateUi::Failed(error);
+                        cx.notify();
+                    }
+                },
+            ))
+    }
+
+    /// Forwards a request to the update worker.
+    fn request_update(&mut self, request: UpdateRequest) {
+        if let Some(service) = self.update_service.as_ref() {
+            service.request(request);
+        }
+    }
+
+    /// Drains pending update-worker events into the banner.
+    fn apply_update_events(&mut self) -> bool {
+        // Destructured so the worker and the banner are borrowed as separate
+        // fields rather than through one borrow of `self`.
+        let Self {
+            update_service,
+            update_ui,
+            ..
+        } = self;
+        update_service
+            .as_ref()
+            .is_some_and(|service| service.drain(update_ui))
     }
 
     /// Drains pending service updates, returning whether any were applied so the
@@ -4688,6 +4865,7 @@ impl Render for SessionMvpView {
                     .flex_col()
                     .flex_1()
                     .min_w_0()
+                    .when_some(self.update_banner(cx), gpui::ParentElement::child)
                     .when(!show_sidebar, |main| {
                         main.child(
                             div()
@@ -5088,6 +5266,7 @@ fn action_button(
 ) -> impl IntoElement {
     div()
         .id(label)
+        .debug_selector(move || label.to_owned())
         .accessibility_id(label)
         .role(Role::Button)
         .aria_label(label)
@@ -5136,13 +5315,17 @@ fn choice_response(kind: InteractionKind, choice: &str) -> InteractionResponse {
     }
 }
 
-fn database_path() -> Result<PathBuf, String> {
+fn data_directory() -> Result<PathBuf, String> {
     if let Some(path) = std::env::var_os("GCABB_DATA_DIR") {
-        return prepare_data_directory(&PathBuf::from(path));
+        return Ok(PathBuf::from(path));
     }
-    let base = dirs::data_local_dir()
-        .ok_or_else(|| "operating system did not provide a local data directory".to_owned())?;
-    prepare_data_directory(&base.join("gcabb"))
+    dirs::data_local_dir()
+        .map(|base| base.join("gcabb"))
+        .ok_or_else(|| "operating system did not provide a local data directory".to_owned())
+}
+
+fn database_path() -> Result<PathBuf, String> {
+    prepare_data_directory(&data_directory()?)
 }
 
 /// Working directory for chats.
@@ -5297,10 +5480,112 @@ fn bind_app_keys(cx: &mut App) {
     ]);
 }
 
+/// Records the running build's identity and clears any update left over from a
+/// previous run.
+///
+/// Reaching startup is the signal that an applied update actually works, so it
+/// is the point at which the previous installation stops being needed as a
+/// rollback target.
+fn resolve_build_identity() -> BuildStamp {
+    let build = BuildStamp::current();
+    tracing::info!(
+        version = %build.version,
+        channel = %build.channel,
+        commit = build.commit.as_deref().unwrap_or("unknown"),
+        target = build.target,
+        release = build.is_release(),
+        "gcabb build identity"
+    );
+    if build.is_release() {
+        match InstallLayout::for_running_executable() {
+            Ok(layout) => layout.clean_completed_updates(),
+            Err(error) => tracing::warn!(%error, "could not resolve the installation layout"),
+        }
+    }
+    build
+}
+
+/// How the binary was asked to run.
+enum Invocation {
+    /// Open the application window.
+    Desktop,
+    /// Print the build identity and exit.
+    Version,
+    /// Report whether an update is available and exit.
+    CheckUpdate,
+    /// Apply an available update and exit.
+    ApplyUpdate,
+    Help,
+    Unknown(String),
+}
+
+fn invocation() -> Invocation {
+    match std::env::args().nth(1).as_deref() {
+        None => Invocation::Desktop,
+        Some("--version" | "-V") => Invocation::Version,
+        Some("--check-update") => Invocation::CheckUpdate,
+        Some("--apply-update") => Invocation::ApplyUpdate,
+        Some("--help" | "-h") => Invocation::Help,
+        Some(other) => Invocation::Unknown(other.to_owned()),
+    }
+}
+
+const USAGE: &str = "\
+GCABB
+
+Usage:
+  gcabb-desktop                 Open the application
+  gcabb-desktop --version       Print the build identity
+  gcabb-desktop --check-update  Report whether an update is available
+  gcabb-desktop --apply-update  Download, verify, and apply an available update
+  gcabb-desktop --help          Show this message
+
+Exit codes for the update commands:
+  0  an update is available, or was applied
+  1  the check or the update failed
+  2  nothing to do
+";
+
 fn main() {
     if let Err(error) = init_tracing("gcabb=info") {
         eprintln!("failed to initialize structured tracing: {error}");
     }
+    if let Some(code) = updates::run_update_helper_if_requested() {
+        std::process::exit(code);
+    }
+    let build = resolve_build_identity();
+
+    // The update commands run the same code the window drives, so CI can
+    // exercise the loop on each platform without driving a GUI.
+    match invocation() {
+        Invocation::Desktop => {}
+        Invocation::Version => {
+            println!("{}", build.display());
+            return;
+        }
+        Invocation::Help => {
+            print!("{USAGE}");
+            return;
+        }
+        Invocation::Unknown(argument) => {
+            eprintln!("unrecognised argument {argument}\n");
+            print!("{USAGE}");
+            std::process::exit(1);
+        }
+        command @ (Invocation::CheckUpdate | Invocation::ApplyUpdate) => {
+            let apply = matches!(command, Invocation::ApplyUpdate);
+            let code = match data_directory() {
+                Ok(data_dir) => updates::run_headless(&build, &data_dir, apply),
+                Err(error) => {
+                    eprintln!("{error}");
+                    1
+                }
+            };
+            std::process::exit(code);
+        }
+    }
+
+    let window_title = format!("GCABB {}", build.display());
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let branch = git_branch(&project_root);
     let service = match database_path() {
@@ -5327,7 +5612,7 @@ fn main() {
                 WindowOptions {
                     window_bounds: Some(WindowBounds::Windowed(bounds)),
                     titlebar: Some(TitlebarOptions {
-                        title: Some("GCABB".into()),
+                        title: Some(window_title.clone().into()),
                         ..Default::default()
                     }),
                     app_id: Some(APP_ID.to_owned()),
@@ -5680,7 +5965,7 @@ mod tests {
         use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
         use session_manager::SessionHandle;
 
-        use crate::{AppService, ServiceCommand, SessionMvpView, SessionProjection};
+        use crate::{AppService, ServiceCommand, SessionMvpView, SessionProjection, UpdateUi};
 
         fn snapshot(id: &str, title: &str) -> SessionSnapshot {
             let mut state = SessionSnapshot::new(SessionMetadata {
@@ -7472,6 +7757,127 @@ mod tests {
                 assert_eq!(view.sessions[0].snapshot.metadata.title, "First session");
             });
             assert!(commands.try_recv().is_err(), "no command should be sent");
+        }
+
+        /// An install with nothing to report must not lose space to a banner.
+        #[gpui::test]
+        fn no_banner_is_shown_when_there_is_no_update(cx: &mut TestAppContext) {
+            let (_view, cx, _commands) = setup(cx);
+            assert!(
+                cx.debug_bounds("update-banner").is_none(),
+                "the banner must stay hidden when there is no update"
+            );
+        }
+
+        #[gpui::test]
+        fn an_offered_update_shows_the_banner_with_its_version(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.update_ui = UpdateUi::Available {
+                    version: "0.2.0".to_owned(),
+                    notes: "## GCABB v0.2.0\n\nFaster startup.".to_owned(),
+                };
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("update-banner").is_some(),
+                "an offered update must be visible"
+            );
+            view.read_with(cx, |view, _| {
+                let (message, _, summary) =
+                    view.update_banner_text().expect("banner text rendered");
+                assert!(message.contains("0.2.0"), "got {message}");
+                // The heading is skipped so the summary is the first real line.
+                assert_eq!(summary.as_deref(), Some("Faster startup."));
+            });
+        }
+
+        /// Regression guard: without a worker the buttons must still be inert
+        /// rather than panicking, since a developer build has no worker at all.
+        #[gpui::test]
+        fn pressing_update_without_a_worker_is_harmless(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.update_ui = UpdateUi::Available {
+                    version: "0.2.0".to_owned(),
+                    notes: String::new(),
+                };
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let button = cx.debug_bounds("Update").expect("update button rendered");
+            cx.simulate_click(button.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(view.update_service.is_none(), "test builds have no worker");
+                assert!(matches!(view.update_ui, UpdateUi::Available { .. }));
+            });
+        }
+
+        /// A failed update must be dismissible, or the banner would be stuck.
+        #[gpui::test]
+        fn a_failed_update_can_be_dismissed(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.update_ui = UpdateUi::Failed("signature does not match".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let button = cx.debug_bounds("Dismiss").expect("dismiss button rendered");
+            cx.simulate_click(button.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| assert_eq!(view.update_ui, UpdateUi::Hidden));
+            assert!(
+                cx.debug_bounds("update-banner").is_none(),
+                "the banner goes away once dismissed"
+            );
+        }
+
+        /// An applied update takes effect on restart, so it must say so and
+        /// offer the restart rather than silently doing nothing.
+        #[gpui::test]
+        fn an_applied_update_offers_a_restart(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.update_ui = UpdateUi::ReadyToRestart {
+                    version: "0.2.0".to_owned(),
+                };
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("update-restart").is_some(),
+                "a staged update must offer a restart"
+            );
+            view.read_with(cx, |view, _| {
+                let (message, _, _) = view.update_banner_text().expect("banner text rendered");
+                assert!(message.contains("restart"), "got {message}");
+            });
+        }
+
+        #[gpui::test]
+        fn download_progress_is_shown_in_the_banner(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.update_ui = UpdateUi::Downloading {
+                    received: 512,
+                    total: Some(1024),
+                };
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                let (message, _, _) = view.update_banner_text().expect("banner text rendered");
+                assert!(message.contains("50%"), "got {message}");
+            });
         }
     }
 }
