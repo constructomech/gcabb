@@ -10,12 +10,16 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
+#[cfg(windows)]
+use std::{ffi::OsStr, fs, process::Stdio};
 
 use updater::install::{InstallLayout, StagedUpdate};
 use updater::settings::UpdateSettings;
 use updater::source::{GitHubReleaseSource, ProgressCallback, ReqwestClient};
 use updater::verify::TrustStore;
 use updater::version::BuildStamp;
+#[cfg(windows)]
+use updater::version::executable_name;
 use updater::{AvailableUpdate, UpdateStatus, Updater};
 
 /// Repository that releases are published to.
@@ -142,11 +146,23 @@ pub fn run_headless(build: &BuildStamp, data_dir: &Path, apply_update: bool) -> 
             return 1;
         }
     };
+    #[cfg(windows)]
+    if let Err(error) = schedule_windows_apply(updater.layout(), &staged, false) {
+        eprintln!("could not schedule the update: {error}");
+        return 1;
+    }
+    #[cfg(not(windows))]
     if let Err(error) = updater.apply(&staged) {
         eprintln!("applying failed: {error}");
         return 1;
     }
 
+    #[cfg(windows)]
+    println!(
+        "scheduled {} for application on exit",
+        available.manifest.version
+    );
+    #[cfg(not(windows))]
     println!("applied {}", available.manifest.version);
     0
 }
@@ -396,20 +412,145 @@ fn install(
     let staged: StagedUpdate = runtime
         .block_on(updater.stage(available, progress))
         .map_err(|error| error.to_string())?;
-    updater.apply(&staged).map_err(|error| error.to_string())
+    #[cfg(not(windows))]
+    updater.apply(&staged).map_err(|error| error.to_string())?;
+    Ok(())
 }
 
 /// Relaunches the installed executable and asks the app to quit.
 ///
-/// The new build is started before the current one exits so a failure to spawn
-/// is reported while there is still a window to report it in.
-pub fn restart_into_updated_build() -> Result<(), String> {
-    let exe = std::env::current_exe()
+/// On Windows a copied helper waits for this process to exit before swapping the
+/// locked installation and starting the new build.
+pub fn restart_into_updated_build(version: &str) -> Result<(), String> {
+    #[cfg(windows)]
+    {
+        let layout = InstallLayout::for_running_executable().map_err(|error| error.to_string())?;
+        let staged = StagedUpdate {
+            version: version.to_owned(),
+            root: layout.staging_root.join(version),
+        };
+        schedule_windows_apply(&layout, &staged, true)
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = version;
+        let exe = std::env::current_exe()
+            .map_err(|error| format!("could not locate the installed executable: {error}"))?;
+        std::process::Command::new(&exe)
+            .spawn()
+            .map_err(|error| format!("could not start {}: {error}", exe.display()))?;
+        Ok(())
+    }
+}
+
+#[cfg(windows)]
+fn schedule_windows_apply(
+    layout: &InstallLayout,
+    staged: &StagedUpdate,
+    launch: bool,
+) -> Result<(), String> {
+    let current = std::env::current_exe()
         .map_err(|error| format!("could not locate the installed executable: {error}"))?;
-    std::process::Command::new(&exe)
+    let helper = layout.update_helper_path();
+    if helper.exists() {
+        fs::remove_file(&helper)
+            .map_err(|error| format!("could not replace {}: {error}", helper.display()))?;
+    }
+    fs::copy(&current, &helper)
+        .map_err(|error| format!("could not create {}: {error}", helper.display()))?;
+
+    let mut child = std::process::Command::new(&helper)
+        .arg("--finish-update")
+        .arg(&layout.install_dir)
+        .arg(&staged.root)
+        .arg(&staged.version)
+        .arg(if launch { "--launch" } else { "--no-launch" })
+        .stdin(Stdio::piped())
         .spawn()
-        .map_err(|error| format!("could not start {}: {error}", exe.display()))?;
+        .map_err(|error| format!("could not start {}: {error}", helper.display()))?;
+    let parent_lifetime = child
+        .stdin
+        .take()
+        .ok_or_else(|| "the update helper did not open its wait pipe".to_owned())?;
+
+    // The helper blocks on this pipe. Leaking the write end deliberately keeps
+    // it open until process teardown, which is the exact signal that the locked
+    // installation can be moved safely.
+    std::mem::forget(parent_lifetime);
     Ok(())
+}
+
+/// Handles the private invocation used by the copied Windows update helper.
+///
+/// Returns `None` for an ordinary application invocation.
+#[cfg(windows)]
+pub fn run_update_helper_if_requested() -> Option<i32> {
+    let mut args = std::env::args_os().skip(1);
+    if args.next().as_deref() != Some(OsStr::new("--finish-update")) {
+        return None;
+    }
+
+    let Some(install_dir) = args.next().map(PathBuf::from) else {
+        eprintln!("update helper is missing the installation directory");
+        return Some(1);
+    };
+    let Some(staged_root) = args.next().map(PathBuf::from) else {
+        eprintln!("update helper is missing the staged update directory");
+        return Some(1);
+    };
+    let Some(version) = args.next().and_then(|value| value.into_string().ok()) else {
+        eprintln!("update helper is missing the update version");
+        return Some(1);
+    };
+    let launch = match args.next().as_deref() {
+        Some(value) if value == OsStr::new("--launch") => true,
+        Some(value) if value == OsStr::new("--no-launch") => false,
+        _ => {
+            eprintln!("update helper is missing the launch mode");
+            return Some(1);
+        }
+    };
+
+    let mut input = std::io::stdin().lock();
+    if let Err(error) = std::io::copy(&mut input, &mut std::io::sink()) {
+        eprintln!("update helper could not wait for the application to exit: {error}");
+        return Some(1);
+    }
+
+    let layout = InstallLayout::for_install_dir(install_dir);
+    let staged = StagedUpdate {
+        version: version.clone(),
+        root: staged_root,
+    };
+    if let Err(error) = updater::install::apply(&layout, &staged) {
+        eprintln!("applying failed: {error}");
+        if launch {
+            let executable = layout.install_dir.join(executable_name());
+            if let Err(restart_error) = std::process::Command::new(&executable).spawn() {
+                eprintln!(
+                    "could not restart {} after the update failed: {restart_error}",
+                    executable.display()
+                );
+            }
+        }
+        return Some(1);
+    }
+
+    if launch {
+        let executable = layout.install_dir.join(executable_name());
+        if let Err(error) = std::process::Command::new(&executable).spawn() {
+            eprintln!("could not start {}: {error}", executable.display());
+            return Some(1);
+        }
+    }
+    use std::io::Write as _;
+    let _ = writeln!(std::io::stdout(), "applied {version}");
+    Some(0)
+}
+
+#[cfg(not(windows))]
+pub const fn run_update_helper_if_requested() -> Option<i32> {
+    None
 }
 
 #[cfg(test)]

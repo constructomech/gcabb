@@ -211,7 +211,14 @@ fi
 # 9. The previous installation must still be on disk right after the swap, so
 #    a build that fails to start can be rolled back to.
 backup="$work/.install-update-backup/$exe"
-if [ ! -f "$backup" ]; then
+for _ in $(seq 1 100); do
+  # Both paths existing means the helper completed both halves of the swap.
+  # Starting the new build any earlier could clean the backup while the helper
+  # still needs it for rollback.
+  [ -f "$backup" ] && [ -f "$installed" ] && break
+  sleep 0.1
+done
+if [ ! -f "$backup" ] || [ ! -f "$installed" ]; then
   echo "FAIL: no rollback copy of the previous installation was kept" >&2
   exit 1
 fi

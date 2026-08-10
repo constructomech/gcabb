@@ -1161,7 +1161,9 @@ impl SessionMvpView {
                 .child(action_button("Later", ELEVATED, cx, |view| {
                     view.request_update(UpdateRequest::Defer);
                 })),
-            UpdateUi::ReadyToRestart { .. } => banner.child(Self::restart_button(cx)),
+            UpdateUi::ReadyToRestart { version } => {
+                banner.child(Self::restart_button(version.clone(), cx))
+            }
             UpdateUi::Failed(_) => banner.child(action_button("Dismiss", ELEVATED, cx, |view| {
                 view.update_ui = UpdateUi::Hidden;
             })),
@@ -1172,7 +1174,7 @@ impl SessionMvpView {
     }
 
     /// Button that starts the replacement build and closes this one.
-    fn restart_button(cx: &mut Context<Self>) -> impl IntoElement {
+    fn restart_button(version: String, cx: &mut Context<Self>) -> impl IntoElement {
         div()
             .id("update-restart")
             .debug_selector(|| "update-restart".to_owned())
@@ -1190,7 +1192,7 @@ impl SessionMvpView {
             .child("Restart")
             .hover(|style| style.opacity(0.85).cursor_pointer())
             .on_click(cx.listener(
-                |view, _, _, cx| match updates::restart_into_updated_build() {
+                move |view, _, _, cx| match updates::restart_into_updated_build(&version) {
                     // The replacement is running, so this process can go.
                     Ok(()) => cx.quit(),
                     Err(error) => {
@@ -5548,6 +5550,9 @@ fn main() {
     if let Err(error) = init_tracing("gcabb=info") {
         eprintln!("failed to initialize structured tracing: {error}");
     }
+    if let Some(code) = updates::run_update_helper_if_requested() {
+        std::process::exit(code);
+    }
     let build = resolve_build_identity();
 
     // The update commands run the same code the window drives, so CI can
@@ -5567,8 +5572,8 @@ fn main() {
             print!("{USAGE}");
             std::process::exit(1);
         }
-        Invocation::CheckUpdate | Invocation::ApplyUpdate => {
-            let apply = matches!(invocation(), Invocation::ApplyUpdate);
+        command @ (Invocation::CheckUpdate | Invocation::ApplyUpdate) => {
+            let apply = matches!(command, Invocation::ApplyUpdate);
             let code = match data_directory() {
                 Ok(data_dir) => updates::run_headless(&build, &data_dir, apply),
                 Err(error) => {

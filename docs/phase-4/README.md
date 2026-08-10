@@ -101,9 +101,10 @@ so a self-hosting install is never stranded behind a promoted build.
 
 ## Applying an update
 
-All three platforms use one strategy, because every supported OS allows renaming
-a directory that contains a running executable — Windows forbids only
-overwriting or deleting the running image:
+All three platforms use the same directory-swap strategy. Linux and macOS can
+perform it while the old executable is still running. Windows locks the running
+executable's directory, so GCABB copies itself to a sibling helper first; the
+helper waits for the application to exit and then performs the same swap:
 
 1. Unpack the verified artifact into a staging directory beside the install.
 2. Rename the current installation to a backup directory.

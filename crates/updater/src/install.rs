@@ -1,11 +1,10 @@
 //! Staging and applying an update on disk.
 //!
-//! All three platforms use one strategy: unpack beside the installation, then
-//! swap directories by rename. This works everywhere because every supported OS
-//! allows renaming a directory that contains a running executable, including
-//! Windows, which forbids only overwriting or deleting the running image. The
-//! previous installation is kept as a backup until the new one has started
-//! successfully, so a failed swap can always be undone.
+//! All three platforms unpack beside the installation, then swap directories by
+//! rename. Windows performs the swap from a helper process after the application
+//! exits because it locks the running executable's directory. The previous
+//! installation is kept as a backup until the new one has started successfully,
+//! so a failed swap can always be undone.
 
 use std::fs;
 use std::io::{Cursor, Read as _};
@@ -100,6 +99,21 @@ impl InstallLayout {
         Ok(Self::for_install_dir(dir))
     }
 
+    /// Path used by a copied executable that performs a Windows update after the
+    /// running application exits.
+    #[must_use]
+    pub fn update_helper_path(&self) -> PathBuf {
+        let parent = self.install_dir.parent().unwrap_or(&self.install_dir);
+        let name = self.install_dir.file_name().map_or_else(
+            || "gcabb".to_owned(),
+            |name| name.to_string_lossy().into_owned(),
+        );
+        parent.join(format!(
+            ".{name}-update-helper{}",
+            std::env::consts::EXE_SUFFIX
+        ))
+    }
+
     /// Confirms the installation can be replaced before anything is downloaded.
     ///
     /// A system-managed or read-only install is a normal deployment, not a bug,
@@ -135,6 +149,16 @@ impl InstallLayout {
             {
                 tracing::warn!(path = %path.display(), %error, "could not clean update directory");
             }
+        }
+        let helper = self.update_helper_path();
+        if helper.exists()
+            && let Err(error) = fs::remove_file(&helper)
+        {
+            tracing::warn!(
+                path = %helper.display(),
+                %error,
+                "could not clean the update helper"
+            );
         }
     }
 }
@@ -208,9 +232,8 @@ pub fn apply(layout: &InstallLayout, staged: &StagedUpdate) -> Result<(), Instal
         fs::create_dir_all(parent).map_err(io("creating the update backup directory"))?;
     }
 
-    // Move the running installation aside. Renaming a directory that contains a
-    // running executable is permitted on all supported platforms; deleting or
-    // overwriting it is not, which is why nothing here does either.
+    // On Windows the caller runs this from a helper copied outside the install
+    // directory, after the application has exited.
     move_dir(&layout.install_dir, &layout.backup_root).map_err(|error| {
         InstallError::RolledBack {
             reason: format!("could not move the current installation aside: {error}"),
