@@ -105,6 +105,18 @@ Releases are tag-driven and cover Linux, macOS, and Windows. Pushing a `v*` tag
 builds every target, validates the workspace, signs update metadata, and
 publishes a single GitHub Release.
 
+On macOS, install the newest published release (including prereleases) with:
+
+```sh
+curl -fsSLO https://raw.githubusercontent.com/constructomech/gcabb/main/scripts/install-macos.sh
+chmod +x install-macos.sh
+./install-macos.sh
+```
+
+The script detects Apple Silicon or Intel, downloads the matching portable
+archive, and installs it in `~/Applications/GCABB`. Pass a tag to install a
+specific release, or set `GCABB_INSTALL_DIR` to choose another location.
+
 ```sh
 # The version is declared once, in [workspace.package] of the root Cargo.toml.
 git tag v0.2.0 && git push origin v0.2.0     # stable channel
