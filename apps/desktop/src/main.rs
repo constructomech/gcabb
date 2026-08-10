@@ -43,6 +43,16 @@ const BORDER: u32 = 0x0030_363d;
 const PRIMARY: u32 = 0x00f0_f3f6;
 const MUTED: u32 = 0x008b_949e;
 const GREEN: u32 = 0x003f_b950;
+const DATA_DIRECTORY_NAME: &str = "GCABB-data";
+const PERSISTENT_DATA_ENTRIES: &[&str] = &[
+    "gcabb.db",
+    "gcabb.db-shm",
+    "gcabb.db-wal",
+    "update-settings.json",
+    "attachments",
+    "chats",
+    "worktrees",
+];
 const BLUE: u32 = 0x0058_a6ff;
 const AMBER: u32 = 0x00d2_9900;
 const RED: u32 = 0x00f8_5161;
@@ -732,12 +742,9 @@ fn runtime_state_root() -> Option<PathBuf> {
 }
 
 fn worktrees_root() -> PathBuf {
-    if let Some(path) = std::env::var_os("GCABB_DATA_DIR") {
-        return PathBuf::from(path).join("worktrees");
-    }
-    dirs::data_local_dir().map_or_else(
-        || PathBuf::from(".gcabb").join("worktrees"),
-        |base| base.join("gcabb").join("worktrees"),
+    data_directory().map_or_else(
+        |_| PathBuf::from(".gcabb").join("worktrees"),
+        |base| base.join("worktrees"),
     )
 }
 
@@ -5320,12 +5327,101 @@ fn data_directory() -> Result<PathBuf, String> {
         return Ok(PathBuf::from(path));
     }
     dirs::data_local_dir()
-        .map(|base| base.join("gcabb"))
+        .map(|base| base.join(DATA_DIRECTORY_NAME))
         .ok_or_else(|| "operating system did not provide a local data directory".to_owned())
 }
 
-fn database_path() -> Result<PathBuf, String> {
-    prepare_data_directory(&data_directory()?)
+/// Moves data written by older builds out of the replaceable install directory.
+///
+/// During an update, the old updater moves the complete installation to its
+/// backup before launching the new build. Migrating before that backup is
+/// cleaned preserves the database and user-created files across the transition
+/// to the dedicated data directory.
+fn prepare_data_directory_for_build(build: &BuildStamp) -> Result<PathBuf, String> {
+    let data_dir = data_directory()?;
+    if build.is_release() {
+        let layout = InstallLayout::for_running_executable().map_err(|error| error.to_string())?;
+        if std::env::var_os("GCABB_DATA_DIR").is_none() {
+            let legacy = dirs::data_local_dir().map(|base| base.join("gcabb"));
+            let mut sources = vec![layout.backup_root.clone()];
+            if let Some(legacy) = legacy {
+                sources.push(legacy);
+            }
+            migrate_persistent_data(&data_dir, &sources)?;
+        }
+        // Data is now independent of the installation, so the rollback copy can
+        // be removed without deleting session state.
+        layout.clean_completed_updates();
+    }
+    Ok(data_dir)
+}
+
+fn database_path(data_dir: &Path) -> Result<PathBuf, String> {
+    prepare_data_directory(data_dir)
+}
+
+fn migrate_persistent_data(target: &Path, sources: &[PathBuf]) -> Result<(), String> {
+    if target.exists() {
+        return Ok(());
+    }
+    let source_with_entries = || {
+        sources.iter().find(|source| {
+            PERSISTENT_DATA_ENTRIES
+                .iter()
+                .any(|entry| source.join(entry).exists())
+        })
+    };
+    let Some(source) = sources
+        .iter()
+        .find(|source| source.join("gcabb.db").exists())
+        .or_else(source_with_entries)
+    else {
+        return Ok(());
+    };
+
+    let staging = target.with_extension("migrating");
+    if staging.exists() {
+        std::fs::remove_dir_all(&staging)
+            .map_err(|error| format!("failed to clear {}: {error}", staging.display()))?;
+    }
+    std::fs::create_dir_all(&staging)
+        .map_err(|error| format!("failed to create {}: {error}", staging.display()))?;
+    for entry in PERSISTENT_DATA_ENTRIES {
+        let from = source.join(entry);
+        if from.exists() {
+            copy_persistent_path(&from, &staging.join(entry))?;
+        }
+    }
+    std::fs::rename(&staging, target).map_err(|error| {
+        format!(
+            "failed to finish data migration from {} to {}: {error}",
+            source.display(),
+            target.display()
+        )
+    })
+}
+
+fn copy_persistent_path(from: &Path, to: &Path) -> Result<(), String> {
+    if from.is_dir() {
+        std::fs::create_dir_all(to)
+            .map_err(|error| format!("failed to create {}: {error}", to.display()))?;
+        let entries = std::fs::read_dir(from)
+            .map_err(|error| format!("failed to read {}: {error}", from.display()))?;
+        for entry in entries {
+            let entry =
+                entry.map_err(|error| format!("failed to read {}: {error}", from.display()))?;
+            copy_persistent_path(&entry.path(), &to.join(entry.file_name()))?;
+        }
+    } else {
+        std::fs::copy(from, to).map_err(|error| {
+            format!(
+                "failed to copy {} to {}: {error}",
+                from.display(),
+                to.display()
+            )
+        })?;
+    }
+    Ok(())
 }
 
 /// Working directory for chats.
@@ -5335,10 +5431,10 @@ fn database_path() -> Result<PathBuf, String> {
 /// activity away from any checkout; if it cannot be created, fall back to the
 /// launch directory so chats still work.
 fn chats_directory(fallback: &Path) -> PathBuf {
-    let Some(base) = dirs::data_local_dir() else {
+    let Ok(base) = data_directory() else {
         return fallback.to_owned();
     };
-    let path = base.join("gcabb").join("chats");
+    let path = base.join("chats");
     if std::fs::create_dir_all(&path).is_err() {
         return fallback.to_owned();
     }
@@ -5352,9 +5448,7 @@ fn chats_directory(fallback: &Path) -> PathBuf {
 /// an attached file in place rather than copying it, so this has to outlive the
 /// composer for the transcript to still show the picture later.
 fn attachments_directory() -> Option<PathBuf> {
-    let base = std::env::var_os("GCABB_DATA_DIR")
-        .map(PathBuf::from)
-        .or_else(|| dirs::data_local_dir().map(|dir| dir.join("gcabb")))?;
+    let base = data_directory().ok()?;
     let path = base.join("attachments");
     std::fs::create_dir_all(&path).ok()?;
     Some(path)
@@ -5480,12 +5574,7 @@ fn bind_app_keys(cx: &mut App) {
     ]);
 }
 
-/// Records the running build's identity and clears any update left over from a
-/// previous run.
-///
-/// Reaching startup is the signal that an applied update actually works, so it
-/// is the point at which the previous installation stops being needed as a
-/// rollback target.
+/// Records the running build's identity.
 fn resolve_build_identity() -> BuildStamp {
     let build = BuildStamp::current();
     tracing::info!(
@@ -5496,12 +5585,6 @@ fn resolve_build_identity() -> BuildStamp {
         release = build.is_release(),
         "gcabb build identity"
     );
-    if build.is_release() {
-        match InstallLayout::for_running_executable() {
-            Ok(layout) => layout.clean_completed_updates(),
-            Err(error) => tracing::warn!(%error, "could not resolve the installation layout"),
-        }
-    }
     build
 }
 
@@ -5574,7 +5657,7 @@ fn main() {
         }
         command @ (Invocation::CheckUpdate | Invocation::ApplyUpdate) => {
             let apply = matches!(command, Invocation::ApplyUpdate);
-            let code = match data_directory() {
+            let code = match prepare_data_directory_for_build(&build) {
                 Ok(data_dir) => updates::run_headless(&build, &data_dir, apply),
                 Err(error) => {
                     eprintln!("{error}");
@@ -5588,7 +5671,8 @@ fn main() {
     let window_title = format!("GCABB {}", build.display());
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let branch = git_branch(&project_root);
-    let service = match database_path() {
+    let data_dir = prepare_data_directory_for_build(&build);
+    let service = match data_dir.and_then(|path| database_path(&path)) {
         Ok(path) => AppService::start(project_root.clone(), path),
         Err(error) => AppService::failed(error),
     };
@@ -5635,6 +5719,7 @@ fn main() {
             .expect("failed to open GCABB window");
         window
             .update(cx, |view, window, cx| {
+                window.activate_window();
                 window.focus(&view.composer.focus_handle(cx), cx);
             })
             .expect("failed to focus composer");
@@ -5649,7 +5734,8 @@ mod tests {
     use super::{
         COMPACT_WIDTH, ControlMenu, compact_layout, context_window_label, control_menu_id,
         control_menu_offset, default_branch, default_context_tier, effort_label,
-        reasoning_effort_for_model, repository_root, toggled_menu, token_label,
+        migrate_persistent_data, reasoning_effort_for_model, repository_root, toggled_menu,
+        token_label,
     };
     use app_model::SessionLocation;
     use std::path::{Path, PathBuf};
@@ -5707,6 +5793,76 @@ mod tests {
         let canonical = dir.path().canonicalize().expect("canonical tempdir");
         assert_eq!(repository_root(dir.path()), canonical);
         assert!(default_branch(dir.path()).is_none());
+    }
+
+    #[test]
+    fn update_backup_data_is_migrated_without_installation_files() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backup = dir.path().join(".GCABB-update-backup");
+        let target = dir.path().join("GCABB-data");
+        std::fs::create_dir_all(backup.join("attachments")).expect("attachments");
+        std::fs::write(backup.join("gcabb.db"), b"database").expect("database");
+        std::fs::write(backup.join("gcabb.db-wal"), b"wal").expect("wal");
+        std::fs::write(backup.join("attachments").join("image.png"), b"image").expect("attachment");
+        std::fs::write(backup.join("gcabb-desktop.exe"), b"binary").expect("binary");
+
+        migrate_persistent_data(&target, &[backup]).expect("migration");
+
+        assert_eq!(
+            std::fs::read(target.join("gcabb.db")).expect("migrated database"),
+            b"database"
+        );
+        assert_eq!(
+            std::fs::read(target.join("gcabb.db-wal")).expect("migrated wal"),
+            b"wal"
+        );
+        assert_eq!(
+            std::fs::read(target.join("attachments").join("image.png"))
+                .expect("migrated attachment"),
+            b"image"
+        );
+        assert!(!target.join("gcabb-desktop.exe").exists());
+    }
+
+    #[test]
+    fn existing_data_directory_is_never_overwritten_by_a_backup() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let backup = dir.path().join(".GCABB-update-backup");
+        let target = dir.path().join("GCABB-data");
+        std::fs::create_dir_all(&backup).expect("backup");
+        std::fs::create_dir_all(&target).expect("target");
+        std::fs::write(backup.join("gcabb.db"), b"old").expect("old database");
+        std::fs::write(target.join("gcabb.db"), b"current").expect("current database");
+
+        migrate_persistent_data(&target, &[backup]).expect("migration");
+
+        assert_eq!(
+            std::fs::read(target.join("gcabb.db")).expect("current database"),
+            b"current"
+        );
+    }
+
+    #[test]
+    fn migration_prefers_the_source_containing_the_database() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let incomplete_backup = dir.path().join(".GCABB-update-backup");
+        let legacy = dir.path().join("GCABB");
+        let target = dir.path().join("GCABB-data");
+        std::fs::create_dir_all(&incomplete_backup).expect("backup");
+        std::fs::create_dir_all(&legacy).expect("legacy");
+        std::fs::write(
+            incomplete_backup.join("update-settings.json"),
+            b"incomplete",
+        )
+        .expect("settings");
+        std::fs::write(legacy.join("gcabb.db"), b"database").expect("database");
+
+        migrate_persistent_data(&target, &[incomplete_backup, legacy]).expect("migration");
+
+        assert_eq!(
+            std::fs::read(target.join("gcabb.db")).expect("migrated database"),
+            b"database"
+        );
     }
 
     /// The changes base must be the repository default, never the branch a
