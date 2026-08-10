@@ -353,6 +353,11 @@ impl SessionManager {
     }
 
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionHandle> {
+        let auto_approve_tools = is_gcabb_worktree(
+            request.kind,
+            &request.project_path,
+            request.repository_root.as_deref(),
+        );
         let provider_session = self
             .provider
             .create_session(SessionRequest {
@@ -361,6 +366,7 @@ impl SessionManager {
                 mode: request.mode.clone(),
                 reasoning_effort: request.reasoning_effort.clone(),
                 context_tier: request.context_tier.clone(),
+                auto_approve_tools,
             })
             .await?;
         let controls = match self
@@ -737,6 +743,11 @@ impl SessionManager {
             .resume_session(
                 &metadata.sdk_session_id,
                 SessionRequest {
+                    auto_approve_tools: is_gcabb_worktree(
+                        metadata.kind,
+                        &working_directory,
+                        metadata.repository_root.as_deref(),
+                    ),
                     working_directory,
                     model: metadata.model.clone(),
                     mode: metadata.mode.clone(),
@@ -1340,6 +1351,15 @@ fn timestamp() -> String {
     )
 }
 
+fn is_gcabb_worktree(
+    kind: SessionKind,
+    working_directory: &Path,
+    repository_root: Option<&str>,
+) -> bool {
+    kind == SessionKind::Project
+        && repository_root.is_some_and(|root| Path::new(root) != working_directory)
+}
+
 #[cfg(test)]
 mod tests {
     use diagnostics::MemoryDiagnostics;
@@ -1347,6 +1367,29 @@ mod tests {
     use test_harness::{FakeProvider, golden_events};
 
     use super::*;
+
+    #[test]
+    fn only_gcabb_worktrees_auto_approve_tools() {
+        let repository = PathBuf::from("repository");
+        let worktree = repository.join("gcabb-worktree");
+
+        assert!(is_gcabb_worktree(
+            SessionKind::Project,
+            &worktree,
+            repository.to_str(),
+        ));
+        assert!(!is_gcabb_worktree(
+            SessionKind::Project,
+            &repository,
+            repository.to_str(),
+        ));
+        assert!(!is_gcabb_worktree(
+            SessionKind::Chat,
+            &worktree,
+            repository.to_str(),
+        ));
+        assert!(!is_gcabb_worktree(SessionKind::Project, &worktree, None,));
+    }
 
     fn request(path: PathBuf) -> CreateSessionRequest {
         CreateSessionRequest {
