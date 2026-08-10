@@ -108,14 +108,14 @@ publishes a single GitHub Release.
 On macOS, install the newest published release (including prereleases) with:
 
 ```sh
-curl -fsSLO https://raw.githubusercontent.com/constructomech/gcabb/main/scripts/install-macos.sh
-chmod +x install-macos.sh
-./install-macos.sh
+curl -fsSL https://raw.githubusercontent.com/constructomech/gcabb/main/scripts/install-macos.sh | bash
+~/Applications/GCABB/gcabb-desktop
 ```
 
 The script detects Apple Silicon or Intel, downloads the matching portable
-archive, and installs it in `~/Applications/GCABB`. Pass a tag to install a
-specific release, or set `GCABB_INSTALL_DIR` to choose another location.
+archive, and installs it in `~/Applications/GCABB`. The second command launches
+the installed application. Download the script first if you need to pass a
+specific tag or set `GCABB_INSTALL_DIR` to choose another location.
 
 ```sh
 # The version is declared once, in [workspace.package] of the root Cargo.toml.
