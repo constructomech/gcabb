@@ -58,7 +58,7 @@ if [ -z "$tag" ]; then
   )
   tag=$(
     printf '%s\n' "$releases" |
-      sed -nE 's/^[[:space:]]*"tag_name":[[:space:]]*"([^"]+)".*/\1/p' |
+      sed -nE 's/.*"tag_name":[[:space:]]*"([^"]+)".*/\1/p' |
       head -n 1
   )
 fi
@@ -100,7 +100,10 @@ if [ -e "$staging" ] || [ -e "$backup" ]; then
 fi
 
 echo "Downloading GCABB $version for $target..."
-curl --fail --silent --show-error --location --retry 3 \
+curl --fail --show-error --location --retry 3 \
+  --progress-bar \
+  --speed-limit 1024 \
+  --speed-time 30 \
   "$download_url" \
   --output "$work/$asset"
 
