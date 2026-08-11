@@ -5,11 +5,13 @@
 //! by [`crate::verify`]. That split means an untrusted or compromised discovery
 //! response can misdirect a client but cannot make it install anything.
 
+use std::collections::HashMap;
 use std::error::Error as _;
 use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
-use std::time::Duration;
+use std::sync::Mutex;
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use semver::Version;
 use serde::Deserialize;
@@ -170,7 +172,7 @@ impl ReleaseSource for GitHubReleaseSource {
     ) -> BoxFuture<'_, Result<Vec<ReleaseCandidate>, SourceError>> {
         Box::pin(async move {
             let url = format!(
-                "{}/repos/{}/releases?per_page=30",
+                "{}/repos/{}/releases?per_page=10",
                 self.api_base, self.repository
             );
             let body = self.client.get(&url).await?;
@@ -229,6 +231,13 @@ impl ReleaseSource for GitHubReleaseSource {
 /// `reqwest`-backed HTTP client.
 pub struct ReqwestClient {
     inner: reqwest::Client,
+    cache: Mutex<HashMap<String, CachedResponse>>,
+}
+
+#[derive(Clone)]
+struct CachedResponse {
+    etag: String,
+    body: Vec<u8>,
 }
 
 const MAX_REQUEST_ATTEMPTS: usize = 3;
@@ -244,6 +253,7 @@ const READ_TIMEOUT: Duration = Duration::from_millis(100);
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
 #[cfg(test)]
 const RETRY_BASE_DELAY: Duration = Duration::from_millis(1);
+const MAX_INLINE_RETRY_DELAY: Duration = Duration::from_mins(1);
 
 impl ReqwestClient {
     /// Builds a client with a GCABB user agent, which the GitHub API requires.
@@ -258,19 +268,48 @@ impl ReqwestClient {
             .read_timeout(READ_TIMEOUT)
             .build()
             .map_err(|error| SourceError::Transport(error.to_string()))?;
-        Ok(Self { inner })
+        Ok(Self {
+            inner,
+            cache: Mutex::new(HashMap::new()),
+        })
     }
 
     async fn response(
         &self,
         url: &str,
         accept_github_json: bool,
+        etag: Option<&str>,
     ) -> Result<reqwest::Response, reqwest::Error> {
         let mut request = self.inner.get(url);
         if accept_github_json {
             request = request.header("Accept", "application/vnd.github+json");
         }
-        request.send().await?.error_for_status()
+        if let Some(etag) = etag {
+            request = request.header("If-None-Match", etag);
+        }
+        request.send().await
+    }
+
+    fn cached(&self, url: &str) -> Option<CachedResponse> {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .get(url)
+            .cloned()
+    }
+
+    fn cache(&self, url: &str, etag: String, body: Vec<u8>) {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .insert(url.to_owned(), CachedResponse { etag, body });
+    }
+
+    fn clear_cached(&self, url: &str) {
+        self.cache
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .remove(url);
     }
 }
 
@@ -290,6 +329,17 @@ fn retryable(error: &reqwest::Error) -> bool {
         || error.is_decode()
 }
 
+fn retryable_status(status: reqwest::StatusCode, headers: &reqwest::header::HeaderMap) -> bool {
+    status == reqwest::StatusCode::REQUEST_TIMEOUT
+        || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+        || status.is_server_error()
+        || (status == reqwest::StatusCode::FORBIDDEN
+            && (headers.contains_key(reqwest::header::RETRY_AFTER)
+                || headers
+                    .get("x-ratelimit-remaining")
+                    .is_some_and(|value| value == "0")))
+}
+
 fn transport(error: &reqwest::Error) -> SourceError {
     let mut message = error.to_string();
     let mut cause = error.source();
@@ -303,31 +353,118 @@ fn transport(error: &reqwest::Error) -> SourceError {
     SourceError::Transport(message)
 }
 
-async fn wait_before_retry(url: &str, attempt: usize, error: &reqwest::Error) {
-    let delay = RETRY_BASE_DELAY * u32::try_from(attempt).unwrap_or(u32::MAX);
+fn retry_delay_from_headers(headers: &reqwest::header::HeaderMap) -> Option<Duration> {
+    if let Some(seconds) = headers
+        .get(reqwest::header::RETRY_AFTER)
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())
+    {
+        return Some(Duration::from_secs(seconds));
+    }
+
+    let reset = headers
+        .get("x-ratelimit-reset")
+        .and_then(|value| value.to_str().ok())
+        .and_then(|value| value.parse::<u64>().ok())?;
+    UNIX_EPOCH
+        .checked_add(Duration::from_secs(reset))?
+        .duration_since(SystemTime::now())
+        .ok()
+}
+
+fn inline_retry_delay(attempt: usize, server_delay: Option<Duration>) -> Option<Duration> {
+    let exponent = u32::try_from(attempt.saturating_sub(1)).unwrap_or(u32::MAX);
+    let multiplier = 2_u32.saturating_pow(exponent);
+    let delay = server_delay.unwrap_or(RETRY_BASE_DELAY * multiplier);
+    (delay <= MAX_INLINE_RETRY_DELAY).then_some(delay)
+}
+
+async fn wait_before_retry(
+    url: &str,
+    attempt: usize,
+    error: &reqwest::Error,
+    server_delay: Option<Duration>,
+) -> bool {
+    let Some(delay) = inline_retry_delay(attempt, server_delay) else {
+        tracing::warn!(
+            url,
+            attempt,
+            %error,
+            "server retry delay is too long for an inline update check"
+        );
+        return false;
+    };
     tracing::warn!(
         url,
         attempt,
         max_attempts = MAX_REQUEST_ATTEMPTS,
+        delay_ms = delay.as_millis(),
         %error,
         "transient update request failed; retrying"
     );
     tokio::time::sleep(delay).await;
+    true
 }
 
 impl HttpClient for ReqwestClient {
     fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<Vec<u8>, SourceError>> {
         Box::pin(async move {
             for attempt in 1..=MAX_REQUEST_ATTEMPTS {
-                let result = async {
-                    let response = self.response(url, true).await?;
-                    response.bytes().await.map(|bytes| bytes.to_vec())
-                }
-                .await;
-                match result {
-                    Ok(bytes) => return Ok(bytes),
+                let cached = self.cached(url);
+                let response = match self
+                    .response(url, true, cached.as_ref().map(|entry| entry.etag.as_str()))
+                    .await
+                {
+                    Ok(response) => response,
                     Err(error) if attempt < MAX_REQUEST_ATTEMPTS && retryable(&error) => {
-                        wait_before_retry(url, attempt, &error).await;
+                        if !wait_before_retry(url, attempt, &error, None).await {
+                            return Err(transport(&error));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(transport(&error)),
+                };
+
+                if response.status() == reqwest::StatusCode::NOT_MODIFIED {
+                    return cached.map(|entry| entry.body).ok_or_else(|| {
+                        SourceError::Transport(format!(
+                            "{url} returned 304 Not Modified without a cached response"
+                        ))
+                    });
+                }
+
+                let status = response.status();
+                let server_delay = retry_delay_from_headers(response.headers());
+                let should_retry = retryable_status(status, response.headers());
+                let etag = response
+                    .headers()
+                    .get(reqwest::header::ETAG)
+                    .and_then(|value| value.to_str().ok())
+                    .map(str::to_owned);
+                let response = match response.error_for_status() {
+                    Ok(response) => response,
+                    Err(error) if attempt < MAX_REQUEST_ATTEMPTS && should_retry => {
+                        if !wait_before_retry(url, attempt, &error, server_delay).await {
+                            return Err(transport(&error));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(transport(&error)),
+                };
+                match response.bytes().await {
+                    Ok(bytes) => {
+                        let bytes = bytes.to_vec();
+                        if let Some(etag) = etag {
+                            self.cache(url, etag, bytes.clone());
+                        } else {
+                            self.clear_cached(url);
+                        }
+                        return Ok(bytes);
+                    }
+                    Err(error) if attempt < MAX_REQUEST_ATTEMPTS && retryable(&error) => {
+                        if !wait_before_retry(url, attempt, &error, None).await {
+                            return Err(transport(&error));
+                        }
                     }
                     Err(error) => return Err(transport(&error)),
                 }
@@ -343,12 +480,35 @@ impl HttpClient for ReqwestClient {
     ) -> BoxFuture<'a, Result<Vec<u8>, SourceError>> {
         Box::pin(async move {
             for attempt in 1..=MAX_REQUEST_ATTEMPTS {
+                let mut response = match self.response(url, false, None).await {
+                    Ok(response) => response,
+                    Err(error) if attempt < MAX_REQUEST_ATTEMPTS && retryable(&error) => {
+                        if !wait_before_retry(url, attempt, &error, None).await {
+                            return Err(transport(&error));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(transport(&error)),
+                };
+                let status = response.status();
+                let server_delay = retry_delay_from_headers(response.headers());
+                let should_retry = retryable_status(status, response.headers());
+                response = match response.error_for_status() {
+                    Ok(response) => response,
+                    Err(error) if attempt < MAX_REQUEST_ATTEMPTS && should_retry => {
+                        if !wait_before_retry(url, attempt, &error, server_delay).await {
+                            return Err(transport(&error));
+                        }
+                        continue;
+                    }
+                    Err(error) => return Err(transport(&error)),
+                };
+
+                let total = response.content_length();
+                let mut bytes =
+                    Vec::with_capacity(usize::try_from(total.unwrap_or(0)).unwrap_or_default());
+                progress(0, total);
                 let result = async {
-                    let mut response = self.response(url, false).await?;
-                    let total = response.content_length();
-                    let mut bytes =
-                        Vec::with_capacity(usize::try_from(total.unwrap_or(0)).unwrap_or_default());
-                    progress(0, total);
                     while let Some(chunk) = response.chunk().await? {
                         bytes.extend_from_slice(&chunk);
                         progress(bytes.len() as u64, total);
@@ -359,7 +519,9 @@ impl HttpClient for ReqwestClient {
                 match result {
                     Ok(bytes) => return Ok(bytes),
                     Err(error) if attempt < MAX_REQUEST_ATTEMPTS && retryable(&error) => {
-                        wait_before_retry(url, attempt, &error).await;
+                        if !wait_before_retry(url, attempt, &error, None).await {
+                            return Err(transport(&error));
+                        }
                     }
                     Err(error) => return Err(transport(&error)),
                 }
@@ -376,10 +538,11 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Mutex;
     use std::thread;
+    use std::time::Duration;
 
     use super::{
         BoxFuture, GitHubReleaseSource, HttpClient, ProgressCallback, ReleaseSource, ReqwestClient,
-        SourceError, version_from_tag,
+        SourceError, inline_retry_delay, retry_delay_from_headers, version_from_tag,
     };
 
     #[derive(Default)]
@@ -423,6 +586,27 @@ mod tests {
         (format!("http://{address}/update"), server)
     }
 
+    fn serve_conditional() -> (String, thread::JoinHandle<std::io::Result<String>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = thread::spawn(move || {
+            let (mut first, _) = listener.accept()?;
+            let mut request = [0_u8; 2048];
+            let _ = first.read(&mut request)?;
+            first.write_all(
+                b"HTTP/1.1 200 OK\r\nETag: \"gcabb-test\"\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+            )?;
+
+            let (mut second, _) = listener.accept()?;
+            let length = second.read(&mut request)?;
+            second.write_all(
+                b"HTTP/1.1 304 Not Modified\r\nETag: \"gcabb-test\"\r\nConnection: close\r\n\r\n",
+            )?;
+            Ok(String::from_utf8_lossy(&request[..length]).into_owned())
+        });
+        (format!("http://{address}/update"), server)
+    }
+
     fn serve_stalled_then(
         partial: &'static [u8],
         retried: &'static [u8],
@@ -458,6 +642,41 @@ mod tests {
             .join()
             .expect("server thread")
             .expect("serve responses");
+    }
+
+    #[tokio::test]
+    async fn conditional_get_returns_cached_body_after_not_modified() {
+        let (url, server) = serve_conditional();
+        let client = ReqwestClient::new().expect("client");
+
+        assert_eq!(client.get(&url).await.expect("first response"), b"ok");
+        assert_eq!(client.get(&url).await.expect("cached response"), b"ok");
+
+        let request = server
+            .join()
+            .expect("server thread")
+            .expect("serve conditional responses")
+            .to_ascii_lowercase();
+        assert!(request.contains("if-none-match: \"gcabb-test\""));
+    }
+
+    #[test]
+    fn retry_after_header_overrides_backoff() {
+        let mut headers = reqwest::header::HeaderMap::new();
+        headers.insert(
+            reqwest::header::RETRY_AFTER,
+            reqwest::header::HeaderValue::from_static("17"),
+        );
+
+        assert_eq!(
+            retry_delay_from_headers(&headers),
+            Some(Duration::from_secs(17))
+        );
+    }
+
+    #[test]
+    fn long_rate_limit_delays_are_left_for_the_next_periodic_check() {
+        assert_eq!(inline_retry_delay(1, Some(Duration::from_mins(2))), None);
     }
 
     #[tokio::test]
@@ -519,7 +738,7 @@ mod tests {
 
     fn source(include: bool) -> (GitHubReleaseSource, bool) {
         let http = StubHttp::with(&[(
-            "https://api.test/repos/constructomech/gcabb/releases?per_page=30",
+            "https://api.test/repos/constructomech/gcabb/releases?per_page=10",
             FEED,
         )]);
         (

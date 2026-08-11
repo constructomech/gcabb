@@ -67,6 +67,9 @@ candidates receive newer release candidates, while stable versions receive
 stable updates. When an update is available, GCABB offers **Update** and then
 **Restart**.
 
+GCABB checks when it starts and about every six hours while it remains open.
+You can also choose **Settings** → **Check for updates** at any time.
+
 Updates are verified with a signed release manifest and artifact checksum
 before installation. GCABB keeps the previous installation until the new
 version starts successfully.
