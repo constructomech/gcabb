@@ -8,6 +8,7 @@
 
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 #[cfg(windows)]
@@ -270,6 +271,7 @@ impl UpdateUi {
 pub struct UpdateService {
     requests: Sender<UpdateRequest>,
     events: Receiver<UpdateEvent>,
+    check_pending: Arc<AtomicBool>,
 }
 
 impl UpdateService {
@@ -278,20 +280,41 @@ impl UpdateService {
     pub fn start(build: BuildStamp, data_dir: PathBuf) -> Self {
         let (requests, request_rx) = channel();
         let (event_tx, events) = channel();
+        let check_pending = Arc::new(AtomicBool::new(false));
+        let worker_check_pending = Arc::clone(&check_pending);
 
         let spawned = thread::Builder::new()
             .name("gcabb-updates".to_owned())
-            .spawn(move || run_worker(&build, &data_dir, &request_rx, &event_tx));
+            .spawn(move || {
+                run_worker(
+                    &build,
+                    &data_dir,
+                    &request_rx,
+                    &event_tx,
+                    &worker_check_pending,
+                );
+            });
         if let Err(error) = spawned {
             tracing::error!(%error, "could not start the update worker");
         }
 
-        Self { requests, events }
+        Self {
+            requests,
+            events,
+            check_pending,
+        }
     }
 
     /// Asks the worker to do something, ignoring a worker that has stopped.
     pub fn request(&self, request: UpdateRequest) {
+        let is_check = matches!(&request, UpdateRequest::Check { .. });
+        if is_check && self.check_pending.swap(true, Ordering::AcqRel) {
+            return;
+        }
         if self.requests.send(request).is_err() {
+            if is_check {
+                self.check_pending.store(false, Ordering::Release);
+            }
             tracing::warn!("the update worker is not running");
         }
     }
@@ -314,6 +337,7 @@ fn run_worker(
     data_dir: &Path,
     requests: &Receiver<UpdateRequest>,
     events: &Sender<UpdateEvent>,
+    check_pending: &AtomicBool,
 ) {
     let runtime = match tokio::runtime::Builder::new_current_thread()
         .enable_all()
@@ -345,7 +369,9 @@ fn run_worker(
     while let Ok(request) = requests.recv() {
         match request {
             UpdateRequest::Check { automatic } => {
-                let _ = events.send(UpdateEvent::Checking);
+                if !automatic {
+                    let _ = events.send(UpdateEvent::Checking);
+                }
                 match runtime.block_on(updater.check(automatic)) {
                     Ok(UpdateStatus::Available(available)) => {
                         let _ = events.send(UpdateEvent::Available {
@@ -364,9 +390,14 @@ fn run_worker(
                         let _ = events.send(UpdateEvent::Unavailable(reason));
                     }
                     Err(error) => {
-                        let _ = events.send(UpdateEvent::Failed(error.to_string()));
+                        if automatic {
+                            tracing::warn!(%error, "automatic update check failed");
+                        } else {
+                            let _ = events.send(UpdateEvent::Failed(error.to_string()));
+                        }
                     }
                 }
+                check_pending.store(false, Ordering::Release);
             }
             UpdateRequest::Install => {
                 let Some(available) = offered.clone() else {

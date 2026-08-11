@@ -123,7 +123,7 @@ fn updater_for(
     let version = release.version;
     let http = Arc::new(StubHttp::default());
     http.insert(
-        &format!("{API_BASE}/repos/{REPOSITORY}/releases?per_page=30"),
+        &format!("{API_BASE}/repos/{REPOSITORY}/releases?per_page=10"),
         serde_json::to_vec(&serde_json::json!([{
             "tag_name": format!("v{version}"),
             "draft": false,

@@ -59,6 +59,8 @@ const BLUE: u32 = 0x0058_a6ff;
 const AMBER: u32 = 0x00d2_9900;
 const RED: u32 = 0x00f8_5161;
 const COMPACT_WIDTH: f32 = 920.0;
+const UPDATE_POLL_INTERVAL: Duration = Duration::from_hours(6);
+const UPDATE_POLL_JITTER: Duration = Duration::from_mins(30);
 /// Vertical budget for the detail blocks inside one tool entry.
 const ENTRY_DETAIL_BUDGET: f32 = 480.0;
 /// Measured thumb geometry for a scrollable region.
@@ -887,6 +889,12 @@ impl SessionPanel {
     }
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SettingsVisibility {
+    Closed,
+    Open,
+}
+
 struct SessionMvpView {
     startup: StartupState,
     projects: Vec<ProjectMetadata>,
@@ -963,7 +971,9 @@ struct SessionMvpView {
     update_ui: UpdateUi,
     /// Background update worker, absent for developer builds that never update.
     update_service: Option<UpdateService>,
+    settings_visibility: SettingsVisibility,
     _poll_task: gpui::Task<()>,
+    _update_poll_task: gpui::Task<()>,
 }
 
 impl SessionMvpView {
@@ -1062,6 +1072,20 @@ impl SessionMvpView {
             }
             _ => None,
         };
+        let periodic_update_delay = update_poll_delay();
+        let update_poll_task = cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(periodic_update_delay).await;
+                if view
+                    .update(cx, |view, _| {
+                        view.request_update(UpdateRequest::Check { automatic: true });
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
 
         Self {
             startup: StartupState::Starting,
@@ -1106,7 +1130,9 @@ impl SessionMvpView {
             action_error: None,
             update_ui: UpdateUi::default(),
             update_service,
+            settings_visibility: SettingsVisibility::Closed,
             _poll_task: poll_task,
+            _update_poll_task: update_poll_task,
         }
     }
 
@@ -1246,6 +1272,140 @@ impl SessionMvpView {
         if let Some(service) = self.update_service.as_ref() {
             service.request(request);
         }
+    }
+
+    fn settings_check_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let updates_available = self.update_service.is_some();
+        let checking = self.update_ui == UpdateUi::Checking;
+        let check_label = if checking {
+            "Checking…"
+        } else if updates_available {
+            "Check for updates"
+        } else {
+            "Unavailable in development builds"
+        };
+
+        div()
+            .id("settings-check-updates")
+            .accessibility_id("settings-check-updates")
+            .role(Role::Button)
+            .aria_label(check_label)
+            .focusable()
+            .tab_stop(updates_available && !checking)
+            .px_4()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .text_sm()
+            .text_color(if updates_available && !checking {
+                rgb(PRIMARY)
+            } else {
+                rgb(MUTED)
+            })
+            .child(check_label)
+            .when(updates_available && !checking, |button| {
+                button
+                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.request_update(UpdateRequest::Check { automatic: false });
+                        cx.notify();
+                    }))
+            })
+            .into_any_element()
+    }
+
+    fn settings_close_button(cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .id("settings-close")
+            .accessibility_id("settings-close")
+            .role(Role::Button)
+            .aria_label("Close settings")
+            .focusable()
+            .tab_stop(true)
+            .px_4()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(ELEVATED))
+            .child("Close")
+            .hover(|style| style.opacity(0.85).cursor_pointer())
+            .on_click(cx.listener(|view, _, _, cx| {
+                view.settings_visibility = SettingsVisibility::Closed;
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
+    fn settings_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.settings_visibility != SettingsVisibility::Open {
+            return None;
+        }
+        let version = BuildStamp::current().version.to_string();
+
+        Some(
+            div()
+                .id("settings-dialog")
+                .accessibility_id("settings-dialog")
+                .role(Role::Dialog)
+                .aria_label("Settings")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0000_00a8))
+                .child(
+                    div()
+                        .id("settings-panel")
+                        .w(px(460.0))
+                        .flex()
+                        .flex_col()
+                        .gap_4()
+                        .p_5()
+                        .rounded_lg()
+                        .bg(rgb(PANEL))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .id("settings-heading")
+                                .role(Role::Heading)
+                                .aria_level(2)
+                                .aria_label("Settings")
+                                .text_xl()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child("Settings"),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .gap_4()
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_1()
+                                        .child(div().child("Updates"))
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(MUTED))
+                                                .child(format!("Current version: {version}")),
+                                        ),
+                                )
+                                .child(self.settings_check_button(cx)),
+                        )
+                        .child(
+                            div()
+                                .flex()
+                                .justify_end()
+                                .child(Self::settings_close_button(cx)),
+                        ),
+                ),
+        )
     }
 
     /// Drains pending update-worker events into the banner.
@@ -3163,9 +3323,23 @@ impl SessionMvpView {
                     .child(div().flex_1().child("Local workspace"))
                     .child(
                         div()
-                            .id("settings-placeholder")
+                            .id("settings-button")
+                            .accessibility_id("settings-button")
+                            .role(Role::Button)
+                            .aria_label("Settings")
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                            .px_2()
+                            .py_1()
+                            .rounded_md()
                             .text_color(rgb(MUTED))
-                            .child("Settings — unavailable"),
+                            .child("Settings")
+                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.settings_visibility = SettingsVisibility::Open;
+                                cx.notify();
+                            })),
                     ),
             )
     }
@@ -5388,6 +5562,7 @@ impl Render for SessionMvpView {
                 view.dismiss_control_menu(cx);
                 view.dismiss_session_menu(cx);
                 view.dismiss_image_preview(cx);
+                view.settings_visibility = SettingsVisibility::Closed;
                 if view.renaming_session.is_some() {
                     view.cancel_rename(cx);
                 }
@@ -5615,6 +5790,7 @@ impl Render for SessionMvpView {
             })
             .when_some(self.session_context_menu(cx), gpui::ParentElement::child)
             .when_some(self.rename_dialog(cx), gpui::ParentElement::child)
+            .when_some(self.settings_dialog(cx), gpui::ParentElement::child)
             .when_some(self.image_preview_overlay(cx), gpui::ParentElement::child)
             .when_some(self.interaction_dialog(cx), |root, dialog| {
                 root.child(dialog)
@@ -6105,6 +6281,20 @@ fn git_output(root: &Path, args: &[&str]) -> Option<String> {
         .filter(|value| !value.is_empty())
 }
 
+fn update_poll_delay() -> Duration {
+    let seed = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .map_or(0, |duration| duration.as_secs())
+        ^ u64::from(std::process::id());
+    update_poll_delay_for(seed)
+}
+
+fn update_poll_delay_for(seed: u64) -> Duration {
+    let jitter_seconds = UPDATE_POLL_JITTER.as_secs();
+    let offset = seed % (jitter_seconds * 2 + 1);
+    UPDATE_POLL_INTERVAL.saturating_sub(UPDATE_POLL_JITTER) + Duration::from_secs(offset)
+}
+
 fn timestamp() -> String {
     SystemTime::now().duration_since(UNIX_EPOCH).map_or_else(
         |_| "0".to_owned(),
@@ -6284,10 +6474,10 @@ mod tests {
     use app_model::ContextWindowOption;
 
     use super::{
-        COMPACT_WIDTH, ControlMenu, compact_layout, context_window_label, control_menu_id,
-        control_menu_offset, default_branch, default_context_tier, effort_label,
-        migrate_persistent_data, reasoning_effort_for_model, repository_root, toggled_menu,
-        token_label,
+        COMPACT_WIDTH, ControlMenu, UPDATE_POLL_INTERVAL, UPDATE_POLL_JITTER, compact_layout,
+        context_window_label, control_menu_id, control_menu_offset, default_branch,
+        default_context_tier, effort_label, migrate_persistent_data, reasoning_effort_for_model,
+        repository_root, toggled_menu, token_label, update_poll_delay_for,
     };
     use app_model::SessionLocation;
     use std::path::{Path, PathBuf};
@@ -6326,6 +6516,15 @@ mod tests {
             ],
         );
         (dir, main, worktree)
+    }
+
+    #[test]
+    fn update_poll_jitter_stays_within_the_six_hour_window() {
+        let minimum = UPDATE_POLL_INTERVAL.saturating_sub(UPDATE_POLL_JITTER);
+        let maximum = UPDATE_POLL_INTERVAL + UPDATE_POLL_JITTER;
+
+        assert_eq!(update_poll_delay_for(0), minimum);
+        assert!(update_poll_delay_for(u64::MAX) <= maximum);
     }
 
     /// Adding a worktree folder must resolve to its repository, so adding a
