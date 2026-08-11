@@ -5,8 +5,11 @@
 //! by [`crate::verify`]. That split means an untrusted or compromised discovery
 //! response can misdirect a client but cannot make it install anything.
 
+use std::error::Error as _;
+use std::fmt::Write as _;
 use std::future::Future;
 use std::pin::Pin;
+use std::time::Duration;
 
 use semver::Version;
 use serde::Deserialize;
@@ -20,7 +23,7 @@ pub const SIGNATURE_ASSET: &str = "update-manifest.json.sig";
 
 #[derive(Debug, thiserror::Error)]
 pub enum SourceError {
-    #[error("update check failed: {0}")]
+    #[error("network request failed: {0}")]
     Transport(String),
     #[error("release feed could not be parsed: {0}")]
     MalformedFeed(String),
@@ -228,6 +231,20 @@ pub struct ReqwestClient {
     inner: reqwest::Client,
 }
 
+const MAX_REQUEST_ATTEMPTS: usize = 3;
+#[cfg(not(test))]
+const CONNECT_TIMEOUT: Duration = Duration::from_secs(15);
+#[cfg(test)]
+const CONNECT_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const READ_TIMEOUT: Duration = Duration::from_secs(30);
+#[cfg(test)]
+const READ_TIMEOUT: Duration = Duration::from_millis(100);
+#[cfg(not(test))]
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(250);
+#[cfg(test)]
+const RETRY_BASE_DELAY: Duration = Duration::from_millis(1);
+
 impl ReqwestClient {
     /// Builds a client with a GCABB user agent, which the GitHub API requires.
     ///
@@ -237,30 +254,85 @@ impl ReqwestClient {
     pub fn new() -> Result<Self, SourceError> {
         let inner = reqwest::Client::builder()
             .user_agent(concat!("gcabb/", env!("CARGO_PKG_VERSION")))
+            .connect_timeout(CONNECT_TIMEOUT)
+            .read_timeout(READ_TIMEOUT)
             .build()
             .map_err(|error| SourceError::Transport(error.to_string()))?;
         Ok(Self { inner })
     }
+
+    async fn response(
+        &self,
+        url: &str,
+        accept_github_json: bool,
+    ) -> Result<reqwest::Response, reqwest::Error> {
+        let mut request = self.inner.get(url);
+        if accept_github_json {
+            request = request.header("Accept", "application/vnd.github+json");
+        }
+        request.send().await?.error_for_status()
+    }
+}
+
+fn retryable(error: &reqwest::Error) -> bool {
+    if error.is_builder() || error.is_redirect() {
+        return false;
+    }
+    if let Some(status) = error.status() {
+        return status == reqwest::StatusCode::REQUEST_TIMEOUT
+            || status == reqwest::StatusCode::TOO_MANY_REQUESTS
+            || status.is_server_error();
+    }
+    error.is_connect()
+        || error.is_timeout()
+        || error.is_request()
+        || error.is_body()
+        || error.is_decode()
+}
+
+fn transport(error: &reqwest::Error) -> SourceError {
+    let mut message = error.to_string();
+    let mut cause = error.source();
+    while let Some(source) = cause {
+        let detail = source.to_string();
+        if !message.contains(&detail) {
+            let _ = write!(message, ": {detail}");
+        }
+        cause = source.source();
+    }
+    SourceError::Transport(message)
+}
+
+async fn wait_before_retry(url: &str, attempt: usize, error: &reqwest::Error) {
+    let delay = RETRY_BASE_DELAY * u32::try_from(attempt).unwrap_or(u32::MAX);
+    tracing::warn!(
+        url,
+        attempt,
+        max_attempts = MAX_REQUEST_ATTEMPTS,
+        %error,
+        "transient update request failed; retrying"
+    );
+    tokio::time::sleep(delay).await;
 }
 
 impl HttpClient for ReqwestClient {
     fn get<'a>(&'a self, url: &'a str) -> BoxFuture<'a, Result<Vec<u8>, SourceError>> {
         Box::pin(async move {
-            let response = self
-                .inner
-                .get(url)
-                .header("Accept", "application/vnd.github+json")
-                .send()
-                .await
-                .map_err(|error| SourceError::Transport(error.to_string()))?;
-            let response = response
-                .error_for_status()
-                .map_err(|error| SourceError::Transport(error.to_string()))?;
-            let bytes = response
-                .bytes()
-                .await
-                .map_err(|error| SourceError::Transport(error.to_string()))?;
-            Ok(bytes.to_vec())
+            for attempt in 1..=MAX_REQUEST_ATTEMPTS {
+                let result = async {
+                    let response = self.response(url, true).await?;
+                    response.bytes().await.map(|bytes| bytes.to_vec())
+                }
+                .await;
+                match result {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(error) if attempt < MAX_REQUEST_ATTEMPTS && retryable(&error) => {
+                        wait_before_retry(url, attempt, &error).await;
+                    }
+                    Err(error) => return Err(transport(&error)),
+                }
+            }
+            unreachable!("the request attempt loop always returns")
         })
     }
 
@@ -270,27 +342,29 @@ impl HttpClient for ReqwestClient {
         progress: ProgressCallback,
     ) -> BoxFuture<'a, Result<Vec<u8>, SourceError>> {
         Box::pin(async move {
-            let mut response = self
-                .inner
-                .get(url)
-                .send()
-                .await
-                .map_err(|error| SourceError::Transport(error.to_string()))?
-                .error_for_status()
-                .map_err(|error| SourceError::Transport(error.to_string()))?;
-
-            let total = response.content_length();
-            let mut bytes =
-                Vec::with_capacity(usize::try_from(total.unwrap_or(0)).unwrap_or_default());
-            while let Some(chunk) = response
-                .chunk()
-                .await
-                .map_err(|error| SourceError::Transport(error.to_string()))?
-            {
-                bytes.extend_from_slice(&chunk);
-                progress(bytes.len() as u64, total);
+            for attempt in 1..=MAX_REQUEST_ATTEMPTS {
+                let result = async {
+                    let mut response = self.response(url, false).await?;
+                    let total = response.content_length();
+                    let mut bytes =
+                        Vec::with_capacity(usize::try_from(total.unwrap_or(0)).unwrap_or_default());
+                    progress(0, total);
+                    while let Some(chunk) = response.chunk().await? {
+                        bytes.extend_from_slice(&chunk);
+                        progress(bytes.len() as u64, total);
+                    }
+                    Ok(bytes)
+                }
+                .await;
+                match result {
+                    Ok(bytes) => return Ok(bytes),
+                    Err(error) if attempt < MAX_REQUEST_ATTEMPTS && retryable(&error) => {
+                        wait_before_retry(url, attempt, &error).await;
+                    }
+                    Err(error) => return Err(transport(&error)),
+                }
             }
-            Ok(bytes)
+            unreachable!("the request attempt loop always returns")
         })
     }
 }
@@ -298,10 +372,15 @@ impl HttpClient for ReqwestClient {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
+    use std::io::{Read as _, Write as _};
+    use std::net::TcpListener;
     use std::sync::Mutex;
+    use std::thread;
+    use std::time::Duration;
 
     use super::{
-        BoxFuture, GitHubReleaseSource, HttpClient, ReleaseSource, SourceError, version_from_tag,
+        BoxFuture, GitHubReleaseSource, HttpClient, ProgressCallback, READ_TIMEOUT, ReleaseSource,
+        ReqwestClient, SourceError, version_from_tag,
     };
 
     #[derive(Default)]
@@ -328,6 +407,98 @@ mod tests {
                 found.ok_or_else(|| SourceError::Transport(format!("no stub for {url}")))
             })
         }
+    }
+
+    fn serve(responses: Vec<&'static [u8]>) -> (String, thread::JoinHandle<std::io::Result<()>>) {
+        serve_with_delays(
+            responses
+                .into_iter()
+                .map(|response| (response, Duration::ZERO))
+                .collect(),
+        )
+    }
+
+    fn serve_with_delays(
+        responses: Vec<(&'static [u8], Duration)>,
+    ) -> (String, thread::JoinHandle<std::io::Result<()>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = thread::spawn(move || {
+            for (response, delay) in responses {
+                let (mut stream, _) = listener.accept()?;
+                let mut request = [0_u8; 2048];
+                let _ = stream.read(&mut request)?;
+                stream.write_all(response)?;
+                thread::sleep(delay);
+            }
+            Ok(())
+        });
+        (format!("http://{address}/update"), server)
+    }
+
+    #[tokio::test]
+    async fn retries_transient_server_errors() {
+        let (url, server) = serve(vec![
+            b"HTTP/1.1 503 Service Unavailable\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 2\r\nConnection: close\r\n\r\nok",
+        ]);
+        let client = ReqwestClient::new().expect("client");
+
+        assert_eq!(client.get(&url).await.expect("retried response"), b"ok");
+        server
+            .join()
+            .expect("server thread")
+            .expect("serve responses");
+    }
+
+    #[tokio::test]
+    async fn retries_a_stalled_download() {
+        let (url, server) = serve_with_delays(vec![
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nno",
+                READ_TIMEOUT + Duration::from_millis(25),
+            ),
+            (
+                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+                Duration::ZERO,
+            ),
+        ]);
+        let client = ReqwestClient::new().expect("client");
+        let progress: ProgressCallback = std::sync::Arc::new(|_, _| {});
+
+        assert_eq!(
+            client
+                .download(&url, progress)
+                .await
+                .expect("retried download"),
+            b"hello"
+        );
+        server
+            .join()
+            .expect("server thread")
+            .expect("serve responses");
+    }
+
+    #[tokio::test]
+    async fn retries_an_interrupted_download_from_the_beginning() {
+        let (url, server) = serve(vec![
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nno",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        ]);
+        let client = ReqwestClient::new().expect("client");
+        let progress: ProgressCallback = std::sync::Arc::new(|_, _| {});
+
+        assert_eq!(
+            client
+                .download(&url, progress)
+                .await
+                .expect("retried download"),
+            b"hello"
+        );
+        server
+            .join()
+            .expect("server thread")
+            .expect("serve responses");
     }
 
     const FEED: &[u8] = br#"[
