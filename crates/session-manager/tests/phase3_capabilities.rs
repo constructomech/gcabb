@@ -724,10 +724,8 @@ async fn real_provider_completes_the_self_hosting_loop() {
         .await
         .expect("prompt sent");
 
-    // Wait for the loop's artifacts rather than for `Idle`. Trailing events
-    // that arrive after `session.idle` currently move the projected status
-    // back to `Running`, so status is not a reliable completion signal; the
-    // exit criterion is that the edit, the command, and the diff all landed.
+    // Wait for the loop's artifacts rather than only for `Idle`; the exit
+    // criterion is that the edit, the command, and the diff all landed.
     let snapshot = await_snapshot_for(&session, Duration::from_mins(4), true, |snapshot| {
         snapshot.changes.file("hello.txt").is_some() && !snapshot.tool_activity.terminals.is_empty()
     })

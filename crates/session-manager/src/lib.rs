@@ -778,7 +778,7 @@ impl SessionManager {
                 return Err(error.into());
             }
         };
-        state.status = SessionStatus::Idle;
+        state.reconcile_after_restart(&timestamp());
         self.populate_capabilities(&mut state).await;
         refresh_changes(&mut state);
         self.storage.write_snapshot(&state)?;
@@ -1553,7 +1553,7 @@ mod tests {
         assert_eq!(report.restored.len(), 1);
         let restored = restored_manager.session(&app_session_id).await.unwrap();
         assert_eq!(restored.snapshot().last_sequence, 4);
-        assert_eq!(restored.snapshot().last_sequence, 4);
+        assert_eq!(restored.snapshot().status, SessionStatus::Idle);
     }
 
     #[tokio::test]

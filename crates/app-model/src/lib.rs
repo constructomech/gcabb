@@ -598,6 +598,15 @@ impl SessionSnapshot {
         self.tool_activity.restore_indexes();
     }
 
+    /// Reconcile state that cannot still be active after reconnecting a runtime.
+    pub fn reconcile_after_restart(&mut self, timestamp: &str) {
+        self.pending_interactions.clear();
+        mark_streaming_interrupted(&mut self.transcript);
+        tools::mark_running_invocations_cancelled(&mut self.tool_activity, timestamp);
+        tools::mark_running_terminals_cancelled(&mut self.tool_activity, timestamp);
+        self.status = SessionStatus::Idle;
+    }
+
     #[allow(
         clippy::needless_pass_by_value,
         reason = "an applied event is consumed conceptually; taking it by value keeps callers from reusing it"
@@ -614,19 +623,21 @@ impl SessionSnapshot {
         }
 
         self.last_sequence = event.sequence;
-        let event_status = status_for_event(&event);
-        self.status = if self.pending_interactions.is_empty()
-            || matches!(
-                event_status,
-                SessionStatus::Failed | SessionStatus::Cancelled | SessionStatus::Disconnected
-            ) {
-            event_status
-        } else {
-            SessionStatus::Waiting
-        };
+        if let Some(event_status) = status_for_event(&event) {
+            self.status = if self.pending_interactions.is_empty()
+                || matches!(
+                    event_status,
+                    SessionStatus::Failed | SessionStatus::Cancelled | SessionStatus::Disconnected
+                ) {
+                event_status
+            } else {
+                SessionStatus::Waiting
+            };
+        }
         project_transcript(&mut self.transcript, &event);
         if is_abort(&event) {
             mark_streaming_interrupted(&mut self.transcript);
+            tools::mark_running_invocations_cancelled(&mut self.tool_activity, &event.timestamp);
             tools::mark_running_terminals_cancelled(&mut self.tool_activity, &event.timestamp);
         }
         tools::project(&mut self.tool_activity, &event);
@@ -728,25 +739,29 @@ pub fn rebuild(
     snapshot
 }
 
-fn status_for_event(event: &DomainEvent) -> SessionStatus {
+fn status_for_event(event: &DomainEvent) -> Option<SessionStatus> {
     if event.source_type == "session.idle" {
-        return if event.state == ActivityState::Cancelled {
+        return Some(if event.state == ActivityState::Cancelled {
             SessionStatus::Cancelled
         } else {
             SessionStatus::Idle
-        };
+        });
     }
 
     if event.source_type.ends_with(".requested") {
-        return SessionStatus::Waiting;
+        return Some(SessionStatus::Waiting);
+    }
+    if matches!(
+        event.source_type.as_str(),
+        "user.message" | "assistant.turn_start"
+    ) {
+        return Some(SessionStatus::Running);
     }
     match event.state {
-        ActivityState::Waiting => SessionStatus::Waiting,
-        ActivityState::Failed => SessionStatus::Failed,
-        ActivityState::Cancelled => SessionStatus::Cancelled,
-        ActivityState::Running | ActivityState::Queued | ActivityState::Completed => {
-            SessionStatus::Running
-        }
+        ActivityState::Waiting => Some(SessionStatus::Waiting),
+        ActivityState::Failed => Some(SessionStatus::Failed),
+        ActivityState::Cancelled => Some(SessionStatus::Cancelled),
+        ActivityState::Running | ActivityState::Queued | ActivityState::Completed => None,
     }
 }
 
@@ -994,6 +1009,63 @@ mod tests {
             ApplyOutcome::Duplicate
         );
         assert_eq!(replayed, first);
+    }
+
+    #[test]
+    fn idle_survives_trailing_resume_metadata() {
+        let mut state = SessionSnapshot::new(metadata());
+        for event in [
+            event(1, "turn", "assistant.turn_start"),
+            event(2, "idle", "session.idle"),
+            event(3, "resume", "session.resume"),
+            event(4, "agents", "session.custom_agents_updated"),
+        ] {
+            assert_eq!(state.apply(event), ApplyOutcome::Applied);
+        }
+
+        assert_eq!(state.status, SessionStatus::Idle);
+        assert_eq!(
+            state.apply(event(5, "user", "user.message")),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(state.status, SessionStatus::Running);
+    }
+
+    #[test]
+    fn restart_cancels_activity_left_running_by_the_previous_runtime() {
+        let mut state = SessionSnapshot::new(metadata());
+        let events = [
+            json!({"id":"user","type":"user.message","data":{"content":"run tests"}}),
+            json!({"id":"message","type":"assistant.message_start","data":{"messageId":"m"}}),
+            json!({
+                "id": "tool",
+                "type": "tool.execution_start",
+                "timestamp": "1",
+                "data": {
+                    "toolCallId": "call",
+                    "toolName": "bash",
+                    "arguments": {"command": "cargo test", "shellId": "shell"},
+                    "shellToolInfo": {"displayCommand": "cargo test"}
+                }
+            }),
+        ];
+        for (index, raw) in events.iter().enumerate() {
+            let event = DomainEvent::from_sdk_event_for("app-session", index as u64 + 1, raw);
+            assert_eq!(state.apply(event), ApplyOutcome::Applied);
+        }
+
+        state.reconcile_after_restart("2");
+
+        assert_eq!(state.status, SessionStatus::Idle);
+        assert_eq!(state.transcript[1].state, TranscriptState::Interrupted);
+        assert_eq!(
+            state.tool_activity.invocations[0].state,
+            InvocationState::Cancelled
+        );
+        assert_eq!(
+            state.tool_activity.terminals[0].state,
+            tools::TerminalState::Cancelled
+        );
     }
 
     #[test]
