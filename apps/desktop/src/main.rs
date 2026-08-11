@@ -30,8 +30,10 @@ use ui_components::{ImagesPasted, InputSubmitted, PastedImage, TextInput, bind_t
 use updater::install::InstallLayout;
 use updater::version::BuildStamp;
 
+mod markdown;
 mod updates;
 
+use markdown::{MarkdownNode, MarkdownTag};
 use updates::{UpdateRequest, UpdateService, UpdateUi};
 
 const BACKGROUND: u32 = 0x000d_1117;
@@ -97,6 +99,31 @@ const COMMAND_BLOCK_HEIGHT: f32 = ENTRY_DETAIL_BUDGET / 3.0;
 const APP_ID: &str = "com.constructomech.gcabb";
 
 actions!(gcabb, [DismissPopup, FocusNext, FocusPrevious]);
+
+const MARKDOWN_STRONG: u8 = 1;
+const MARKDOWN_EMPHASIS: u8 = 1 << 1;
+const MARKDOWN_STRIKETHROUGH: u8 = 1 << 2;
+
+#[derive(Clone, Default)]
+struct MarkdownInlineStyle {
+    marks: u8,
+    link: Option<String>,
+}
+
+impl MarkdownInlineStyle {
+    fn has(&self, mark: u8) -> bool {
+        self.marks & mark != 0
+    }
+}
+
+fn safe_markdown_url(target: &str) -> Option<String> {
+    let target = target.trim();
+    let lowercase = target.to_ascii_lowercase();
+    (lowercase.starts_with("https://")
+        || lowercase.starts_with("http://")
+        || lowercase.starts_with("mailto:"))
+    .then(|| target.to_owned())
+}
 
 /// An image shown full size over the session.
 #[derive(Clone)]
@@ -3537,7 +3564,7 @@ impl SessionMvpView {
     fn message_attachment_chips(
         message: &app_model::TranscriptMessage,
         cx: &mut Context<Self>,
-    ) -> Vec<impl IntoElement> {
+    ) -> Vec<gpui::AnyElement> {
         message
             .attachments
             .iter()
@@ -3590,8 +3617,473 @@ impl SessionMvpView {
                             .text_color(rgb(PRIMARY))
                             .child(attachment.display_name.clone()),
                     )
+                    .into_any_element()
             })
             .collect()
+    }
+
+    fn markdown_inline(
+        nodes: &[MarkdownNode],
+        style: &MarkdownInlineStyle,
+        message_id: &str,
+        element_index: &mut usize,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        let mut elements = Vec::new();
+        for node in nodes {
+            match node {
+                MarkdownNode::Container(tag, children) => {
+                    let mut child_style = style.clone();
+                    match tag {
+                        MarkdownTag::Strong => child_style.marks |= MARKDOWN_STRONG,
+                        MarkdownTag::Emphasis => child_style.marks |= MARKDOWN_EMPHASIS,
+                        MarkdownTag::Strikethrough => {
+                            child_style.marks |= MARKDOWN_STRIKETHROUGH;
+                        }
+                        MarkdownTag::Link(target) | MarkdownTag::Image(target) => {
+                            child_style.link = safe_markdown_url(target);
+                        }
+                        _ => {}
+                    }
+                    elements.extend(Self::markdown_inline(
+                        children,
+                        &child_style,
+                        message_id,
+                        element_index,
+                        cx,
+                    ));
+                }
+                MarkdownNode::Text(text) | MarkdownNode::Code(text) | MarkdownNode::Html(text) => {
+                    let is_code = matches!(node, MarkdownNode::Code(_));
+                    let link = style.link.clone();
+                    let element_id =
+                        SharedString::from(format!("markdown-{message_id}-{}", *element_index));
+                    *element_index += 1;
+                    elements.push(
+                        div()
+                            .id(element_id)
+                            .min_w_0()
+                            .when(style.has(MARKDOWN_STRONG), |text| {
+                                text.font_weight(gpui::FontWeight::BOLD)
+                            })
+                            .when(style.has(MARKDOWN_EMPHASIS), gpui::Styled::italic)
+                            .when(
+                                style.has(MARKDOWN_STRIKETHROUGH),
+                                gpui::Styled::line_through,
+                            )
+                            .when(is_code, |text| {
+                                text.px_1()
+                                    .rounded_sm()
+                                    .bg(rgb(SUBTLE))
+                                    .font_family(".ZedMono")
+                            })
+                            .when(link.is_some(), |text| {
+                                text.text_color(rgb(BLUE))
+                                    .underline()
+                                    .hover(gpui::Styled::cursor_pointer)
+                            })
+                            .when_some(link, |text, target| {
+                                text.on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.open_url(&target);
+                                }))
+                            })
+                            .child(text.clone())
+                            .into_any_element(),
+                    );
+                }
+                MarkdownNode::SoftBreak => {
+                    elements.push(div().child(" ").into_any_element());
+                }
+                MarkdownNode::HardBreak => {
+                    elements.push(div().w_full().h(px(0.)).into_any_element());
+                }
+                MarkdownNode::TaskMarker(checked) => {
+                    elements.push(
+                        div()
+                            .font_family(".ZedMono")
+                            .child(if *checked { "[x] " } else { "[ ] " })
+                            .into_any_element(),
+                    );
+                }
+                MarkdownNode::Rule => {}
+            }
+        }
+        elements
+    }
+
+    fn markdown_inline_block(
+        nodes: &[MarkdownNode],
+        message_id: &str,
+        element_index: &mut usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .flex()
+            .flex_wrap()
+            .min_w_0()
+            .children(Self::markdown_inline(
+                nodes,
+                &MarkdownInlineStyle::default(),
+                message_id,
+                element_index,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn markdown_table_section(
+        nodes: &[MarkdownNode],
+        header: bool,
+        message_id: &str,
+        element_index: &mut usize,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        if header
+            && nodes
+                .iter()
+                .all(|node| matches!(node, MarkdownNode::Container(MarkdownTag::TableCell, _)))
+        {
+            return vec![Self::markdown_table_row(
+                nodes,
+                true,
+                message_id,
+                element_index,
+                cx,
+            )];
+        }
+
+        nodes
+            .iter()
+            .filter_map(|node| {
+                let MarkdownNode::Container(MarkdownTag::TableRow, cells) = node else {
+                    return None;
+                };
+                Some(Self::markdown_table_row(
+                    cells,
+                    header,
+                    message_id,
+                    element_index,
+                    cx,
+                ))
+            })
+            .collect()
+    }
+
+    fn markdown_table_row(
+        cells: &[MarkdownNode],
+        header: bool,
+        message_id: &str,
+        element_index: &mut usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .flex()
+            .min_w_full()
+            .children(cells.iter().filter_map(|cell| {
+                let MarkdownNode::Container(MarkdownTag::TableCell, content) = cell else {
+                    return None;
+                };
+                Some(
+                    div()
+                        .min_w(px(120.))
+                        .flex_1()
+                        .p_2()
+                        .border_b_1()
+                        .border_r_1()
+                        .border_color(rgb(BORDER))
+                        .when(header, |cell| {
+                            cell.bg(rgb(SUBTLE)).font_weight(gpui::FontWeight::SEMIBOLD)
+                        })
+                        .child(Self::markdown_inline_block(
+                            content,
+                            message_id,
+                            element_index,
+                            cx,
+                        )),
+                )
+            }))
+            .into_any_element()
+    }
+
+    fn markdown_heading(
+        level: u8,
+        children: &[MarkdownNode],
+        message_id: &str,
+        element_index: &mut usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .mt_1()
+            .when(level <= 2, |heading| {
+                heading.text_xl().font_weight(gpui::FontWeight::BOLD)
+            })
+            .when(level == 3, |heading| {
+                heading.text_lg().font_weight(gpui::FontWeight::BOLD)
+            })
+            .when(level >= 4, |heading| {
+                heading.font_weight(gpui::FontWeight::SEMIBOLD)
+            })
+            .child(Self::markdown_inline_block(
+                children,
+                message_id,
+                element_index,
+                cx,
+            ))
+            .into_any_element()
+    }
+
+    fn markdown_quote(
+        children: &[MarkdownNode],
+        message_id: &str,
+        element_index: &mut usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        div()
+            .pl_3()
+            .border_l_2()
+            .border_color(rgb(MUTED))
+            .text_color(rgb(MUTED))
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(
+                children
+                    .iter()
+                    .map(|child| Self::markdown_block(child, message_id, element_index, cx)),
+            )
+            .into_any_element()
+    }
+
+    fn markdown_code_block(
+        language: Option<&String>,
+        children: &[MarkdownNode],
+        message_id: &str,
+        element_index: &mut usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let code = markdown::plain_text(children);
+        let copy = code.clone();
+        let block_index = *element_index;
+        *element_index += 1;
+        div()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(SUBTLE))
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .px_2()
+                    .py_1()
+                    .border_b_1()
+                    .border_color(rgb(BORDER))
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(language.cloned().unwrap_or_else(|| "code".to_owned()))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "copy-code-{message_id}-{block_index}"
+                            )))
+                            .role(Role::Button)
+                            .aria_label("Copy code")
+                            .focusable()
+                            .tab_stop(true)
+                            .px_2()
+                            .rounded_sm()
+                            .child("Copy")
+                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                            .on_click(cx.listener(move |_, _, _, cx| {
+                                cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                    copy.clone(),
+                                ));
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "code-content-{message_id}-{block_index}"
+                    )))
+                    .debug_selector(|| "markdown-code".to_owned())
+                    .p_3()
+                    .overflow_x_scroll()
+                    .whitespace_nowrap()
+                    .font_family(".ZedMono")
+                    .text_sm()
+                    .child(code),
+            )
+            .into_any_element()
+    }
+
+    fn markdown_list(
+        start: Option<u64>,
+        children: &[MarkdownNode],
+        message_id: &str,
+        element_index: &mut usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let first = start.unwrap_or(1);
+        div()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .children(children.iter().enumerate().map(|(index, child)| {
+                let marker = if start.is_some() {
+                    format!("{}.", first + u64::try_from(index).unwrap_or(0))
+                } else {
+                    "•".to_owned()
+                };
+                let content = match child {
+                    MarkdownNode::Container(MarkdownTag::Item, content) => content,
+                    _ => std::slice::from_ref(child),
+                };
+                div()
+                    .flex()
+                    .items_start()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(24.))
+                            .flex_shrink_0()
+                            .text_color(rgb(MUTED))
+                            .child(marker),
+                    )
+                    .child(
+                        div().min_w_0().flex_1().flex().flex_col().gap_1().children(
+                            content.iter().map(|item| {
+                                Self::markdown_block(item, message_id, element_index, cx)
+                            }),
+                        ),
+                    )
+            }))
+            .into_any_element()
+    }
+
+    fn markdown_table(
+        children: &[MarkdownNode],
+        message_id: &str,
+        element_index: &mut usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let table_index = *element_index;
+        *element_index += 1;
+        let mut rows = Vec::new();
+        for child in children {
+            match child {
+                MarkdownNode::Container(MarkdownTag::TableHead, head) => {
+                    rows.extend(Self::markdown_table_section(
+                        head,
+                        true,
+                        message_id,
+                        element_index,
+                        cx,
+                    ));
+                }
+                MarkdownNode::Container(MarkdownTag::TableRow, _) => {
+                    rows.extend(Self::markdown_table_section(
+                        std::slice::from_ref(child),
+                        false,
+                        message_id,
+                        element_index,
+                        cx,
+                    ));
+                }
+                _ => {}
+            }
+        }
+        div()
+            .id(SharedString::from(format!(
+                "markdown-table-{message_id}-{table_index}"
+            )))
+            .debug_selector(|| "markdown-table".to_owned())
+            .overflow_x_scroll()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .children(rows)
+            .into_any_element()
+    }
+
+    fn markdown_block(
+        node: &MarkdownNode,
+        message_id: &str,
+        element_index: &mut usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        match node {
+            MarkdownNode::Container(MarkdownTag::Paragraph, children) => {
+                Self::markdown_inline_block(children, message_id, element_index, cx)
+            }
+            MarkdownNode::Container(MarkdownTag::Heading(level), children) => {
+                Self::markdown_heading(*level, children, message_id, element_index, cx)
+            }
+            MarkdownNode::Container(MarkdownTag::BlockQuote, children) => {
+                Self::markdown_quote(children, message_id, element_index, cx)
+            }
+            MarkdownNode::Container(MarkdownTag::CodeBlock(language), children) => {
+                Self::markdown_code_block(
+                    language.as_ref(),
+                    children,
+                    message_id,
+                    element_index,
+                    cx,
+                )
+            }
+            MarkdownNode::Container(MarkdownTag::List(start), children) => {
+                Self::markdown_list(*start, children, message_id, element_index, cx)
+            }
+            MarkdownNode::Container(MarkdownTag::Table, children) => {
+                Self::markdown_table(children, message_id, element_index, cx)
+            }
+            MarkdownNode::Rule => div()
+                .w_full()
+                .h(px(1.))
+                .my_2()
+                .bg(rgb(BORDER))
+                .into_any_element(),
+            MarkdownNode::Container(_, children) => div()
+                .flex()
+                .flex_col()
+                .gap_1()
+                .children(
+                    children
+                        .iter()
+                        .map(|child| Self::markdown_block(child, message_id, element_index, cx)),
+                )
+                .into_any_element(),
+            _ => Self::markdown_inline_block(
+                std::slice::from_ref(node),
+                message_id,
+                element_index,
+                cx,
+            ),
+        }
+    }
+
+    fn markdown_content(
+        message_id: &str,
+        source: &str,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let document = markdown::parse(source);
+        let mut element_index = 0;
+        div()
+            .id(SharedString::from(format!("markdown-content-{message_id}")))
+            .debug_selector(|| "markdown-content".to_owned())
+            .flex()
+            .flex_col()
+            .gap_2()
+            .children(
+                document
+                    .children
+                    .iter()
+                    .map(|node| Self::markdown_block(node, message_id, &mut element_index, cx)),
+            )
+            .into_any_element()
     }
 
     fn transcript_message(
@@ -3601,6 +4093,8 @@ impl SessionMvpView {
         let is_user = message.role == TranscriptRole::User;
         let speaker = if is_user { "You" } else { "Copilot" };
         let attachments = Self::message_attachment_chips(message, cx);
+        let markdown_source = message.content.clone();
+        let markdown = Self::markdown_content(&message.id, &message.content, cx);
         div()
             .id(SharedString::from(format!("message-{}", message.id)))
             .accessibility_id(message.id.clone())
@@ -3620,17 +4114,48 @@ impl SessionMvpView {
                     .border_color(rgb(BORDER))
                     .child(
                         div()
-                            .text_xs()
-                            .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
-                            .child(if is_user { "You" } else { "Copilot" }),
+                            .flex()
+                            .items_center()
+                            .justify_between()
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
+                                    .child(if is_user { "You" } else { "Copilot" }),
+                            )
+                            .when(!message.content.is_empty(), |header| {
+                                header.child(
+                                    div()
+                                        .id(SharedString::from(format!(
+                                            "copy-markdown-{}",
+                                            message.id
+                                        )))
+                                        .debug_selector(|| "copy-markdown".to_owned())
+                                        .role(Role::Button)
+                                        .aria_label("Copy original markdown")
+                                        .focusable()
+                                        .tab_stop(true)
+                                        .px_1()
+                                        .rounded_sm()
+                                        .text_xs()
+                                        .text_color(rgb(MUTED))
+                                        .child("Copy")
+                                        .hover(|style| {
+                                            style
+                                                .bg(rgb(SUBTLE))
+                                                .text_color(rgb(PRIMARY))
+                                                .cursor_pointer()
+                                        })
+                                        .on_click(cx.listener(move |_, _, _, cx| {
+                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                                markdown_source.clone(),
+                                            ));
+                                        })),
+                                )
+                            }),
                     )
                     .when(!message.content.is_empty(), |bubble| {
-                        bubble.child(
-                            div()
-                                .mt_2()
-                                .text_color(rgb(PRIMARY))
-                                .child(message.content.clone()),
-                        )
+                        bubble.child(div().mt_2().text_color(rgb(PRIMARY)).child(markdown))
                     })
                     // Shown after the text, mirroring the composer, so the
                     // message reads back the way it was written.
@@ -6696,6 +7221,41 @@ mod tests {
             assert!(
                 commands.try_recv().is_err(),
                 "shift-enter submitted the composer"
+            );
+        }
+
+        #[gpui::test]
+        fn transcript_renders_markdown_and_copies_its_source(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let source = "# Result\n\n| Name | State |\n|---|---|\n| Build | **Passing** |\n\n```rust\nfn main() {}\n```";
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "markdown-message".to_owned(),
+                    role: app_model::TranscriptRole::Assistant,
+                    content: source.to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("markdown-content").is_some());
+            assert!(cx.debug_bounds("markdown-table").is_some());
+            assert!(cx.debug_bounds("markdown-code").is_some());
+
+            let copy = cx
+                .debug_bounds("copy-markdown")
+                .expect("copy markdown button rendered");
+            cx.simulate_click(copy.center(), Modifiers::none());
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(source.to_owned())
             );
         }
 
