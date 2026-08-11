@@ -115,8 +115,8 @@ curl -fsSL https://raw.githubusercontent.com/constructomech/gcabb/main/scripts/i
 ~/Applications/GCABB/gcabb-desktop
 ```
 
-The installer detects Apple Silicon or Intel and installs GCABB in
-`~/Applications/GCABB`.
+The installer supports Apple Silicon Macs and installs GCABB in
+`~/Applications/GCABB`. Intel Macs are not supported.
 
 ### Linux
 

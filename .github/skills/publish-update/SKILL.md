@@ -84,17 +84,49 @@ If it is not on `main`, push the branch and create a pull request. Do not tag
 the feature branch and do not tag an unmerged commit. Continue only after the
 release commit has landed on `main`.
 
-## 4. Create and push the tag
+## 4. Rehearse the update before tagging
 
-Fetch `main`, verify its version and clean lockfile, then create an annotated
-tag on the exact `origin/main` commit:
+Run the cross-platform self-update rehearsal against the release commit on
+`main`, then wait for it to finish:
+
+```powershell
+$releaseCommit = git rev-parse origin/main
+$previousRun = gh run list --repo constructomech/gcabb `
+    --workflow update-rehearsal.yml --branch main --commit $releaseCommit `
+    --event workflow_dispatch --limit 1 --json databaseId `
+    --jq '.[0].databaseId'
+gh workflow run update-rehearsal.yml --repo constructomech/gcabb --ref main
+do {
+    Start-Sleep -Seconds 2
+    $run = gh run list --repo constructomech/gcabb `
+        --workflow update-rehearsal.yml --branch main --commit $releaseCommit `
+        --event workflow_dispatch --limit 1 --json databaseId `
+        --jq '.[0].databaseId'
+} while (!$run -or $run -eq $previousRun)
+gh run watch $run --repo constructomech/gcabb --exit-status
+```
+
+Do not create the tag unless the Linux, macOS, and Windows rehearsal jobs all
+pass. If any job fails, inspect it with `gh run view $run --log-failed`, make
+and land the correction on `main`, then dispatch and pass a new rehearsal run.
+
+## 5. Create and push the tag
+
+Fetch `main` and confirm it still points to the commit that passed rehearsal.
+If it advanced, return to step 4 and rehearse the new commit. Otherwise verify
+its version and clean lockfile, then create an annotated tag on that exact
+commit:
 
 ```powershell
 git fetch origin main --tags
+$currentMain = git rev-parse origin/main
+if ($currentMain -ne $releaseCommit) {
+    throw "origin/main advanced after rehearsal; rehearse $currentMain before tagging"
+}
 git --no-pager show origin/main:Cargo.toml |
     Select-String -Pattern '^version\s*=' |
     Select-Object -First 1
-git tag -a "v<version>" origin/main -m "GCABB v<version>"
+git tag -a "v<version>" $releaseCommit -m "GCABB v<version>"
 git push origin "v<version>"
 ```
 
@@ -103,7 +135,7 @@ channel from the version, checks the tag against `Cargo.toml`, builds all
 platform artifacts, validates the workspace, signs update metadata, and
 publishes the GitHub Release.
 
-## 5. Monitor and verify publication
+## 6. Monitor and verify publication
 
 Find and watch the tag's release run:
 
