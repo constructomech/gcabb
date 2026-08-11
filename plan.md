@@ -389,6 +389,58 @@ crates/
   test-harness/          fake provider and deterministic event fixtures
 ```
 
+## Developer Workflow
+
+Rust 1.95 is pinned in `rust-toolchain.toml`. Start the desktop app from a
+checkout with:
+
+```sh
+source "$HOME/.cargo/env"
+cargo run -p gcabb-desktop
+```
+
+On fish, source `$HOME/.cargo/env.fish` or add `$HOME/.cargo/bin` to `PATH`.
+Set `GCABB_DATA_DIR` to isolate the application database during development.
+
+When developing GCABB inside GCABB, use the self-development script so the
+build does not target the executable running the current session:
+
+```sh
+./scripts/self-dev.sh test
+```
+
+```powershell
+./scripts/self-dev.ps1 test
+```
+
+Both scripts accept `build`, `test`, `clippy`, `fmt`, and `run`.
+
+On Linux, install the desktop entry once so the taskbar and window titlebar
+can resolve the application icon:
+
+```sh
+./scripts/install-linux-desktop-entry.sh
+```
+
+Releases are tag-driven. The workspace version is declared in the root
+`Cargo.toml`; release candidates use tags such as `v0.2.0-rc.1`, while stable
+releases use tags such as `v0.2.0`. The release workflow validates every
+platform, signs update metadata, and publishes one GitHub Release. Run
+`scripts/update-rehearsal.sh` before tagging.
+
+The retained Phase 0 SDK probe can be run without a model prompt:
+
+```sh
+cargo run -p sdk-probe -- --cwd .
+```
+
+Model-driven probes should use an isolated workspace. Probe output defaults to
+`.phase0/events.jsonl` and may contain prompts, model output, paths, and tool
+arguments.
+
+Implementation status and planned work belong in this document. Concrete
+defects and feature work are tracked as GitHub issues.
+
 ## Delivery Plan
 
 ### Phase 0: Feasibility and Event-Coverage Spike (1-2 weeks)
