@@ -409,11 +409,13 @@ fn install(
         let _ = reporter.send(UpdateEvent::Progress { received, total });
     });
 
-    let _staged: StagedUpdate = runtime
+    let staged: StagedUpdate = runtime
         .block_on(updater.stage(available, progress))
         .map_err(|error| error.to_string())?;
     #[cfg(not(windows))]
-    updater.apply(&_staged).map_err(|error| error.to_string())?;
+    updater.apply(&staged).map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    drop(staged);
     Ok(())
 }
 

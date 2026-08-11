@@ -5637,6 +5637,7 @@ fn main() {
         std::process::exit(code);
     }
     let build = resolve_build_identity();
+    let data_dir = prepare_data_directory_for_build(&build);
 
     // The update commands run the same code the window drives, so CI can
     // exercise the loop on each platform without driving a GUI.
@@ -5657,8 +5658,8 @@ fn main() {
         }
         command @ (Invocation::CheckUpdate | Invocation::ApplyUpdate) => {
             let apply = matches!(command, Invocation::ApplyUpdate);
-            let code = match prepare_data_directory_for_build(&build) {
-                Ok(data_dir) => updates::run_headless(&build, &data_dir, apply),
+            let code = match &data_dir {
+                Ok(data_dir) => updates::run_headless(&build, data_dir, apply),
                 Err(error) => {
                     eprintln!("{error}");
                     1
@@ -5671,7 +5672,6 @@ fn main() {
     let window_title = format!("GCABB {}", build.display());
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let branch = git_branch(&project_root);
-    let data_dir = prepare_data_directory_for_build(&build);
     let service = match data_dir.and_then(|path| database_path(&path)) {
         Ok(path) => AppService::start(project_root.clone(), path),
         Err(error) => AppService::failed(error),
