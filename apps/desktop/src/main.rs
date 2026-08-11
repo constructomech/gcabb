@@ -6466,6 +6466,56 @@ mod tests {
             });
         }
 
+        #[gpui::test]
+        fn composer_wraps_text_to_multiple_lines(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let single_line_height = cx
+                .debug_bounds("composer-input")
+                .expect("composer rendered")
+                .size
+                .height;
+
+            view.update(cx, |view, cx| {
+                view.composer.update(cx, |input, cx| {
+                    input.set_value("word ".repeat(300), cx);
+                });
+            });
+            cx.run_until_parked();
+
+            let wrapped_height = cx
+                .debug_bounds("composer-input")
+                .expect("composer rendered")
+                .size
+                .height;
+            assert!(
+                wrapped_height > single_line_height * 2.,
+                "long composer text remained on one line: {wrapped_height:?}"
+            );
+        }
+
+        #[gpui::test]
+        fn shift_enter_inserts_a_newline_without_submitting(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update_in(cx, |view, window, cx| {
+                view.composer
+                    .update(cx, |input, cx| input.set_value("first line", cx));
+                let handle = gpui::Focusable::focus_handle(view.composer.read(cx), cx);
+                window.focus(&handle, cx);
+            });
+            cx.run_until_parked();
+
+            cx.simulate_keystrokes("shift-enter");
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, cx| {
+                assert_eq!(view.composer.read(cx).value(), "first line\n");
+            });
+            assert!(
+                commands.try_recv().is_err(),
+                "shift-enter submitted the composer"
+            );
+        }
+
         /// Clicking an image chip in the transcript shows the picture.
         #[gpui::test]
         fn clicking_a_transcript_image_opens_a_preview(cx: &mut TestAppContext) {
