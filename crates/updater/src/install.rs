@@ -277,11 +277,35 @@ pub fn rollback(layout: &InstallLayout) -> Result<(), InstallError> {
 
 /// Moves a directory, falling back to copy-then-delete across filesystems.
 fn move_dir(from: &Path, to: &Path) -> Result<(), std::io::Error> {
-    if fs::rename(from, to).is_ok() {
+    if rename_dir(from, to).is_ok() {
         return Ok(());
     }
     copy_dir(from, to)?;
     fs::remove_dir_all(from)
+}
+
+#[cfg(windows)]
+fn rename_dir(from: &Path, to: &Path) -> Result<(), std::io::Error> {
+    const MAX_ATTEMPTS: usize = 50;
+    const RETRY_DELAY: std::time::Duration = std::time::Duration::from_millis(100);
+
+    for attempt in 1..=MAX_ATTEMPTS {
+        match fs::rename(from, to) {
+            Err(error)
+                if error.kind() == std::io::ErrorKind::PermissionDenied
+                    && attempt < MAX_ATTEMPTS =>
+            {
+                std::thread::sleep(RETRY_DELAY);
+            }
+            result => return result,
+        }
+    }
+    unreachable!("the rename loop always returns on its final attempt")
+}
+
+#[cfg(not(windows))]
+fn rename_dir(from: &Path, to: &Path) -> Result<(), std::io::Error> {
+    fs::rename(from, to)
 }
 
 fn copy_dir(from: &Path, to: &Path) -> Result<(), std::io::Error> {

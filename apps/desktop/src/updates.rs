@@ -11,7 +11,7 @@ use std::sync::Arc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::thread;
 #[cfg(windows)]
-use std::{ffi::OsStr, fs, process::Stdio};
+use std::{ffi::OsStr, fs, io::Write as _, process::Stdio};
 
 use updater::install::{InstallLayout, StagedUpdate};
 use updater::settings::UpdateSettings;
@@ -414,6 +414,8 @@ fn install(
         .map_err(|error| error.to_string())?;
     #[cfg(not(windows))]
     updater.apply(&staged).map_err(|error| error.to_string())?;
+    #[cfg(windows)]
+    drop(staged);
     Ok(())
 }
 
@@ -543,7 +545,6 @@ pub fn run_update_helper_if_requested() -> Option<i32> {
             return Some(1);
         }
     }
-    use std::io::Write as _;
     let _ = writeln!(std::io::stdout(), "applied {version}");
     Some(0)
 }
