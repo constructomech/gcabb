@@ -6838,6 +6838,7 @@ name = "ui-components"
 version = "0.1.0-rc.4"
 dependencies = [
  "gpui",
+ "unicode-segmentation",
 ]
 
 [[package]]
