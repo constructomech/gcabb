@@ -376,11 +376,10 @@ mod tests {
     use std::net::TcpListener;
     use std::sync::Mutex;
     use std::thread;
-    use std::time::Duration;
 
     use super::{
-        BoxFuture, GitHubReleaseSource, HttpClient, ProgressCallback, READ_TIMEOUT, ReleaseSource,
-        ReqwestClient, SourceError, version_from_tag,
+        BoxFuture, GitHubReleaseSource, HttpClient, ProgressCallback, ReleaseSource, ReqwestClient,
+        SourceError, version_from_tag,
     };
 
     #[derive(Default)]
@@ -410,27 +409,37 @@ mod tests {
     }
 
     fn serve(responses: Vec<&'static [u8]>) -> (String, thread::JoinHandle<std::io::Result<()>>) {
-        serve_with_delays(
-            responses
-                .into_iter()
-                .map(|response| (response, Duration::ZERO))
-                .collect(),
-        )
-    }
-
-    fn serve_with_delays(
-        responses: Vec<(&'static [u8], Duration)>,
-    ) -> (String, thread::JoinHandle<std::io::Result<()>>) {
         let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
         let address = listener.local_addr().expect("test server address");
         let server = thread::spawn(move || {
-            for (response, delay) in responses {
+            for response in responses {
                 let (mut stream, _) = listener.accept()?;
                 let mut request = [0_u8; 2048];
                 let _ = stream.read(&mut request)?;
                 stream.write_all(response)?;
-                thread::sleep(delay);
             }
+            Ok(())
+        });
+        (format!("http://{address}/update"), server)
+    }
+
+    fn serve_stalled_then(
+        partial: &'static [u8],
+        retried: &'static [u8],
+    ) -> (String, thread::JoinHandle<std::io::Result<()>>) {
+        let listener = TcpListener::bind("127.0.0.1:0").expect("bind test server");
+        let address = listener.local_addr().expect("test server address");
+        let server = thread::spawn(move || {
+            let (mut stalled_stream, _) = listener.accept()?;
+            let mut request = [0_u8; 2048];
+            let _ = stalled_stream.read(&mut request)?;
+            stalled_stream.write_all(partial)?;
+
+            // Accepting the retry is the barrier: the partial response remains
+            // open until the client has observed its read timeout and reconnects.
+            let (mut retried_stream, _) = listener.accept()?;
+            let _ = retried_stream.read(&mut request)?;
+            retried_stream.write_all(retried)?;
             Ok(())
         });
         (format!("http://{address}/update"), server)
@@ -453,16 +462,10 @@ mod tests {
 
     #[tokio::test]
     async fn retries_a_stalled_download() {
-        let (url, server) = serve_with_delays(vec![
-            (
-                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nno",
-                READ_TIMEOUT + Duration::from_millis(25),
-            ),
-            (
-                b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
-                Duration::ZERO,
-            ),
-        ]);
+        let (url, server) = serve_stalled_then(
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nno",
+            b"HTTP/1.1 200 OK\r\nContent-Length: 5\r\nConnection: close\r\n\r\nhello",
+        );
         let client = ReqwestClient::new().expect("client");
         let progress: ProgressCallback = std::sync::Arc::new(|_, _| {});
 
