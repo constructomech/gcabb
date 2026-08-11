@@ -3377,6 +3377,7 @@ impl SessionMvpView {
             app_model::InvocationState::Running => ("running", GREEN),
             app_model::InvocationState::Succeeded => ("done", MUTED),
             app_model::InvocationState::Failed => ("failed", RED),
+            app_model::InvocationState::Cancelled => ("cancelled", MUTED),
         };
         let summary = invocation.summary_line();
         let detail = invocation.multiline_summary();
@@ -3401,7 +3402,8 @@ impl SessionMvpView {
             .map(|child| {
                 let child_status = match child.state {
                     app_model::InvocationState::Running => GREEN,
-                    app_model::InvocationState::Succeeded => MUTED,
+                    app_model::InvocationState::Succeeded
+                    | app_model::InvocationState::Cancelled => MUTED,
                     app_model::InvocationState::Failed => RED,
                 };
                 div()

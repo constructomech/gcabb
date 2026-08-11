@@ -183,6 +183,7 @@ pub enum InvocationState {
     Running,
     Succeeded,
     Failed,
+    Cancelled,
 }
 
 /// A single tool call, projected from `tool.execution_*` events.
@@ -805,5 +806,15 @@ pub fn mark_running_terminals_cancelled(activity: &mut ToolActivity, timestamp: 
         .collect();
     for shell_id in running {
         mark_terminal_cancelled(activity, &shell_id, timestamp);
+    }
+}
+
+/// Mark every tool call left running by a stopped runtime as cancelled.
+pub fn mark_running_invocations_cancelled(activity: &mut ToolActivity, timestamp: &str) {
+    for invocation in &mut activity.invocations {
+        if invocation.state == InvocationState::Running {
+            invocation.state = InvocationState::Cancelled;
+            invocation.completed_at = Some(timestamp.to_owned());
+        }
     }
 }
