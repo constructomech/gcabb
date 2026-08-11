@@ -893,6 +893,9 @@ struct SessionMvpView {
     /// Scroll positions of the detail blocks inside tool entries, keyed by
     /// block id so each keeps its position across renders.
     detail_scrolls: RefCell<HashMap<String, gpui::ScrollHandle>>,
+    /// Last rendered content length for each detail block, used to follow
+    /// streaming shell output without resetting blocks the user scrolled up.
+    detail_extents: RefCell<HashMap<String, usize>>,
     /// Scrollable extent the transcript last rendered with.
     ///
     /// Scrollbar geometry is only knowable after a layout pass, and the window
@@ -907,7 +910,7 @@ struct SessionMvpView {
     dragging_scrollbar: Option<ScrollbarDrag>,
     /// Transcript length last auto-scrolled for, so the view follows new
     /// output without fighting a user who has scrolled up to read.
-    transcript_extent: (String, usize, usize),
+    transcript_extent: (String, usize, usize, usize, usize),
     restore_failures: Vec<RestoreFailure>,
     updates: Receiver<ServiceUpdate>,
     commands: Sender<ServiceCommand>,
@@ -1051,9 +1054,10 @@ impl SessionMvpView {
             project_branch: None,
             transcript_scroll: gpui::ScrollHandle::new(),
             detail_scrolls: RefCell::new(HashMap::new()),
+            detail_extents: RefCell::new(HashMap::new()),
             transcript_extent_px: 0.0,
             dragging_scrollbar: None,
-            transcript_extent: (String::new(), 0, 0),
+            transcript_extent: (String::new(), 0, 0, 0, 0),
             restore_failures: Vec::new(),
             updates: service.updates,
             commands,
@@ -1471,12 +1475,23 @@ impl SessionMvpView {
                 .transcript
                 .last()
                 .map_or(0, |message| message.content.len()),
+            session.snapshot.tool_activity.invocations.len(),
+            session
+                .snapshot
+                .tool_activity
+                .invocations
+                .iter()
+                .map(|invocation| invocation.output.len())
+                .sum(),
         );
         if extent == self.transcript_extent {
             return;
         }
         let switched_session = extent.0 != self.transcript_extent.0;
-        let grew = extent.1 > self.transcript_extent.1 || extent.2 > self.transcript_extent.2;
+        let grew = extent.1 > self.transcript_extent.1
+            || extent.2 > self.transcript_extent.2
+            || extent.3 > self.transcript_extent.3
+            || extent.4 > self.transcript_extent.4;
         self.transcript_extent = extent;
         if switched_session || grew {
             self.transcript_scroll.scroll_to_bottom();
@@ -3306,6 +3321,14 @@ impl SessionMvpView {
             .entry(id.to_owned())
             .or_default()
             .clone();
+        let previous_extent = self
+            .detail_extents
+            .borrow_mut()
+            .insert(id.to_owned(), content.len());
+        let at_tail = f32::from(handle.max_offset().y) + f32::from(handle.offset().y) <= 1.0;
+        if previous_extent.is_none_or(|previous| content.len() > previous) && at_tail {
+            handle.scroll_to_bottom();
+        }
 
         let group = SharedString::from(format!("scroll-{id}"));
         let scrollbar = Self::scrollbar(id, &handle, group.clone(), cx);
@@ -3364,8 +3387,10 @@ impl SessionMvpView {
         // Command output is the tail, since the interesting part is the end.
         // The block scrolls, so it can hold considerably more than the
         // terminals panel preview.
-        let output = (invocation.class == app_model::ToolClass::Shell
-            && !invocation.output.is_empty())
+        let output = (matches!(
+            invocation.class,
+            app_model::ToolClass::Shell | app_model::ToolClass::ShellControl
+        ) && !invocation.output.is_empty())
         .then(|| tail_lines(&invocation.output, 400));
         let exit = invocation
             .exit_code
@@ -7527,6 +7552,45 @@ mod tests {
                 "the entry stays compact, got {:?}",
                 bounds.size.height
             );
+        }
+
+        /// `read_bash` carries output from a long-running shell. Treating it as
+        /// control-only hid every compile chunk until the agent finished.
+        #[gpui::test]
+        fn running_read_bash_output_streams_in_the_transcript(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for (sequence, raw) in [
+                    serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"read_bash",
+                                "arguments":{"shellId":"36"}}}),
+                    serde_json::json!({"id":"p","type":"tool.execution_partial_result",
+                        "data":{"toolCallId":"c1","partialOutput":"Compiling gcabb v0.1.0\n"}}),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    state.apply(app_model::DomainEvent::from_sdk_event_for(
+                        "session-1",
+                        u64::try_from(sequence).unwrap_or(0) + 1,
+                        &raw,
+                    ));
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("tool-detail").is_some(),
+                "partial read_bash output should render before the shell completes"
+            );
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.transcript_extent.3, 1);
+                assert_eq!(view.transcript_extent.4, "Compiling gcabb v0.1.0\n".len());
+            });
         }
 
         /// Regression: the transcript clipped its overflow, so a long
