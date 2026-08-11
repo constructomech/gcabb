@@ -7,10 +7,8 @@ name: Update rehearsal
 #
 # It is a separate workflow because it builds the desktop app twice per
 # platform, which is far too slow to run on every pull request. It runs when the
-# update path itself changes, on main, and on demand.
+# update path itself changes in a pull request and on demand before a release.
 on:
-  push:
-    branches: [main]
   pull_request:
     paths:
       - "crates/updater/**"
