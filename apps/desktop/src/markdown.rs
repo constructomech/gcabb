@@ -185,7 +185,7 @@ fn find_url_start(text: &str) -> Option<usize> {
         let boundary_ok = start == 0
             || matches!(
                 bytes[start - 1],
-                b' ' | b'\t' | b'\n' | b'(' | b'[' | b'*' | b'_'
+                b' ' | b'\t' | b'\n' | b'(' | b'[' | b'{' | b'*' | b'_' | b'\'' | b'"'
             );
         if boundary_ok {
             return Some(start);
@@ -226,7 +226,7 @@ fn url_extent(candidate: &str) -> usize {
         url = &url[..url.len() - last.len_utf8()];
     }
 
-    url.len()
+    if url.len() > scheme_len { url.len() } else { 0 }
 }
 
 fn push(stack: &mut [(MarkdownTag, Vec<MarkdownNode>)], node: MarkdownNode) {
@@ -427,5 +427,24 @@ mod tests {
         let document = parse("foohttps://example.com bar");
         assert_eq!(links(&document.children), Vec::new());
         assert_eq!(plain_text(&document.children), "foohttps://example.com bar");
+    }
+
+    #[test]
+    fn does_not_autolink_scheme_with_only_trailing_punctuation() {
+        let document = parse("not a URL: https://...");
+        assert_eq!(links(&document.children), Vec::new());
+        assert_eq!(plain_text(&document.children), "not a URL: https://...");
+    }
+
+    #[test]
+    fn autolinks_bare_url_inside_quotes() {
+        let document = parse(r#"visit "https://example.com" now"#);
+        assert_eq!(
+            links(&document.children),
+            vec![(
+                "https://example.com".to_owned(),
+                "https://example.com".to_owned()
+            )]
+        );
     }
 }

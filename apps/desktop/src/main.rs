@@ -8921,6 +8921,39 @@ mod tests {
             );
         }
 
+        #[gpui::test]
+        fn user_messages_are_narrower_and_right_aligned(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "user".to_owned(),
+                    role: app_model::TranscriptRole::User,
+                    content: "A user message with enough text to size the bubble.".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.simulate_resize(gpui::size(gpui::px(1_400.0), gpui::px(800.0)));
+            cx.run_until_parked();
+
+            let composer = cx.debug_bounds("composer").expect("composer rendered");
+            let message = cx
+                .debug_bounds("transcript-message")
+                .expect("user message rendered");
+            assert_eq!(message.right(), composer.right());
+            assert!(
+                message.size.width <= composer.size.width * 0.85,
+                "user message was not capped at 85%: {message:?} vs {composer:?}"
+            );
+            assert!(message.origin.x > composer.origin.x);
+        }
+
         /// The command block is capped at a third of the entry budget, so a
         /// long script cannot crowd out the output worth reading.
         #[test]

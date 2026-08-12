@@ -400,9 +400,6 @@ pub struct TerminalSession {
     pub output_error: Option<String>,
     #[serde(skip)]
     pub output_load_error: Option<String>,
-    /// Last partial-result delivery mirrored into this terminal.
-    #[serde(default)]
-    last_partial_delivery: Option<PartialOutputDelivery>,
     pub exit_code: Option<i64>,
     /// Every tool call that has contributed to this shell, in order.
     #[serde(default)]
@@ -570,7 +567,6 @@ impl ToolActivity {
                 output_metadata: OutputMetadata::default(),
                 output_error: None,
                 output_load_error: None,
-                last_partial_delivery: None,
                 exit_code: None,
                 tool_call_ids: Vec::new(),
                 started_at: timestamp.to_owned(),
@@ -747,16 +743,19 @@ fn project_partial(activity: &mut ToolActivity, event: &crate::DomainEvent) {
     if chunk.is_empty() {
         return;
     }
+    if is_redelivered_partial(activity, event) {
+        return;
+    }
     let delivery = partial_output_delivery(event);
 
     let mut shell_id = None;
     if let Some(invocation) = activity.invocation_mut(call_id) {
-        if invocation.last_partial_delivery.as_ref() != delivery.as_ref() || delivery.is_none() {
-            append_output(
-                &mut invocation.output,
-                &mut invocation.output_metadata,
-                chunk,
-            );
+        append_output(
+            &mut invocation.output,
+            &mut invocation.output_metadata,
+            chunk,
+        );
+        if delivery.is_some() {
             invocation.last_partial_delivery.clone_from(&delivery);
         }
         shell_id.clone_from(&invocation.shell_id);
@@ -767,10 +766,7 @@ fn project_partial(activity: &mut ToolActivity, event: &crate::DomainEvent) {
     if let Some(shell_id) = shell_id
         && let Some(terminal) = activity.terminal_mut(&shell_id)
     {
-        if terminal.last_partial_delivery.as_ref() != delivery.as_ref() || delivery.is_none() {
-            append_output(&mut terminal.output, &mut terminal.output_metadata, chunk);
-            terminal.last_partial_delivery = delivery;
-        }
+        append_output(&mut terminal.output, &mut terminal.output_metadata, chunk);
         terminal.updated_at.clone_from(&event.timestamp);
     }
 }

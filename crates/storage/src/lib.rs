@@ -812,6 +812,90 @@ mod tests {
         )
     }
 
+    fn append_raw_events(
+        storage: &Storage,
+        snapshot: &mut SessionSnapshot,
+        events: impl IntoIterator<Item = serde_json::Value>,
+    ) {
+        for raw in events {
+            let event =
+                DomainEvent::from_sdk_event_for("app-session", snapshot.last_sequence + 1, &raw);
+            let updates = app_model::tools::output_updates(&snapshot.tool_activity, &event);
+            assert!(storage.append_event_with_output(&event, &updates).unwrap());
+            assert_eq!(snapshot.apply(event), app_model::ApplyOutcome::Applied);
+        }
+    }
+
+    fn assert_output_range(
+        storage: &Storage,
+        kind: OutputStreamKind,
+        identity: &str,
+        range: OutputRange,
+        expected: &str,
+        next_chunk: u64,
+    ) {
+        let output = storage
+            .read_output("app-session", kind, identity, range)
+            .unwrap();
+        assert_eq!(output.content, expected);
+        assert_eq!(output.next_chunk, next_chunk);
+    }
+
+    fn repeated_output_events() -> [serde_json::Value; 7] {
+        [
+            json!({
+                "id": "start",
+                "type": "tool.execution_start",
+                "timestamp": "1",
+                "data": {
+                    "toolCallId": "call-1",
+                    "toolName": "bash",
+                    "arguments": {"command": "printf repeated", "shellId": "shell-1"}
+                }
+            }),
+            json!({
+                "id": "partial-1",
+                "type": "tool.execution_partial_result",
+                "timestamp": "2",
+                "data": {"toolCallId": "call-1", "partialOutput": "same\n"}
+            }),
+            json!({
+                "id": "read-start",
+                "type": "tool.execution_start",
+                "timestamp": "3",
+                "data": {
+                    "toolCallId": "call-2",
+                    "toolName": "read_bash",
+                    "arguments": {"shellId": "shell-1"}
+                }
+            }),
+            json!({
+                "id": "read-partial",
+                "type": "tool.execution_partial_result",
+                "timestamp": "4",
+                "data": {"toolCallId": "call-2", "partialOutput": "middle\n"}
+            }),
+            json!({
+                "id": "partial-delayed-redelivery",
+                "type": "tool.execution_partial_result",
+                "timestamp": "2",
+                "data": {"toolCallId": "call-1", "partialOutput": "same\n"}
+            }),
+            json!({
+                "id": "partial-legitimate-repeat",
+                "type": "tool.execution_partial_result",
+                "timestamp": "5",
+                "data": {"toolCallId": "call-1", "partialOutput": "same\n"}
+            }),
+            json!({
+                "id": "partial-tail",
+                "type": "tool.execution_partial_result",
+                "timestamp": "6",
+                "data": {"toolCallId": "call-1", "partialOutput": "tail\n"}
+            }),
+        ]
+    }
+
     #[test]
     fn migration_enables_wal_and_tracks_schema_version() {
         let directory = tempdir().unwrap();
@@ -846,6 +930,68 @@ mod tests {
         // The event log, not the snapshot, is where the events live.
         assert_eq!(storage.event_ids("app-session").unwrap().len(), 2);
         assert_eq!(recovered.state.status, app_model::SessionStatus::Idle);
+    }
+
+    #[test]
+    fn redelivered_output_is_not_persisted_but_repeated_chunks_remain_addressable() {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_session(&metadata()).unwrap();
+        let mut snapshot = SessionSnapshot::new(metadata());
+        append_raw_events(&storage, &mut snapshot, repeated_output_events());
+        storage.write_snapshot(&snapshot).unwrap();
+
+        for (kind, identity, expected, expected_chunks) in [
+            (
+                OutputStreamKind::Invocation,
+                "call-1",
+                "same\nsame\ntail\n",
+                3,
+            ),
+            (
+                OutputStreamKind::Terminal,
+                "shell-1",
+                "same\nmiddle\nsame\ntail\n",
+                4,
+            ),
+        ] {
+            let metadata = storage
+                .read_output(
+                    "app-session",
+                    kind,
+                    identity,
+                    OutputRange {
+                        start_chunk: 0,
+                        max_chunks: 10,
+                    },
+                )
+                .unwrap();
+            assert_eq!(metadata.content, expected);
+            assert_eq!(metadata.metadata.chunk_count, expected_chunks);
+            assert_eq!(metadata.next_chunk, expected_chunks);
+            let expected_tail = match kind {
+                OutputStreamKind::Invocation => "same\ntail\n",
+                OutputStreamKind::Terminal => "middle\nsame\ntail\n",
+            };
+            assert_output_range(
+                &storage,
+                kind,
+                identity,
+                OutputRange {
+                    start_chunk: 1,
+                    max_chunks: 10,
+                },
+                expected_tail,
+                expected_chunks,
+            );
+        }
+
+        let recovered = storage.recover_session("app-session").unwrap();
+        let invocation = recovered.state.tool_activity.invocation("call-1").unwrap();
+        assert_eq!(invocation.output, "same\nsame\ntail\n");
+        assert_eq!(invocation.output_metadata.chunk_count, 3);
+        let terminal = recovered.state.tool_activity.terminal("shell-1").unwrap();
+        assert_eq!(terminal.output, "same\nmiddle\nsame\ntail\n");
+        assert_eq!(terminal.output_metadata.chunk_count, 4);
     }
 
     #[test]
