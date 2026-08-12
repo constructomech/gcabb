@@ -51,6 +51,14 @@ pub struct OutputStreamUpdate {
     pub complete: bool,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+struct PartialOutputDelivery {
+    call_id: String,
+    timestamp: String,
+    byte_count: u64,
+    content_hash: u64,
+}
+
 /// Where a tool came from, so the UI can group and label it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(tag = "type", rename_all = "snake_case")]
@@ -246,6 +254,13 @@ pub struct ToolInvocation {
     pub output_error: Option<String>,
     #[serde(skip)]
     pub output_load_error: Option<String>,
+    /// Last partial-result delivery projected for this invocation.
+    ///
+    /// Persisting a compact fingerprint keeps deduplication effective across
+    /// snapshot restore without copying an arbitrarily large chunk into the
+    /// snapshot itself.
+    #[serde(default)]
+    last_partial_delivery: Option<PartialOutputDelivery>,
     /// Full detailed result retained for UI display, notably edit diffs.
     #[serde(skip)]
     pub detailed_output: Option<String>,
@@ -385,6 +400,9 @@ pub struct TerminalSession {
     pub output_error: Option<String>,
     #[serde(skip)]
     pub output_load_error: Option<String>,
+    /// Last partial-result delivery mirrored into this terminal.
+    #[serde(default)]
+    last_partial_delivery: Option<PartialOutputDelivery>,
     pub exit_code: Option<i64>,
     /// Every tool call that has contributed to this shell, in order.
     #[serde(default)]
@@ -552,6 +570,7 @@ impl ToolActivity {
                 output_metadata: OutputMetadata::default(),
                 output_error: None,
                 output_load_error: None,
+                last_partial_delivery: None,
                 exit_code: None,
                 tool_call_ids: Vec::new(),
                 started_at: timestamp.to_owned(),
@@ -567,6 +586,37 @@ fn append_output(target: &mut String, metadata: &mut OutputMetadata, chunk: &str
     target.push_str(chunk);
     metadata.chunk_count += 1;
     metadata.byte_count += chunk.len() as u64;
+}
+
+fn partial_output_delivery(event: &crate::DomainEvent) -> Option<PartialOutputDelivery> {
+    let call_id = event.details.get("toolCallId")?.as_str()?;
+    let chunk = event.details.get("partialOutput")?.as_str()?;
+    if event.timestamp.is_empty() || chunk.is_empty() {
+        return None;
+    }
+
+    // FNV-1a is stable across processes and app versions, unlike
+    // `DefaultHasher`. Timestamp and byte count further constrain matches.
+    let mut content_hash = 0xcbf2_9ce4_8422_2325u64;
+    for byte in chunk.bytes() {
+        content_hash ^= u64::from(byte);
+        content_hash = content_hash.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+    Some(PartialOutputDelivery {
+        call_id: call_id.to_owned(),
+        timestamp: event.timestamp.clone(),
+        byte_count: chunk.len() as u64,
+        content_hash,
+    })
+}
+
+fn is_redelivered_partial(activity: &ToolActivity, event: &crate::DomainEvent) -> bool {
+    let Some(delivery) = partial_output_delivery(event) else {
+        return false;
+    };
+    activity
+        .invocation(&delivery.call_id)
+        .is_some_and(|invocation| invocation.last_partial_delivery.as_ref() == Some(&delivery))
 }
 
 /// Project a single SDK event into tool and terminal state.
@@ -662,6 +712,7 @@ fn project_start(activity: &mut ToolActivity, event: &crate::DomainEvent) {
         output_metadata: OutputMetadata::default(),
         output_error: None,
         output_load_error: None,
+        last_partial_delivery: None,
         detailed_output: None,
         error_code: None,
         error_message: None,
@@ -696,14 +747,18 @@ fn project_partial(activity: &mut ToolActivity, event: &crate::DomainEvent) {
     if chunk.is_empty() {
         return;
     }
+    let delivery = partial_output_delivery(event);
 
     let mut shell_id = None;
     if let Some(invocation) = activity.invocation_mut(call_id) {
-        append_output(
-            &mut invocation.output,
-            &mut invocation.output_metadata,
-            chunk,
-        );
+        if invocation.last_partial_delivery.as_ref() != delivery.as_ref() || delivery.is_none() {
+            append_output(
+                &mut invocation.output,
+                &mut invocation.output_metadata,
+                chunk,
+            );
+            invocation.last_partial_delivery.clone_from(&delivery);
+        }
         shell_id.clone_from(&invocation.shell_id);
     }
 
@@ -712,7 +767,10 @@ fn project_partial(activity: &mut ToolActivity, event: &crate::DomainEvent) {
     if let Some(shell_id) = shell_id
         && let Some(terminal) = activity.terminal_mut(&shell_id)
     {
-        append_output(&mut terminal.output, &mut terminal.output_metadata, chunk);
+        if terminal.last_partial_delivery.as_ref() != delivery.as_ref() || delivery.is_none() {
+            append_output(&mut terminal.output, &mut terminal.output_metadata, chunk);
+            terminal.last_partial_delivery = delivery;
+        }
         terminal.updated_at.clone_from(&event.timestamp);
     }
 }
@@ -895,6 +953,9 @@ pub fn output_updates(
             updates
         }
         "tool.execution_partial_result" => {
+            if is_redelivered_partial(activity, event) {
+                return Vec::new();
+            }
             let Some(chunk) = data
                 .get("partialOutput")
                 .and_then(Value::as_str)

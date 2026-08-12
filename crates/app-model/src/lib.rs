@@ -1366,6 +1366,148 @@ mod tests {
         assert_eq!(terminal.state, TerminalState::Exited);
     }
 
+    /// The SDK has been observed to redeliver a `tool.execution_partial_result`
+    /// event with a distinct event id but the exact same `partialOutput`
+    /// chunk. Without guarding against this, the chunk would be appended
+    /// twice and the same line of output would render twice in a row.
+    #[test]
+    fn a_redelivered_partial_result_is_not_applied_twice() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({
+                    "id": "call-1-start",
+                    "type": "tool.execution_start",
+                    "timestamp": "1",
+                    "data": {
+                        "toolCallId": "call-1",
+                        "toolName": "bash",
+                        "arguments": {"command": "echo hi", "shellId": "shell-a"}
+                    }
+                }),
+                json!({
+                    "id": "call-1-partial-1",
+                    "type": "tool.execution_partial_result",
+                    "timestamp": "2",
+                    "data": {"toolCallId": "call-1", "partialOutput": "hi\n"}
+                }),
+                // Same delivery timestamp and chunk, but a different event id:
+                // a runtime redelivery rather than an event-log replay.
+                json!({
+                    "id": "call-1-partial-2",
+                    "type": "tool.execution_partial_result",
+                    "timestamp": "2",
+                    "data": {"toolCallId": "call-1", "partialOutput": "hi\n"}
+                }),
+            ],
+        );
+
+        let invocation = state
+            .tool_activity
+            .invocation("call-1")
+            .expect("invocation exists");
+        assert_eq!(invocation.output, "hi\n");
+
+        let terminal = state.tool_activity.terminal("shell-a").expect("terminal");
+        assert_eq!(terminal.output, "hi\n");
+    }
+
+    /// A later delivery with identical content is legitimate output. Content
+    /// equality alone must not collapse append-only chunks.
+    #[test]
+    fn identical_chunks_from_distinct_deliveries_are_preserved() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({
+                    "id": "call-1-start",
+                    "type": "tool.execution_start",
+                    "timestamp": "1",
+                    "data": {
+                        "toolCallId": "call-1",
+                        "toolName": "bash",
+                        "arguments": {"command": "echo hi", "shellId": "shell-a"}
+                    }
+                }),
+                json!({
+                    "id": "call-1-partial-1",
+                    "type": "tool.execution_partial_result",
+                    "timestamp": "2",
+                    "data": {"toolCallId": "call-1", "partialOutput": "hi\n"}
+                }),
+                json!({
+                    "id": "call-1-partial-2",
+                    "type": "tool.execution_partial_result",
+                    "timestamp": "3",
+                    "data": {"toolCallId": "call-1", "partialOutput": "hi\n"}
+                }),
+                json!({
+                    "id": "call-1-partial-3",
+                    "type": "tool.execution_partial_result",
+                    "timestamp": "4",
+                    "data": {"toolCallId": "call-1", "partialOutput": "hi\n"}
+                }),
+            ],
+        );
+
+        let invocation = state
+            .tool_activity
+            .invocation("call-1")
+            .expect("invocation exists");
+        assert_eq!(invocation.output, "hi\nhi\nhi\n");
+        assert_eq!(invocation.output_metadata.chunk_count, 3);
+    }
+
+    #[test]
+    fn partial_delivery_fingerprint_survives_snapshot_restore() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({
+                    "id": "call-1-start",
+                    "type": "tool.execution_start",
+                    "timestamp": "1",
+                    "data": {
+                        "toolCallId": "call-1",
+                        "toolName": "bash",
+                        "arguments": {"command": "echo hi", "shellId": "shell-a"}
+                    }
+                }),
+                json!({
+                    "id": "call-1-partial-1",
+                    "type": "tool.execution_partial_result",
+                    "timestamp": "2",
+                    "data": {"toolCallId": "call-1", "partialOutput": "hi\n"}
+                }),
+            ],
+        );
+        let encoded = serde_json::to_value(&state).unwrap();
+        let mut restored: SessionSnapshot = serde_json::from_value(encoded).unwrap();
+        restored.restore_indexes();
+        let redelivery = DomainEvent::from_sdk_event_for(
+            "app-session",
+            restored.last_sequence + 1,
+            &json!({
+                "id": "call-1-partial-2",
+                "type": "tool.execution_partial_result",
+                "timestamp": "2",
+                "data": {"toolCallId": "call-1", "partialOutput": "hi\n"}
+            }),
+        );
+
+        assert!(tools::output_updates(&restored.tool_activity, &redelivery).is_empty());
+        assert_eq!(restored.apply(redelivery), ApplyOutcome::Applied);
+        let invocation = restored
+            .tool_activity
+            .invocation("call-1")
+            .expect("invocation exists");
+        assert!(invocation.output.is_empty());
+        assert_eq!(invocation.output_metadata.chunk_count, 1);
+    }
+
     #[test]
     fn failed_tools_are_surfaced_with_structured_errors() {
         let mut state = SessionSnapshot::new(metadata());
