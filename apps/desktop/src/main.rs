@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::HashMap;
+use std::collections::{HashMap, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
@@ -7,19 +7,20 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    ContextWindowOption, InteractionKind, InteractionResponse, ProjectMetadata, PromptAttachment,
-    SessionKind, SessionLocation, SessionMetadata, SessionSnapshot, SessionStatus, TitleSource,
-    TranscriptRole, TranscriptState,
+    ContextWindowOption, InteractionKind, InteractionResponse, OutputStreamKind, ProjectMetadata,
+    PromptAttachment, SessionKind, SessionLocation, SessionMetadata, SessionSnapshot,
+    SessionStatus, TitleSource, TranscriptRole, TranscriptState,
 };
 use copilot_provider::{CopilotProvider, ProviderCompatibility};
 use diagnostics::{DiagnosticEvent, DiagnosticsSink, TracingDiagnostics, init_tracing};
 use git_service::GitService;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable,
-    InteractiveElement, IntoElement, KeyBinding, MouseButton, ParentElement, PathPromptOptions,
-    Render, Role, SharedString, StatefulInteractiveElement, Styled, TitlebarOptions, Window,
-    WindowBounds, WindowOptions, actions, div, px, rgb, size,
+    App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, FollowMode,
+    InteractiveElement, IntoElement, KeyBinding, ListAlignment, ListState, MouseButton,
+    ParentElement, PathPromptOptions, Render, Role, SharedString, StatefulInteractiveElement,
+    Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, list, px, rgb,
+    size,
 };
 use session_manager::{
     CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, SessionRoots,
@@ -34,7 +35,7 @@ use updater::version::BuildStamp;
 mod markdown;
 mod updates;
 
-use markdown::{MarkdownNode, MarkdownTag};
+use markdown::{MarkdownDocument, MarkdownNode, MarkdownTag};
 use updates::{UpdateRequest, UpdateService, UpdateUi};
 
 const BACKGROUND: u32 = 0x000d_1117;
@@ -66,6 +67,7 @@ const UPDATE_POLL_JITTER: Duration = Duration::from_mins(30);
 /// Vertical budget for the detail blocks inside one tool entry.
 const ENTRY_DETAIL_BUDGET: f32 = 480.0;
 /// Measured thumb geometry for a scrollable region.
+#[derive(Clone, Copy)]
 struct ScrollbarGeometry {
     track_top: gpui::Pixels,
     track: f32,
@@ -93,6 +95,13 @@ const SCROLLBAR_WIDTH: f32 = 14.0;
 const THUMB_WIDTH: f32 = 10.0;
 /// Scrollbar id for the conversation itself.
 const TRANSCRIPT_SCROLL_ID: &str = "transcript";
+/// Extra content laid out above and below the viewport to avoid blank flashes
+/// during fast trackpad and scrollbar movement.
+const TRANSCRIPT_OVERDRAW: f32 = 720.0;
+/// Initial height estimate used to size the scrollbar without laying out every
+/// row. Measured dynamic heights replace it as rows enter the window.
+const TRANSCRIPT_ROW_HEIGHT_HINT: f32 = 144.0;
+const MARKDOWN_CACHE_CAPACITY: usize = 128;
 /// The command never takes more than a third of that budget, so output — the
 /// part worth reading — always gets the majority.
 const COMMAND_BLOCK_HEIGHT: f32 = ENTRY_DETAIL_BUDGET / 3.0;
@@ -231,6 +240,11 @@ enum ServiceCommand {
         app_session_id: String,
         interaction_id: String,
         response: InteractionResponse,
+    },
+    LoadEarlierOutput {
+        app_session_id: String,
+        identity: String,
+        before_chunk: u64,
     },
     SetModel {
         app_session_id: String,
@@ -703,6 +717,22 @@ async fn handle_service_command(
             .respond(interaction_id, response)
             .await
             .map_err(|error| error.to_string())?,
+        ServiceCommand::LoadEarlierOutput {
+            app_session_id,
+            identity,
+            before_chunk,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .load_output_before(
+                OutputStreamKind::Invocation,
+                identity,
+                before_chunk,
+                storage::RESTORED_OUTPUT_CHUNKS,
+            )
+            .await
+            .map_err(|error| error.to_string())?,
         ServiceCommand::SetModel {
             app_session_id,
             model,
@@ -931,6 +961,92 @@ struct SessionProjection {
     snapshot: Arc<SessionSnapshot>,
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum TimelineItemKind {
+    Message(usize),
+    Tool(usize),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct TimelineItem {
+    id: String,
+    sequence: u64,
+    kind: TimelineItemKind,
+}
+
+#[derive(Default)]
+struct TimelineIndex {
+    session_id: String,
+    items: Vec<TimelineItem>,
+    scanned_messages: usize,
+    scanned_invocations: usize,
+    children: HashMap<String, Vec<usize>>,
+}
+
+impl TimelineIndex {
+    fn reset(&mut self, snapshot: &SessionSnapshot) {
+        self.session_id.clone_from(&snapshot.metadata.id);
+        self.items.clear();
+        self.scanned_messages = 0;
+        self.scanned_invocations = 0;
+        self.children.clear();
+        self.append(snapshot);
+    }
+
+    fn append(&mut self, snapshot: &SessionSnapshot) {
+        let mut additions = Vec::new();
+        additions.extend(
+            snapshot.transcript[self.scanned_messages..]
+                .iter()
+                .enumerate()
+                .map(|(offset, message)| TimelineItem {
+                    id: message.id.clone(),
+                    sequence: message.sequence,
+                    kind: TimelineItemKind::Message(self.scanned_messages + offset),
+                }),
+        );
+        for (offset, invocation) in snapshot.tool_activity.invocations[self.scanned_invocations..]
+            .iter()
+            .enumerate()
+        {
+            let index = self.scanned_invocations + offset;
+            if let Some(agent) = invocation.agent_id.as_deref() {
+                if let Some(parent) = snapshot.tool_activity.agent_parents.get(agent) {
+                    self.children.entry(parent.clone()).or_default().push(index);
+                }
+            } else {
+                additions.push(TimelineItem {
+                    id: invocation.call_id.clone(),
+                    sequence: invocation.sequence,
+                    kind: TimelineItemKind::Tool(index),
+                });
+            }
+        }
+        additions.sort_by_key(|item| item.sequence);
+        self.items.extend(additions);
+        self.scanned_messages = snapshot.transcript.len();
+        self.scanned_invocations = snapshot.tool_activity.invocations.len();
+    }
+
+    fn sync(&mut self, snapshot: &SessionSnapshot) -> bool {
+        let reset = self.session_id != snapshot.metadata.id
+            || self.scanned_messages > snapshot.transcript.len()
+            || self.scanned_invocations > snapshot.tool_activity.invocations.len();
+        let previous_len = self.items.len();
+        if reset {
+            self.reset(snapshot);
+        } else {
+            self.append(snapshot);
+        }
+        reset || self.items.len() != previous_len
+    }
+}
+
+struct CachedMarkdown {
+    source: String,
+    document: Arc<markdown::MarkdownDocument>,
+}
+
 impl SessionProjection {
     fn new(handle: SessionHandle) -> Self {
         let receiver = handle.subscribe();
@@ -1060,28 +1176,33 @@ struct SessionMvpView {
     /// Branch currently checked out in the selected project, refreshed when
     /// the selection changes so the composer never runs git per frame.
     project_branch: Option<String>,
-    /// Scroll position of the transcript.
-    transcript_scroll: gpui::ScrollHandle,
+    /// Variable-height virtual list state for the transcript.
+    transcript_list: ListState,
+    /// Geometry used to paint the transcript thumb, retained so hit testing
+    /// cannot race later dynamic-height measurements.
+    drawn_transcript_scrollbar: Option<ScrollbarGeometry>,
+    /// Stable, incrementally maintained order and child lookup for transcript rows.
+    timeline: TimelineIndex,
+    /// Parsed documents for immutable completed messages.
+    markdown_cache: HashMap<String, CachedMarkdown>,
+    markdown_cache_order: VecDeque<String>,
+    /// Number of transcript rows instantiated during the latest render pass.
+    transcript_rows_rendered: usize,
+    /// Last snapshot revision whose mutable rows were invalidated.
+    transcript_snapshot_sequence: u64,
+    transcript_snapshot_ptr: usize,
     /// Scroll positions of the detail blocks inside tool entries, keyed by
     /// block id so each keeps its position across renders.
     detail_scrolls: RefCell<HashMap<String, gpui::ScrollHandle>>,
     /// Last rendered content length for each detail block, used to follow
     /// streaming shell output without resetting blocks the user scrolled up.
     detail_extents: RefCell<HashMap<String, usize>>,
-    /// Scrollable extent the transcript last rendered with.
-    ///
-    /// Scrollbar geometry is only knowable after a layout pass, and the window
-    /// now repaints only when something changed, so a static transcript would
-    /// never come back to draw its scrollbar. Noticing the extent change asks
-    /// for exactly one more frame.
-    transcript_extent_px: f32,
     /// Scrollbar currently being dragged, if any.
     ///
     /// Tracked on the view rather than the thumb so a drag keeps working once
     /// the pointer leaves the narrow track, which is most of the time.
     dragging_scrollbar: Option<ScrollbarDrag>,
-    /// Transcript length last auto-scrolled for, so the view follows new
-    /// output without fighting a user who has scrolled up to read.
+    /// Transcript shape retained for diagnostics and regression assertions.
     transcript_extent: (String, usize, usize, usize, usize),
     restore_failures: Vec<RestoreFailure>,
     updates: Receiver<ServiceUpdate>,
@@ -1230,6 +1351,9 @@ impl SessionMvpView {
             }
         });
 
+        let transcript_list = ListState::new(0, ListAlignment::Top, px(TRANSCRIPT_OVERDRAW))
+            .with_uniform_item_height(px(TRANSCRIPT_ROW_HEIGHT_HINT));
+        transcript_list.set_follow_mode(FollowMode::Tail);
         let mut view = Self {
             startup: StartupState::Starting,
             projects: Vec::new(),
@@ -1247,10 +1371,16 @@ impl SessionMvpView {
             image_preview: None,
             image_preview_focus: cx.focus_handle(),
             project_branch: None,
-            transcript_scroll: gpui::ScrollHandle::new(),
+            transcript_list,
+            drawn_transcript_scrollbar: None,
+            timeline: TimelineIndex::default(),
+            markdown_cache: HashMap::new(),
+            markdown_cache_order: VecDeque::new(),
+            transcript_rows_rendered: 0,
+            transcript_snapshot_sequence: 0,
+            transcript_snapshot_ptr: 0,
             detail_scrolls: RefCell::new(HashMap::new()),
             detail_extents: RefCell::new(HashMap::new()),
-            transcript_extent_px: 0.0,
             dragging_scrollbar: None,
             transcript_extent: (String::new(), 0, 0, 0, 0),
             restore_failures: Vec::new(),
@@ -1813,57 +1943,68 @@ impl SessionMvpView {
             )
     }
 
-    /// Ask for another frame when the transcript's scrollable extent changes.
+    /// Synchronize the virtual list with append-only snapshot state.
     ///
-    /// The scrollbar can only be sized once a layout pass has measured the
-    /// content, so the frame that first grows the transcript cannot draw it.
-    fn note_transcript_extent(&mut self, cx: &mut Context<Self>) {
-        let extent = f32::from(self.transcript_scroll.max_offset().y);
-        if (extent - self.transcript_extent_px).abs() > f32::EPSILON {
-            self.transcript_extent_px = extent;
-            cx.notify();
-        }
-    }
-
-    /// Keep the newest output in view as it arrives.
-    ///
-    /// Only scrolls when the transcript actually grew, so a user who has
-    /// scrolled up to read earlier output is not yanked back to the bottom on
-    /// every frame. Switching sessions also scrolls, so a session never opens
-    /// showing the middle of a conversation.
-    fn follow_transcript_tail(&mut self) {
-        let Some(session) = self.selected() else {
+    /// New entries extend the index without sorting or scanning old rows. A
+    /// snapshot revision only invalidates the visible neighborhood and tail, so
+    /// streaming output cannot force whole-history layout.
+    fn sync_transcript(&mut self) {
+        let Some(snapshot) = self.selected().map(|session| session.snapshot.clone()) else {
+            if self.timeline.items.is_empty() {
+                return;
+            }
+            self.timeline = TimelineIndex::default();
+            self.transcript_list.reset(0);
             return;
         };
+        let old_len = self.timeline.items.len();
+        let old_session = self.timeline.session_id.clone();
+        let changed_shape = self.timeline.sync(&snapshot);
+        if old_session != snapshot.metadata.id {
+            self.transcript_list.reset_with_uniform_height(
+                self.timeline.items.len(),
+                px(TRANSCRIPT_ROW_HEIGHT_HINT),
+            );
+            self.transcript_list.set_follow_mode(FollowMode::Tail);
+            self.transcript_list.scroll_to_end();
+            self.markdown_cache.clear();
+            self.markdown_cache_order.clear();
+        } else if changed_shape {
+            self.transcript_list
+                .splice(old_len..old_len, self.timeline.items.len() - old_len);
+        }
+        let snapshot_ptr = Arc::as_ptr(&snapshot) as usize;
+        if self.transcript_snapshot_sequence != snapshot.last_sequence
+            || self.transcript_snapshot_ptr != snapshot_ptr
+        {
+            let top = self.transcript_list.logical_scroll_top().item_ix;
+            let visible_end = (top + 32).min(self.timeline.items.len());
+            if top < visible_end {
+                self.transcript_list.remeasure_items(top..visible_end);
+            }
+            let tail = self.timeline.items.len().saturating_sub(2);
+            if tail < self.timeline.items.len() && tail >= visible_end {
+                self.transcript_list
+                    .remeasure_items(tail..self.timeline.items.len());
+            }
+            self.transcript_snapshot_sequence = snapshot.last_sequence;
+            self.transcript_snapshot_ptr = snapshot_ptr;
+        }
         let extent = (
-            session.snapshot.metadata.id.clone(),
-            session.snapshot.transcript.len(),
-            session
-                .snapshot
+            snapshot.metadata.id.clone(),
+            snapshot.transcript.len(),
+            snapshot
                 .transcript
                 .last()
                 .map_or(0, |message| message.content.len()),
-            session.snapshot.tool_activity.invocations.len(),
-            session
-                .snapshot
+            snapshot.tool_activity.invocations.len(),
+            snapshot
                 .tool_activity
                 .invocations
-                .iter()
-                .map(|invocation| invocation.output.len())
-                .sum(),
+                .last()
+                .map_or(0, |invocation| invocation.output.len()),
         );
-        if extent == self.transcript_extent {
-            return;
-        }
-        let switched_session = extent.0 != self.transcript_extent.0;
-        let grew = extent.1 > self.transcript_extent.1
-            || extent.2 > self.transcript_extent.2
-            || extent.3 > self.transcript_extent.3
-            || extent.4 > self.transcript_extent.4;
         self.transcript_extent = extent;
-        if switched_session || grew {
-            self.transcript_scroll.scroll_to_bottom();
-        }
     }
 
     /// Branch shown beside the location pill.
@@ -3531,9 +3672,6 @@ impl SessionMvpView {
 
     /// The scroll handle behind a scrollbar id.
     fn scroll_handle(&self, id: &str) -> Option<gpui::ScrollHandle> {
-        if id == TRANSCRIPT_SCROLL_ID {
-            return Some(self.transcript_scroll.clone());
-        }
         self.detail_scrolls.borrow().get(id).cloned()
     }
 
@@ -3544,6 +3682,21 @@ impl SessionMvpView {
     /// is what lets a thumb anywhere on screen be dragged without the element
     /// having to measure itself.
     fn drag_scrollbar_to(&self, id: &str, pointer_y: gpui::Pixels, grab_offset: f32) {
+        if id == TRANSCRIPT_SCROLL_ID {
+            let Some(geometry) = self
+                .drawn_transcript_scrollbar
+                .or_else(|| self.transcript_scrollbar_geometry())
+            else {
+                return;
+            };
+            let local = f32::from(pointer_y - geometry.track_top) - grab_offset;
+            let fraction = (local / geometry.usable).clamp(0.0, 1.0);
+            self.transcript_list.set_offset_from_scrollbar(gpui::point(
+                px(0.0),
+                px(-(fraction * geometry.scrollable)),
+            ));
+            return;
+        }
         let Some(handle) = self.scroll_handle(id) else {
             return;
         };
@@ -3566,9 +3719,31 @@ impl SessionMvpView {
         if track <= 0.0 || scrollable <= 0.0 {
             return None;
         }
+
         let thumb = (track * (track / (track + scrollable))).max(MIN_THUMB_HEIGHT);
         let usable = (track - thumb).max(1.0);
         let scrolled = (-f32::from(handle.offset().y) / scrollable).clamp(0.0, 1.0);
+        Some(ScrollbarGeometry {
+            track_top: bounds.origin.y,
+            track,
+            thumb_top: scrolled * usable,
+            thumb,
+            usable,
+            scrollable,
+        })
+    }
+
+    fn transcript_scrollbar_geometry(&self) -> Option<ScrollbarGeometry> {
+        let bounds = self.transcript_list.viewport_bounds();
+        let track = f32::from(bounds.size.height);
+        let scrollable = f32::from(self.transcript_list.max_offset_for_scrollbar().y);
+        if track <= 0.0 || scrollable <= 0.0 {
+            return None;
+        }
+        let thumb = (track * (track / (track + scrollable))).max(MIN_THUMB_HEIGHT);
+        let usable = (track - thumb).max(1.0);
+        let offset = self.transcript_list.scroll_px_offset_for_scrollbar().y;
+        let scrolled = (-f32::from(offset) / scrollable).clamp(0.0, 1.0);
         Some(ScrollbarGeometry {
             track_top: bounds.origin.y,
             track,
@@ -3584,6 +3759,35 @@ impl SessionMvpView {
     /// Pressing the track jumps the thumb under the pointer; pressing the
     /// thumb keeps it where it is so the content does not lurch on grab.
     fn begin_scrollbar_drag(&mut self, id: &str, pointer_y: gpui::Pixels) {
+        if id == TRANSCRIPT_SCROLL_ID {
+            let Some(geometry) = self
+                .drawn_transcript_scrollbar
+                .or_else(|| self.transcript_scrollbar_geometry())
+            else {
+                return;
+            };
+            let local = f32::from(pointer_y - geometry.track_top);
+            let within_thumb =
+                local >= geometry.thumb_top && local <= geometry.thumb_top + geometry.thumb;
+            let grab_offset = if within_thumb {
+                local - geometry.thumb_top
+            } else {
+                geometry.thumb / 2.0
+            };
+            let current_offset = self.transcript_list.scroll_px_offset_for_scrollbar();
+            self.transcript_list.scrollbar_drag_started();
+            self.dragging_scrollbar = Some(ScrollbarDrag {
+                id: id.to_owned(),
+                grab_offset,
+            });
+            if within_thumb {
+                self.transcript_list
+                    .set_offset_from_scrollbar(current_offset);
+            } else {
+                self.drag_scrollbar_to(id, pointer_y, grab_offset);
+            }
+            return;
+        }
         let Some(handle) = self.scroll_handle(id) else {
             return;
         };
@@ -3604,6 +3808,17 @@ impl SessionMvpView {
         self.drag_scrollbar_to(id, pointer_y, grab_offset);
     }
 
+    fn end_scrollbar_drag(&mut self) {
+        if self
+            .dragging_scrollbar
+            .as_ref()
+            .is_some_and(|drag| drag.id == TRANSCRIPT_SCROLL_ID)
+        {
+            self.transcript_list.scrollbar_drag_ended();
+        }
+        self.dragging_scrollbar = None;
+    }
+
     /// A scrollbar for a scrollable region, shown while the pointer is over it.
     ///
     /// GPUI has no scrollbar element, so this draws the track and thumb and
@@ -3620,69 +3835,93 @@ impl SessionMvpView {
         // viewport — so a press on the visible thumb was classified as a press
         // on bare track and jumped the content instead of grabbing.
         let geometry = Self::scrollbar_geometry(handle)?;
+        Some(Self::scrollbar_element(id, geometry, group, cx))
+    }
+
+    fn transcript_scrollbar(
+        &mut self,
+        group: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Option<impl IntoElement> {
+        self.drawn_transcript_scrollbar = None;
+        let geometry = self.transcript_scrollbar_geometry()?;
+        self.drawn_transcript_scrollbar = Some(geometry);
+        Some(Self::scrollbar_element(
+            TRANSCRIPT_SCROLL_ID,
+            geometry,
+            group,
+            cx,
+        ))
+    }
+
+    fn scrollbar_element(
+        id: &str,
+        geometry: ScrollbarGeometry,
+        group: SharedString,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
         let track_id = id.to_owned();
         let thumb_id = id.to_owned();
 
-        Some(
-            div()
-                .id(SharedString::from(format!("{id}-scrollbar")))
-                .debug_selector(|| "scrollbar".to_owned())
-                .occlude()
-                .absolute()
-                .top_0()
-                .right_0()
-                .w(px(SCROLLBAR_WIDTH))
-                .h(px(geometry.track))
-                .opacity(0.0)
-                .group_hover(group, |style| style.opacity(1.0))
-                // Pressing bare track jumps the thumb there and starts a drag.
-                .on_mouse_down(
-                    MouseButton::Left,
-                    cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
-                        view.begin_scrollbar_drag(&track_id, event.position.y);
-                        cx.notify();
-                    }),
-                )
-                // The track occludes what is behind it, so a release over the
-                // track never reaches the window handler.
-                .on_mouse_up(
-                    MouseButton::Left,
-                    cx.listener(|view, _, _, cx| {
-                        view.dragging_scrollbar = None;
-                        cx.notify();
-                    }),
-                )
-                .child(
-                    div()
-                        // The thumb sits above the track and would otherwise
-                        // swallow presses meant for it, so it carries the same
-                        // handlers rather than relying on the track's.
-                        .id(SharedString::from(format!("{id}-thumb")))
-                        .debug_selector(|| "scrollbar-thumb".to_owned())
-                        .absolute()
-                        .top(px(geometry.thumb_top))
-                        .right(px(2.0))
-                        .w(px(THUMB_WIDTH))
-                        .h(px(geometry.thumb))
-                        .rounded_full()
-                        .bg(rgb(BORDER))
-                        .hover(|style| style.bg(rgb(MUTED)).cursor_pointer())
-                        .on_mouse_down(
-                            MouseButton::Left,
-                            cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
-                                view.begin_scrollbar_drag(&thumb_id, event.position.y);
-                                cx.notify();
-                            }),
-                        )
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|view, _, _, cx| {
-                                view.dragging_scrollbar = None;
-                                cx.notify();
-                            }),
-                        ),
-                ),
-        )
+        div()
+            .id(SharedString::from(format!("{id}-scrollbar")))
+            .debug_selector(|| "scrollbar".to_owned())
+            .occlude()
+            .absolute()
+            .top_0()
+            .right_0()
+            .w(px(SCROLLBAR_WIDTH))
+            .h(px(geometry.track))
+            .opacity(0.0)
+            .group_hover(group, |style| style.opacity(1.0))
+            // Pressing bare track jumps the thumb there and starts a drag.
+            .on_mouse_down(
+                MouseButton::Left,
+                cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
+                    view.begin_scrollbar_drag(&track_id, event.position.y);
+                    cx.notify();
+                }),
+            )
+            // The track occludes what is behind it, so a release over the
+            // track never reaches the window handler.
+            .on_mouse_up(
+                MouseButton::Left,
+                cx.listener(|view, _, _, cx| {
+                    view.end_scrollbar_drag();
+                    cx.notify();
+                }),
+            )
+            .child(
+                div()
+                    // The thumb sits above the track and would otherwise
+                    // swallow presses meant for it, so it carries the same
+                    // handlers rather than relying on the track's.
+                    .id(SharedString::from(format!("{id}-thumb")))
+                    .debug_selector(|| "scrollbar-thumb".to_owned())
+                    .absolute()
+                    .top(px(geometry.thumb_top))
+                    .right(px(2.0))
+                    .w(px(THUMB_WIDTH))
+                    .h(px(geometry.thumb))
+                    .rounded_full()
+                    .bg(rgb(BORDER))
+                    .hover(|style| style.bg(rgb(MUTED)).cursor_pointer())
+                    .on_mouse_down(
+                        MouseButton::Left,
+                        cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
+                            view.begin_scrollbar_drag(&thumb_id, event.position.y);
+                            cx.stop_propagation();
+                            cx.notify();
+                        }),
+                    )
+                    .on_mouse_up(
+                        MouseButton::Left,
+                        cx.listener(|view, _, _, cx| {
+                            view.end_scrollbar_drag();
+                            cx.notify();
+                        }),
+                    ),
+            )
     }
 
     /// A bounded, scrollable block of detail inside a tool entry.
@@ -3777,14 +4016,20 @@ impl SessionMvpView {
             .output_load_error
             .clone()
             .or_else(|| invocation.output_error.clone());
-        // Command output is the tail, since the interesting part is the end.
-        // The block scrolls, so it can hold considerably more than the
-        // terminals panel preview.
+        // Restored command output is already a bounded chunk window. When the
+        // user explicitly prepends older windows, keep them reachable here.
         let output = (matches!(
             invocation.class,
             app_model::ToolClass::Shell | app_model::ToolClass::ShellControl
         ) && !invocation.output.is_empty())
-        .then(|| tail_lines(&invocation.output, 400));
+        .then(|| invocation.output.clone());
+        let earlier_output = (invocation.output_start_chunk > 0).then(|| {
+            (
+                self.selected_session.clone().unwrap_or_default(),
+                invocation.call_id.clone(),
+                invocation.output_start_chunk,
+            )
+        });
         let exit = invocation
             .exit_code
             .filter(|code| *code != 0)
@@ -3915,6 +4160,41 @@ impl SessionMvpView {
                             cx,
                         ))
                     })
+                    .when_some(
+                        earlier_output,
+                        |entry, (session_id, identity, before_chunk)| {
+                            entry.child(
+                                div()
+                                    .id(SharedString::from(format!(
+                                        "load-output-{}",
+                                        invocation.call_id
+                                    )))
+                                    .role(Role::Button)
+                                    .aria_label("Load earlier retained output")
+                                    .focusable()
+                                    .tab_stop(true)
+                                    .mt_1()
+                                    .px_2()
+                                    .py_1()
+                                    .rounded_sm()
+                                    .text_xs()
+                                    .text_color(rgb(BLUE))
+                                    .child(format!(
+                                        "Load earlier output ({before_chunk} chunks retained)"
+                                    ))
+                                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        let _ =
+                                            view.commands.send(ServiceCommand::LoadEarlierOutput {
+                                                app_session_id: session_id.clone(),
+                                                identity: identity.clone(),
+                                                before_chunk,
+                                            });
+                                        cx.notify();
+                                    })),
+                            )
+                        },
+                    )
                     .when_some(output, |entry, output| {
                         entry.child(self.detail_block(
                             &format!("tool-output-{}", invocation.call_id),
@@ -4447,10 +4727,9 @@ impl SessionMvpView {
 
     fn markdown_content(
         message_id: &str,
-        source: &str,
+        document: &MarkdownDocument,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
-        let document = markdown::parse(source);
         let mut element_index = 0;
         div()
             .id(SharedString::from(format!("markdown-content-{message_id}")))
@@ -4467,20 +4746,59 @@ impl SessionMvpView {
             .into_any_element()
     }
 
+    fn message_markdown(
+        &mut self,
+        message: &app_model::TranscriptMessage,
+    ) -> Arc<MarkdownDocument> {
+        if message.state != TranscriptState::Complete {
+            return Arc::new(markdown::parse(&message.content));
+        }
+        if !self.markdown_cache.contains_key(&message.id) {
+            if self.markdown_cache.len() == MARKDOWN_CACHE_CAPACITY
+                && let Some(evicted) = self.markdown_cache_order.pop_front()
+            {
+                self.markdown_cache.remove(&evicted);
+            }
+            self.markdown_cache_order.push_back(message.id.clone());
+        }
+        let cached = self
+            .markdown_cache
+            .entry(message.id.clone())
+            .or_insert_with(|| CachedMarkdown {
+                source: message.content.clone(),
+                document: Arc::new(markdown::parse(&message.content)),
+            });
+        if cached.source != message.content {
+            cached.source.clone_from(&message.content);
+            cached.document = Arc::new(markdown::parse(&message.content));
+        }
+        cached.document.clone()
+    }
+
+    fn message_aria_label(message: &app_model::TranscriptMessage) -> String {
+        let speaker = if message.role == TranscriptRole::User {
+            "You"
+        } else {
+            "Copilot"
+        };
+        format!("{speaker}: {}", message.content)
+    }
+
     fn transcript_message(
+        &mut self,
         message: &app_model::TranscriptMessage,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let is_user = message.role == TranscriptRole::User;
-        let speaker = if is_user { "You" } else { "Copilot" };
         let attachments = Self::message_attachment_chips(message, cx);
         let markdown_source = message.content.clone();
-        let markdown = Self::markdown_content(&message.id, &message.content, cx);
+        let document = self.message_markdown(message);
+        let markdown = Self::markdown_content(&message.id, &document, cx);
         div()
             .id(SharedString::from(format!("message-{}", message.id)))
             .accessibility_id(message.id.clone())
             .role(Role::ListItem)
-            .aria_label(format!("{speaker}: {}", message.content))
+            .aria_label(Self::message_aria_label(message))
             .flex()
             .w_full()
             .justify_end()
@@ -4540,8 +4858,6 @@ impl SessionMvpView {
                     .when(!message.content.is_empty(), |bubble| {
                         bubble.child(div().mt_2().text_color(rgb(PRIMARY)).child(markdown))
                     })
-                    // Shown after the text, mirroring the composer, so the
-                    // message reads back the way it was written.
                     .when(!attachments.is_empty(), |bubble| {
                         bubble.child(
                             div()
@@ -4575,7 +4891,55 @@ impl SessionMvpView {
             )
     }
 
-    fn transcript(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn render_timeline_row(&mut self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let Some(item) = self.timeline.items.get(index).cloned() else {
+            return div().into_any_element();
+        };
+        let Some(snapshot) = self.selected().map(|session| session.snapshot.clone()) else {
+            return div().into_any_element();
+        };
+        self.transcript_rows_rendered += 1;
+        let content = match item.kind {
+            TimelineItemKind::Message(message_index) => snapshot
+                .transcript
+                .get(message_index)
+                .map(|message| self.transcript_message(message, cx).into_any_element()),
+            TimelineItemKind::Tool(invocation_index) => snapshot
+                .tool_activity
+                .invocations
+                .get(invocation_index)
+                .map(|invocation| {
+                    let children = self
+                        .timeline
+                        .children
+                        .get(&invocation.call_id)
+                        .into_iter()
+                        .flatten()
+                        .filter_map(|index| snapshot.tool_activity.invocations.get(*index))
+                        .collect::<Vec<_>>();
+                    self.tool_entry(invocation, &children, cx)
+                        .into_any_element()
+                }),
+        };
+        div()
+            .id(SharedString::from(format!("timeline-{}", item.id)))
+            .w_full()
+            .min_w_0()
+            .px_5()
+            .pb_3()
+            .child(
+                div()
+                    .debug_selector(|| "transcript-content".to_owned())
+                    .mx_auto()
+                    .w_full()
+                    .max_w(px(CONVERSATION_COLUMN_WIDTH))
+                    .min_w_0()
+                    .children(content),
+            )
+            .into_any_element()
+    }
+
+    fn transcript(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
         let Some(session) = self.selected() else {
             return div()
                 .id("empty-session")
@@ -4608,34 +4972,18 @@ impl SessionMvpView {
                         ),
                 );
         };
-        // The whole conversation is rendered now that the transcript scrolls;
-        // capping it would put a wall part-way up the scrollback. Phase 6
-        // replaces this with the virtualized list.
-        let entries = session
-            .snapshot
-            .timeline()
-            .into_iter()
-            .map(|entry| match entry {
-                app_model::TimelineEntry::Message(message) => {
-                    Self::transcript_message(message, cx).into_any_element()
-                }
-                app_model::TimelineEntry::Tool(invocation) => {
-                    let children = session
-                        .snapshot
-                        .tool_activity
-                        .children_of(&invocation.call_id);
-                    self.tool_entry(invocation, &children, cx)
-                        .into_any_element()
-                }
-            })
-            .collect::<Vec<_>>();
+        let _ = session;
+        self.transcript_rows_rendered = 0;
         let group = SharedString::from("scroll-transcript");
-        let scrollbar = Self::scrollbar(
-            TRANSCRIPT_SCROLL_ID,
-            &self.transcript_scroll,
-            group.clone(),
-            cx,
-        );
+        let view = cx.entity();
+        let list_state = self.transcript_list.clone();
+        let scrollbar = self.transcript_scrollbar(group.clone(), cx);
+        let transcript = list(list_state, move |index, _, cx| {
+            view.update(cx, |view, cx| view.render_timeline_row(index, cx))
+        })
+        .flex_1()
+        .min_h_0()
+        .py_5();
 
         div()
             .id("transcript-frame")
@@ -4651,25 +4999,11 @@ impl SessionMvpView {
                     .debug_selector(|| "transcript".to_owned())
                     .role(Role::List)
                     .aria_label("Conversation")
-                    .track_scroll(&self.transcript_scroll)
                     .flex()
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .p_5()
-                    .overflow_y_scroll()
-                    .child(
-                        div()
-                            .debug_selector(|| "transcript-content".to_owned())
-                            .mx_auto()
-                            .w_full()
-                            .max_w(px(CONVERSATION_COLUMN_WIDTH))
-                            .min_w_0()
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .children(entries),
-                    ),
+                    .child(div().flex().flex_col().flex_1().min_h_0().child(transcript)),
             )
             .children(scrollbar)
     }
@@ -5705,8 +6039,7 @@ impl SessionMvpView {
 impl Render for SessionMvpView {
     #[allow(clippy::too_many_lines)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
-        self.follow_transcript_tail();
-        self.note_transcript_extent(cx);
+        self.sync_transcript();
         let (provider_status, provider_color) = self.provider_status();
         let compact = compact_layout(f32::from(window.viewport_size().width));
         let show_sidebar = self.sidebar_open;
@@ -5773,14 +6106,14 @@ impl Render for SessionMvpView {
                         view.drag_scrollbar_to(&drag.id, event.position.y, drag.grab_offset);
                         cx.notify();
                     } else {
-                        view.dragging_scrollbar = None;
+                        view.end_scrollbar_drag();
                     }
                 }
             }))
             .on_mouse_up(
                 MouseButton::Left,
                 cx.listener(|view, _, _, _| {
-                    view.dragging_scrollbar = None;
+                    view.end_scrollbar_drag();
                 }),
             )
             .when(show_sidebar, |root| root.child(self.sidebar(compact, cx)))
@@ -8623,12 +8956,16 @@ mod tests {
             // Without this the assertion below could pass on a transcript that
             // never scrolls at all.
             let transcript = cx.debug_bounds("transcript").expect("transcript rendered");
-            let before = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let before = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
             wheel(
                 gpui::point(transcript.center().x, transcript.origin.y + gpui::px(8.0)),
                 cx,
             );
-            let after_transcript = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let after_transcript = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
             assert_ne!(
                 before, after_transcript,
                 "the control case must scroll the transcript"
@@ -8639,7 +8976,9 @@ mod tests {
                 .debug_bounds("tool-detail")
                 .expect("output block rendered");
             wheel(block.center(), cx);
-            let after_block = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let after_block = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
             assert_eq!(
                 after_transcript, after_block,
                 "the transcript must not move when scrolling inside a tool entry"
@@ -8675,7 +9014,9 @@ mod tests {
             cx.run_until_parked();
 
             // Auto-follow leaves the view at the bottom.
-            let bottom = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let bottom = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
             assert!(bottom < gpui::px(0.0));
 
             // Press near the top of the track: the content should jump up.
@@ -8689,7 +9030,9 @@ mod tests {
             );
             cx.run_until_parked();
 
-            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let after = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
             assert!(
                 after > bottom,
                 "dragging the scrollbar must scroll: {bottom:?} -> {after:?}"
@@ -8743,9 +9086,13 @@ mod tests {
             cx.run_until_parked();
 
             // Auto-follow leaves the thumb at the bottom of its track.
-            let handle = view.read_with(cx, |view, _| view.transcript_scroll.clone());
-            let geometry = super::super::SessionMvpView::scrollbar_geometry(&handle)
-                .expect("the transcript should be scrollable");
+            let geometry = view.read_with(cx, |view, _| {
+                view.drawn_transcript_scrollbar
+                    .expect("the transcript should be scrollable")
+            });
+            let before = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
             let track = cx.debug_bounds("scrollbar").expect("scrollbar rendered");
 
             // Press the middle of the thumb itself, not the track beside it.
@@ -8767,11 +9114,12 @@ mod tests {
 
             // Grabbing the middle of the thumb must not move the content; the
             // grab point is preserved rather than recentred on the pointer.
-            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
-            let expected = -(geometry.thumb_top / geometry.usable * geometry.scrollable);
+            let after = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
             assert!(
-                (f32::from(after) - expected).abs() < 2.0,
-                "grabbing the thumb should not lurch: {after:?} vs {expected}"
+                (f32::from(after) - f32::from(before)).abs() < 2.0,
+                "grabbing the thumb should not lurch: {before:?} -> {after:?}"
             );
         }
 
@@ -8804,9 +9152,10 @@ mod tests {
             view.update(cx, |_, cx| cx.notify());
             cx.run_until_parked();
 
-            let handle = view.read_with(cx, |view, _| view.transcript_scroll.clone());
-            let geometry = super::super::SessionMvpView::scrollbar_geometry(&handle)
-                .expect("the transcript should be scrollable");
+            let geometry = view.read_with(cx, |view, _| {
+                view.transcript_scrollbar_geometry()
+                    .expect("the transcript should be scrollable")
+            });
             let drawn = cx.debug_bounds("scrollbar-thumb").expect("thumb rendered");
 
             let drawn_top = f32::from(drawn.origin.y - geometry.track_top);
@@ -8824,10 +9173,14 @@ mod tests {
 
             // Pressing the drawn thumb's middle must therefore grab it, not
             // jump the content.
-            let before = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let before = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
             cx.simulate_mouse_down(drawn.center(), MouseButton::Left, Modifiers::none());
             cx.run_until_parked();
-            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let after = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
             assert!(
                 (f32::from(after) - f32::from(before)).abs() < 4.0,
                 "pressing the drawn thumb must grab it: {before:?} -> {after:?}"
@@ -8862,19 +9215,22 @@ mod tests {
             cx.run_until_parked();
 
             // Move off the bottom so the thumb has room either side of it.
-            view.update(cx, |view, _| {
+            view.update(cx, |view, cx| {
                 view.drag_scrollbar_to(
                     super::super::TRANSCRIPT_SCROLL_ID,
-                    view.transcript_scroll.bounds().origin.y + gpui::px(200.0),
+                    view.transcript_list.viewport_bounds().origin.y + gpui::px(200.0),
                     0.0,
                 );
+                cx.notify();
             });
             cx.run_until_parked();
 
-            let before = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
-            let handle = view.read_with(cx, |view, _| view.transcript_scroll.clone());
-            let geometry =
-                super::super::SessionMvpView::scrollbar_geometry(&handle).expect("scrollable");
+            let before = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
+            let geometry = view.read_with(cx, |view, _| {
+                view.drawn_transcript_scrollbar.expect("scrollable")
+            });
             let track = cx.debug_bounds("scrollbar").expect("scrollbar rendered");
 
             // Press near the top edge of the thumb rather than its centre.
@@ -8886,7 +9242,9 @@ mod tests {
             );
             cx.run_until_parked();
 
-            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let after = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
             assert!(
                 (f32::from(after) - f32::from(before)).abs() < 4.0,
                 "pressing the thumb must not move the content: {before:?} -> {after:?}"
@@ -9012,7 +9370,9 @@ mod tests {
             cx.run_until_parked();
 
             // Auto-follow leaves the view at the tail, so scroll back up.
-            let before = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let before = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
             assert!(
                 before < gpui::px(0.0),
                 "the transcript should be scrolled to the newest output, got {before:?}"
@@ -9027,15 +9387,58 @@ mod tests {
                 touch_phase: gpui::TouchPhase::Moved,
             });
             cx.run_until_parked();
-            let after = view.read_with(cx, |view, _| view.transcript_scroll.offset().y);
+            let after = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
             assert!(
                 after > before,
                 "scrolling up must move the transcript: {before:?} -> {after:?}"
             );
 
-            // Every message is rendered, so scrolling up reaches the start.
+            // The complete model remains available even though only a window is
+            // instantiated.
             view.read_with(cx, |view, _| {
                 assert_eq!(view.selected().unwrap().snapshot.transcript.len(), 80);
+            });
+        }
+
+        /// The deterministic large-session shape must not make render work grow
+        /// with retained history. This counter covers element creation and,
+        /// through the markdown cache, parsing of completed off-screen rows.
+        #[gpui::test]
+        fn large_transcript_render_work_is_bounded_by_the_window(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "Large session");
+                state.transcript = (0..10_000)
+                    .map(|index| app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content: format!("## Result {index}\n\nDeterministic transcript row."),
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
+                    })
+                    .collect();
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.timeline.items.len(), 10_000);
+                assert!(
+                    view.transcript_rows_rendered <= 64,
+                    "rendered {} rows for a 10,000-row transcript",
+                    view.transcript_rows_rendered
+                );
+                assert!(
+                    view.markdown_cache.len() <= 64,
+                    "parsed {} off-screen markdown documents",
+                    view.markdown_cache.len()
+                );
             });
         }
 
