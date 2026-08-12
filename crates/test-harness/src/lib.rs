@@ -28,6 +28,8 @@ pub struct FakeProvider {
     fail_resume: AtomicBool,
     fail_history: AtomicBool,
     fail_tool_discovery: AtomicBool,
+    fail_title_generation: AtomicBool,
+    generated_title: Mutex<Option<String>>,
     extra_tools: Mutex<Vec<String>>,
     omit_tools: Mutex<Vec<String>>,
     sent_attachments: Mutex<Vec<Vec<PromptAttachment>>>,
@@ -52,6 +54,14 @@ impl FakeProvider {
 
     pub fn fail_tool_discovery(&self, fail: bool) {
         self.fail_tool_discovery.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn fail_title_generation(&self, fail: bool) {
+        self.fail_title_generation.store(fail, Ordering::SeqCst);
+    }
+
+    pub async fn set_generated_title(&self, title: impl Into<String>) {
+        *self.generated_title.lock().await = Some(title.into());
     }
 
     /// Add tools beyond the built-in set, e.g. to simulate GitHub MCP.
@@ -286,6 +296,27 @@ impl AgentProvider for FakeProvider {
             discovered_at: Some("fake".to_owned()),
             error: None,
         })
+    }
+
+    async fn generate_title(
+        &self,
+        prompt: &str,
+        _model: Option<&str>,
+        _working_directory: &std::path::Path,
+    ) -> Result<String> {
+        if self.fail_title_generation.load(Ordering::SeqCst) {
+            return Err(ProviderError::Sdk(
+                "configured title generation failure".to_owned(),
+            ));
+        }
+        if let Some(title) = self.generated_title.lock().await.clone() {
+            return Ok(title);
+        }
+        Ok(prompt
+            .split_whitespace()
+            .take(4)
+            .collect::<Vec<_>>()
+            .join(" "))
     }
 }
 

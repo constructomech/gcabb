@@ -8,7 +8,7 @@ use std::time::{SystemTime, UNIX_EPOCH};
 use app_model::{
     ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus, DomainEvent,
     InteractionResponse, ProjectMetadata, PromptAttachment, SessionKind, SessionMetadata,
-    SessionSnapshot, SessionStatus, ToolCatalog,
+    SessionSnapshot, SessionStatus, TitleSource, ToolCatalog,
 };
 use copilot_provider::{
     AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderInteraction,
@@ -107,6 +107,7 @@ pub struct SessionRoots {
 pub struct CreateSessionRequest {
     pub project_path: PathBuf,
     pub title: String,
+    pub title_source: TitleSource,
     pub model: Option<String>,
     pub mode: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -213,8 +214,19 @@ impl SessionHandle {
 
     /// Rename the session, updating the published snapshot and storage.
     pub async fn rename(&self, title: impl Into<String>) -> Result<()> {
-        self.control(SessionControlCommand::Rename(title.into()))
-            .await
+        self.control(SessionControlCommand::Rename {
+            title: title.into(),
+            source: TitleSource::Manual,
+        })
+        .await
+    }
+
+    async fn apply_generated_title(&self, title: String) -> Result<()> {
+        self.control(SessionControlCommand::Rename {
+            title,
+            source: TitleSource::Generated,
+        })
+        .await
     }
 
     pub async fn set_model(&self, model: impl Into<String>) -> Result<()> {
@@ -390,6 +402,7 @@ impl SessionManager {
             project_path: request.project_path.to_string_lossy().into_owned(),
             repository_root: request.repository_root,
             title: request.title,
+            title_source: request.title_source,
             kind: request.kind,
             model: request.model,
             mode: request.mode,
@@ -495,8 +508,33 @@ impl SessionManager {
             .find(|metadata| metadata.id == app_session_id)
             .ok_or_else(|| SessionManagerError::SessionNotFound(app_session_id.to_owned()))?;
         title.clone_into(&mut metadata.title);
+        metadata.title_source = TitleSource::Manual;
         metadata.updated_at = timestamp();
         self.storage.upsert_session(&metadata)?;
+        Ok(())
+    }
+
+    /// Replace a new session's fallback title with an isolated model-generated one.
+    ///
+    /// The actor checks ownership again when applying the result, so a manual
+    /// rename that races with generation always wins.
+    pub async fn generate_session_title(&self, app_session_id: &str, prompt: &str) -> Result<()> {
+        let handle = self.session(app_session_id).await?;
+        let snapshot = handle.snapshot();
+        if snapshot.metadata.title_source != TitleSource::Fallback {
+            return Ok(());
+        }
+        let generated = self
+            .provider
+            .generate_title(
+                prompt,
+                snapshot.metadata.model.as_deref(),
+                Path::new(&snapshot.metadata.project_path),
+            )
+            .await?;
+        if let Some(title) = normalize_generated_title(&generated) {
+            handle.apply_generated_title(title).await?;
+        }
         Ok(())
     }
 
@@ -877,7 +915,10 @@ enum SessionCommandKind {
 }
 
 enum SessionControlCommand {
-    Rename(String),
+    Rename {
+        title: String,
+        source: TitleSource,
+    },
     Model {
         model: String,
         reasoning_effort: ReasoningEffortUpdate,
@@ -1059,9 +1100,15 @@ impl SessionActor {
 
     async fn apply_control(&mut self, control: SessionControlCommand) -> Result<()> {
         match control {
-            SessionControlCommand::Rename(title) => {
-                self.state.metadata.title = title;
+            SessionControlCommand::Rename { title, source } => {
+                if source == TitleSource::Manual
+                    || self.state.metadata.title_source == TitleSource::Fallback
+                {
+                    self.state.metadata.title = title;
+                    self.state.metadata.title_source = source;
+                }
             }
+
             SessionControlCommand::Model {
                 model,
                 reasoning_effort,
@@ -1166,6 +1213,19 @@ impl SessionActor {
             details: json!({"error": error}),
         });
     }
+}
+
+fn normalize_generated_title(raw: &str) -> Option<String> {
+    let line = raw.lines().find(|line| !line.trim().is_empty())?.trim();
+    let title = line
+        .trim_matches(|character| matches!(character, '"' | '\'' | '`' | '#'))
+        .trim()
+        .trim_end_matches(['.', '!', '?', ':'])
+        .split_whitespace()
+        .collect::<Vec<_>>()
+        .join(" ");
+    let word_count = title.split_whitespace().count();
+    ((2..=5).contains(&word_count) && title.chars().count() <= 56).then_some(title)
 }
 
 /// Attachment paths recorded across a session's transcript.
@@ -1396,6 +1456,7 @@ mod tests {
             project_path: path,
             repository_root: None,
             title: "Foundation test".to_owned(),
+            title_source: TitleSource::Manual,
             kind: SessionKind::Project,
             model: None,
             mode: Some("interactive".to_owned()),
@@ -1569,6 +1630,7 @@ mod tests {
             project_path: std::env::temp_dir().to_string_lossy().into_owned(),
             repository_root: None,
             title: "Broken restore".to_owned(),
+            title_source: TitleSource::Manual,
             kind: SessionKind::Project,
             model: None,
             mode: None,
@@ -1599,6 +1661,7 @@ mod tests {
             project_path: missing.to_string_lossy().into_owned(),
             repository_root: None,
             title: "Deleted worktree".to_owned(),
+            title_source: TitleSource::Manual,
             kind: SessionKind::Project,
             model: None,
             mode: None,
@@ -1817,8 +1880,99 @@ mod tests {
             .unwrap();
 
         assert_eq!(handle.snapshot().metadata.title, "Renamed session");
+        assert_eq!(handle.snapshot().metadata.title_source, TitleSource::Manual);
         let stored = storage.list_sessions().unwrap();
         assert_eq!(stored[0].title, "Renamed session");
+        assert_eq!(stored[0].title_source, TitleSource::Manual);
+    }
+
+    #[tokio::test]
+    async fn generated_title_replaces_only_the_fallback_and_persists() {
+        let provider = Arc::new(FakeProvider::default());
+        provider
+            .set_generated_title("  \"Improve session naming.\"  ")
+            .await;
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider, storage.clone(), diagnostics);
+        manager.start().await.unwrap();
+        let mut create = request(std::env::temp_dir());
+        create.title = "Can you improve session naming?".to_owned();
+        create.title_source = TitleSource::Fallback;
+        let handle = manager.create_session(create).await.unwrap();
+
+        manager
+            .generate_session_title(handle.id(), "Can you improve session naming?")
+            .await
+            .unwrap();
+
+        assert_eq!(handle.snapshot().metadata.title, "Improve session naming");
+        assert_eq!(
+            handle.snapshot().metadata.title_source,
+            TitleSource::Generated
+        );
+        let stored = storage.list_sessions().unwrap();
+        assert_eq!(stored[0].title, "Improve session naming");
+        assert_eq!(stored[0].title_source, TitleSource::Generated);
+    }
+
+    #[tokio::test]
+    async fn manual_title_is_never_replaced_by_generation() {
+        let provider = Arc::new(FakeProvider::default());
+        provider.set_generated_title("Generated replacement").await;
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider, storage, diagnostics);
+        manager.start().await.unwrap();
+        let mut create = request(std::env::temp_dir());
+        create.title = "Initial fallback title".to_owned();
+        create.title_source = TitleSource::Fallback;
+        let handle = manager.create_session(create).await.unwrap();
+        handle.rename("User chosen title").await.unwrap();
+
+        manager
+            .generate_session_title(handle.id(), "Original prompt")
+            .await
+            .unwrap();
+
+        assert_eq!(handle.snapshot().metadata.title, "User chosen title");
+        assert_eq!(handle.snapshot().metadata.title_source, TitleSource::Manual);
+    }
+
+    #[tokio::test]
+    async fn title_generation_failure_keeps_the_fallback() {
+        let provider = Arc::new(FakeProvider::default());
+        provider.fail_title_generation(true);
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider, storage, diagnostics);
+        manager.start().await.unwrap();
+        let mut create = request(std::env::temp_dir());
+        create.title = "Reliable fallback title".to_owned();
+        create.title_source = TitleSource::Fallback;
+        let handle = manager.create_session(create).await.unwrap();
+
+        assert!(
+            manager
+                .generate_session_title(handle.id(), "Original prompt")
+                .await
+                .is_err()
+        );
+        assert_eq!(handle.snapshot().metadata.title, "Reliable fallback title");
+        assert_eq!(
+            handle.snapshot().metadata.title_source,
+            TitleSource::Fallback
+        );
+    }
+
+    #[test]
+    fn generated_titles_must_be_concise_plain_text() {
+        assert_eq!(
+            normalize_generated_title("## Fix authentication flow!\nExtra explanation"),
+            Some("Fix authentication flow".to_owned())
+        );
+        assert!(normalize_generated_title("One").is_none());
+        assert!(normalize_generated_title("This title contains far too many words").is_none());
     }
 
     #[tokio::test]
@@ -1839,6 +1993,7 @@ mod tests {
                     project_path: worktree.to_owned(),
                     repository_root: None,
                     title: "Legacy".to_owned(),
+                    title_source: TitleSource::Manual,
                     kind: SessionKind::Project,
                     model: None,
                     mode: None,
@@ -1907,6 +2062,7 @@ mod tests {
                 project_path: "/worktrees/feature-a".to_owned(),
                 repository_root: Some("/src/other".to_owned()),
                 title: "Already adopted".to_owned(),
+                title_source: TitleSource::Manual,
                 kind: SessionKind::Project,
                 model: None,
                 mode: None,

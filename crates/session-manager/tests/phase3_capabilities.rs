@@ -11,7 +11,9 @@ use std::process::Command;
 use std::sync::Arc;
 use std::time::Duration;
 
-use app_model::{CapabilityId, CapabilityStatus, ChangeStage, SessionKind, TerminalState};
+use app_model::{
+    CapabilityId, CapabilityStatus, ChangeStage, SessionKind, TerminalState, TitleSource,
+};
 use copilot_provider::{AgentProvider, CopilotProvider};
 use diagnostics::MemoryDiagnostics;
 use session_manager::{CreateSessionRequest, SessionManager, SessionRoots};
@@ -59,6 +61,7 @@ fn request(path: &Path) -> CreateSessionRequest {
         project_path: path.to_owned(),
         repository_root: None,
         title: "Phase 3 capability".to_owned(),
+        title_source: TitleSource::Manual,
         kind: SessionKind::Project,
         model: None,
         mode: Some("interactive".to_owned()),
