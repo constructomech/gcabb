@@ -4339,41 +4339,48 @@ impl SessionMvpView {
                         if word.is_empty() && word_count > 1 {
                             continue;
                         }
-                        let element_id =
-                            SharedString::from(format!("markdown-{message_id}-{}", *element_index));
-                        *element_index += 1;
                         let link = link.clone();
-                        elements.push(
-                            div()
-                                .id(element_id)
-                                .min_w_0()
-                                .when(style.has(MARKDOWN_STRONG), |text| {
-                                    text.font_weight(gpui::FontWeight::BOLD)
-                                })
-                                .when(style.has(MARKDOWN_EMPHASIS), gpui::Styled::italic)
-                                .when(
-                                    style.has(MARKDOWN_STRIKETHROUGH),
-                                    gpui::Styled::line_through,
-                                )
-                                .when(is_code, |text| {
-                                    text.px_1()
-                                        .rounded_sm()
-                                        .bg(rgb(SUBTLE))
-                                        .font_family(".ZedMono")
-                                })
-                                .when(link.is_some(), |text| {
-                                    text.text_color(rgb(BLUE))
-                                        .underline()
-                                        .hover(gpui::Styled::cursor_pointer)
-                                })
-                                .when_some(link, |text, target| {
-                                    text.on_click(cx.listener(move |_, _, _, cx| {
-                                        cx.open_url(&target);
-                                    }))
-                                })
-                                .child(word.to_owned())
-                                .into_any_element(),
-                        );
+                        // `.id()` allocates a `SharedString` and is only
+                        // needed for elements with interactive/stateful
+                        // behavior (here, link click handling). Plain prose
+                        // and code words are stateless, so skip the id and
+                        // its allocation for them -- this matters once
+                        // per-word splitting is in play, since a long
+                        // message can produce hundreds of word elements.
+                        let base = div()
+                            .min_w_0()
+                            .when(style.has(MARKDOWN_STRONG), |text| {
+                                text.font_weight(gpui::FontWeight::BOLD)
+                            })
+                            .when(style.has(MARKDOWN_EMPHASIS), gpui::Styled::italic)
+                            .when(
+                                style.has(MARKDOWN_STRIKETHROUGH),
+                                gpui::Styled::line_through,
+                            )
+                            .when(is_code, |text| {
+                                text.px_1()
+                                    .rounded_sm()
+                                    .bg(rgb(SUBTLE))
+                                    .font_family(".ZedMono")
+                            })
+                            .child(word.to_owned());
+                        elements.push(if let Some(target) = link {
+                            let element_id = SharedString::from(format!(
+                                "markdown-{message_id}-{}",
+                                *element_index
+                            ));
+                            *element_index += 1;
+                            base.id(element_id)
+                                .text_color(rgb(BLUE))
+                                .underline()
+                                .hover(gpui::Styled::cursor_pointer)
+                                .on_click(cx.listener(move |_, _, _, cx| {
+                                    cx.open_url(&target);
+                                }))
+                                .into_any_element()
+                        } else {
+                            base.into_any_element()
+                        });
                     }
                 }
                 MarkdownNode::SoftBreak => {
