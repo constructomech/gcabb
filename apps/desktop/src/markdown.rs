@@ -91,9 +91,142 @@ pub(crate) fn parse(source: &str) -> MarkdownDocument {
             .push(MarkdownNode::Container(tag, children));
     }
 
-    MarkdownDocument {
-        children: stack.pop().expect("markdown root exists").1,
+    let mut children = stack.pop().expect("markdown root exists").1;
+    autolink_nodes(&mut children, false);
+
+    MarkdownDocument { children }
+}
+
+/// Detects bare `https://`/`http://` URLs inside plain text runs and rewrites
+/// them as `Link` containers, matching the Markdown-link autolinking behavior
+/// GCABB's renderer already applies to explicit `[label](url)` syntax.
+///
+/// Text already nested inside a `Link` tag is left untouched so link labels
+/// are never re-linked or duplicated.
+fn autolink_nodes(nodes: &mut Vec<MarkdownNode>, inside_link: bool) {
+    let mut index = 0;
+    while index < nodes.len() {
+        match &mut nodes[index] {
+            MarkdownNode::Container(tag, children) => {
+                let now_inside_link = inside_link || matches!(tag, MarkdownTag::Link(_));
+                autolink_nodes(children, now_inside_link);
+                index += 1;
+            }
+            MarkdownNode::Text(text) if !inside_link => {
+                let split = split_autolinks(text);
+                let inserted = split.len();
+                nodes.splice(index..=index, split);
+                // None of the freshly inserted nodes need further
+                // autolinking: plain `Text` runs already went through
+                // `split_autolinks`, and `Link` containers wrap literal URL
+                // text that must not be re-linked.
+                index += inserted;
+            }
+            _ => index += 1,
+        }
     }
+}
+
+/// Splits `text` into a run of `Text` and autolinked `Link` container nodes.
+///
+/// Trailing punctuation adjacent to a URL (closing brackets, sentence-ending
+/// punctuation) is treated as part of the surrounding sentence rather than
+/// the link target, matching common Markdown autolink conventions.
+fn split_autolinks(text: &str) -> Vec<MarkdownNode> {
+    let mut nodes = Vec::new();
+    let mut rest = text;
+    let mut plain = String::new();
+
+    while let Some(rel_start) = find_url_start(rest) {
+        let candidate = &rest[rel_start..];
+        let url_len = url_extent(candidate);
+        if url_len == 0 {
+            // Not actually a valid autolink boundary; keep scanning past it
+            // as plain text so we don't loop forever on the same position.
+            plain.push_str(&rest[..=rel_start]);
+            rest = &rest[rel_start + 1..];
+            continue;
+        }
+
+        plain.push_str(&rest[..rel_start]);
+        if !plain.is_empty() {
+            nodes.push(MarkdownNode::Text(std::mem::take(&mut plain)));
+        }
+
+        let url = &candidate[..url_len];
+        nodes.push(MarkdownNode::Container(
+            MarkdownTag::Link(url.to_owned()),
+            vec![MarkdownNode::Text(url.to_owned())],
+        ));
+        rest = &candidate[url_len..];
+    }
+
+    plain.push_str(rest);
+    if !plain.is_empty() || nodes.is_empty() {
+        nodes.push(MarkdownNode::Text(plain));
+    }
+    nodes
+}
+
+/// Finds the byte offset of the next `http://`/`https://` scheme in `text`
+/// that begins at the start of a word (start of string or after whitespace
+/// or an opening bracket), so URLs embedded in things like `foo:https://` are
+/// not mistakenly treated as autolinks.
+fn find_url_start(text: &str) -> Option<usize> {
+    let bytes = text.as_bytes();
+    let mut search_from = 0;
+    while let Some(offset) = text[search_from..]
+        .find("http://")
+        .into_iter()
+        .chain(text[search_from..].find("https://"))
+        .min()
+    {
+        let start = search_from + offset;
+        let boundary_ok = start == 0
+            || matches!(
+                bytes[start - 1],
+                b' ' | b'\t' | b'\n' | b'(' | b'[' | b'*' | b'_'
+            );
+        if boundary_ok {
+            return Some(start);
+        }
+        search_from = start + 1;
+    }
+    None
+}
+
+/// Returns the byte length of the URL starting at the beginning of
+/// `candidate`, stopping at whitespace and stripping trailing punctuation
+/// that is more likely to belong to the surrounding sentence than the link.
+fn url_extent(candidate: &str) -> usize {
+    let end = candidate
+        .find(|c: char| c.is_whitespace())
+        .unwrap_or(candidate.len());
+    let mut url = &candidate[..end];
+
+    // A URL must have something after the scheme to be worth linking.
+    let scheme_len = if url.starts_with("https://") { 8 } else { 7 };
+    if url.len() <= scheme_len {
+        return 0;
+    }
+
+    // Trim trailing punctuation unless it balances an opening bracket that
+    // is part of the URL itself (e.g. Wikipedia-style `(disambiguation)`
+    // URLs).
+    while let Some(last) = url.chars().last() {
+        let should_trim = match last {
+            '.' | ',' | ';' | ':' | '!' | '?' | '\'' | '"' => true,
+            ')' => url.matches('(').count() < url.matches(')').count(),
+            ']' => url.matches('[').count() < url.matches(']').count(),
+            _ => false,
+        };
+        if !should_trim {
+            break;
+        }
+        url = &url[..url.len() - last.len_utf8()];
+    }
+
+    url.len()
 }
 
 fn push(stack: &mut [(MarkdownTag, Vec<MarkdownNode>)], node: MarkdownNode) {
@@ -183,5 +316,116 @@ mod tests {
             plain_text(&document.children),
             "<script>alert('no')</script>"
         );
+    }
+
+    fn links(nodes: &[MarkdownNode]) -> Vec<(String, String)> {
+        let mut found = Vec::new();
+        for node in nodes {
+            if let MarkdownNode::Container(tag, children) = node {
+                if let MarkdownTag::Link(target) = tag {
+                    found.push((target.clone(), plain_text(children)));
+                }
+                found.extend(links(children));
+            }
+        }
+        found
+    }
+
+    #[test]
+    fn autolinks_explicit_markdown_link() {
+        let document = parse("see [docs](https://example.com/docs) now");
+        assert_eq!(
+            links(&document.children),
+            vec![("https://example.com/docs".to_owned(), "docs".to_owned())]
+        );
+    }
+
+    #[test]
+    fn autolinks_bare_url_in_plain_text() {
+        let document = parse("visit https://example.com for more");
+        assert_eq!(
+            links(&document.children),
+            vec![(
+                "https://example.com".to_owned(),
+                "https://example.com".to_owned()
+            )]
+        );
+        assert_eq!(
+            plain_text(&document.children),
+            "visit https://example.com for more"
+        );
+    }
+
+    #[test]
+    fn autolinks_multiple_bare_urls() {
+        let document = parse("http://a.example and https://b.example are both fine");
+        assert_eq!(
+            links(&document.children),
+            vec![
+                ("http://a.example".to_owned(), "http://a.example".to_owned()),
+                (
+                    "https://b.example".to_owned(),
+                    "https://b.example".to_owned()
+                ),
+            ]
+        );
+    }
+
+    #[test]
+    fn does_not_autolink_bare_url_inside_markdown_link_label() {
+        let document = parse("[see https://a.example here](https://b.example)");
+        assert_eq!(
+            links(&document.children),
+            vec![(
+                "https://b.example".to_owned(),
+                "see https://a.example here".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn trims_trailing_punctuation_from_bare_url() {
+        let document = parse("check this out: https://example.com/page.");
+        assert_eq!(
+            links(&document.children),
+            vec![(
+                "https://example.com/page".to_owned(),
+                "https://example.com/page".to_owned()
+            )]
+        );
+        assert!(plain_text(&document.children).ends_with('.'));
+    }
+
+    #[test]
+    fn keeps_balanced_trailing_parenthesis_in_bare_url() {
+        let document = parse("see (https://example.com/page) here");
+        assert_eq!(
+            links(&document.children),
+            vec![(
+                "https://example.com/page".to_owned(),
+                "https://example.com/page".to_owned()
+            )]
+        );
+    }
+
+    #[test]
+    fn unsafe_scheme_link_target_is_rejected_by_render_time_filter() {
+        // `parse` preserves every explicit Markdown link target as-is; it is
+        // the renderer's `safe_markdown_url` allowlist (exercised in
+        // `main.rs`) that keeps unsafe schemes inert at click time. This
+        // confirms the parser still recognizes the link node so the
+        // renderer has something to filter.
+        let document = parse("[danger](javascript:alert(1))");
+        assert_eq!(
+            links(&document.children),
+            vec![("javascript:alert(1)".to_owned(), "danger".to_owned())]
+        );
+    }
+
+    #[test]
+    fn does_not_autolink_url_without_boundary() {
+        let document = parse("foohttps://example.com bar");
+        assert_eq!(links(&document.children), Vec::new());
+        assert_eq!(plain_text(&document.children), "foohttps://example.com bar");
     }
 }

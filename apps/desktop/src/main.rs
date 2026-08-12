@@ -19,8 +19,8 @@ use gpui::{
     App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, FollowMode,
     InteractiveElement, IntoElement, KeyBinding, ListAlignment, ListState, MouseButton,
     ParentElement, PathPromptOptions, Render, Role, SharedString, StatefulInteractiveElement,
-    Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, list, px, rgb,
-    size,
+    Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, list, px, relative,
+    rgb, size,
 };
 use session_manager::{
     CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, SessionRoots,
@@ -4784,6 +4784,51 @@ impl SessionMvpView {
         format!("{speaker}: {}", message.content)
     }
 
+    fn transcript_message_header(
+        message: &app_model::TranscriptMessage,
+        is_user: bool,
+        markdown_source: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
+                    .child(if is_user { "You" } else { "Copilot" }),
+            )
+            .when(!message.content.is_empty(), |header| {
+                header.child(
+                    div()
+                        .id(SharedString::from(format!("copy-markdown-{}", message.id)))
+                        .debug_selector(|| "copy-markdown".to_owned())
+                        .role(Role::Button)
+                        .aria_label("Copy original markdown")
+                        .focusable()
+                        .tab_stop(true)
+                        .px_1()
+                        .rounded_sm()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("Copy")
+                        .hover(|style| {
+                            style
+                                .bg(rgb(SUBTLE))
+                                .text_color(rgb(PRIMARY))
+                                .cursor_pointer()
+                        })
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                markdown_source.clone(),
+                            ));
+                        })),
+                )
+            })
+    }
+
     fn transcript_message(
         &mut self,
         message: &app_model::TranscriptMessage,
@@ -4794,6 +4839,7 @@ impl SessionMvpView {
         let markdown_source = message.content.clone();
         let document = self.message_markdown(message);
         let markdown = Self::markdown_content(&message.id, &document, cx);
+        let header = Self::transcript_message_header(message, is_user, markdown_source, cx);
         div()
             .id(SharedString::from(format!("message-{}", message.id)))
             .accessibility_id(message.id.clone())
@@ -4806,55 +4852,23 @@ impl SessionMvpView {
             .child(
                 div()
                     .debug_selector(|| "transcript-message".to_owned())
-                    .w_full()
+                    .when(is_user, |bubble| {
+                        // User messages are capped narrower than the agent's
+                        // and pushed right by the parent's `justify_end`, so
+                        // they read as indented from the left edge and are
+                        // easy to spot while scrolling back through the
+                        // transcript, while staying right-aligned with the
+                        // agent's output below.
+                        bubble.max_w(relative(0.85))
+                    })
+                    .when(!is_user, gpui::Styled::w_full)
                     .min_w_0()
                     .p_3()
                     .rounded_lg()
                     .bg(if is_user { rgb(ELEVATED) } else { rgb(PANEL) })
                     .border_1()
                     .border_color(rgb(BORDER))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
-                                    .child(if is_user { "You" } else { "Copilot" }),
-                            )
-                            .when(!message.content.is_empty(), |header| {
-                                header.child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "copy-markdown-{}",
-                                            message.id
-                                        )))
-                                        .debug_selector(|| "copy-markdown".to_owned())
-                                        .role(Role::Button)
-                                        .aria_label("Copy original markdown")
-                                        .focusable()
-                                        .tab_stop(true)
-                                        .px_1()
-                                        .rounded_sm()
-                                        .text_xs()
-                                        .text_color(rgb(MUTED))
-                                        .child("Copy")
-                                        .hover(|style| {
-                                            style
-                                                .bg(rgb(SUBTLE))
-                                                .text_color(rgb(PRIMARY))
-                                                .cursor_pointer()
-                                        })
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                                markdown_source.clone(),
-                                            ));
-                                        })),
-                                )
-                            }),
-                    )
+                    .child(header)
                     .when(!message.content.is_empty(), |bubble| {
                         bubble.child(div().mt_2().text_color(rgb(PRIMARY)).child(markdown))
                     })
