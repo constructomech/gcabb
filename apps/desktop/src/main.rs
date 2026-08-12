@@ -222,9 +222,6 @@ enum ServiceCommand {
     Cancel {
         app_session_id: String,
     },
-    Close {
-        app_session_id: String,
-    },
     Resume {
         app_session_id: String,
     },
@@ -565,10 +562,6 @@ async fn handle_service_command(
             .await
             .map_err(|error| error.to_string())?
             .cancel()
-            .await
-            .map_err(|error| error.to_string())?,
-        ServiceCommand::Close { app_session_id } => manager
-            .close_session(&app_session_id)
             .await
             .map_err(|error| error.to_string())?,
         ServiceCommand::Resume { app_session_id } => {
@@ -1025,6 +1018,7 @@ impl SessionMvpView {
             view.attach_pasted_images(&event.images, cx);
         })
         .detach();
+        cx.observe(&composer, |_, _, cx| cx.notify()).detach();
         let interaction_input =
             cx.new(|cx| TextInput::new(cx, "interaction-input", "Type your response..."));
         cx.subscribe(&interaction_input, |view, _, event: &InputSubmitted, cx| {
@@ -4914,12 +4908,23 @@ impl SessionMvpView {
                 SessionStatus::Running | SessionStatus::Starting
             )
         });
-        let cancel = self.selected_session.clone();
+        let has_draft =
+            !self.composer.read(cx).value().trim().is_empty() || !self.draft_attachments.is_empty();
+        let stops_running_session = running && !has_draft;
+        let action_id = if stops_running_session {
+            "stop-session"
+        } else {
+            "submit-prompt"
+        };
+        let action_label = if stops_running_session {
+            "Stop agent"
+        } else if running {
+            "Send steering message"
+        } else {
+            "Send message"
+        };
         let disconnected =
             selected.is_some_and(|session| session.snapshot.status == SessionStatus::Disconnected);
-        let close = (!disconnected)
-            .then(|| self.selected_session.clone())
-            .flatten();
         let resume = disconnected
             .then(|| self.selected_session.clone())
             .flatten();
@@ -4995,10 +5000,11 @@ impl SessionMvpView {
                     .child(div().flex_1())
                     .child(
                         div()
-                            .id("submit-prompt")
-                            .accessibility_id("submit-prompt")
+                            .id(action_id)
+                            .debug_selector(move || action_id.to_owned())
+                            .accessibility_id(action_id)
                             .role(Role::Button)
-                            .aria_label("Send message")
+                            .aria_label(action_label)
                             .focusable()
                             .tab_stop(true)
                             .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
@@ -5009,72 +5015,30 @@ impl SessionMvpView {
                             .justify_center()
                             .rounded_full()
                             .bg(rgb(ELEVATED))
-                            .text_color(rgb(MUTED))
-                            .child("↑")
+                            .text_color(if stops_running_session {
+                                rgb(RED)
+                            } else {
+                                rgb(MUTED)
+                            })
+                            .child(if stops_running_session { "■" } else { "↑" })
                             .hover(|style| {
                                 style
                                     .bg(rgb(BORDER))
                                     .text_color(rgb(PRIMARY))
                                     .cursor_pointer()
                             })
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.submit_composer(cx);
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                if stops_running_session {
+                                    if let Some(app_session_id) = view.selected_session.clone() {
+                                        let _ = view
+                                            .commands
+                                            .send(ServiceCommand::Cancel { app_session_id });
+                                    }
+                                } else {
+                                    view.submit_composer(cx);
+                                }
                             })),
                     )
-                    .when_some(cancel, |row, id| {
-                        row.child(
-                            div()
-                                .id("cancel-session")
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(if running { rgb(RED) } else { rgb(BORDER) })
-                                .text_color(if running { rgb(RED) } else { rgb(MUTED) })
-                                .child(if running { "Cancel" } else { "Idle" })
-                                .when(running, |button| {
-                                    button
-                                        .accessibility_id("cancel-session")
-                                        .role(Role::Button)
-                                        .aria_label("Cancel current session")
-                                        .focusable()
-                                        .tab_stop(true)
-                                        .focus_visible(|style| {
-                                            style.border_1().border_color(rgb(BLUE))
-                                        })
-                                        .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                                        .on_click(cx.listener(move |view, _, _, _| {
-                                            let _ = view.commands.send(ServiceCommand::Cancel {
-                                                app_session_id: id.clone(),
-                                            });
-                                        }))
-                                }),
-                        )
-                    })
-                    .when_some(close, |row, id| {
-                        row.child(
-                            div()
-                                .id("close-session")
-                                .accessibility_id("close-session")
-                                .role(Role::Button)
-                                .aria_label("Close session")
-                                .focusable()
-                                .tab_stop(true)
-                                .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
-                                .px_3()
-                                .py_1()
-                                .rounded_md()
-                                .text_color(rgb(MUTED))
-                                .child("Close")
-                                .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    let _ = view.commands.send(ServiceCommand::Close {
-                                        app_session_id: id.clone(),
-                                    });
-                                    cx.notify();
-                                })),
-                        )
-                    })
                     .when(disconnected, |row| {
                         row.when_some(resume, |row, id| {
                             row.child(
@@ -6868,9 +6832,10 @@ mod tests {
     /// which is the only way to catch event-wiring mistakes such as a dismiss
     /// overlay consuming the click meant for a menu item.
     mod interaction {
-        use app_model::{SessionKind, SessionMetadata, SessionSnapshot};
+        use app_model::{SessionKind, SessionMetadata, SessionSnapshot, SessionStatus};
         use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
         use session_manager::SessionHandle;
+        use std::sync::Arc;
 
         use crate::{AppService, ServiceCommand, SessionMvpView, SessionProjection, UpdateUi};
 
@@ -6934,6 +6899,70 @@ mod tests {
             });
             cx.run_until_parked();
             (view, cx, commands, attachments)
+        }
+
+        #[gpui::test]
+        fn active_empty_composer_uses_the_trailing_action_to_cancel(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                let mut snapshot = (*view.sessions[0].snapshot).clone();
+                snapshot.status = SessionStatus::Running;
+                view.sessions[0].snapshot = Arc::new(snapshot);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("stop-session").is_some());
+            assert!(cx.debug_bounds("submit-prompt").is_none());
+            assert!(cx.debug_bounds("close-session").is_none());
+
+            let stop = cx
+                .debug_bounds("stop-session")
+                .expect("stop action rendered");
+            cx.simulate_click(stop.center(), Modifiers::none());
+
+            match commands.try_recv().expect("a command was sent") {
+                ServiceCommand::Cancel { app_session_id } => {
+                    assert_eq!(app_session_id, "session-1");
+                }
+                _ => panic!("expected a Cancel command"),
+            }
+        }
+
+        #[gpui::test]
+        fn typing_during_active_work_turns_stop_into_steering_send(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                let mut snapshot = (*view.sessions[0].snapshot).clone();
+                snapshot.status = SessionStatus::Running;
+                view.sessions[0].snapshot = Arc::new(snapshot);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let composer = view.read_with(cx, |view, _| view.composer.clone());
+            composer.update(cx, |input, cx| input.set_value("change direction", cx));
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("stop-session").is_none());
+            let send = cx
+                .debug_bounds("submit-prompt")
+                .expect("steering send action rendered");
+            cx.simulate_click(send.center(), Modifiers::none());
+
+            match commands.try_recv().expect("a command was sent") {
+                ServiceCommand::Submit {
+                    app_session_id,
+                    prompt,
+                    ..
+                } => {
+                    assert_eq!(app_session_id.as_deref(), Some("session-1"));
+                    assert_eq!(prompt, "change direction");
+                }
+                _ => panic!("expected a Submit command"),
+            }
         }
 
         /// Regression: the right-click that opens the menu releases after the

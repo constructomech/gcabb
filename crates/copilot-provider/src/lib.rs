@@ -18,8 +18,9 @@ use github_copilot_sdk::handler::{
 use github_copilot_sdk::rpc::ToolsListRequest;
 use github_copilot_sdk::session::Session;
 use github_copilot_sdk::{
-    Client, ClientMode, ClientOptions, ElicitationRequest, ElicitationResult, ExitPlanModeData,
-    PermissionRequestData, RequestId, ResumeSessionConfig, SessionConfig, SessionId,
+    Client, ClientMode, ClientOptions, DeliveryMode, ElicitationRequest, ElicitationResult,
+    ExitPlanModeData, MessageOptions, PermissionRequestData, RequestId, ResumeSessionConfig,
+    SessionConfig, SessionId,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -583,39 +584,9 @@ impl AgentProvider for CopilotProvider {
         prompt: &str,
         attachments: &[PromptAttachment],
     ) -> Result<String> {
-        let mut options = github_copilot_sdk::MessageOptions::from(prompt.to_owned());
-        if !attachments.is_empty() {
-            // Paths rather than inlined bytes: the runtime reads the file
-            // itself, so a large screenshot never crosses the RPC boundary.
-            options = options.with_attachments(
-                attachments
-                    .iter()
-                    .map(|attachment| match attachment {
-                        PromptAttachment::File { path, display_name } => {
-                            github_copilot_sdk::Attachment::File {
-                                path: PathBuf::from(path),
-                                display_name: Some(display_name.clone()),
-                                line_range: None,
-                            }
-                        }
-                        // A pasted image has no file to point at, so the bytes
-                        // themselves travel.
-                        PromptAttachment::Image {
-                            data,
-                            mime_type,
-                            display_name,
-                        } => github_copilot_sdk::Attachment::Blob {
-                            data: data.clone(),
-                            mime_type: mime_type.clone(),
-                            display_name: Some(display_name.clone()),
-                        },
-                    })
-                    .collect(),
-            );
-        }
         self.session(sdk_session_id)
             .await?
-            .send(options)
+            .send(message_options(prompt, attachments))
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))
     }
@@ -1007,6 +978,41 @@ fn context_tier_value(tier: &str) -> Result<github_copilot_sdk::types::ContextTi
     }
 }
 
+fn message_options(prompt: &str, attachments: &[PromptAttachment]) -> MessageOptions {
+    // Immediate delivery is a normal turn while idle and steering input while busy.
+    let mut options = MessageOptions::from(prompt.to_owned()).with_mode(DeliveryMode::Immediate);
+    if attachments.is_empty() {
+        return options;
+    }
+    // Paths rather than inlined bytes: the runtime reads the file itself, so a
+    // large screenshot never crosses the RPC boundary.
+    options = options.with_attachments(
+        attachments
+            .iter()
+            .map(|attachment| match attachment {
+                PromptAttachment::File { path, display_name } => {
+                    github_copilot_sdk::Attachment::File {
+                        path: PathBuf::from(path),
+                        display_name: Some(display_name.clone()),
+                        line_range: None,
+                    }
+                }
+                // A pasted image has no file to point at, so the bytes themselves travel.
+                PromptAttachment::Image {
+                    data,
+                    mime_type,
+                    display_name,
+                } => github_copilot_sdk::Attachment::Blob {
+                    data: data.clone(),
+                    mime_type: mime_type.clone(),
+                    display_name: Some(display_name.clone()),
+                },
+            })
+            .collect(),
+    );
+    options
+}
+
 fn parse_lag_count(message: &str) -> Option<u64> {
     message
         .split_whitespace()
@@ -1033,11 +1039,18 @@ pub fn default_database_path(root: &Path) -> PathBuf {
 mod tests {
     use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
     use github_copilot_sdk::rpc::PermissionDecision;
-    use github_copilot_sdk::{PermissionRequestData, RequestId, SessionId};
+    use github_copilot_sdk::{DeliveryMode, PermissionRequestData, RequestId, SessionId};
     use serde_json::json;
     use tokio::sync::mpsc;
 
-    use super::{InteractionBroker, model_option, sdk_context_windows};
+    use super::{InteractionBroker, message_options, model_option, sdk_context_windows};
+
+    #[test]
+    fn user_messages_request_immediate_delivery_for_steering() {
+        let options = message_options("change direction", &[]);
+
+        assert_eq!(options.mode, Some(DeliveryMode::Immediate));
+    }
 
     #[tokio::test]
     async fn isolated_worktree_permissions_are_approved_without_prompting() {
