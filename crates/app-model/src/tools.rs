@@ -16,11 +16,40 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
-/// Maximum retained output characters per tool invocation or terminal.
-///
-/// Phase 3 keeps output bounded in the projection; Phase 6 replaces this with
-/// the virtualized terminal's own scrollback management.
-pub const MAX_RETAINED_OUTPUT: usize = 256 * 1024;
+#[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum OutputStreamKind {
+    Invocation,
+    Terminal,
+}
+
+impl OutputStreamKind {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Invocation => "invocation",
+            Self::Terminal => "terminal",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct OutputMetadata {
+    #[serde(default)]
+    pub chunk_count: u64,
+    #[serde(default)]
+    pub byte_count: u64,
+    #[serde(default)]
+    pub complete: bool,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutputStreamUpdate {
+    pub kind: OutputStreamKind,
+    pub identity: String,
+    pub chunk: Option<String>,
+    pub complete: bool,
+}
 
 /// Where a tool came from, so the UI can group and label it.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -205,12 +234,17 @@ pub struct ToolInvocation {
     /// Paths the runtime believes the call may touch, used to refresh changes.
     #[serde(default)]
     pub possible_paths: Vec<String>,
-    /// Streaming output accumulated from partial results.
-    #[serde(default)]
+    /// Output loaded from the append-only output store for display.
+    #[serde(skip)]
     pub output: String,
     #[serde(default)]
-    pub output_truncated: bool,
+    pub output_metadata: OutputMetadata,
+    #[serde(default)]
+    pub output_error: Option<String>,
+    #[serde(skip)]
+    pub output_load_error: Option<String>,
     /// Full detailed result retained for UI display, notably edit diffs.
+    #[serde(skip)]
     pub detailed_output: Option<String>,
     pub error_code: Option<String>,
     pub error_message: Option<String>,
@@ -337,10 +371,14 @@ pub struct TerminalSession {
     pub command: Option<String>,
     pub cwd: Option<String>,
     pub state: TerminalState,
-    #[serde(default)]
+    #[serde(skip)]
     pub output: String,
     #[serde(default)]
-    pub output_truncated: bool,
+    pub output_metadata: OutputMetadata,
+    #[serde(default)]
+    pub output_error: Option<String>,
+    #[serde(skip)]
+    pub output_load_error: Option<String>,
     pub exit_code: Option<i64>,
     /// Every tool call that has contributed to this shell, in order.
     #[serde(default)]
@@ -504,7 +542,9 @@ impl ToolActivity {
                 cwd: None,
                 state: TerminalState::Running,
                 output: String::new(),
-                output_truncated: false,
+                output_metadata: OutputMetadata::default(),
+                output_error: None,
+                output_load_error: None,
                 exit_code: None,
                 tool_call_ids: Vec::new(),
                 started_at: timestamp.to_owned(),
@@ -516,23 +556,10 @@ impl ToolActivity {
     }
 }
 
-/// Append to `target`, trimming from the front when the cap is exceeded.
-///
-/// Returns true when trimming occurred so the UI can show a truncation notice.
-fn append_bounded(target: &mut String, chunk: &str) -> bool {
+fn append_output(target: &mut String, metadata: &mut OutputMetadata, chunk: &str) {
     target.push_str(chunk);
-    if target.len() <= MAX_RETAINED_OUTPUT {
-        return false;
-    }
-    let overflow = target.len() - MAX_RETAINED_OUTPUT;
-    // Trim on a char boundary so the retained tail stays valid UTF-8.
-    let cut = target
-        .char_indices()
-        .map(|(index, _)| index)
-        .find(|index| *index >= overflow)
-        .unwrap_or(target.len());
-    target.drain(..cut);
-    true
+    metadata.chunk_count += 1;
+    metadata.byte_count += chunk.len() as u64;
 }
 
 /// Project a single SDK event into tool and terminal state.
@@ -624,7 +651,9 @@ fn project_start(activity: &mut ToolActivity, event: &crate::DomainEvent) {
         display_command: display_command.clone(),
         possible_paths,
         output: String::new(),
-        output_truncated: false,
+        output_metadata: OutputMetadata::default(),
+        output_error: None,
+        output_load_error: None,
         detailed_output: None,
         error_code: None,
         error_message: None,
@@ -662,8 +691,11 @@ fn project_partial(activity: &mut ToolActivity, event: &crate::DomainEvent) {
 
     let mut shell_id = None;
     if let Some(invocation) = activity.invocation_mut(call_id) {
-        let truncated = append_bounded(&mut invocation.output, chunk);
-        invocation.output_truncated |= truncated;
+        append_output(
+            &mut invocation.output,
+            &mut invocation.output_metadata,
+            chunk,
+        );
         shell_id.clone_from(&invocation.shell_id);
     }
 
@@ -672,12 +704,15 @@ fn project_partial(activity: &mut ToolActivity, event: &crate::DomainEvent) {
     if let Some(shell_id) = shell_id
         && let Some(terminal) = activity.terminal_mut(&shell_id)
     {
-        let truncated = append_bounded(&mut terminal.output, chunk);
-        terminal.output_truncated |= truncated;
+        append_output(&mut terminal.output, &mut terminal.output_metadata, chunk);
         terminal.updated_at.clone_from(&event.timestamp);
     }
 }
 
+#[allow(
+    clippy::too_many_lines,
+    reason = "completion projects one runtime result atomically across invocation and terminal state"
+)]
 fn project_complete(activity: &mut ToolActivity, event: &crate::DomainEvent) {
     let data = &event.details;
     let Some(call_id) = data.get("toolCallId").and_then(Value::as_str) else {
@@ -717,7 +752,17 @@ fn project_complete(activity: &mut ToolActivity, event: &crate::DomainEvent) {
             InvocationState::Failed
         };
         invocation.completed_at = Some(event.timestamp.clone());
-        invocation.detailed_output = detailed;
+        if invocation.output.is_empty()
+            && let Some(detailed) = detailed
+        {
+            append_output(
+                &mut invocation.output,
+                &mut invocation.output_metadata,
+                &detailed,
+            );
+            invocation.detailed_output = Some(detailed);
+        }
+        invocation.output_metadata.complete = true;
         invocation.error_code = error
             .and_then(|error| error.get("code"))
             .and_then(Value::as_str)
@@ -748,12 +793,15 @@ fn project_complete(activity: &mut ToolActivity, event: &crate::DomainEvent) {
                     exit.get("outputTruncated")
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
+                    invocation.output.clone(),
                 ));
             }
         }
     }
 
-    if let Some((shell_id, exit_code, cwd, preview, preview_truncated)) = terminal_update {
+    if let Some((shell_id, exit_code, cwd, preview, preview_truncated, invocation_output)) =
+        terminal_update
+    {
         let call_id = call_id.to_owned();
         let timestamp = event.timestamp.clone();
         let terminal = activity.ensure_terminal(&shell_id, &timestamp);
@@ -774,11 +822,201 @@ fn project_complete(activity: &mut ToolActivity, event: &crate::DomainEvent) {
         }
         // Only fall back to the preview when nothing streamed, otherwise the
         // preview would duplicate output already shown.
-        if terminal.output.is_empty()
-            && let Some(preview) = preview
-        {
-            terminal.output = preview;
-            terminal.output_truncated = preview_truncated;
+        if terminal.output.is_empty() {
+            if !invocation_output.is_empty() {
+                append_output(
+                    &mut terminal.output,
+                    &mut terminal.output_metadata,
+                    &invocation_output,
+                );
+            } else if let Some(preview) = preview {
+                append_output(
+                    &mut terminal.output,
+                    &mut terminal.output_metadata,
+                    &preview,
+                );
+                if preview_truncated {
+                    terminal.output_error =
+                        Some("Runtime supplied only a truncated output preview.".to_owned());
+                }
+            }
+        }
+        terminal.output_metadata.complete = exit_code.is_some();
+    }
+}
+
+/// Output mutations produced by an event before it is projected.
+///
+/// Storage calls this first so the event and its output chunks are committed in
+/// one transaction. Projection then applies the same mutations to in-memory
+/// display state.
+#[must_use]
+#[allow(
+    clippy::too_many_lines,
+    reason = "all output mutations for one event must be derived together before transactional persistence"
+)]
+pub fn output_updates(
+    activity: &ToolActivity,
+    event: &crate::DomainEvent,
+) -> Vec<OutputStreamUpdate> {
+    let data = &event.details;
+    let Some(call_id) = data.get("toolCallId").and_then(Value::as_str) else {
+        return Vec::new();
+    };
+    let invocation = activity.invocation(call_id);
+    match event.source_type.as_str() {
+        "tool.execution_start" => {
+            let mut updates = vec![OutputStreamUpdate {
+                kind: OutputStreamKind::Invocation,
+                identity: call_id.to_owned(),
+                chunk: None,
+                complete: false,
+            }];
+            if let Some(shell_id) = data
+                .get("arguments")
+                .and_then(|arguments| arguments.get("shellId"))
+                .and_then(Value::as_str)
+            {
+                updates.push(OutputStreamUpdate {
+                    kind: OutputStreamKind::Terminal,
+                    identity: shell_id.to_owned(),
+                    chunk: None,
+                    complete: false,
+                });
+            }
+            updates
+        }
+        "tool.execution_partial_result" => {
+            let Some(chunk) = data
+                .get("partialOutput")
+                .and_then(Value::as_str)
+                .filter(|chunk| !chunk.is_empty())
+            else {
+                return Vec::new();
+            };
+            let mut updates = vec![OutputStreamUpdate {
+                kind: OutputStreamKind::Invocation,
+                identity: call_id.to_owned(),
+                chunk: Some(chunk.to_owned()),
+                complete: false,
+            }];
+            if let Some(shell_id) = invocation.and_then(|invocation| invocation.shell_id.as_deref())
+            {
+                updates.push(OutputStreamUpdate {
+                    kind: OutputStreamKind::Terminal,
+                    identity: shell_id.to_owned(),
+                    chunk: Some(chunk.to_owned()),
+                    complete: false,
+                });
+            }
+            updates
+        }
+        "tool.execution_complete" => {
+            let result = data.get("result");
+            let detailed = result
+                .and_then(|result| result.get("detailedContent"))
+                .and_then(Value::as_str)
+                .or_else(|| {
+                    result
+                        .and_then(|result| result.get("content"))
+                        .and_then(Value::as_str)
+                });
+            let invocation_chunk = invocation
+                .filter(|invocation| invocation.output_metadata.byte_count == 0)
+                .and(detailed)
+                .filter(|chunk| !chunk.is_empty())
+                .map(str::to_owned);
+            let terminal_fallback = invocation_chunk.clone().or_else(|| {
+                invocation
+                    .map(|invocation| invocation.output.clone())
+                    .filter(|output| !output.is_empty())
+            });
+            let mut updates = vec![OutputStreamUpdate {
+                kind: OutputStreamKind::Invocation,
+                identity: call_id.to_owned(),
+                chunk: invocation_chunk,
+                complete: true,
+            }];
+            let shell_exit = result
+                .and_then(|result| result.get("contents"))
+                .and_then(Value::as_array)
+                .and_then(|contents| {
+                    contents.iter().find(|content| {
+                        content.get("type").and_then(Value::as_str) == Some("shell_exit")
+                    })
+                });
+            let shell_id = shell_exit
+                .and_then(|exit| exit.get("shellId"))
+                .and_then(Value::as_str)
+                .or_else(|| invocation.and_then(|invocation| invocation.shell_id.as_deref()));
+            if let Some(shell_id) = shell_id {
+                let terminal = activity.terminal(shell_id);
+                let preview = shell_exit
+                    .and_then(|exit| exit.get("outputPreview"))
+                    .and_then(Value::as_str);
+                let terminal_chunk = terminal
+                    .is_none_or(|terminal| terminal.output_metadata.byte_count == 0)
+                    .then(|| terminal_fallback.or_else(|| preview.map(str::to_owned)))
+                    .flatten()
+                    .filter(|chunk| !chunk.is_empty());
+                updates.push(OutputStreamUpdate {
+                    kind: OutputStreamKind::Terminal,
+                    identity: shell_id.to_owned(),
+                    chunk: terminal_chunk,
+                    complete: shell_exit.and_then(|exit| exit.get("exitCode")).is_some(),
+                });
+            }
+            updates
+        }
+        _ => Vec::new(),
+    }
+}
+
+impl ToolActivity {
+    pub fn set_output(
+        &mut self,
+        kind: OutputStreamKind,
+        identity: &str,
+        output: std::result::Result<(String, OutputMetadata), String>,
+    ) {
+        match kind {
+            OutputStreamKind::Invocation => {
+                if let Some(invocation) = self.invocation_mut(identity) {
+                    match output {
+                        Ok((output, metadata)) => {
+                            invocation.output = output;
+                            invocation.output_metadata = metadata;
+                            invocation.output_load_error = None;
+                            if !matches!(
+                                invocation.class,
+                                ToolClass::Shell | ToolClass::ShellControl
+                            ) {
+                                invocation.detailed_output = Some(invocation.output.clone());
+                            }
+                        }
+                        Err(error) => {
+                            invocation.output.clear();
+                            invocation.detailed_output = None;
+                            invocation.output_load_error = Some(error);
+                        }
+                    }
+                }
+            }
+            OutputStreamKind::Terminal => {
+                if let Some(terminal) = self.terminal_mut(identity) {
+                    match output {
+                        Ok((output, metadata)) => {
+                            terminal.output = output;
+                            terminal.output_metadata = metadata;
+                            terminal.output_load_error = None;
+                        }
+                        Err(error) => {
+                            terminal.output.clear();
+                            terminal.output_load_error = Some(error);
+                        }
+                    }
+                }
+            }
         }
     }
 }

@@ -143,7 +143,15 @@ at model time rather than at configuration time, the mode is set explicitly in
 
 `shell_exit` content carries `shellId`, `exitCode`, `cwd`, `outputPreview`, and
 `outputTruncated`. The preview is only used when nothing streamed, so it never
-duplicates output the UI already displayed.
+duplicates output the UI already displayed. If the runtime supplies only a
+truncated preview, the terminal reports that incompleteness explicitly.
+
+Streaming and fallback output is stored separately from `SessionSnapshot` in
+append-only `output_chunks`, indexed by app session, stream kind, stream
+identity, and chunk order. `output_streams` keeps bounded byte/chunk/completion
+metadata. Invocation streams use `toolCallId`; terminal streams use `shellId`.
+The storage API supports ordered chunk ranges so transcript virtualization can
+load windows later without changing the persistence format.
 
 ## Session filesystem interception
 

@@ -169,6 +169,12 @@ Together these made storage grow with the square of a session's length.
 Opening an older database prunes the superseded rows and vacuums. On the
 database above that returned 486 MB.
 
+Tool and terminal output also no longer lives in serialized snapshots. It is
+persisted once as ordered chunks with bounded stream metadata in the snapshot,
+then hydrated for the current non-virtualized UI. Existing event logs are
+backfilled during schema migration, preserving output that older snapshots had
+trimmed. Virtualized range loading remains separate follow-up work.
+
 ## Deleting a session
 
 Deleting used to leave several things behind. Events and snapshots cascaded

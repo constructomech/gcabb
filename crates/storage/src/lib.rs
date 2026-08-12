@@ -5,14 +5,14 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use app_model::{
-    DomainEvent, ProjectMetadata, SessionKind, SessionMetadata, SessionSnapshot, TitleSource,
-    rebuild,
+    DomainEvent, OutputMetadata, OutputStreamKind, OutputStreamUpdate, ProjectMetadata,
+    SessionKind, SessionMetadata, SessionSnapshot, TitleSource, ToolActivity, rebuild,
 };
 use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 7;
+const SCHEMA_VERSION: i64 = 8;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -24,6 +24,15 @@ pub enum StorageError {
     LockPoisoned,
     #[error("session not found: {0}")]
     SessionNotFound(String),
+    #[error(
+        "output stream {kind}/{identity} is incomplete: expected {expected} chunks, read {actual}"
+    )]
+    OutputIncomplete {
+        kind: &'static str,
+        identity: String,
+        expected: u64,
+        actual: u64,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, StorageError>;
@@ -35,6 +44,19 @@ pub struct Storage {
 pub struct RecoveredSession {
     pub state: SessionSnapshot,
     pub replayed_events: usize,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct OutputRange {
+    pub start_chunk: u64,
+    pub max_chunks: u64,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct OutputRead {
+    pub content: String,
+    pub metadata: OutputMetadata,
+    pub next_chunk: u64,
 }
 
 impl Storage {
@@ -227,7 +249,17 @@ impl Storage {
     }
 
     pub fn append_event(&self, event: &DomainEvent) -> Result<bool> {
-        let affected = self.connection()?.execute(
+        self.append_event_with_output(event, &[])
+    }
+
+    pub fn append_event_with_output(
+        &self,
+        event: &DomainEvent,
+        updates: &[OutputStreamUpdate],
+    ) -> Result<bool> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let affected = transaction.execute(
             "INSERT OR IGNORE INTO domain_events (
                 session_id, sequence, event_id, event_version, payload
              ) VALUES (?1, ?2, ?3, ?4, ?5)",
@@ -239,7 +271,15 @@ impl Storage {
                 serde_json::to_string(event)?,
             ],
         )?;
-        Ok(affected == 1)
+        if affected == 0 {
+            transaction.commit()?;
+            return Ok(false);
+        }
+        for update in updates {
+            Self::apply_output_update(&transaction, &event.session_id, event.sequence, update)?;
+        }
+        transaction.commit()?;
+        Ok(true)
     }
 
     /// Replace a session's snapshot.
@@ -307,10 +347,116 @@ impl Storage {
             })
             .collect::<Result<Vec<DomainEvent>>>()?;
         let replayed_events = events.len();
+        let mut state = rebuild(snapshot, events);
+        drop(statement);
+        drop(connection);
+        self.hydrate_output(&mut state);
         Ok(RecoveredSession {
-            state: rebuild(snapshot, events),
+            state,
             replayed_events,
         })
+    }
+
+    pub fn read_output(
+        &self,
+        session_id: &str,
+        kind: OutputStreamKind,
+        identity: &str,
+        range: OutputRange,
+    ) -> Result<OutputRead> {
+        let connection = self.connection()?;
+        let metadata = connection
+            .query_row(
+                "SELECT chunk_count, byte_count, complete
+                 FROM output_streams
+                 WHERE session_id = ?1 AND stream_kind = ?2 AND stream_id = ?3",
+                params![session_id, kind.as_str(), identity],
+                |row| {
+                    Ok(OutputMetadata {
+                        chunk_count: row.get(0)?,
+                        byte_count: row.get(1)?,
+                        complete: row.get(2)?,
+                    })
+                },
+            )
+            .optional()?
+            .unwrap_or_default();
+        let mut statement = connection.prepare(
+            "SELECT content FROM output_chunks
+             WHERE session_id = ?1 AND stream_kind = ?2 AND stream_id = ?3
+               AND chunk_index >= ?4
+             ORDER BY chunk_index
+             LIMIT ?5",
+        )?;
+        let chunks = statement.query_map(
+            params![
+                session_id,
+                kind.as_str(),
+                identity,
+                range.start_chunk,
+                range.max_chunks
+            ],
+            |row| row.get::<_, String>(0),
+        )?;
+        let mut content = String::new();
+        let mut read = 0u64;
+        for chunk in chunks {
+            content.push_str(&chunk?);
+            read += 1;
+        }
+        let expected = metadata
+            .chunk_count
+            .saturating_sub(range.start_chunk)
+            .min(range.max_chunks);
+        if read != expected {
+            return Err(StorageError::OutputIncomplete {
+                kind: kind.as_str(),
+                identity: identity.to_owned(),
+                expected,
+                actual: read,
+            });
+        }
+        Ok(OutputRead {
+            content,
+            metadata,
+            next_chunk: range.start_chunk + read,
+        })
+    }
+
+    fn hydrate_output(&self, snapshot: &mut SessionSnapshot) {
+        let session_id = snapshot.metadata.id.clone();
+        let invocations: Vec<String> = snapshot
+            .tool_activity
+            .invocations
+            .iter()
+            .map(|invocation| invocation.call_id.clone())
+            .collect();
+        let terminals: Vec<String> = snapshot
+            .tool_activity
+            .terminals
+            .iter()
+            .map(|terminal| terminal.shell_id.clone())
+            .collect();
+        for (kind, identities) in [
+            (OutputStreamKind::Invocation, invocations),
+            (OutputStreamKind::Terminal, terminals),
+        ] {
+            for identity in identities {
+                let output = self
+                    .read_output(
+                        &session_id,
+                        kind,
+                        &identity,
+                        OutputRange {
+                            start_chunk: 0,
+                            max_chunks: i64::MAX as u64,
+                        },
+                    )
+                    .map(|read| (read.content, read.metadata))
+                    .map_err(|error| error.to_string());
+                snapshot.tool_activity.set_output(kind, &identity, output);
+            }
+        }
     }
 
     pub fn record_diagnostic(&self, event: &DiagnosticEvent) -> Result<()> {
@@ -341,8 +487,14 @@ impl Storage {
         Ok(())
     }
 
+    #[allow(
+        clippy::too_many_lines,
+        reason = "schema creation and backfill must remain in one migration transaction"
+    )]
     fn migrate(&self) -> Result<()> {
         let mut connection = self.connection()?;
+        let previous_version: i64 =
+            connection.query_row("PRAGMA user_version", [], |row| row.get(0))?;
         let transaction = connection.transaction()?;
         transaction.execute_batch(
             "CREATE TABLE IF NOT EXISTS projects (
@@ -384,6 +536,30 @@ impl Storage {
                 payload TEXT NOT NULL,
                 PRIMARY KEY(session_id, sequence)
              );
+             CREATE TABLE IF NOT EXISTS output_streams (
+                session_id TEXT NOT NULL REFERENCES app_sessions(id) ON DELETE CASCADE,
+                stream_kind TEXT NOT NULL,
+                stream_id TEXT NOT NULL,
+                chunk_count INTEGER NOT NULL DEFAULT 0,
+                byte_count INTEGER NOT NULL DEFAULT 0,
+                complete INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(session_id, stream_kind, stream_id)
+             );
+             CREATE TABLE IF NOT EXISTS output_chunks (
+                session_id TEXT NOT NULL,
+                stream_kind TEXT NOT NULL,
+                stream_id TEXT NOT NULL,
+                chunk_index INTEGER NOT NULL,
+                event_sequence INTEGER NOT NULL,
+                byte_count INTEGER NOT NULL,
+                content TEXT NOT NULL,
+                PRIMARY KEY(session_id, stream_kind, stream_id, chunk_index),
+                FOREIGN KEY(session_id, stream_kind, stream_id)
+                    REFERENCES output_streams(session_id, stream_kind, stream_id)
+                    ON DELETE CASCADE
+             );
+             CREATE INDEX IF NOT EXISTS output_chunks_event
+                ON output_chunks(session_id, event_sequence);
              CREATE TABLE IF NOT EXISTS diagnostics (
                 id INTEGER PRIMARY KEY AUTOINCREMENT,
                 timestamp TEXT NOT NULL,
@@ -409,6 +585,9 @@ impl Storage {
             "title_source",
             "TEXT NOT NULL DEFAULT 'manual'",
         )?;
+        if previous_version < 8 {
+            Self::backfill_output_streams(&transaction)?;
+        }
         // Earlier builds kept every snapshot a session ever wrote, and each
         // one embedded the whole event log. Only the newest is ever read, so
         // the rest are discarded on open. One database shrank from 499 MB to
@@ -426,6 +605,93 @@ impl Storage {
         // it the pages freed above stay allocated to the file.
         if pruned > 0 {
             connection.execute_batch("VACUUM;")?;
+        }
+
+        Ok(())
+    }
+
+    fn apply_output_update(
+        transaction: &rusqlite::Transaction<'_>,
+        session_id: &str,
+        event_sequence: u64,
+        update: &OutputStreamUpdate,
+    ) -> Result<()> {
+        transaction.execute(
+            "INSERT INTO output_streams (
+                session_id, stream_kind, stream_id, chunk_count, byte_count, complete
+             ) VALUES (?1, ?2, ?3, 0, 0, ?4)
+             ON CONFLICT(session_id, stream_kind, stream_id) DO UPDATE SET
+                complete = output_streams.complete OR excluded.complete",
+            params![
+                session_id,
+                update.kind.as_str(),
+                update.identity,
+                update.complete
+            ],
+        )?;
+        if let Some(chunk) = update.chunk.as_deref() {
+            let chunk_index: u64 = transaction.query_row(
+                "SELECT chunk_count FROM output_streams
+                 WHERE session_id = ?1 AND stream_kind = ?2 AND stream_id = ?3",
+                params![session_id, update.kind.as_str(), update.identity],
+                |row| row.get(0),
+            )?;
+            transaction.execute(
+                "INSERT INTO output_chunks (
+                    session_id, stream_kind, stream_id, chunk_index,
+                    event_sequence, byte_count, content
+                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                params![
+                    session_id,
+                    update.kind.as_str(),
+                    update.identity,
+                    chunk_index,
+                    event_sequence,
+                    chunk.len() as u64,
+                    chunk
+                ],
+            )?;
+            transaction.execute(
+                "UPDATE output_streams
+                 SET chunk_count = chunk_count + 1, byte_count = byte_count + ?4
+                 WHERE session_id = ?1 AND stream_kind = ?2 AND stream_id = ?3",
+                params![
+                    session_id,
+                    update.kind.as_str(),
+                    update.identity,
+                    chunk.len() as u64
+                ],
+            )?;
+        }
+        Ok(())
+    }
+
+    fn backfill_output_streams(transaction: &rusqlite::Transaction<'_>) -> Result<()> {
+        let session_ids = {
+            let mut statement = transaction.prepare("SELECT id FROM app_sessions ORDER BY id")?;
+            statement
+                .query_map([], |row| row.get::<_, String>(0))?
+                .collect::<std::result::Result<Vec<_>, _>>()?
+        };
+        for session_id in session_ids {
+            let payloads = {
+                let mut statement = transaction.prepare(
+                    "SELECT payload FROM domain_events
+                     WHERE session_id = ?1 ORDER BY sequence",
+                )?;
+                statement
+                    .query_map([&session_id], |row| row.get::<_, String>(0))?
+                    .collect::<std::result::Result<Vec<_>, _>>()?
+            };
+            let mut activity = ToolActivity::default();
+            for payload in payloads {
+                let event: DomainEvent = serde_json::from_str(&payload)?;
+                let updates = app_model::tools::output_updates(&activity, &event);
+                for update in &updates {
+                    Self::apply_output_update(transaction, &session_id, event.sequence, update)?;
+                }
+                app_model::tools::project(&mut activity, &event);
+            }
         }
         Ok(())
     }
@@ -483,6 +749,7 @@ mod tests {
     use app_model::DomainEvent;
     use serde_json::json;
     use tempfile::tempdir;
+    use test_harness::{LargeSessionConfig, large_session_events};
 
     use super::*;
 
@@ -549,6 +816,168 @@ mod tests {
         // The event log, not the snapshot, is where the events live.
         assert_eq!(storage.event_ids("app-session").unwrap().len(), 2);
         assert_eq!(recovered.state.status, app_model::SessionStatus::Idle);
+    }
+
+    #[test]
+    fn complete_large_output_survives_reopen_and_supports_chunk_ranges() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gcabb.db");
+        let chunk_bytes = 1_024;
+        let chunk_count = 300;
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage.upsert_session(&metadata()).unwrap();
+            let mut snapshot = SessionSnapshot::new(metadata());
+            for raw in large_session_events(LargeSessionConfig {
+                turns: 1,
+                output_chunks_per_turn: chunk_count,
+                output_chunk_bytes: chunk_bytes,
+            }) {
+                let event = DomainEvent::from_sdk_event_for(
+                    "app-session",
+                    snapshot.last_sequence + 1,
+                    &raw,
+                );
+                let updates = app_model::tools::output_updates(&snapshot.tool_activity, &event);
+                assert!(storage.append_event_with_output(&event, &updates).unwrap());
+                assert_eq!(snapshot.apply(event), app_model::ApplyOutcome::Applied);
+            }
+            storage.write_snapshot(&snapshot).unwrap();
+
+            let payload: String = storage
+                .connection()
+                .unwrap()
+                .query_row(
+                    "SELECT payload FROM snapshots WHERE session_id = 'app-session'",
+                    [],
+                    |row| row.get(0),
+                )
+                .unwrap();
+            assert!(
+                payload.len() < 32 * 1_024,
+                "snapshot embedded the large output: {} bytes",
+                payload.len()
+            );
+            assert!(!payload.contains(&"x".repeat(chunk_bytes)));
+        }
+
+        let storage = Storage::open(&path).unwrap();
+        let first = storage
+            .read_output(
+                "app-session",
+                OutputStreamKind::Invocation,
+                "call-0",
+                OutputRange {
+                    start_chunk: 0,
+                    max_chunks: 17,
+                },
+            )
+            .unwrap();
+        assert_eq!(first.content.len(), 17 * chunk_bytes);
+        assert_eq!(first.next_chunk, 17);
+        assert_eq!(first.metadata.chunk_count, chunk_count as u64);
+        assert_eq!(
+            first.metadata.byte_count,
+            (chunk_count * chunk_bytes) as u64
+        );
+        assert!(first.metadata.complete);
+
+        let recovered = storage.recover_session("app-session").unwrap();
+        let invocation = recovered.state.tool_activity.invocation("call-0").unwrap();
+        assert_eq!(invocation.output.len(), chunk_count * chunk_bytes);
+        assert_eq!(invocation.output_metadata, first.metadata);
+        assert!(invocation.output_load_error.is_none());
+        assert!(
+            !invocation.output.contains('\n'),
+            "fixture should exercise one long logical line"
+        );
+        let terminal = recovered.state.tool_activity.terminal("shell-0").unwrap();
+        assert_eq!(terminal.output, invocation.output);
+        assert_eq!(terminal.output_metadata, invocation.output_metadata);
+        assert_eq!(terminal.state, app_model::TerminalState::Exited);
+
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "DELETE FROM output_chunks
+                 WHERE session_id = 'app-session'
+                   AND stream_kind = 'invocation'
+                   AND stream_id = 'call-0'
+                   AND chunk_index = 42",
+                [],
+            )
+            .unwrap();
+        let recovered = storage.recover_session("app-session").unwrap();
+        let invocation = recovered.state.tool_activity.invocation("call-0").unwrap();
+        assert!(invocation.output.is_empty());
+        assert!(
+            invocation
+                .output_load_error
+                .as_deref()
+                .is_some_and(|error| error.contains("expected 300 chunks, read 299")),
+            "missing chunks were not surfaced: {:?}",
+            invocation.output_load_error
+        );
+    }
+
+    #[test]
+    fn completion_only_shell_output_survives_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gcabb.db");
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage.upsert_session(&metadata()).unwrap();
+            let mut snapshot = SessionSnapshot::new(metadata());
+            for raw in [
+                json!({
+                    "id": "start",
+                    "type": "tool.execution_start",
+                    "data": {
+                        "toolCallId": "call",
+                        "toolName": "bash",
+                        "arguments": {"command": "printf complete"},
+                        "shellToolInfo": {"displayCommand": "printf complete"}
+                    }
+                }),
+                json!({
+                    "id": "complete",
+                    "type": "tool.execution_complete",
+                    "data": {
+                        "toolCallId": "call",
+                        "success": true,
+                        "result": {
+                            "detailedContent": "complete output\n",
+                            "contents": [{
+                                "type": "shell_exit",
+                                "shellId": "shell",
+                                "exitCode": 0,
+                                "outputPreview": ""
+                            }]
+                        }
+                    }
+                }),
+            ] {
+                let event = DomainEvent::from_sdk_event_for(
+                    "app-session",
+                    snapshot.last_sequence + 1,
+                    &raw,
+                );
+                let updates = app_model::tools::output_updates(&snapshot.tool_activity, &event);
+                storage.append_event_with_output(&event, &updates).unwrap();
+                assert_eq!(snapshot.apply(event), app_model::ApplyOutcome::Applied);
+            }
+            storage.write_snapshot(&snapshot).unwrap();
+        }
+
+        let storage = Storage::open(&path).unwrap();
+        let recovered = storage.recover_session("app-session").unwrap();
+        let invocation = recovered.state.tool_activity.invocation("call").unwrap();
+        let terminal = recovered.state.tool_activity.terminal("shell").unwrap();
+        assert_eq!(invocation.output, "complete output\n");
+        assert_eq!(terminal.output, invocation.output);
+        assert!(invocation.output_metadata.complete);
+        assert!(terminal.output_metadata.complete);
     }
 
     /// A session keeps one snapshot, not one per event. Retaining every

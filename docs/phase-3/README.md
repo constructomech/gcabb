@@ -89,9 +89,13 @@ that:
 - A `shell_exit` content block sets the exit code and moves the terminal to
   `Exited`. A later read cannot resurrect an exited shell.
 
-Output is mirrored into both the invocation and its terminal, bounded to
-`MAX_RETAINED_OUTPUT` with front trimming on a character boundary, and flagged
-via `output_truncated` when trimming occurs.
+Output is mirrored into both the invocation and its terminal without trimming.
+Each stream is persisted as ordered chunks keyed by app session plus tool-call
+or shell identity. Snapshots carry only byte/chunk counts and completion state;
+display content is loaded from the chunk store after recovery. Range reads are
+available for later transcript virtualization, while the current UI still
+renders bounded tails. Storage or runtime-preview failures are shown explicitly
+instead of presenting incomplete output as complete.
 
 ## Changes view
 
@@ -126,7 +130,7 @@ A session inspector panel beside the transcript exposes three tabs:
 - **Changes** — changed-file list with per-file insertions and deletions, and
   the unified diff for the selected file.
 - **Terminals** — one card per `shellId` with command, state, exit code,
-  contributing call count, and a bounded output tail.
+  contributing call count, persisted output size, and a bounded display tail.
 - **Capabilities** — per-capability status and detail, plus recent tool
   failures with their structured error codes.
 

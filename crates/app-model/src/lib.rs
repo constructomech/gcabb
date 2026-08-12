@@ -11,14 +11,15 @@ pub mod tools;
 pub use capability::{Capability, CapabilityId, CapabilityReport, CapabilityStatus};
 pub use changes::{ChangeStage, ChangeStatus, ChangedFile, ChangesView, DiffStats};
 pub use tools::{
-    InvocationState, TerminalSession, TerminalState, ToolActivity, ToolCatalog, ToolClass,
-    ToolDescriptor, ToolInvocation, ToolSource,
+    InvocationState, OutputMetadata, OutputStreamKind, OutputStreamUpdate, TerminalSession,
+    TerminalState, ToolActivity, ToolCatalog, ToolClass, ToolDescriptor, ToolInvocation,
+    ToolSource,
 };
 
 pub const DOMAIN_EVENT_VERSION: u16 = 1;
 /// Version 5 drops the embedded event log, which duplicated `domain_events`
 /// and made every snapshot grow with the length of the session.
-pub const SNAPSHOT_VERSION: u16 = 5;
+pub const SNAPSHOT_VERSION: u16 = 6;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]

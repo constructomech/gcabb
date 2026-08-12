@@ -6052,6 +6052,7 @@ dependencies = [
  "rusqlite",
  "serde_json",
  "tempfile",
+ "test-harness",
  "thiserror 2.0.20",
 ]
 
