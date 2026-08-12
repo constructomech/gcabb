@@ -16,6 +16,26 @@ use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+/// Maximum byte size of one persisted output chunk.
+pub const OUTPUT_CHUNK_BYTES: usize = 16 * 1_024;
+
+/// Split output on UTF-8 boundaries so one large runtime event cannot bypass
+/// bounded restore windows.
+#[must_use]
+pub fn persisted_output_chunks(output: &str) -> Vec<&str> {
+    let mut chunks = Vec::new();
+    let mut start = 0;
+    while start < output.len() {
+        let mut end = (start + OUTPUT_CHUNK_BYTES).min(output.len());
+        while !output.is_char_boundary(end) {
+            end -= 1;
+        }
+        chunks.push(&output[start..end]);
+        start = end;
+    }
+    chunks
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, Hash, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum OutputStreamKind {
@@ -48,6 +68,8 @@ pub struct OutputStreamUpdate {
     pub kind: OutputStreamKind,
     pub identity: String,
     pub chunk: Option<String>,
+    /// Replace provisional chunks with authoritative completion output.
+    pub replace: bool,
     pub complete: bool,
 }
 
@@ -261,6 +283,9 @@ pub struct ToolInvocation {
     /// snapshot itself.
     #[serde(default)]
     last_partial_delivery: Option<PartialOutputDelivery>,
+    /// Whether the runtime marked its streaming preview as incomplete.
+    #[serde(default)]
+    output_was_dropped: bool,
     /// Full detailed result retained for UI display, notably edit diffs.
     #[serde(skip)]
     pub detailed_output: Option<String>,
@@ -588,8 +613,37 @@ impl ToolActivity {
 
 fn append_output(target: &mut String, metadata: &mut OutputMetadata, chunk: &str) {
     target.push_str(chunk);
-    metadata.chunk_count += 1;
+    metadata.chunk_count += persisted_output_chunks(chunk).len() as u64;
     metadata.byte_count += chunk.len() as u64;
+}
+
+fn replace_output(target: &mut String, metadata: &mut OutputMetadata, output: &str) {
+    target.clear();
+    metadata.chunk_count = 0;
+    metadata.byte_count = 0;
+    append_output(target, metadata, output);
+}
+
+fn is_dropped_output_marker(line: &str) -> bool {
+    let line = line.trim();
+    line.starts_with("<output too long - dropped ") && line.ends_with('>')
+}
+
+fn contains_dropped_output_marker(output: &str) -> bool {
+    output.lines().any(is_dropped_output_marker)
+}
+
+fn without_dropped_output_marker(output: &str) -> (String, bool) {
+    let mut cleaned = String::with_capacity(output.len());
+    let mut dropped = false;
+    for segment in output.split_inclusive('\n') {
+        if is_dropped_output_marker(segment.trim_end_matches(['\r', '\n'])) {
+            dropped = true;
+        } else {
+            cleaned.push_str(segment);
+        }
+    }
+    (cleaned, dropped)
 }
 
 fn partial_output_delivery(event: &crate::DomainEvent) -> Option<PartialOutputDelivery> {
@@ -737,6 +791,7 @@ fn project_start(activity: &mut ToolActivity, event: &crate::DomainEvent) {
         output_error: None,
         output_load_error: None,
         last_partial_delivery: None,
+        output_was_dropped: false,
         detailed_output: None,
         error_code: None,
         error_message: None,
@@ -751,7 +806,7 @@ fn project_start(activity: &mut ToolActivity, event: &crate::DomainEvent) {
         let terminal = activity.ensure_terminal(&shell_id, &event.timestamp);
         terminal.updated_at.clone_from(&event.timestamp);
         if !terminal.tool_call_ids.contains(&call_id) {
-            terminal.tool_call_ids.push(call_id);
+            terminal.tool_call_ids.push(call_id.clone());
         }
         if terminal.command.is_none() {
             terminal.command = display_command;
@@ -775,14 +830,18 @@ fn project_partial(activity: &mut ToolActivity, event: &crate::DomainEvent) {
         return;
     }
     let delivery = partial_output_delivery(event);
+    let (chunk, output_was_dropped) = without_dropped_output_marker(chunk);
 
     let mut shell_id = None;
     if let Some(invocation) = activity.invocation_mut(call_id) {
-        append_output(
-            &mut invocation.output,
-            &mut invocation.output_metadata,
-            chunk,
-        );
+        if !chunk.is_empty() {
+            append_output(
+                &mut invocation.output,
+                &mut invocation.output_metadata,
+                &chunk,
+            );
+        }
+        invocation.output_was_dropped |= output_was_dropped;
         if delivery.is_some() {
             invocation.last_partial_delivery.clone_from(&delivery);
         }
@@ -794,7 +853,9 @@ fn project_partial(activity: &mut ToolActivity, event: &crate::DomainEvent) {
     if let Some(shell_id) = shell_id
         && let Some(terminal) = activity.terminal_mut(&shell_id)
     {
-        append_output(&mut terminal.output, &mut terminal.output_metadata, chunk);
+        if !chunk.is_empty() {
+            append_output(&mut terminal.output, &mut terminal.output_metadata, &chunk);
+        }
         terminal.updated_at.clone_from(&event.timestamp);
     }
 }
@@ -842,15 +903,35 @@ fn project_complete(activity: &mut ToolActivity, event: &crate::DomainEvent) {
             InvocationState::Failed
         };
         invocation.completed_at = Some(event.timestamp.clone());
-        if invocation.output.is_empty()
-            && let Some(detailed) = detailed
-        {
-            append_output(
-                &mut invocation.output,
-                &mut invocation.output_metadata,
-                &detailed,
-            );
+        let mut output_replaced = false;
+        let mut completion_suffix = None;
+        let provisional_output = invocation.output.clone();
+        if let Some(detailed) = detailed {
+            if invocation.output_was_dropped && !contains_dropped_output_marker(&detailed) {
+                completion_suffix = detailed
+                    .strip_prefix(&provisional_output)
+                    .filter(|suffix| !suffix.is_empty())
+                    .map(str::to_owned);
+                replace_output(
+                    &mut invocation.output,
+                    &mut invocation.output_metadata,
+                    &detailed,
+                );
+                invocation.output_start_chunk = 0;
+                invocation.output_was_dropped = false;
+                output_replaced = true;
+            } else if invocation.output.is_empty() {
+                append_output(
+                    &mut invocation.output,
+                    &mut invocation.output_metadata,
+                    &detailed,
+                );
+            }
             invocation.detailed_output = Some(detailed);
+        }
+        if invocation.output_was_dropped {
+            invocation.output_error =
+                Some("Runtime did not supply complete output after truncating its preview.".into());
         }
         invocation.output_metadata.complete = true;
         invocation.error_code = error
@@ -884,13 +965,37 @@ fn project_complete(activity: &mut ToolActivity, event: &crate::DomainEvent) {
                         .and_then(Value::as_bool)
                         .unwrap_or(false),
                     invocation.output.clone(),
+                    output_replaced,
+                    provisional_output,
+                    completion_suffix,
                 ));
             }
+        } else if let Some(shell_id) = invocation.shell_id.clone() {
+            terminal_update = Some((
+                shell_id,
+                None,
+                None,
+                None,
+                false,
+                invocation.output.clone(),
+                output_replaced,
+                provisional_output,
+                completion_suffix,
+            ));
         }
     }
 
-    if let Some((shell_id, exit_code, cwd, preview, preview_truncated, invocation_output)) =
-        terminal_update
+    if let Some((
+        shell_id,
+        exit_code,
+        cwd,
+        preview,
+        preview_truncated,
+        invocation_output,
+        invocation_output_replaced,
+        provisional_output,
+        completion_suffix,
+    )) = terminal_update
     {
         let call_id = call_id.to_owned();
         let timestamp = event.timestamp.clone();
@@ -908,11 +1013,39 @@ fn project_complete(activity: &mut ToolActivity, event: &crate::DomainEvent) {
             terminal.cwd = cwd;
         }
         if !terminal.tool_call_ids.contains(&call_id) {
-            terminal.tool_call_ids.push(call_id);
+            terminal.tool_call_ids.push(call_id.clone());
         }
         // Only fall back to the preview when nothing streamed, otherwise the
         // preview would duplicate output already shown.
-        if terminal.output.is_empty() {
+        let authoritative_output = (invocation_output_replaced
+            && !invocation_output.is_empty()
+            && terminal.tool_call_ids.len() == 1
+            && terminal.tool_call_ids[0] == call_id)
+            .then_some(invocation_output.as_str());
+        if let Some(authoritative_output) = authoritative_output
+            && terminal.output != authoritative_output
+        {
+            replace_output(
+                &mut terminal.output,
+                &mut terminal.output_metadata,
+                authoritative_output,
+            );
+            terminal.output_start_chunk = 0;
+            terminal.output_error = None;
+        } else if invocation_output_replaced
+            && let Some(completion_suffix) = completion_suffix
+            && terminal.output.ends_with(&provisional_output)
+        {
+            append_output(
+                &mut terminal.output,
+                &mut terminal.output_metadata,
+                &completion_suffix,
+            );
+            terminal.output_error = None;
+        } else if invocation_output_replaced && terminal.tool_call_ids.len() > 1 {
+            terminal.output_error =
+                Some("Complete output is available in the command's transcript entry.".into());
+        } else if terminal.output.is_empty() {
             if !invocation_output.is_empty() {
                 append_output(
                     &mut terminal.output,
@@ -960,6 +1093,7 @@ pub fn output_updates(
                 kind: OutputStreamKind::Invocation,
                 identity: call_id.to_owned(),
                 chunk: None,
+                replace: false,
                 complete: false,
             }];
             if let Some(shell_id) = data
@@ -971,6 +1105,7 @@ pub fn output_updates(
                     kind: OutputStreamKind::Terminal,
                     identity: shell_id.to_owned(),
                     chunk: None,
+                    replace: false,
                     complete: false,
                 });
             }
@@ -987,10 +1122,15 @@ pub fn output_updates(
             else {
                 return Vec::new();
             };
+            let (chunk, _) = without_dropped_output_marker(chunk);
+            if chunk.is_empty() {
+                return Vec::new();
+            }
             let mut updates = vec![OutputStreamUpdate {
                 kind: OutputStreamKind::Invocation,
                 identity: call_id.to_owned(),
-                chunk: Some(chunk.to_owned()),
+                chunk: Some(chunk.clone()),
+                replace: false,
                 complete: false,
             }];
             if let Some(shell_id) = invocation.and_then(|invocation| invocation.shell_id.as_deref())
@@ -998,7 +1138,8 @@ pub fn output_updates(
                 updates.push(OutputStreamUpdate {
                     kind: OutputStreamKind::Terminal,
                     identity: shell_id.to_owned(),
-                    chunk: Some(chunk.to_owned()),
+                    chunk: Some(chunk),
+                    replace: false,
                     complete: false,
                 });
             }
@@ -1014,11 +1155,27 @@ pub fn output_updates(
                         .and_then(|result| result.get("content"))
                         .and_then(Value::as_str)
                 });
-            let invocation_chunk = invocation
-                .filter(|invocation| invocation.output_metadata.byte_count == 0)
-                .and(detailed)
-                .filter(|chunk| !chunk.is_empty())
+            let invocation_replacement = invocation
+                .zip(detailed)
+                .filter(|(invocation, detailed)| {
+                    invocation.output_was_dropped && !contains_dropped_output_marker(detailed)
+                })
+                .map(|(_, detailed)| detailed.to_owned());
+            let invocation_suffix = invocation
+                .zip(detailed)
+                .filter(|(invocation, detailed)| {
+                    invocation.output_was_dropped && !contains_dropped_output_marker(detailed)
+                })
+                .and_then(|(invocation, detailed)| detailed.strip_prefix(&invocation.output))
+                .filter(|suffix| !suffix.is_empty())
                 .map(str::to_owned);
+            let invocation_chunk = invocation_replacement.clone().or_else(|| {
+                invocation
+                    .filter(|invocation| invocation.output_metadata.byte_count == 0)
+                    .and(detailed)
+                    .filter(|chunk| !chunk.is_empty())
+                    .map(str::to_owned)
+            });
             let terminal_fallback = invocation_chunk.clone().or_else(|| {
                 invocation
                     .map(|invocation| invocation.output.clone())
@@ -1028,6 +1185,7 @@ pub fn output_updates(
                 kind: OutputStreamKind::Invocation,
                 identity: call_id.to_owned(),
                 chunk: invocation_chunk,
+                replace: invocation_replacement.is_some(),
                 complete: true,
             }];
             let shell_exit = result
@@ -1050,12 +1208,32 @@ pub fn output_updates(
                 let terminal_chunk = terminal
                     .is_none_or(|terminal| terminal.output_metadata.byte_count == 0)
                     .then(|| terminal_fallback.or_else(|| preview.map(str::to_owned)))
-                    .flatten()
-                    .filter(|chunk| !chunk.is_empty());
+                    .flatten();
+                let terminal_replacement = terminal
+                    .filter(|terminal| {
+                        terminal.tool_call_ids.len() == 1 && terminal.tool_call_ids[0] == call_id
+                    })
+                    .and_then(|terminal| {
+                        invocation_replacement
+                            .as_ref()
+                            .filter(|output| terminal.output.as_str() != output.as_str())
+                            .cloned()
+                    });
+                let terminal_append = terminal
+                    .filter(|terminal| terminal.tool_call_ids.len() > 1)
+                    .filter(|terminal| {
+                        invocation
+                            .is_some_and(|invocation| terminal.output.ends_with(&invocation.output))
+                    })
+                    .and(invocation_suffix);
                 updates.push(OutputStreamUpdate {
                     kind: OutputStreamKind::Terminal,
                     identity: shell_id.to_owned(),
-                    chunk: terminal_chunk,
+                    chunk: terminal_replacement
+                        .clone()
+                        .or(terminal_append)
+                        .or(terminal_chunk),
+                    replace: terminal_replacement.is_some(),
                     complete: shell_exit.and_then(|exit| exit.get("exitCode")).is_some(),
                 });
             }
