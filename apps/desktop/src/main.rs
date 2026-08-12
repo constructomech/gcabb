@@ -5306,21 +5306,18 @@ impl SessionMvpView {
         }
         let cards = terminals.iter().rev().take(12).map(|terminal| {
             let (state_label, state_color) = terminal_state_display(terminal.state);
+            let command = terminal_title(terminal);
+            let aria_label = format!("{command}, {state_label}");
             let exit = terminal
                 .exit_code
                 .map_or_else(String::new, |code| format!(" · exit {code}"));
-            let command = terminal
-                .command
-                .clone()
-                .unwrap_or_else(|| "(command unavailable)".to_owned());
             div()
                 .id(SharedString::from(format!(
                     "terminal-{}",
                     terminal.shell_id
                 )))
-                .accessibility_id(terminal.shell_id.clone())
                 .role(Role::Group)
-                .aria_label(format!("Shell {} {state_label}", terminal.shell_id))
+                .aria_label(aria_label)
                 .flex()
                 .flex_col()
                 .gap_1()
@@ -5350,8 +5347,7 @@ impl SessionMvpView {
                         ),
                 )
                 .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                    "shell {} · {} call(s) · {} bytes in {} chunk(s)",
-                    terminal.shell_id,
+                    "{} call(s) · {} bytes in {} chunk(s)",
                     terminal.tool_call_ids.len(),
                     terminal.output_metadata.byte_count,
                     terminal.output_metadata.chunk_count
@@ -6384,10 +6380,17 @@ fn terminal_tail(output: &str) -> String {
 
 fn terminal_state_display(state: app_model::TerminalState) -> (&'static str, u32) {
     match state {
-        app_model::TerminalState::Running => ("running", GREEN),
-        app_model::TerminalState::Exited => ("exited", MUTED),
-        app_model::TerminalState::Cancelled => ("cancelled", RED),
+        app_model::TerminalState::Running => ("Still running", GREEN),
+        app_model::TerminalState::Exited => ("Completed", MUTED),
+        app_model::TerminalState::Cancelled => ("Interrupted", RED),
     }
+}
+
+fn terminal_title(terminal: &app_model::TerminalSession) -> String {
+    terminal
+        .command
+        .clone()
+        .unwrap_or_else(|| "Shell command".to_owned())
 }
 
 fn terminal_output_error(terminal: &app_model::TerminalSession) -> Option<String> {

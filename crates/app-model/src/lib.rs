@@ -1767,6 +1767,50 @@ mod tests {
         assert!(invocation.multiline_summary().is_none());
     }
 
+    #[test]
+    fn shell_control_summaries_do_not_expose_internal_shell_ids() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"read_bash",
+                                "arguments":{"shellId":"internal-shell-37"}}})],
+        );
+
+        let invocation = state.tool_activity.invocation("c1").expect("invocation");
+        assert_eq!(invocation.summary(), "Check command output");
+        assert!(!invocation.summary().contains("internal-shell-37"));
+    }
+
+    #[test]
+    fn shell_control_summaries_reuse_the_commands_human_readable_description() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"start","type":"tool.execution_start",
+                       "data":{"toolCallId":"c1","toolName":"bash",
+                               "arguments":{"command":"./scripts/self-dev.sh run",
+                                            "description":"Building and launching GCABB",
+                                            "shellId":"internal-shell-37"}}}),
+                json!({"id":"read","type":"tool.execution_start",
+                       "data":{"toolCallId":"c2","toolName":"read_bash",
+                               "arguments":{"shellId":"internal-shell-37"}}}),
+            ],
+        );
+
+        let terminal = state
+            .tool_activity
+            .terminal("internal-shell-37")
+            .expect("terminal");
+        let read = state.tool_activity.invocation("c2").expect("invocation");
+        assert_eq!(
+            terminal.command.as_deref(),
+            Some("Building and launching GCABB")
+        );
+        assert_eq!(read.summary(), "Building and launching GCABB");
+    }
+
     /// Very long single-line targets are truncated rather than wrapped.
     #[test]
     fn long_targets_are_truncated_in_the_header() {
