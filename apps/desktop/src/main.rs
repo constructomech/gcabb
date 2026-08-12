@@ -4317,40 +4317,64 @@ impl SessionMvpView {
                 MarkdownNode::Text(text) | MarkdownNode::Code(text) | MarkdownNode::Html(text) => {
                     let is_code = matches!(node, MarkdownNode::Code(_));
                     let link = style.link.clone();
-                    let element_id =
-                        SharedString::from(format!("markdown-{message_id}-{}", *element_index));
-                    *element_index += 1;
-                    elements.push(
-                        div()
-                            .id(element_id)
-                            .min_w_0()
-                            .when(style.has(MARKDOWN_STRONG), |text| {
-                                text.font_weight(gpui::FontWeight::BOLD)
-                            })
-                            .when(style.has(MARKDOWN_EMPHASIS), gpui::Styled::italic)
-                            .when(
-                                style.has(MARKDOWN_STRIKETHROUGH),
-                                gpui::Styled::line_through,
-                            )
-                            .when(is_code, |text| {
-                                text.px_1()
-                                    .rounded_sm()
-                                    .bg(rgb(SUBTLE))
-                                    .font_family(".ZedMono")
-                            })
-                            .when(link.is_some(), |text| {
-                                text.text_color(rgb(BLUE))
-                                    .underline()
-                                    .hover(gpui::Styled::cursor_pointer)
-                            })
-                            .when_some(link, |text, target| {
-                                text.on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.open_url(&target);
-                                }))
-                            })
-                            .child(text.clone())
-                            .into_any_element(),
-                    );
+                    // Code/HTML runs (and link labels, which must stay intact
+                    // for click targets to make sense) render as a single
+                    // flex item. Plain text is split into individual words so
+                    // the wrapping flex container can reflow it word-by-word
+                    // like normal inline text, instead of treating the whole
+                    // run as one atomic block that jumps to the next line
+                    // wholesale whenever it doesn't fit the remaining space
+                    // (which is what produced the spurious line breaks right
+                    // after short inline elements like bolded links).
+                    let words: Vec<&str> = if is_code || link.is_some() {
+                        vec![text.as_str()]
+                    } else {
+                        text.split(' ').collect()
+                    };
+                    let word_count = words.len();
+                    for (word_index, word) in words.into_iter().enumerate() {
+                        if word_index > 0 {
+                            elements.push(div().child(" ").into_any_element());
+                        }
+                        if word.is_empty() && word_count > 1 {
+                            continue;
+                        }
+                        let element_id =
+                            SharedString::from(format!("markdown-{message_id}-{}", *element_index));
+                        *element_index += 1;
+                        let link = link.clone();
+                        elements.push(
+                            div()
+                                .id(element_id)
+                                .min_w_0()
+                                .when(style.has(MARKDOWN_STRONG), |text| {
+                                    text.font_weight(gpui::FontWeight::BOLD)
+                                })
+                                .when(style.has(MARKDOWN_EMPHASIS), gpui::Styled::italic)
+                                .when(
+                                    style.has(MARKDOWN_STRIKETHROUGH),
+                                    gpui::Styled::line_through,
+                                )
+                                .when(is_code, |text| {
+                                    text.px_1()
+                                        .rounded_sm()
+                                        .bg(rgb(SUBTLE))
+                                        .font_family(".ZedMono")
+                                })
+                                .when(link.is_some(), |text| {
+                                    text.text_color(rgb(BLUE))
+                                        .underline()
+                                        .hover(gpui::Styled::cursor_pointer)
+                                })
+                                .when_some(link, |text, target| {
+                                    text.on_click(cx.listener(move |_, _, _, cx| {
+                                        cx.open_url(&target);
+                                    }))
+                                })
+                                .child(word.to_owned())
+                                .into_any_element(),
+                        );
+                    }
                 }
                 MarkdownNode::SoftBreak => {
                     elements.push(div().child(" ").into_any_element());
