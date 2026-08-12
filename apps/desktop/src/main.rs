@@ -19,8 +19,8 @@ use gpui::{
     App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, FollowMode,
     InteractiveElement, IntoElement, KeyBinding, ListAlignment, ListState, MouseButton,
     ParentElement, PathPromptOptions, Render, Role, SharedString, StatefulInteractiveElement,
-    Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, list, px, rgb,
-    size,
+    Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, list, px, relative,
+    rgb, size,
 };
 use session_manager::{
     CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, SessionRoots,
@@ -4317,12 +4317,37 @@ impl SessionMvpView {
                 MarkdownNode::Text(text) | MarkdownNode::Code(text) | MarkdownNode::Html(text) => {
                     let is_code = matches!(node, MarkdownNode::Code(_));
                     let link = style.link.clone();
-                    let element_id =
-                        SharedString::from(format!("markdown-{message_id}-{}", *element_index));
-                    *element_index += 1;
-                    elements.push(
-                        div()
-                            .id(element_id)
+                    // Code/HTML runs (and link labels, which must stay intact
+                    // for click targets to make sense) render as a single
+                    // flex item. Plain text is split into individual words so
+                    // the wrapping flex container can reflow it word-by-word
+                    // like normal inline text, instead of treating the whole
+                    // run as one atomic block that jumps to the next line
+                    // wholesale whenever it doesn't fit the remaining space
+                    // (which is what produced the spurious line breaks right
+                    // after short inline elements like bolded links).
+                    let words: Vec<&str> = if is_code || link.is_some() {
+                        vec![text.as_str()]
+                    } else {
+                        text.split(' ').collect()
+                    };
+                    let word_count = words.len();
+                    for (word_index, word) in words.into_iter().enumerate() {
+                        if word_index > 0 {
+                            elements.push(div().child(" ").into_any_element());
+                        }
+                        if word.is_empty() && word_count > 1 {
+                            continue;
+                        }
+                        let link = link.clone();
+                        // `.id()` allocates a `SharedString` and is only
+                        // needed for elements with interactive/stateful
+                        // behavior (here, link click handling). Plain prose
+                        // and code words are stateless, so skip the id and
+                        // its allocation for them -- this matters once
+                        // per-word splitting is in play, since a long
+                        // message can produce hundreds of word elements.
+                        let base = div()
                             .min_w_0()
                             .when(style.has(MARKDOWN_STRONG), |text| {
                                 text.font_weight(gpui::FontWeight::BOLD)
@@ -4338,19 +4363,25 @@ impl SessionMvpView {
                                     .bg(rgb(SUBTLE))
                                     .font_family(".ZedMono")
                             })
-                            .when(link.is_some(), |text| {
-                                text.text_color(rgb(BLUE))
-                                    .underline()
-                                    .hover(gpui::Styled::cursor_pointer)
-                            })
-                            .when_some(link, |text, target| {
-                                text.on_click(cx.listener(move |_, _, _, cx| {
+                            .child(word.to_owned());
+                        elements.push(if let Some(target) = link {
+                            let element_id = SharedString::from(format!(
+                                "markdown-{message_id}-{}",
+                                *element_index
+                            ));
+                            *element_index += 1;
+                            base.id(element_id)
+                                .text_color(rgb(BLUE))
+                                .underline()
+                                .hover(gpui::Styled::cursor_pointer)
+                                .on_click(cx.listener(move |_, _, _, cx| {
                                     cx.open_url(&target);
                                 }))
-                            })
-                            .child(text.clone())
-                            .into_any_element(),
-                    );
+                                .into_any_element()
+                        } else {
+                            base.into_any_element()
+                        });
+                    }
                 }
                 MarkdownNode::SoftBreak => {
                     elements.push(div().child(" ").into_any_element());
@@ -4784,6 +4815,51 @@ impl SessionMvpView {
         format!("{speaker}: {}", message.content)
     }
 
+    fn transcript_message_header(
+        message: &app_model::TranscriptMessage,
+        is_user: bool,
+        markdown_source: String,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
+                    .child(if is_user { "You" } else { "Copilot" }),
+            )
+            .when(!message.content.is_empty(), |header| {
+                header.child(
+                    div()
+                        .id(SharedString::from(format!("copy-markdown-{}", message.id)))
+                        .debug_selector(|| "copy-markdown".to_owned())
+                        .role(Role::Button)
+                        .aria_label("Copy original markdown")
+                        .focusable()
+                        .tab_stop(true)
+                        .px_1()
+                        .rounded_sm()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("Copy")
+                        .hover(|style| {
+                            style
+                                .bg(rgb(SUBTLE))
+                                .text_color(rgb(PRIMARY))
+                                .cursor_pointer()
+                        })
+                        .on_click(cx.listener(move |_, _, _, cx| {
+                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
+                                markdown_source.clone(),
+                            ));
+                        })),
+                )
+            })
+    }
+
     fn transcript_message(
         &mut self,
         message: &app_model::TranscriptMessage,
@@ -4794,6 +4870,7 @@ impl SessionMvpView {
         let markdown_source = message.content.clone();
         let document = self.message_markdown(message);
         let markdown = Self::markdown_content(&message.id, &document, cx);
+        let header = Self::transcript_message_header(message, is_user, markdown_source, cx);
         div()
             .id(SharedString::from(format!("message-{}", message.id)))
             .accessibility_id(message.id.clone())
@@ -4806,55 +4883,23 @@ impl SessionMvpView {
             .child(
                 div()
                     .debug_selector(|| "transcript-message".to_owned())
-                    .w_full()
+                    .when(is_user, |bubble| {
+                        // User messages are capped narrower than the agent's
+                        // and pushed right by the parent's `justify_end`, so
+                        // they read as indented from the left edge and are
+                        // easy to spot while scrolling back through the
+                        // transcript, while staying right-aligned with the
+                        // agent's output below.
+                        bubble.max_w(relative(0.85))
+                    })
+                    .when(!is_user, gpui::Styled::w_full)
                     .min_w_0()
                     .p_3()
                     .rounded_lg()
                     .bg(if is_user { rgb(ELEVATED) } else { rgb(PANEL) })
                     .border_1()
                     .border_color(rgb(BORDER))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .justify_between()
-                            .child(
-                                div()
-                                    .text_xs()
-                                    .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
-                                    .child(if is_user { "You" } else { "Copilot" }),
-                            )
-                            .when(!message.content.is_empty(), |header| {
-                                header.child(
-                                    div()
-                                        .id(SharedString::from(format!(
-                                            "copy-markdown-{}",
-                                            message.id
-                                        )))
-                                        .debug_selector(|| "copy-markdown".to_owned())
-                                        .role(Role::Button)
-                                        .aria_label("Copy original markdown")
-                                        .focusable()
-                                        .tab_stop(true)
-                                        .px_1()
-                                        .rounded_sm()
-                                        .text_xs()
-                                        .text_color(rgb(MUTED))
-                                        .child("Copy")
-                                        .hover(|style| {
-                                            style
-                                                .bg(rgb(SUBTLE))
-                                                .text_color(rgb(PRIMARY))
-                                                .cursor_pointer()
-                                        })
-                                        .on_click(cx.listener(move |_, _, _, cx| {
-                                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                                markdown_source.clone(),
-                                            ));
-                                        })),
-                                )
-                            }),
-                    )
+                    .child(header)
                     .when(!message.content.is_empty(), |bubble| {
                         bubble.child(div().mt_2().text_color(rgb(PRIMARY)).child(markdown))
                     })
@@ -8874,6 +8919,39 @@ mod tests {
                 compact_composer.size.width < wide_composer.size.width,
                 "the column did not respond to the narrower window"
             );
+        }
+
+        #[gpui::test]
+        fn user_messages_are_narrower_and_right_aligned(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "user".to_owned(),
+                    role: app_model::TranscriptRole::User,
+                    content: "A user message with enough text to size the bubble.".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.simulate_resize(gpui::size(gpui::px(1_400.0), gpui::px(800.0)));
+            cx.run_until_parked();
+
+            let composer = cx.debug_bounds("composer").expect("composer rendered");
+            let message = cx
+                .debug_bounds("transcript-message")
+                .expect("user message rendered");
+            assert_eq!(message.right(), composer.right());
+            assert!(
+                message.size.width <= composer.size.width * 0.85,
+                "user message was not capped at 85%: {message:?} vs {composer:?}"
+            );
+            assert!(message.origin.x > composer.origin.x);
         }
 
         /// The command block is capped at a third of the entry budget, so a
