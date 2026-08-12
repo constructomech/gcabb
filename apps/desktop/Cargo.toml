@@ -16,6 +16,7 @@ gpui.workspace = true
 gpui_platform.workspace = true
 pulldown-cmark.workspace = true
 session-manager.workspace = true
+serde_json.workspace = true
 storage.workspace = true
 tokio.workspace = true
 tracing.workspace = true
@@ -23,7 +24,6 @@ ui-components.workspace = true
 updater.workspace = true
 
 [dev-dependencies]
-serde_json.workspace = true
 gpui = { workspace = true, features = ["test-support"] }
 session-manager = { workspace = true, features = ["test-support"] }
 tempfile.workspace = true

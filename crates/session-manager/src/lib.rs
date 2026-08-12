@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
     ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus, DomainEvent,
@@ -343,9 +343,80 @@ impl SessionManager {
     }
 
     pub async fn start(&self) -> Result<(ProviderCompatibility, RestoreReport)> {
+        let selected_session = self.selected_session()?;
+        self.start_with_restore_updates(selected_session.as_deref(), |_| {})
+            .await
+    }
+
+    /// Start the provider and restore sessions, publishing each usable handle
+    /// as soon as it is ready. The preferred session is restored first.
+    pub async fn start_with_restore_updates(
+        &self,
+        preferred_session: Option<&str>,
+        mut on_restored: impl FnMut(SessionHandle),
+    ) -> Result<(ProviderCompatibility, RestoreReport)> {
+        let started = Instant::now();
+        let provider_started = Instant::now();
         let compatibility = self.provider.start().await?;
-        let report = self.restore_sessions().await?;
+        let provider_ms = elapsed_ms(provider_started);
+        let restore_started = Instant::now();
+        let report = self
+            .restore_sessions(preferred_session, &mut on_restored)
+            .await?;
+        let restore_ms = elapsed_ms(restore_started);
+        self.diagnostics.record(DiagnosticEvent {
+            timestamp: timestamp(),
+            category: "session_manager".to_owned(),
+            operation: "startup".to_owned(),
+            elapsed_ms: Some(elapsed_ms(started)),
+            session_id: None,
+            success: true,
+            details: json!({
+                "providerMs": provider_ms,
+                "restoreMs": restore_ms,
+                "restoredSessions": report.restored.len(),
+                "failedSessions": report.failed.len()
+            }),
+        });
         Ok((compatibility, report))
+    }
+
+    /// Start the provider and restore only the preferred session.
+    ///
+    /// Remaining metadata is returned so the caller can hydrate it in a
+    /// background task without delaying command handling for the selected
+    /// session.
+    pub async fn start_preferred_session(
+        &self,
+        preferred_session: Option<&str>,
+        mut on_restored: impl FnMut(SessionHandle),
+    ) -> Result<(ProviderCompatibility, RestoreReport, Vec<SessionMetadata>)> {
+        let compatibility = self.provider.start().await?;
+        let mut sessions = self.storage.list_sessions()?;
+        let preferred = preferred_session.and_then(|id| {
+            sessions
+                .iter()
+                .position(|metadata| metadata.id == id)
+                .map(|index| sessions.remove(index))
+        });
+        let report = match preferred {
+            Some(metadata) => {
+                self.restore_metadata_sessions(vec![metadata], &mut on_restored)
+                    .await
+            }
+            None => RestoreReport::default(),
+        };
+        Ok((compatibility, report, sessions))
+    }
+
+    /// Restore a known metadata set, publishing each usable handle immediately.
+    pub async fn restore_remaining_sessions(
+        &self,
+        sessions: Vec<SessionMetadata>,
+        mut on_restored: impl FnMut(SessionHandle),
+    ) -> RestoreReport {
+        self.restore_metadata_sessions(sessions, &mut on_restored)
+            .await
     }
 
     pub async fn stop(&self) -> Result<()> {
@@ -488,6 +559,10 @@ impl SessionManager {
 
     pub fn projects(&self) -> Result<Vec<ProjectMetadata>> {
         self.storage.list_projects().map_err(Into::into)
+    }
+
+    pub fn session_metadata(&self) -> Result<Vec<SessionMetadata>> {
+        self.storage.list_sessions().map_err(Into::into)
     }
 
     /// Rename a session.
@@ -708,19 +783,41 @@ impl SessionManager {
         self.storage.selected_session().map_err(Into::into)
     }
 
-    async fn restore_sessions(&self) -> Result<RestoreReport> {
+    async fn restore_sessions(
+        &self,
+        preferred_session: Option<&str>,
+        on_restored: &mut impl FnMut(SessionHandle),
+    ) -> Result<RestoreReport> {
+        let mut sessions = self.storage.list_sessions()?;
+        if let Some(preferred_session) = preferred_session
+            && let Some(index) = sessions
+                .iter()
+                .position(|metadata| metadata.id == preferred_session)
+        {
+            sessions.swap(0, index);
+        }
+        Ok(self.restore_metadata_sessions(sessions, on_restored).await)
+    }
+
+    async fn restore_metadata_sessions(
+        &self,
+        sessions: Vec<SessionMetadata>,
+        on_restored: &mut impl FnMut(SessionHandle),
+    ) -> RestoreReport {
         let mut report = RestoreReport::default();
-        for metadata in self.storage.list_sessions()? {
+        for metadata in sessions {
+            let started = Instant::now();
             match self.restore_session(metadata.clone()).await {
                 Ok(handle) => {
                     self.sessions
                         .lock()
                         .await
                         .insert(handle.id.clone(), handle.clone());
+                    on_restored(handle.clone());
                     report.restored.push(handle);
                 }
                 Err(error) => {
-                    self.record_restore_failure(&metadata, &error);
+                    self.record_restore_failure(&metadata, &error, elapsed_ms(started));
                     report.failed.push(RestoreFailure {
                         app_session_id: metadata.id,
                         sdk_session_id: metadata.sdk_session_id,
@@ -729,7 +826,7 @@ impl SessionManager {
                 }
             }
         }
-        Ok(report)
+        report
     }
 
     /// Discover tools for the session's model and derive capability status.
@@ -766,7 +863,11 @@ impl SessionManager {
     }
 
     async fn restore_session(&self, metadata: SessionMetadata) -> Result<SessionHandle> {
+        let started = Instant::now();
+        let recovery_started = Instant::now();
         let recovered = self.storage.recover_session(&metadata.id)?;
+        let recovery_ms = elapsed_ms(recovery_started);
+        let replayed_events = recovered.replayed_events;
         let mut state = recovered.state;
         state.status = SessionStatus::Recovering;
         state.pending_interactions.clear();
@@ -776,6 +877,7 @@ impl SessionManager {
                 working_directory,
             ));
         }
+        let resume_started = Instant::now();
         let provider_session = self
             .provider
             .resume_session(
@@ -794,6 +896,8 @@ impl SessionManager {
                 },
             )
             .await?;
+        let resume_ms = elapsed_ms(resume_started);
+        let history_started = Instant::now();
         let history = match self.provider.history(&metadata.sdk_session_id).await {
             Ok(history) => history,
             Err(error) => {
@@ -808,7 +912,12 @@ impl SessionManager {
                 return Err(error.into());
             }
         };
+        let history_ms = elapsed_ms(history_started);
+        let history_events = history.len();
+        let reconcile_started = Instant::now();
         reconcile_history(&self.storage, &mut state, history)?;
+        let reconcile_ms = elapsed_ms(reconcile_started);
+        let controls_started = Instant::now();
         state.controls = match self.provider.controls(&metadata.sdk_session_id).await {
             Ok(controls) => controls,
             Err(error) => {
@@ -816,11 +925,39 @@ impl SessionManager {
                 return Err(error.into());
             }
         };
+        let controls_ms = elapsed_ms(controls_started);
         state.reconcile_after_restart(&timestamp());
+        let capabilities_started = Instant::now();
         self.populate_capabilities(&mut state).await;
+        let capabilities_ms = elapsed_ms(capabilities_started);
+        let changes_started = Instant::now();
         refresh_changes(&mut state);
+        let changes_ms = elapsed_ms(changes_started);
+        let persistence_started = Instant::now();
         self.storage.write_snapshot(&state)?;
-        Ok(self.spawn_actor(state, provider_session))
+        let persistence_ms = elapsed_ms(persistence_started);
+        let handle = self.spawn_actor(state, provider_session);
+        self.diagnostics.record(DiagnosticEvent {
+            timestamp: timestamp(),
+            category: "session_manager".to_owned(),
+            operation: "restore_session".to_owned(),
+            elapsed_ms: Some(elapsed_ms(started)),
+            session_id: Some(metadata.id),
+            success: true,
+            details: json!({
+                "storageRecoveryMs": recovery_ms,
+                "replayedEvents": replayed_events,
+                "providerResumeMs": resume_ms,
+                "historyMs": history_ms,
+                "historyEvents": history_events,
+                "reconcileMs": reconcile_ms,
+                "controlsMs": controls_ms,
+                "capabilitiesMs": capabilities_ms,
+                "changesMs": changes_ms,
+                "persistenceMs": persistence_ms
+            }),
+        });
+        Ok(handle)
     }
 
     fn spawn_actor(
@@ -851,12 +988,17 @@ impl SessionManager {
         }
     }
 
-    fn record_restore_failure(&self, metadata: &SessionMetadata, error: &SessionManagerError) {
+    fn record_restore_failure(
+        &self,
+        metadata: &SessionMetadata,
+        error: &SessionManagerError,
+        elapsed_ms: u64,
+    ) {
         self.diagnostics.record(DiagnosticEvent {
             timestamp: timestamp(),
             category: "session_manager".to_owned(),
             operation: "restore_session".to_owned(),
-            elapsed_ms: None,
+            elapsed_ms: Some(elapsed_ms),
             session_id: Some(metadata.id.clone()),
             success: false,
             details: json!({
@@ -1411,6 +1553,10 @@ fn timestamp() -> String {
     )
 }
 
+fn elapsed_ms(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 fn is_gcabb_worktree(
     kind: SessionKind,
     working_directory: &Path,
@@ -1607,7 +1753,7 @@ mod tests {
         drop(manager);
 
         let reopened = Arc::new(Storage::open(&database_path).unwrap());
-        let restored_manager = SessionManager::new(provider, reopened, diagnostics);
+        let restored_manager = SessionManager::new(provider, reopened, diagnostics.clone());
         let (_, report) = restored_manager.start().await.unwrap();
 
         assert!(report.failed.is_empty());
@@ -1615,6 +1761,62 @@ mod tests {
         let restored = restored_manager.session(&app_session_id).await.unwrap();
         assert_eq!(restored.snapshot().last_sequence, 4);
         assert_eq!(restored.snapshot().status, SessionStatus::Idle);
+        let events = diagnostics.events();
+        let restore_timing = events
+            .iter()
+            .rev()
+            .find(|event| {
+                event.operation == "restore_session"
+                    && event.session_id.as_deref() == Some(app_session_id.as_str())
+                    && event.success
+            })
+            .expect("successful restore timing is recorded");
+        assert!(restore_timing.elapsed_ms.is_some());
+        assert_eq!(restore_timing.details["historyEvents"], 4);
+        assert!(restore_timing.details["storageRecoveryMs"].is_number());
+    }
+
+    #[tokio::test]
+    async fn selected_session_is_published_before_other_restores() {
+        let directory = tempdir().unwrap();
+        let provider = Arc::new(FakeProvider::default());
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider.clone(), storage.clone(), diagnostics.clone());
+        manager.start().await.unwrap();
+        let selected = manager
+            .create_session(request(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let selected_id = selected.id().to_owned();
+        manager
+            .create_session(request(directory.path().to_owned()))
+            .await
+            .unwrap();
+        manager.stop().await.unwrap();
+
+        let restored_manager = SessionManager::new(provider, storage, diagnostics);
+        let mut published = Vec::new();
+        let (_, report, remaining) = restored_manager
+            .start_preferred_session(Some(&selected_id), |handle| {
+                published.push(handle.id().to_owned());
+            })
+            .await
+            .unwrap();
+
+        assert_eq!(published.first(), Some(&selected_id));
+        assert_eq!(published.len(), 1);
+        assert_eq!(report.restored.len(), 1);
+        assert_eq!(remaining.len(), 1);
+        assert!(restored_manager.session(&selected_id).await.is_ok());
+
+        let background = restored_manager
+            .restore_remaining_sessions(remaining, |handle| {
+                published.push(handle.id().to_owned());
+            })
+            .await;
+        assert!(background.failed.is_empty());
+        assert_eq!(published.len(), 2);
     }
 
     #[tokio::test]
@@ -1645,7 +1847,19 @@ mod tests {
 
         assert!(report.restored.is_empty());
         assert_eq!(report.failed.len(), 1);
-        assert_eq!(diagnostics.events().len(), 1);
+        let events = diagnostics.events();
+        let failure = events
+            .iter()
+            .find(|event| event.operation == "restore_session")
+            .expect("restore failure timing is recorded");
+        assert!(!failure.success);
+        assert!(failure.elapsed_ms.is_some());
+        let startup = events
+            .iter()
+            .find(|event| event.operation == "startup")
+            .expect("startup summary is recorded");
+        assert_eq!(startup.details["restoredSessions"], 0);
+        assert_eq!(startup.details["failedSessions"], 1);
     }
 
     #[tokio::test]
