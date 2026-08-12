@@ -60,6 +60,7 @@ const BLUE: u32 = 0x0058_a6ff;
 const AMBER: u32 = 0x00d2_9900;
 const RED: u32 = 0x00f8_5161;
 const COMPACT_WIDTH: f32 = 920.0;
+const CONVERSATION_COLUMN_WIDTH: f32 = 820.0;
 const UPDATE_POLL_INTERVAL: Duration = Duration::from_hours(6);
 const UPDATE_POLL_JITTER: Duration = Duration::from_mins(30);
 /// Vertical budget for the detail blocks inside one tool entry.
@@ -3569,6 +3570,8 @@ impl SessionMvpView {
                     .track_scroll(&handle)
                     .max_h(px(max_height))
                     .w_full()
+                    .min_w_0()
+                    .overflow_x_scroll()
                     .overflow_y_scroll()
                     // Without this the transcript scrolls too, so reading a
                     // command's output dragged the whole conversation along.
@@ -3666,7 +3669,8 @@ impl SessionMvpView {
             .justify_start()
             .child(
                 div()
-                    .max_w(px(760.0))
+                    .debug_selector(|| "tool-card".to_owned())
+                    .w_full()
                     .min_w_0()
                     .flex()
                     .flex_col()
@@ -3675,6 +3679,7 @@ impl SessionMvpView {
                     .py_2()
                     .rounded_md()
                     .bg(rgb(SUBTLE))
+                    .overflow_hidden()
                     .border_1()
                     .border_color(rgb(
                         if invocation.state == app_model::InvocationState::Failed {
@@ -3780,6 +3785,7 @@ impl SessionMvpView {
                     });
                 div()
                     .id(SharedString::from(accessible_id.clone()))
+                    .debug_selector(|| "message-attachment".to_owned())
                     .flex()
                     .items_center()
                     .gap_2()
@@ -4302,7 +4308,9 @@ impl SessionMvpView {
             .when(!is_user, gpui::Styled::justify_start)
             .child(
                 div()
-                    .max_w(px(760.0))
+                    .debug_selector(|| "transcript-message".to_owned())
+                    .w_full()
+                    .min_w_0()
                     .p_3()
                     .rounded_lg()
                     .bg(if is_user { rgb(ELEVATED) } else { rgb(PANEL) })
@@ -4470,9 +4478,19 @@ impl SessionMvpView {
                     .flex_1()
                     .min_h_0()
                     .p_5()
-                    .gap_3()
                     .overflow_y_scroll()
-                    .children(entries),
+                    .child(
+                        div()
+                            .debug_selector(|| "transcript-content".to_owned())
+                            .mx_auto()
+                            .w_full()
+                            .max_w(px(CONVERSATION_COLUMN_WIDTH))
+                            .min_w_0()
+                            .flex()
+                            .flex_col()
+                            .gap_3()
+                            .children(entries),
+                    ),
             )
             .children(scrollbar)
     }
@@ -4958,6 +4976,7 @@ impl SessionMvpView {
             .flatten();
         div()
             .id("composer")
+            .debug_selector(|| "composer".to_owned())
             .accessibility_id("composer")
             .relative()
             .role(Role::Group)
@@ -4969,7 +4988,7 @@ impl SessionMvpView {
             .mx_auto()
             .mb_4()
             .w_full()
-            .max_w(px(820.0))
+            .max_w(px(CONVERSATION_COLUMN_WIDTH))
             .flex()
             .flex_col()
             .bg(rgb(PANEL))
@@ -5119,7 +5138,7 @@ impl SessionMvpView {
             .drag_over::<ExternalPaths>(|style, _, _, _| style.border_color(rgb(BLUE)))
             .relative()
             .w_full()
-            .max_w(px(820.0))
+            .max_w(px(CONVERSATION_COLUMN_WIDTH))
             .flex()
             .flex_col()
             .rounded_lg()
@@ -5699,7 +5718,31 @@ impl Render for SessionMvpView {
                                 .flex()
                                 .flex_1()
                                 .min_h_0()
-                                .child(self.transcript(cx))
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .flex_1()
+                                        .min_w_0()
+                                        .min_h_0()
+                                        .child(self.transcript(cx))
+                                        .when_some(self.action_error.clone(), |column, error| {
+                                            column.child(
+                                                div()
+                                                    .id("action-error")
+                                                    .role(Role::Alert)
+                                                    .aria_label(error.clone())
+                                                    .mx_auto()
+                                                    .mb_2()
+                                                    .text_sm()
+                                                    .text_color(rgb(RED))
+                                                    .child(error),
+                                            )
+                                        })
+                                        .child(
+                                            div().w_full().px_5().child(self.session_composer(cx)),
+                                        ),
+                                )
                                 .when_some(
                                     if self.panel_open {
                                         self.side_panel(cx)
@@ -5709,22 +5752,6 @@ impl Render for SessionMvpView {
                                     gpui::ParentElement::child,
                                 ),
                         )
-                    })
-                    .when_some(self.action_error.clone(), |column, error| {
-                        column.child(
-                            div()
-                                .id("action-error")
-                                .role(Role::Alert)
-                                .aria_label(error.clone())
-                                .mx_auto()
-                                .mb_2()
-                                .text_sm()
-                                .text_color(rgb(RED))
-                                .child(error),
-                        )
-                    })
-                    .when(self.selected_session.is_some(), |main| {
-                        main.child(div().w_full().px_5().child(self.session_composer(cx)))
                     }),
             )
             .when(self.open_control_menu.is_some(), |root| {
@@ -5754,7 +5781,7 @@ impl Render for SessionMvpView {
                         .child(
                             div()
                                 .w_full()
-                                .max_w(px(820.0))
+                                .max_w(px(CONVERSATION_COLUMN_WIDTH))
                                 .pl(px(f32::from(control_menu_left)))
                                 .child(menu),
                         ),
@@ -6932,6 +6959,19 @@ mod tests {
             (view, cx, commands, attachments)
         }
 
+        fn assert_horizontally_aligned(
+            label: &str,
+            actual: gpui::Bounds<gpui::Pixels>,
+            expected: gpui::Bounds<gpui::Pixels>,
+        ) {
+            let left_delta = f32::from(actual.origin.x - expected.origin.x).abs();
+            let width_delta = f32::from(actual.size.width - expected.size.width).abs();
+            assert!(
+                left_delta < 0.5 && width_delta < 0.5,
+                "{label} is not aligned: {actual:?} vs {expected:?}"
+            );
+        }
+
         #[gpui::test]
         fn active_empty_composer_uses_the_trailing_action_to_cancel(cx: &mut TestAppContext) {
             let (view, cx, commands) = setup(cx);
@@ -7544,7 +7584,7 @@ mod tests {
             cx.run_until_parked();
 
             let chip = cx
-                .debug_bounds("message-attachments")
+                .debug_bounds("message-attachment")
                 .expect("the attachment chip rendered");
             cx.simulate_click(chip.center(), Modifiers::none());
             cx.run_until_parked();
@@ -7583,7 +7623,7 @@ mod tests {
             cx.run_until_parked();
 
             let chip = cx
-                .debug_bounds("message-attachments")
+                .debug_bounds("message-attachment")
                 .expect("the attachment chip rendered");
             cx.simulate_click(chip.center(), Modifiers::none());
             cx.run_until_parked();
@@ -7969,6 +8009,140 @@ mod tests {
                 let timeline = snapshot.timeline();
                 assert_eq!(timeline.len(), 2, "one message and one tool call");
             });
+        }
+
+        #[gpui::test]
+        fn short_tool_entries_fill_the_composer_column(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.apply(app_model::DomainEvent::from_sdk_event_for(
+                    "session-1",
+                    1,
+                    &serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"grep",
+                                "arguments":{"query":"x"}}}),
+                ));
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let composer = cx.debug_bounds("composer").expect("composer rendered");
+            let column = cx
+                .debug_bounds("transcript-content")
+                .expect("transcript column rendered");
+            let tool = cx.debug_bounds("tool-card").expect("tool card rendered");
+            assert_horizontally_aligned("transcript column", column, composer);
+            assert_horizontally_aligned("short tool card", tool, composer);
+        }
+
+        #[gpui::test]
+        fn wide_terminal_output_stays_inside_the_conversation_column(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for (sequence, raw) in [
+                    serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"bash",
+                                "arguments":{"command":"printf wide"},
+                                "shellToolInfo":{"displayCommand":"printf wide",
+                                                 "hasWriteFileRedirection":false,
+                                                 "possiblePaths":[]}}}),
+                    serde_json::json!({"id":"p","type":"tool.execution_partial_result",
+                        "data":{"toolCallId":"c1","partialOutput":"x".repeat(4_000)}}),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    state.apply(app_model::DomainEvent::from_sdk_event_for(
+                        "session-1",
+                        u64::try_from(sequence).unwrap_or(0) + 1,
+                        &raw,
+                    ));
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let column = cx
+                .debug_bounds("transcript-content")
+                .expect("transcript column rendered");
+            let tool = cx.debug_bounds("tool-card").expect("tool card rendered");
+            let output = cx
+                .debug_bounds("tool-detail")
+                .expect("terminal output rendered");
+            assert_horizontally_aligned("terminal tool card", tool, column);
+            assert!(
+                output.origin.x >= tool.origin.x && output.right() <= tool.right(),
+                "terminal output escaped its card: {output:?} vs {tool:?}"
+            );
+        }
+
+        #[gpui::test]
+        fn conversation_column_tracks_resizing_and_the_inspector(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "assistant".to_owned(),
+                    role: app_model::TranscriptRole::Assistant,
+                    content: "Done".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.simulate_resize(gpui::size(gpui::px(1_400.0), gpui::px(800.0)));
+            cx.run_until_parked();
+
+            let wide_composer = cx.debug_bounds("composer").expect("composer rendered");
+            let wide_message = cx
+                .debug_bounds("transcript-message")
+                .expect("message rendered");
+            assert_horizontally_aligned("wide message", wide_message, wide_composer);
+            assert_eq!(
+                wide_composer.size.width,
+                gpui::px(super::super::CONVERSATION_COLUMN_WIDTH)
+            );
+
+            view.update(cx, |view, cx| {
+                view.panel_open = true;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let inspected_composer = cx.debug_bounds("composer").expect("composer rendered");
+            let inspected_message = cx
+                .debug_bounds("transcript-message")
+                .expect("message rendered");
+            assert_horizontally_aligned(
+                "message with inspector open",
+                inspected_message,
+                inspected_composer,
+            );
+
+            view.update(cx, |view, cx| {
+                view.panel_open = false;
+                cx.notify();
+            });
+            cx.simulate_resize(gpui::size(gpui::px(800.0), gpui::px(800.0)));
+            cx.run_until_parked();
+            let compact_composer = cx.debug_bounds("composer").expect("composer rendered");
+            let compact_message = cx
+                .debug_bounds("transcript-message")
+                .expect("message rendered");
+            assert_horizontally_aligned("compact message", compact_message, compact_composer);
+            assert!(
+                compact_composer.size.width < wide_composer.size.width,
+                "the column did not respond to the narrower window"
+            );
         }
 
         /// The command block is capped at a third of the entry budget, so a
