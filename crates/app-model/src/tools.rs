@@ -237,6 +237,9 @@ pub struct ToolInvocation {
     /// Output loaded from the append-only output store for display.
     #[serde(skip)]
     pub output: String,
+    /// First persisted chunk represented by `output`.
+    #[serde(skip)]
+    pub output_start_chunk: u64,
     #[serde(default)]
     pub output_metadata: OutputMetadata,
     #[serde(default)]
@@ -373,6 +376,9 @@ pub struct TerminalSession {
     pub state: TerminalState,
     #[serde(skip)]
     pub output: String,
+    /// First persisted chunk represented by `output`.
+    #[serde(skip)]
+    pub output_start_chunk: u64,
     #[serde(default)]
     pub output_metadata: OutputMetadata,
     #[serde(default)]
@@ -542,6 +548,7 @@ impl ToolActivity {
                 cwd: None,
                 state: TerminalState::Running,
                 output: String::new(),
+                output_start_chunk: 0,
                 output_metadata: OutputMetadata::default(),
                 output_error: None,
                 output_load_error: None,
@@ -651,6 +658,7 @@ fn project_start(activity: &mut ToolActivity, event: &crate::DomainEvent) {
         display_command: display_command.clone(),
         possible_paths,
         output: String::new(),
+        output_start_chunk: 0,
         output_metadata: OutputMetadata::default(),
         output_error: None,
         output_load_error: None,
@@ -977,14 +985,15 @@ impl ToolActivity {
         &mut self,
         kind: OutputStreamKind,
         identity: &str,
-        output: std::result::Result<(String, OutputMetadata), String>,
+        output: std::result::Result<(String, OutputMetadata, u64), String>,
     ) {
         match kind {
             OutputStreamKind::Invocation => {
                 if let Some(invocation) = self.invocation_mut(identity) {
                     match output {
-                        Ok((output, metadata)) => {
+                        Ok((output, metadata, start_chunk)) => {
                             invocation.output = output;
+                            invocation.output_start_chunk = start_chunk;
                             invocation.output_metadata = metadata;
                             invocation.output_load_error = None;
                             if !matches!(
@@ -1005,8 +1014,9 @@ impl ToolActivity {
             OutputStreamKind::Terminal => {
                 if let Some(terminal) = self.terminal_mut(identity) {
                     match output {
-                        Ok((output, metadata)) => {
+                        Ok((output, metadata, start_chunk)) => {
                             terminal.output = output;
+                            terminal.output_start_chunk = start_chunk;
                             terminal.output_metadata = metadata;
                             terminal.output_load_error = None;
                         }
@@ -1018,6 +1028,36 @@ impl ToolActivity {
                 }
             }
         }
+    }
+
+    pub fn prepend_output(
+        &mut self,
+        kind: OutputStreamKind,
+        identity: &str,
+        start_chunk: u64,
+        before_chunk: u64,
+        content: &str,
+    ) -> bool {
+        let (output, current_start) = match kind {
+            OutputStreamKind::Invocation => {
+                let Some(invocation) = self.invocation_mut(identity) else {
+                    return false;
+                };
+                (&mut invocation.output, &mut invocation.output_start_chunk)
+            }
+            OutputStreamKind::Terminal => {
+                let Some(terminal) = self.terminal_mut(identity) else {
+                    return false;
+                };
+                (&mut terminal.output, &mut terminal.output_start_chunk)
+            }
+        };
+        if *current_start != before_chunk || start_chunk >= before_chunk {
+            return false;
+        }
+        output.insert_str(0, content);
+        *current_start = start_chunk;
+        true
     }
 }
 

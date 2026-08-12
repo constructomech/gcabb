@@ -42,6 +42,20 @@ A scroll gesture also used to affect both the pane under the pointer and the
 transcript behind it. Nested scrollables now stop propagation, so a gesture
 moves exactly the pane it is aimed at.
 
+Large transcripts now use GPUI's variable-height `ListState` rather than an
+overflow container holding every row. It lays out only the viewport plus 720 px
+of overdraw, preserves the top row's pixel anchor when streaming content changes
+height, follows the tail only while already following it, and stabilizes the
+custom scrollbar against the geometry that was actually painted. Stable message
+and tool ids back each row.
+
+The mixed timeline is incrementally indexed as transcript and root-tool suffixes
+arrive. Rendering no longer sorts the complete history or scans every invocation
+for subagent children. Completed markdown documents are cached; streaming
+messages remain uncached so partial syntax is always current. The deterministic
+10,000-message UI fixture asserts that no more than 64 rows or markdown documents
+are instantiated for one frame.
+
 ## Attachments
 
 Screenshots are how interface defects actually get reported. Both composers had
@@ -171,9 +185,11 @@ database above that returned 486 MB.
 
 Tool and terminal output also no longer lives in serialized snapshots. It is
 persisted once as ordered chunks with bounded stream metadata in the snapshot,
-then hydrated for the current non-virtualized UI. Existing event logs are
-backfilled during schema migration, preserving output that older snapshots had
-trimmed. Virtualized range loading remains separate follow-up work.
+then restored as only the newest 64 chunks. Earlier chunks remain in SQLite and
+the tool card prepends them in 64-chunk pages on request through the ordered range
+API. Existing event logs are backfilled during schema migration, preserving
+output that older snapshots had trimmed. Missing chunks fail the requested page
+explicitly rather than presenting incomplete output as complete.
 
 ## Deleting a session
 

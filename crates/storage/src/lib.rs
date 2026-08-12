@@ -13,6 +13,9 @@ use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
 const SCHEMA_VERSION: i64 = 8;
+/// Initial restored output window. Older chunks stay in `SQLite` and can be
+/// prepended through `read_output` without inflating every restored snapshot.
+pub const RESTORED_OUTPUT_CHUNKS: u64 = 64;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -382,7 +385,7 @@ impl Storage {
             .optional()?
             .unwrap_or_default();
         let mut statement = connection.prepare(
-            "SELECT content FROM output_chunks
+            "SELECT chunk_index, content FROM output_chunks
              WHERE session_id = ?1 AND stream_kind = ?2 AND stream_id = ?3
                AND chunk_index >= ?4
              ORDER BY chunk_index
@@ -396,12 +399,24 @@ impl Storage {
                 range.start_chunk,
                 range.max_chunks
             ],
-            |row| row.get::<_, String>(0),
+            |row| Ok((row.get::<_, u64>(0)?, row.get::<_, String>(1)?)),
         )?;
         let mut content = String::new();
         let mut read = 0u64;
         for chunk in chunks {
-            content.push_str(&chunk?);
+            let (chunk_index, chunk) = chunk?;
+            if chunk_index != range.start_chunk + read {
+                return Err(StorageError::OutputIncomplete {
+                    kind: kind.as_str(),
+                    identity: identity.to_owned(),
+                    expected: metadata
+                        .chunk_count
+                        .saturating_sub(range.start_chunk)
+                        .min(range.max_chunks),
+                    actual: read,
+                });
+            }
+            content.push_str(&chunk);
             read += 1;
         }
         let expected = metadata
@@ -449,10 +464,25 @@ impl Storage {
                         &identity,
                         OutputRange {
                             start_chunk: 0,
-                            max_chunks: i64::MAX as u64,
+                            max_chunks: 0,
                         },
                     )
-                    .map(|read| (read.content, read.metadata))
+                    .and_then(|metadata| {
+                        let start_chunk = metadata
+                            .metadata
+                            .chunk_count
+                            .saturating_sub(RESTORED_OUTPUT_CHUNKS);
+                        self.read_output(
+                            &session_id,
+                            kind,
+                            &identity,
+                            OutputRange {
+                                start_chunk,
+                                max_chunks: RESTORED_OUTPUT_CHUNKS,
+                            },
+                        )
+                        .map(|read| (read.content, read.metadata, start_chunk))
+                    })
                     .map_err(|error| error.to_string());
                 snapshot.tool_activity.set_output(kind, &identity, output);
             }
@@ -862,6 +892,7 @@ mod tests {
         }
 
         let storage = Storage::open(&path).unwrap();
+        let restored_chunks = usize::try_from(RESTORED_OUTPUT_CHUNKS).unwrap();
         let first = storage
             .read_output(
                 "app-session",
@@ -884,7 +915,11 @@ mod tests {
 
         let recovered = storage.recover_session("app-session").unwrap();
         let invocation = recovered.state.tool_activity.invocation("call-0").unwrap();
-        assert_eq!(invocation.output.len(), chunk_count * chunk_bytes);
+        assert_eq!(invocation.output.len(), restored_chunks * chunk_bytes);
+        assert_eq!(
+            invocation.output_start_chunk,
+            chunk_count as u64 - RESTORED_OUTPUT_CHUNKS
+        );
         assert_eq!(invocation.output_metadata, first.metadata);
         assert!(invocation.output_load_error.is_none());
         assert!(
@@ -896,6 +931,10 @@ mod tests {
         assert_eq!(terminal.output_metadata, invocation.output_metadata);
         assert_eq!(terminal.state, app_model::TerminalState::Exited);
 
+        assert_missing_output_chunk_is_reported(&storage, chunk_bytes);
+    }
+
+    fn assert_missing_output_chunk_is_reported(storage: &Storage, chunk_bytes: usize) {
         storage
             .connection()
             .unwrap()
@@ -910,14 +949,24 @@ mod tests {
             .unwrap();
         let recovered = storage.recover_session("app-session").unwrap();
         let invocation = recovered.state.tool_activity.invocation("call-0").unwrap();
-        assert!(invocation.output.is_empty());
+        assert_eq!(
+            invocation.output.len(),
+            usize::try_from(RESTORED_OUTPUT_CHUNKS).unwrap() * chunk_bytes
+        );
+        let error = storage
+            .read_output(
+                "app-session",
+                OutputStreamKind::Invocation,
+                "call-0",
+                OutputRange {
+                    start_chunk: 0,
+                    max_chunks: RESTORED_OUTPUT_CHUNKS,
+                },
+            )
+            .unwrap_err();
         assert!(
-            invocation
-                .output_load_error
-                .as_deref()
-                .is_some_and(|error| error.contains("expected 300 chunks, read 299")),
-            "missing chunks were not surfaced: {:?}",
-            invocation.output_load_error
+            error.to_string().contains("expected 64 chunks, read 42"),
+            "missing requested chunks were not surfaced: {error}"
         );
     }
 

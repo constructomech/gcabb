@@ -7,8 +7,8 @@ use std::time::{Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
     ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus, DomainEvent,
-    InteractionResponse, ProjectMetadata, PromptAttachment, SessionKind, SessionMetadata,
-    SessionSnapshot, SessionStatus, TitleSource, ToolCatalog,
+    InteractionResponse, OutputStreamKind, ProjectMetadata, PromptAttachment, SessionKind,
+    SessionMetadata, SessionSnapshot, SessionStatus, TitleSource, ToolCatalog,
 };
 use copilot_provider::{
     AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderInteraction,
@@ -17,7 +17,7 @@ use copilot_provider::{
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
 use git_service::GitService;
 use serde_json::{Value, json};
-use storage::{Storage, StorageError};
+use storage::{OutputRange, Storage, StorageError};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -203,6 +203,30 @@ impl SessionHandle {
             .send(SessionCommand::Respond {
                 interaction_id: interaction_id.into(),
                 answer,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| SessionManagerError::ActorClosed)?;
+        response_rx
+            .await
+            .map_err(|_| SessionManagerError::ActorClosed)?
+    }
+
+    /// Prepend an older persisted output window to the currently loaded one.
+    pub async fn load_output_before(
+        &self,
+        kind: OutputStreamKind,
+        identity: impl Into<String>,
+        before_chunk: u64,
+        max_chunks: u64,
+    ) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(SessionCommand::LoadOutput {
+                kind,
+                identity: identity.into(),
+                before_chunk,
+                max_chunks,
                 response: response_tx,
             })
             .await
@@ -1045,6 +1069,13 @@ enum SessionCommand {
         answer: InteractionResponse,
         response: oneshot::Sender<Result<()>>,
     },
+    LoadOutput {
+        kind: OutputStreamKind,
+        identity: String,
+        before_chunk: u64,
+        max_chunks: u64,
+        response: oneshot::Sender<Result<()>>,
+    },
     Control {
         control: SessionControlCommand,
         response: oneshot::Sender<Result<()>>,
@@ -1149,6 +1180,21 @@ impl SessionActor {
                             let result = self.respond(&interaction_id, answer);
                             let _ = response.send(result);
                         }
+                        Some(SessionCommand::LoadOutput {
+                            kind,
+                            identity,
+                            before_chunk,
+                            max_chunks,
+                            response,
+                        }) => {
+                            let result = self.load_output(
+                                kind,
+                                &identity,
+                                before_chunk,
+                                max_chunks,
+                            );
+                            let _ = response.send(result);
+                        }
                         Some(SessionCommand::Control { control, response }) => {
                             let result = self.apply_control(control).await;
                             let _ = response.send(result);
@@ -1194,6 +1240,45 @@ impl SessionActor {
             }
             Err(error) => self.record_actor_error("append_event", &error.to_string()),
         }
+    }
+
+    fn load_output(
+        &mut self,
+        kind: OutputStreamKind,
+        identity: &str,
+        before_chunk: u64,
+        max_chunks: u64,
+    ) -> Result<()> {
+        let start_chunk = before_chunk.saturating_sub(max_chunks);
+        let read = self.storage.read_output(
+            &self.state.metadata.id,
+            kind,
+            identity,
+            OutputRange {
+                start_chunk,
+                max_chunks: before_chunk - start_chunk,
+            },
+        )?;
+        if read.next_chunk != before_chunk
+            || !self.state.tool_activity.prepend_output(
+                kind,
+                identity,
+                start_chunk,
+                before_chunk,
+                &read.content,
+            )
+        {
+            return Err(SessionManagerError::Storage(
+                StorageError::OutputIncomplete {
+                    kind: kind.as_str(),
+                    identity: identity.to_owned(),
+                    expected: before_chunk - start_chunk,
+                    actual: read.next_chunk - start_chunk,
+                },
+            ));
+        }
+        self.publish(false);
+        Ok(())
     }
 
     /// Recompute changes when a worktree-mutating tool has just completed.
