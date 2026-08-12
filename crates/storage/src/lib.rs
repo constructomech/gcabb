@@ -659,37 +659,54 @@ impl Storage {
                 update.complete
             ],
         )?;
-        if let Some(chunk) = update.chunk.as_deref() {
+        if update.replace {
+            transaction.execute(
+                "DELETE FROM output_chunks
+                 WHERE session_id = ?1 AND stream_kind = ?2 AND stream_id = ?3",
+                params![session_id, update.kind.as_str(), update.identity],
+            )?;
+            transaction.execute(
+                "UPDATE output_streams
+                 SET chunk_count = 0, byte_count = 0
+                 WHERE session_id = ?1 AND stream_kind = ?2 AND stream_id = ?3",
+                params![session_id, update.kind.as_str(), update.identity],
+            )?;
+        }
+        if let Some(output) = update.chunk.as_deref() {
             let chunk_index: u64 = transaction.query_row(
                 "SELECT chunk_count FROM output_streams
                  WHERE session_id = ?1 AND stream_kind = ?2 AND stream_id = ?3",
                 params![session_id, update.kind.as_str(), update.identity],
                 |row| row.get(0),
             )?;
-            transaction.execute(
-                "INSERT INTO output_chunks (
-                    session_id, stream_kind, stream_id, chunk_index,
-                    event_sequence, byte_count, content
-                 ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
-                params![
-                    session_id,
-                    update.kind.as_str(),
-                    update.identity,
-                    chunk_index,
-                    event_sequence,
-                    chunk.len() as u64,
-                    chunk
-                ],
-            )?;
+            let chunks = app_model::tools::persisted_output_chunks(output);
+            for (offset, chunk) in chunks.iter().enumerate() {
+                transaction.execute(
+                    "INSERT INTO output_chunks (
+                        session_id, stream_kind, stream_id, chunk_index,
+                        event_sequence, byte_count, content
+                     ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                    params![
+                        session_id,
+                        update.kind.as_str(),
+                        update.identity,
+                        chunk_index + offset as u64,
+                        event_sequence,
+                        chunk.len() as u64,
+                        chunk
+                    ],
+                )?;
+            }
             transaction.execute(
                 "UPDATE output_streams
-                 SET chunk_count = chunk_count + 1, byte_count = byte_count + ?4
+                 SET chunk_count = chunk_count + ?4, byte_count = byte_count + ?5
                  WHERE session_id = ?1 AND stream_kind = ?2 AND stream_id = ?3",
                 params![
                     session_id,
                     update.kind.as_str(),
                     update.identity,
-                    chunk.len() as u64
+                    chunks.len() as u64,
+                    output.len() as u64
                 ],
             )?;
         }
@@ -1173,6 +1190,83 @@ mod tests {
         assert_eq!(terminal.output, invocation.output);
         assert!(invocation.output_metadata.complete);
         assert!(terminal.output_metadata.complete);
+    }
+
+    #[test]
+    fn authoritative_completion_replaces_truncated_persisted_output() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gcabb.db");
+        let complete_output = "x".repeat(app_model::tools::OUTPUT_CHUNK_BYTES + 7);
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage.upsert_session(&metadata()).unwrap();
+            let mut snapshot = SessionSnapshot::new(metadata());
+            append_raw_events(
+                &storage,
+                &mut snapshot,
+                [
+                    json!({
+                        "id": "start",
+                        "type": "tool.execution_start",
+                        "timestamp": "1",
+                        "data": {
+                            "toolCallId": "call",
+                            "toolName": "bash",
+                            "arguments": {"command": "print-many-lines"}
+                        }
+                    }),
+                    json!({
+                        "id": "partial",
+                        "type": "tool.execution_partial_result",
+                        "timestamp": "2",
+                        "data": {
+                            "toolCallId": "call",
+                            "partialOutput":
+                                "line 1\n<output too long - dropped 207 lines from the end>\n"
+                        }
+                    }),
+                    json!({
+                        "id": "complete",
+                        "type": "tool.execution_complete",
+                        "timestamp": "3",
+                        "data": {
+                            "toolCallId": "call",
+                            "success": true,
+                            "result": {
+                                "content": complete_output,
+                                "detailedContent": complete_output
+                            }
+                        }
+                    }),
+                ],
+            );
+            storage.write_snapshot(&snapshot).unwrap();
+        }
+
+        let storage = Storage::open(&path).unwrap();
+        let output = storage
+            .read_output(
+                "app-session",
+                OutputStreamKind::Invocation,
+                "call",
+                OutputRange {
+                    start_chunk: 0,
+                    max_chunks: 10,
+                },
+            )
+            .unwrap();
+        assert_eq!(output.content, complete_output);
+        assert_eq!(output.metadata.chunk_count, 2);
+        assert_eq!(
+            output.metadata.byte_count,
+            app_model::tools::OUTPUT_CHUNK_BYTES as u64 + 7
+        );
+        assert!(output.metadata.complete);
+
+        let recovered = storage.recover_session("app-session").unwrap();
+        let invocation = recovered.state.tool_activity.invocation("call").unwrap();
+        assert_eq!(invocation.output, output.content);
+        assert!(!invocation.output.contains("output too long"));
     }
 
     /// A session keeps one snapshot, not one per event. Retaining every

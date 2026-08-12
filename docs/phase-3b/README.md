@@ -191,6 +191,12 @@ API. Existing event logs are backfilled during schema migration, preserving
 output that older snapshots had trimmed. Missing chunks fail the requested page
 explicitly rather than presenting incomplete output as complete.
 
+Streaming previews are provisional. When the runtime reports that it dropped
+lines from a preview, the marker is not shown as command output; the complete
+result replaces those provisional chunks atomically when the command finishes.
+Persisted chunks are byte-bounded even when the runtime delivers one very large
+event, so complete long lines still use the same restore and paging window.
+
 ## Deleting a session
 
 Deleting used to leave several things behind. Events and snapshots cascaded
