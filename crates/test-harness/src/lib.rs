@@ -12,10 +12,106 @@ use copilot_provider::{
     AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderInteraction,
     ProviderSession, Result, SDK_CRATE_VERSION, SessionRequest,
 };
-use serde_json::Value;
+use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
 
 pub const GOLDEN_SESSION_EVENTS: &str = include_str!("../fixtures/session-events.json");
+
+/// Deterministic workload for transcript, streaming-output, and restore tests.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub struct LargeSessionConfig {
+    pub turns: usize,
+    pub output_chunks_per_turn: usize,
+    pub output_chunk_bytes: usize,
+}
+
+impl Default for LargeSessionConfig {
+    fn default() -> Self {
+        Self {
+            turns: 1_000,
+            output_chunks_per_turn: 8,
+            output_chunk_bytes: 1_024,
+        }
+    }
+}
+
+/// Build a repeatable mixed transcript/tool stream without provider access.
+#[must_use]
+pub fn large_session_events(config: LargeSessionConfig) -> Vec<Value> {
+    let events_per_turn = 5usize.saturating_add(config.output_chunks_per_turn);
+    let mut events = Vec::with_capacity(
+        config
+            .turns
+            .saturating_mul(events_per_turn)
+            .saturating_add(1),
+    );
+    let output_chunk = "x".repeat(config.output_chunk_bytes);
+
+    for turn in 0..config.turns {
+        let message_id = format!("message-{turn}");
+        let call_id = format!("call-{turn}");
+        let shell_id = format!("shell-{turn}");
+        events.push(json!({
+            "id": format!("user-{turn}"),
+            "type": "user.message",
+            "data": {"content": format!("Run deterministic workload {turn}")}
+        }));
+        events.push(json!({
+            "id": format!("message-start-{turn}"),
+            "type": "assistant.message_start",
+            "data": {"messageId": message_id}
+        }));
+        events.push(json!({
+            "id": format!("message-complete-{turn}"),
+            "type": "assistant.message",
+            "data": {
+                "messageId": message_id,
+                "content": format!("## Result {turn}\n\nCompleted deterministic workload.")
+            }
+        }));
+        events.push(json!({
+            "id": format!("tool-start-{turn}"),
+            "type": "tool.execution_start",
+            "data": {
+                "toolCallId": call_id,
+                "toolName": "bash",
+                "arguments": {"command": "fixture", "shellId": shell_id},
+                "shellToolInfo": {"displayCommand": "fixture"}
+            }
+        }));
+        for chunk in 0..config.output_chunks_per_turn {
+            events.push(json!({
+                "id": format!("tool-output-{turn}-{chunk}"),
+                "type": "tool.execution_partial_result",
+                "data": {"toolCallId": call_id, "partialOutput": output_chunk}
+            }));
+        }
+        events.push(json!({
+            "id": format!("tool-complete-{turn}"),
+            "type": "tool.execution_complete",
+            "data": {
+                "toolCallId": call_id,
+                "success": true,
+                "result": {
+                    "content": "done",
+                    "contents": [{
+                        "type": "shell_exit",
+                        "shellId": shell_id,
+                        "exitCode": 0,
+                        "cwd": "/fixture",
+                        "outputPreview": ""
+                    }]
+                }
+            }
+        }));
+    }
+    events.push(json!({
+        "id": "fixture-idle",
+        "type": "session.idle",
+        "data": {}
+    }));
+    events
+}
 
 #[derive(Default)]
 pub struct FakeProvider {
@@ -375,5 +471,25 @@ mod tests {
         assert_eq!(events.len(), 4);
         assert_eq!(events[0]["type"], "assistant.turn_start");
         assert_eq!(events[3]["type"], "session.idle");
+    }
+
+    #[test]
+    fn large_fixture_has_repeatable_transcript_and_output_shape() {
+        let config = LargeSessionConfig {
+            turns: 3,
+            output_chunks_per_turn: 2,
+            output_chunk_bytes: 16,
+        };
+        let first = large_session_events(config);
+        let second = large_session_events(config);
+
+        assert_eq!(first, second);
+        assert_eq!(first.len(), 22);
+        assert_eq!(first[0]["type"], "user.message");
+        assert_eq!(
+            first[4]["data"]["partialOutput"].as_str().unwrap().len(),
+            16
+        );
+        assert_eq!(first.last().unwrap()["type"], "session.idle");
     }
 }

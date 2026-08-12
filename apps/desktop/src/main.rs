@@ -4,15 +4,15 @@ use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
-use std::time::{Duration, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
     ContextWindowOption, InteractionKind, InteractionResponse, ProjectMetadata, PromptAttachment,
-    SessionKind, SessionLocation, SessionSnapshot, SessionStatus, TitleSource, TranscriptRole,
-    TranscriptState,
+    SessionKind, SessionLocation, SessionMetadata, SessionSnapshot, SessionStatus, TitleSource,
+    TranscriptRole, TranscriptState,
 };
 use copilot_provider::{CopilotProvider, ProviderCompatibility};
-use diagnostics::{TracingDiagnostics, init_tracing};
+use diagnostics::{DiagnosticEvent, DiagnosticsSink, TracingDiagnostics, init_tracing};
 use git_service::GitService;
 use gpui::prelude::FluentBuilder;
 use gpui::{
@@ -184,10 +184,10 @@ enum ServiceUpdate {
     Ready {
         compatibility: ProviderCompatibility,
         projects: Vec<ProjectMetadata>,
-        restored: Vec<SessionHandle>,
         failures: Vec<RestoreFailure>,
-        selected_session: Option<String>,
     },
+    SessionHydrated(SessionHandle),
+    RestorationFinished(Vec<RestoreFailure>),
     SessionAdded(SessionHandle),
     SessionsDiscovered(Vec<SessionHandle>),
     /// A session was deleted and must be dropped from the UI.
@@ -274,17 +274,68 @@ struct AppService {
     updates: Receiver<ServiceUpdate>,
     commands: Sender<ServiceCommand>,
     stopped: Receiver<()>,
+    bootstrap: Option<BootstrapState>,
+}
+
+struct BootstrapState {
+    projects: Vec<ProjectMetadata>,
+    sessions: Vec<SessionMetadata>,
+    selected_session: Option<String>,
 }
 
 impl AppService {
     #[allow(clippy::too_many_lines)]
-    fn start(project_root: PathBuf, database_path: PathBuf) -> Self {
+    fn start(project_root: PathBuf, database_path: &Path) -> Self {
+        let startup_started = Instant::now();
+        let diagnostics = Arc::new(TracingDiagnostics);
+        let storage_started = Instant::now();
+        let storage = match Storage::open(database_path) {
+            Ok(storage) => Arc::new(storage),
+            Err(error) => {
+                return Self::failed(format!(
+                    "failed to open {}: {error}",
+                    database_path.display()
+                ));
+            }
+        };
+        let storage_ms = elapsed_millis(storage_started);
+        let bootstrap = BootstrapState {
+            projects: storage.list_projects().unwrap_or_else(|error| {
+                tracing::error!(%error, "failed to list bootstrap projects");
+                Vec::new()
+            }),
+            sessions: storage.list_sessions().unwrap_or_else(|error| {
+                tracing::error!(%error, "failed to list bootstrap sessions");
+                Vec::new()
+            }),
+            selected_session: storage.selected_session().unwrap_or(None),
+        };
+        diagnostics.record(DiagnosticEvent {
+            timestamp: timestamp(),
+            category: "desktop_startup".to_owned(),
+            operation: "bootstrap".to_owned(),
+            elapsed_ms: Some(elapsed_millis(startup_started)),
+            session_id: bootstrap.selected_session.clone(),
+            success: true,
+            details: serde_json::json!({
+                "storageMs": storage_ms,
+                "projectCount": bootstrap.projects.len(),
+                "sessionCount": bootstrap.sessions.len()
+            }),
+        });
+        let preferred_session = bootstrap
+            .selected_session
+            .as_ref()
+            .filter(|id| bootstrap.sessions.iter().any(|session| &session.id == *id))
+            .cloned()
+            .or_else(|| bootstrap.sessions.first().map(|session| session.id.clone()));
         let (update_tx, updates) = channel();
         let (commands, command_rx) = channel();
         let (stopped_tx, stopped) = channel();
         thread::Builder::new()
             .name("gcabb-services".to_owned())
             .spawn(move || {
+                let runtime_started = Instant::now();
                 let runtime = match tokio::runtime::Builder::new_multi_thread()
                     .enable_all()
                     .thread_name("gcabb-worker")
@@ -299,23 +350,12 @@ impl AppService {
                         return;
                     }
                 };
-                let storage = match Storage::open(&database_path) {
-                    Ok(storage) => Arc::new(storage),
-                    Err(error) => {
-                        let _ = update_tx.send(ServiceUpdate::Failed(format!(
-                            "failed to open {}: {error}",
-                            database_path.display()
-                        )));
-                        let _ = stopped_tx.send(());
-                        return;
-                    }
-                };
-                let diagnostics = Arc::new(TracingDiagnostics);
+                let runtime_ms = elapsed_millis(runtime_started);
                 let provider = Arc::new(CopilotProvider::new(
                     project_root.clone(),
                     diagnostics.clone(),
                 ));
-                let manager = Arc::new(SessionManager::new(provider, storage, diagnostics));
+                let manager = Arc::new(SessionManager::new(provider, storage, diagnostics.clone()));
                 let session_roots = SessionRoots {
                     worktrees: Some(worktrees_root()),
                     attachments: attachments_directory(),
@@ -327,6 +367,7 @@ impl AppService {
 
                 // Fold projects and sessions recorded by earlier builds, which
                 // registered one project per worktree, into their repository.
+                let adoption_started = Instant::now();
                 match manager.adopt_repository_roots(|path| {
                     let path = Path::new(path);
                     path.is_dir()
@@ -340,21 +381,60 @@ impl AppService {
                         tracing::warn!(%error, "failed to adopt repository roots");
                     }
                 }
+                let adoption_ms = elapsed_millis(adoption_started);
 
-                match runtime.block_on(manager.start()) {
-                    Ok((compatibility, report)) => {
+                let manager_started = Instant::now();
+                let mut restoration_task = None;
+                match runtime.block_on(manager.start_preferred_session(
+                    preferred_session.as_deref(),
+                    |handle| {
+                        let _ = update_tx.send(ServiceUpdate::SessionHydrated(handle));
+                    },
+                )) {
+                    Ok((compatibility, report, remaining)) => {
+                        let manager_ms = elapsed_millis(manager_started);
+                        let metadata_started = Instant::now();
                         let projects = manager.projects().unwrap_or_else(|error| {
                             tracing::error!(%error, "failed to list projects");
                             Vec::new()
                         });
-                        let selected_session = manager.selected_session().unwrap_or(None);
+                        let metadata_ms = elapsed_millis(metadata_started);
+                        diagnostics.record(DiagnosticEvent {
+                            timestamp: timestamp(),
+                            category: "desktop_startup".to_owned(),
+                            operation: "ready".to_owned(),
+                            elapsed_ms: Some(elapsed_millis(startup_started)),
+                            session_id: preferred_session.clone(),
+                            success: true,
+                            details: serde_json::json!({
+                                "runtimeMs": runtime_ms,
+                                "storageMs": storage_ms,
+                                "adoptionMs": adoption_ms,
+                                "managerMs": manager_ms,
+                                "metadataMs": metadata_ms,
+                                "projectCount": projects.len(),
+                                "restoredSessions": report.restored.len(),
+                                "failedSessions": report.failed.len(),
+                                "remainingSessions": remaining.len()
+                            }),
+                        });
                         let _ = update_tx.send(ServiceUpdate::Ready {
                             compatibility,
                             projects,
-                            restored: report.restored,
                             failures: report.failed,
-                            selected_session,
                         });
+                        let background_manager = manager.clone();
+                        let background_updates = update_tx.clone();
+                        restoration_task = Some(runtime.spawn(async move {
+                            let report = background_manager
+                                .restore_remaining_sessions(remaining, |handle| {
+                                    let _ = background_updates
+                                        .send(ServiceUpdate::SessionHydrated(handle));
+                                })
+                                .await;
+                            let _ = background_updates
+                                .send(ServiceUpdate::RestorationFinished(report.failed));
+                        }));
                     }
                     Err(error) => {
                         let _ = update_tx.send(ServiceUpdate::Failed(format!(
@@ -365,6 +445,9 @@ impl AppService {
 
                 while let Ok(command) = command_rx.recv() {
                     if matches!(command, ServiceCommand::Stop) {
+                        if let Some(task) = restoration_task.take() {
+                            let _ = runtime.block_on(task);
+                        }
                         let _ = runtime.block_on(manager.stop());
                         break;
                     }
@@ -477,6 +560,7 @@ impl AppService {
             updates,
             commands,
             stopped,
+            bootstrap: Some(bootstrap),
         }
     }
 
@@ -490,6 +574,7 @@ impl AppService {
             updates,
             commands,
             stopped,
+            bootstrap: None,
         }
     }
 
@@ -499,7 +584,13 @@ impl AppService {
     /// commands are captured and asserted on instead of executed.
     #[cfg(test)]
     fn for_test() -> (Self, Receiver<ServiceCommand>) {
-        let (_update_tx, updates) = channel();
+        let (service, commands, _updates) = Self::for_test_with_updates();
+        (service, commands)
+    }
+
+    #[cfg(test)]
+    fn for_test_with_updates() -> (Self, Receiver<ServiceCommand>, Sender<ServiceUpdate>) {
+        let (update_tx, updates) = channel();
         let (commands, command_rx) = channel();
         let (_stopped_tx, stopped) = channel();
         (
@@ -507,8 +598,10 @@ impl AppService {
                 updates,
                 commands,
                 stopped,
+                bootstrap: None,
             },
             command_rx,
+            update_tx,
         )
     }
 }
@@ -833,8 +926,8 @@ fn session_title(prompt: &str) -> String {
 }
 
 struct SessionProjection {
-    handle: SessionHandle,
-    receiver: watch::Receiver<Arc<SessionSnapshot>>,
+    _handle: Option<SessionHandle>,
+    receiver: Option<watch::Receiver<Arc<SessionSnapshot>>>,
     snapshot: Arc<SessionSnapshot>,
 }
 
@@ -843,10 +936,24 @@ impl SessionProjection {
         let receiver = handle.subscribe();
         let snapshot = receiver.borrow().clone();
         Self {
-            handle,
-            receiver,
+            _handle: Some(handle),
+            receiver: Some(receiver),
             snapshot,
         }
+    }
+
+    fn bootstrap(metadata: SessionMetadata) -> Self {
+        let mut snapshot = SessionSnapshot::new(metadata);
+        snapshot.status = SessionStatus::Recovering;
+        Self {
+            _handle: None,
+            receiver: None,
+            snapshot: Arc::new(snapshot),
+        }
+    }
+
+    fn id(&self) -> &str {
+        &self.snapshot.metadata.id
     }
 
     #[cfg(test)]
@@ -859,6 +966,12 @@ enum StartupState {
     Starting,
     Ready(ProviderCompatibility),
     Failed(String),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum StartupNavigation {
+    Untouched,
+    Changed,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -922,6 +1035,8 @@ struct SessionMvpView {
     projects: Vec<ProjectMetadata>,
     sessions: Vec<SessionProjection>,
     selected_session: Option<String>,
+    /// User navigation during startup wins over delayed bootstrap/restoration.
+    startup_navigation: StartupNavigation,
     /// Repository grouping key for the sidebar.
     selected_project: PathBuf,
     /// Directory new sessions run in.
@@ -1008,9 +1123,14 @@ impl SessionMvpView {
         attachments_root: Option<PathBuf>,
         cx: &mut Context<Self>,
     ) -> Self {
-        let commands = service.commands;
+        let AppService {
+            updates,
+            commands,
+            stopped,
+            bootstrap,
+        } = service;
         let quit_commands = commands.clone();
-        let stopped = Arc::new(Mutex::new(service.stopped));
+        let stopped = Arc::new(Mutex::new(stopped));
         let background_executor = cx.background_executor().clone();
         cx.on_app_quit(move |_, _| {
             let quit_commands = quit_commands.clone();
@@ -1110,11 +1230,12 @@ impl SessionMvpView {
             }
         });
 
-        Self {
+        let mut view = Self {
             startup: StartupState::Starting,
             projects: Vec::new(),
             sessions: Vec::new(),
             selected_session: None,
+            startup_navigation: StartupNavigation::Untouched,
             selected_project: repository_root(&project_root),
             workspace_root: project_root.clone(),
             launch_workspace: project_root,
@@ -1133,7 +1254,7 @@ impl SessionMvpView {
             dragging_scrollbar: None,
             transcript_extent: (String::new(), 0, 0, 0, 0),
             restore_failures: Vec::new(),
-            updates: service.updates,
+            updates,
             commands,
             branch,
             composer,
@@ -1156,7 +1277,11 @@ impl SessionMvpView {
             settings_visibility: SettingsVisibility::Closed,
             _poll_task: poll_task,
             _update_poll_task: update_poll_task,
+        };
+        if let Some(bootstrap) = bootstrap {
+            view.apply_bootstrap(bootstrap);
         }
+        view
     }
 
     /// Message, accent colour, and optional detail line for the update banner.
@@ -1459,74 +1584,33 @@ impl SessionMvpView {
                 ServiceUpdate::Ready {
                     compatibility,
                     projects,
-                    restored,
                     failures,
-                    selected_session,
                 } => {
                     self.startup = StartupState::Ready(compatibility);
                     self.projects = projects;
-                    self.sessions = restored.into_iter().map(SessionProjection::new).collect();
-                    self.selected_session = selected_session
-                        .filter(|id| {
-                            self.sessions
-                                .iter()
-                                .any(|session| session.handle.id() == id)
-                        })
-                        .or_else(|| {
-                            self.sessions
-                                .first()
-                                .map(|session| session.snapshot.metadata.id.clone())
-                        });
-                    if let Some((project, workspace)) = self
-                        .selected()
-                        .filter(|session| !session.snapshot.metadata.is_chat())
-                        .map(|session| {
-                            (
-                                PathBuf::from(session.snapshot.metadata.project_key()),
-                                PathBuf::from(&session.snapshot.metadata.project_path),
-                            )
-                        })
-                    {
-                        self.selected_project = project;
-                        self.workspace_root = workspace;
-                    }
-                    if self.projects.is_empty() {
-                        self.composing_chat = true;
-                    }
-                    self.restore_failures = failures;
+                    self.apply_restore_failures(failures);
+                }
+                ServiceUpdate::SessionHydrated(handle) => {
+                    self.upsert_hydrated_session(handle);
+                }
+                ServiceUpdate::RestorationFinished(failures) => {
+                    self.apply_restore_failures(failures);
                 }
                 ServiceUpdate::SessionAdded(handle) => {
                     let id = handle.id().to_owned();
-                    if let Some(index) = self
-                        .sessions
-                        .iter()
-                        .position(|session| session.handle.id() == id)
-                    {
-                        self.sessions[index] = SessionProjection::new(handle);
-                    } else {
-                        self.sessions.insert(0, SessionProjection::new(handle));
-                    }
+                    self.upsert_hydrated_session(handle);
                     self.selected_session = Some(id);
                 }
                 ServiceUpdate::SessionsDiscovered(handles) => {
                     for handle in handles {
-                        let id = handle.id().to_owned();
-                        if let Some(index) = self
-                            .sessions
-                            .iter()
-                            .position(|session| session.handle.id() == id)
-                        {
-                            self.sessions[index] = SessionProjection::new(handle);
-                        } else {
-                            self.sessions.insert(0, SessionProjection::new(handle));
-                        }
+                        self.upsert_hydrated_session(handle);
                     }
                 }
                 ServiceUpdate::ProjectsChanged { projects, selected } => {
                     self.apply_projects_changed(projects, selected, cx);
                 }
                 ServiceUpdate::SessionDeleted(id) => {
-                    self.sessions.retain(|session| session.handle.id() != id);
+                    self.sessions.retain(|session| session.id() != id);
                     if self.selected_session.as_deref() == Some(id.as_str()) {
                         self.selected_session = None;
                     }
@@ -1545,6 +1629,72 @@ impl SessionMvpView {
             }
         }
         changed
+    }
+
+    fn apply_bootstrap(&mut self, bootstrap: BootstrapState) {
+        self.projects = bootstrap.projects;
+        self.sessions = bootstrap
+            .sessions
+            .into_iter()
+            .map(SessionProjection::bootstrap)
+            .collect();
+        if self.startup_navigation == StartupNavigation::Untouched {
+            self.selected_session = bootstrap
+                .selected_session
+                .filter(|id| self.sessions.iter().any(|session| session.id() == id))
+                .or_else(|| self.sessions.first().map(|session| session.id().to_owned()));
+            self.adopt_selected_session_location();
+        }
+        if self.projects.is_empty() && self.selected_session.is_none() {
+            self.composing_chat = true;
+        }
+    }
+
+    fn apply_restore_failures(&mut self, failures: Vec<RestoreFailure>) {
+        for failure in &failures {
+            if let Some(session) = self
+                .sessions
+                .iter_mut()
+                .find(|session| session.id() == failure.app_session_id)
+            {
+                let mut snapshot = (*session.snapshot).clone();
+                snapshot.status = SessionStatus::Failed;
+                snapshot.last_error = Some(failure.error.clone());
+                session.snapshot = Arc::new(snapshot);
+            }
+        }
+        self.restore_failures.extend(failures);
+    }
+
+    fn upsert_hydrated_session(&mut self, handle: SessionHandle) {
+        let id = handle.id().to_owned();
+        if let Some(index) = self.sessions.iter().position(|session| session.id() == id) {
+            self.sessions[index] = SessionProjection::new(handle);
+        } else {
+            self.sessions.insert(0, SessionProjection::new(handle));
+        }
+        if self.startup_navigation == StartupNavigation::Untouched {
+            if self.selected_session.is_none() {
+                self.selected_session = Some(id);
+            }
+            self.adopt_selected_session_location();
+        }
+    }
+
+    fn adopt_selected_session_location(&mut self) {
+        if let Some((project, workspace)) = self
+            .selected()
+            .filter(|session| !session.snapshot.metadata.is_chat())
+            .map(|session| {
+                (
+                    PathBuf::from(session.snapshot.metadata.project_key()),
+                    PathBuf::from(&session.snapshot.metadata.project_path),
+                )
+            })
+        {
+            self.selected_project = project;
+            self.workspace_root = workspace;
+        }
     }
 
     /// Adopt a new project list, selecting `selected` when one was given.
@@ -1567,6 +1717,7 @@ impl SessionMvpView {
         self.selected_project.clone_from(&self.launch_workspace);
         self.workspace_root.clone_from(&self.launch_workspace);
         self.selected_session = None;
+        self.startup_navigation = StartupNavigation::Changed;
         let _ = self.commands.send(ServiceCommand::Select {
             app_session_id: None,
         });
@@ -1576,8 +1727,17 @@ impl SessionMvpView {
     fn refresh_snapshots(&mut self) -> bool {
         let mut changed = false;
         for projection in &mut self.sessions {
-            if projection.receiver.has_changed().unwrap_or(false) {
-                projection.snapshot = projection.receiver.borrow_and_update().clone();
+            if projection
+                .receiver
+                .as_ref()
+                .is_some_and(|receiver| receiver.has_changed().unwrap_or(false))
+            {
+                projection.snapshot = projection
+                    .receiver
+                    .as_mut()
+                    .expect("changed receiver is present")
+                    .borrow_and_update()
+                    .clone();
                 changed = true;
             }
         }
@@ -1586,9 +1746,7 @@ impl SessionMvpView {
 
     fn selected(&self) -> Option<&SessionProjection> {
         let id = self.selected_session.as_deref()?;
-        self.sessions
-            .iter()
-            .find(|session| session.handle.id() == id)
+        self.sessions.iter().find(|session| session.id() == id)
     }
 
     fn submit_prompt(&mut self, prompt: String) {
@@ -1737,6 +1895,7 @@ impl SessionMvpView {
         self.open_control_menu = None;
         self.composing_chat = true;
         self.selected_session = None;
+        self.startup_navigation = StartupNavigation::Changed;
         self.action_error = None;
         self.composer.update(cx, TextInput::clear);
         let _ = self.commands.send(ServiceCommand::Select {
@@ -1767,7 +1926,7 @@ impl SessionMvpView {
             return;
         };
         let _ = self.commands.send(ServiceCommand::Respond {
-            app_session_id: session.handle.id().to_owned(),
+            app_session_id: session.id().to_owned(),
             interaction_id: interaction.id.clone(),
             response: InteractionResponse::Submit {
                 value: value.into(),
@@ -1779,6 +1938,7 @@ impl SessionMvpView {
     fn select_session(&mut self, id: String, cx: &mut Context<Self>) {
         self.open_control_menu = None;
         self.selected_session = Some(id);
+        self.startup_navigation = StartupNavigation::Changed;
         let _ = self.commands.send(ServiceCommand::Select {
             app_session_id: self.selected_session.clone(),
         });
@@ -1814,6 +1974,7 @@ impl SessionMvpView {
 
     fn select_project(&mut self, path: &str, cx: &mut Context<Self>) {
         self.open_control_menu = None;
+        self.startup_navigation = StartupNavigation::Changed;
         // Choosing a project leaves chat mode. This is the single place that
         // means "the user picked a project", so adding a project, picking one
         // from the menu, and restoring a session all clear the flag here.
@@ -1826,7 +1987,7 @@ impl SessionMvpView {
             .sessions
             .iter()
             .find(|session| session.snapshot.metadata.project_key() == path)
-            .map(|session| session.handle.id().to_owned());
+            .map(|session| session.id().to_owned());
         if let Some(workspace) = self
             .selected()
             .map(|session| PathBuf::from(&session.snapshot.metadata.project_path))
@@ -1941,7 +2102,7 @@ impl SessionMvpView {
             if let Some(session) = self
                 .sessions
                 .iter_mut()
-                .find(|session| session.handle.id() == app_session_id)
+                .find(|session| session.id() == app_session_id)
             {
                 // Reflect the new name immediately; the actor's snapshot
                 // follows once the command is applied.
@@ -2149,6 +2310,7 @@ impl SessionMvpView {
     fn new_session(&mut self, cx: &mut Context<Self>) {
         self.open_control_menu = None;
         self.selected_session = None;
+        self.startup_navigation = StartupNavigation::Changed;
         let _ = self.commands.send(ServiceCommand::Select {
             app_session_id: None,
         });
@@ -2917,7 +3079,7 @@ impl SessionMvpView {
             .filter(|session| !session.snapshot.metadata.is_chat())
             .filter(|session| session.snapshot.metadata.project_key() == selected_path)
             .map(|session| {
-                let id = session.handle.id().to_owned();
+                let id = session.id().to_owned();
                 let accessible_id = id.clone();
                 let label = session.snapshot.metadata.title.clone();
                 let menu_id = id.clone();
@@ -2982,7 +3144,7 @@ impl SessionMvpView {
             .iter()
             .filter(|session| session.snapshot.metadata.is_chat())
             .map(|session| {
-                let id = session.handle.id().to_owned();
+                let id = session.id().to_owned();
                 let label = session.snapshot.metadata.title.clone();
                 let menu_id = id.clone();
                 let menu_label = label.clone();
@@ -5391,7 +5553,7 @@ impl SessionMvpView {
     fn interaction_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let session = self.selected()?;
         let interaction = session.snapshot.pending_interactions.first()?.clone();
-        let app_session_id = session.handle.id().to_owned();
+        let app_session_id = session.id().to_owned();
         let interaction_id = interaction.id.clone();
         let approve = interaction_id.clone();
         let reject = interaction_id.clone();
@@ -6321,6 +6483,10 @@ fn timestamp() -> String {
     )
 }
 
+fn elapsed_millis(started: Instant) -> u64 {
+    u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
+}
+
 /// Install every key binding the app responds to.
 ///
 /// Shared with the interaction tests so they exercise the bindings the app
@@ -6434,7 +6600,7 @@ fn main() {
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let branch = git_branch(&project_root);
     let service = match data_dir.and_then(|path| database_path(&path)) {
-        Ok(path) => AppService::start(project_root.clone(), path),
+        Ok(path) => AppService::start(project_root.clone(), &path),
         Err(error) => AppService::failed(error),
     };
     let chats_workspace = chats_directory(&project_root);
@@ -6894,7 +7060,9 @@ mod tests {
         use session_manager::SessionHandle;
         use std::sync::Arc;
 
-        use crate::{AppService, ServiceCommand, SessionMvpView, SessionProjection, UpdateUi};
+        use crate::{
+            AppService, ServiceCommand, ServiceUpdate, SessionMvpView, SessionProjection, UpdateUi,
+        };
 
         fn snapshot(id: &str, title: &str) -> SessionSnapshot {
             let mut state = SessionSnapshot::new(SessionMetadata {
@@ -6925,6 +7093,30 @@ mod tests {
         ) {
             let (view, cx, commands, _) = setup_with_attachments(cx);
             (view, cx, commands)
+        }
+
+        fn setup_for_bootstrap(
+            cx: &mut TestAppContext,
+        ) -> (
+            gpui::Entity<SessionMvpView>,
+            &mut VisualTestContext,
+            std::sync::mpsc::Receiver<ServiceCommand>,
+            std::sync::mpsc::Sender<ServiceUpdate>,
+        ) {
+            let (service, commands, updates) = AppService::for_test_with_updates();
+            cx.update(super::super::bind_app_keys);
+            let (view, cx) = cx.add_window_view(|_, cx| {
+                SessionMvpView::new(
+                    service,
+                    std::path::PathBuf::from("/tmp/project"),
+                    "main".to_owned(),
+                    std::path::PathBuf::from("/tmp/chats"),
+                    None,
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+            (view, cx, commands, updates)
         }
 
         /// Same view, plus a temporary directory for pasted images.
@@ -6970,6 +7162,180 @@ mod tests {
                 left_delta < 0.5 && width_delta < 0.5,
                 "{label} is not aligned: {actual:?} vs {expected:?}"
             );
+        }
+
+        #[gpui::test]
+        fn bootstrap_selects_the_stored_session_before_hydration(cx: &mut TestAppContext) {
+            let (mut service, _commands) = AppService::for_test();
+            let first = snapshot("session-1", "First session").metadata;
+            let second = snapshot("session-2", "Second session").metadata;
+            service.bootstrap = Some(super::super::BootstrapState {
+                projects: Vec::new(),
+                sessions: vec![first, second],
+                selected_session: Some("session-2".to_owned()),
+            });
+            cx.update(super::super::bind_app_keys);
+            let (view, cx) = cx.add_window_view(|_, cx| {
+                SessionMvpView::new(
+                    service,
+                    std::path::PathBuf::from("/tmp/project"),
+                    "main".to_owned(),
+                    std::path::PathBuf::from("/tmp/chats"),
+                    None,
+                    cx,
+                )
+            });
+
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected_session.as_deref(), Some("session-2"));
+                assert_eq!(view.sessions.len(), 2);
+                assert_eq!(
+                    view.selected().unwrap().snapshot.status,
+                    SessionStatus::Recovering
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn navigation_before_bootstrap_is_never_overwritten(cx: &mut TestAppContext) {
+            let (view, cx, _commands, _updates) = setup_for_bootstrap(cx);
+            view.update(cx, SessionMvpView::new_session);
+            view.update(cx, |view, _| {
+                view.apply_bootstrap(super::super::BootstrapState {
+                    projects: Vec::new(),
+                    sessions: vec![snapshot("session-1", "First session").metadata],
+                    selected_session: Some("session-1".to_owned()),
+                });
+            });
+
+            view.read_with(cx, |view, _| {
+                assert!(view.selected_session.is_none());
+                assert_eq!(view.sessions.len(), 1);
+            });
+        }
+
+        #[gpui::test]
+        fn hydration_replaces_the_shell_without_changing_navigation(cx: &mut TestAppContext) {
+            let (view, cx, _commands, updates) = setup_for_bootstrap(cx);
+            view.update(cx, |view, _| {
+                view.apply_bootstrap(super::super::BootstrapState {
+                    projects: Vec::new(),
+                    sessions: vec![snapshot("session-1", "First session").metadata],
+                    selected_session: Some("session-1".to_owned()),
+                });
+            });
+            view.update(cx, SessionMvpView::new_session);
+            updates
+                .send(ServiceUpdate::SessionHydrated(SessionHandle::for_test(
+                    snapshot("session-1", "Hydrated session"),
+                )))
+                .unwrap();
+
+            view.update(cx, SessionMvpView::apply_service_updates);
+
+            view.read_with(cx, |view, _| {
+                assert!(view.selected_session.is_none());
+                assert_eq!(view.sessions[0].snapshot.status, SessionStatus::Idle);
+                assert_eq!(view.sessions[0].snapshot.metadata.title, "Hydrated session");
+            });
+        }
+
+        #[gpui::test]
+        fn first_hydration_is_selected_when_bootstrap_metadata_was_empty(cx: &mut TestAppContext) {
+            let (view, cx, _commands, updates) = setup_for_bootstrap(cx);
+            updates
+                .send(ServiceUpdate::SessionHydrated(SessionHandle::for_test(
+                    snapshot("session-1", "Recovered session"),
+                )))
+                .unwrap();
+
+            view.update(cx, SessionMvpView::apply_service_updates);
+
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected_session.as_deref(), Some("session-1"));
+            });
+        }
+
+        #[gpui::test]
+        fn hydration_refreshes_repository_grouping_after_metadata_adoption(
+            cx: &mut TestAppContext,
+        ) {
+            let (view, cx, _commands, updates) = setup_for_bootstrap(cx);
+            let mut legacy = snapshot("session-1", "Legacy session").metadata;
+            legacy.repository_root = None;
+            legacy.project_path = "/tmp/repository/worktree".to_owned();
+            view.update(cx, |view, _| {
+                view.apply_bootstrap(super::super::BootstrapState {
+                    projects: Vec::new(),
+                    sessions: vec![legacy],
+                    selected_session: Some("session-1".to_owned()),
+                });
+            });
+            let mut adopted = snapshot("session-1", "Legacy session");
+            adopted.metadata.project_path = "/tmp/repository/worktree".to_owned();
+            adopted.metadata.repository_root = Some("/tmp/repository".to_owned());
+            updates
+                .send(ServiceUpdate::SessionHydrated(SessionHandle::for_test(
+                    adopted,
+                )))
+                .unwrap();
+
+            view.update(cx, SessionMvpView::apply_service_updates);
+
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.selected_project,
+                    std::path::PathBuf::from("/tmp/repository")
+                );
+                assert_eq!(
+                    view.workspace_root,
+                    std::path::PathBuf::from("/tmp/repository/worktree")
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn restoration_failure_keeps_the_selected_shell_and_surfaces_error(
+            cx: &mut TestAppContext,
+        ) {
+            let (view, cx, _commands, updates) = setup_for_bootstrap(cx);
+            view.update(cx, |view, _| {
+                view.apply_bootstrap(super::super::BootstrapState {
+                    projects: Vec::new(),
+                    sessions: vec![snapshot("session-1", "First session").metadata],
+                    selected_session: Some("session-1".to_owned()),
+                });
+            });
+            updates
+                .send(ServiceUpdate::Ready {
+                    compatibility: copilot_provider::ProviderCompatibility {
+                        sdk_crate_version: "test".to_owned(),
+                        sdk_protocol_version: 3,
+                        negotiated_protocol_version: 3,
+                        process_id: None,
+                        startup: None,
+                        available_modes: Vec::new(),
+                        available_models: Vec::new(),
+                    },
+                    projects: Vec::new(),
+                    failures: vec![session_manager::RestoreFailure {
+                        app_session_id: "session-1".to_owned(),
+                        sdk_session_id: "sdk-session-1".to_owned(),
+                        error: "saved worktree is missing".to_owned(),
+                    }],
+                })
+                .unwrap();
+
+            view.update(cx, SessionMvpView::apply_service_updates);
+
+            view.read_with(cx, |view, _| {
+                let session = view.selected().expect("failed session remains selected");
+                assert_eq!(session.snapshot.status, SessionStatus::Failed);
+                assert_eq!(
+                    session.snapshot.last_error.as_deref(),
+                    Some("saved worktree is missing")
+                );
+            });
         }
 
         #[gpui::test]
