@@ -1346,7 +1346,24 @@ mod tests {
                     "id": "call-2-partial",
                     "type": "tool.execution_partial_result",
                     "timestamp": "5",
-                    "data": {"toolCallId": "call-2", "partialOutput": "more output\n"}
+                    "data": {
+                        "toolCallId": "call-2",
+                        "partialOutput":
+                            "more output\n<output too long - dropped 1 line from the end>\n"
+                    }
+                }),
+                json!({
+                    "id": "call-2-complete",
+                    "type": "tool.execution_complete",
+                    "timestamp": "6",
+                    "data": {
+                        "toolCallId": "call-2",
+                        "success": true,
+                        "result": {
+                            "content": "more output\nrecovered output\n",
+                            "detailedContent": "more output\nrecovered output\n"
+                        }
+                    }
                 }),
             ],
         );
@@ -1357,7 +1374,11 @@ mod tests {
             "read_bash must not create a second terminal for the same shell"
         );
         let terminal = state.tool_activity.terminal("shell-a").expect("terminal");
-        assert_eq!(terminal.output, "running tests\nmore output\n");
+        assert_eq!(
+            terminal.output,
+            "running tests\nmore output\nrecovered output\n"
+        );
+        assert!(!terminal.output.contains("output too long"));
         assert_eq!(
             terminal.tool_call_ids,
             vec!["call-1".to_owned(), "call-2".to_owned()]
@@ -1411,6 +1432,70 @@ mod tests {
 
         let terminal = state.tool_activity.terminal("shell-a").expect("terminal");
         assert_eq!(terminal.output, "hi\n");
+    }
+
+    #[test]
+    fn completion_replaces_a_truncated_partial_with_the_full_result() {
+        let mut state = SessionSnapshot::new(metadata());
+        let events = [
+            json!({
+                "id": "start",
+                "type": "tool.execution_start",
+                "timestamp": "1",
+                "data": {
+                    "toolCallId": "call-1",
+                    "toolName": "bash",
+                    "arguments": {"command": "print-many-lines"}
+                }
+            }),
+            json!({
+                "id": "partial",
+                "type": "tool.execution_partial_result",
+                "timestamp": "2",
+                "data": {
+                    "toolCallId": "call-1",
+                    "partialOutput": "line 1\n<output too long - dropped 207 lines from the end>\n"
+                }
+            }),
+            json!({
+                "id": "complete",
+                "type": "tool.execution_complete",
+                "timestamp": "3",
+                "data": {
+                    "toolCallId": "call-1",
+                    "success": true,
+                    "result": {
+                        "content": "line 1\nline 2\nline 3\n",
+                        "detailedContent": "line 1\nline 2\nline 3\n"
+                    }
+                }
+            }),
+        ];
+
+        for raw in events {
+            let event =
+                DomainEvent::from_sdk_event_for("app-session", state.last_sequence + 1, &raw);
+            let updates = tools::output_updates(&state.tool_activity, &event);
+            if event.source_type == "tool.execution_complete" {
+                assert_eq!(updates.len(), 1);
+                assert!(updates[0].replace);
+            }
+            let event_type = event.source_type.clone();
+            assert_eq!(state.apply(event), ApplyOutcome::Applied);
+            if event_type == "tool.execution_partial_result" {
+                let invocation = state.tool_activity.invocation("call-1").unwrap();
+                assert_eq!(invocation.output, "line 1\n");
+                assert!(!invocation.output.contains("output too long"));
+                assert_eq!(updates[0].chunk.as_deref(), Some("line 1\n"));
+            }
+        }
+
+        let invocation = state.tool_activity.invocation("call-1").unwrap();
+        assert_eq!(invocation.output, "line 1\nline 2\nline 3\n");
+        assert!(!invocation.output.contains("output too long"));
+        assert_eq!(invocation.output_metadata.chunk_count, 1);
+        assert_eq!(invocation.output_metadata.byte_count, 21);
+        assert!(invocation.output_metadata.complete);
     }
 
     /// A later delivery with identical content is legitimate output. Content
