@@ -1166,7 +1166,11 @@ impl SessionActor {
     async fn apply_raw(&mut self, raw: &Value) {
         let sequence = self.state.last_sequence + 1;
         let event = DomainEvent::from_sdk_event_for(&self.state.metadata.id, sequence, raw);
-        match self.storage.append_event(&event) {
+        let output_updates = app_model::tools::output_updates(&self.state.tool_activity, &event);
+        match self
+            .storage
+            .append_event_with_output(&event, &output_updates)
+        {
             Ok(true) => {
                 let refresh_after = {
                     let applied = self.state.apply(event);
@@ -1432,7 +1436,8 @@ fn reconcile_history(
         }
         let event =
             DomainEvent::from_sdk_event_for(&state.metadata.id, state.last_sequence + 1, &raw);
-        if storage.append_event(&event)? {
+        let output_updates = app_model::tools::output_updates(&state.tool_activity, &event);
+        if storage.append_event_with_output(&event, &output_updates)? {
             seen.insert(event.id.clone());
             let _ = state.apply(event);
         } else {

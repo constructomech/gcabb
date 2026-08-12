@@ -3773,6 +3773,10 @@ impl SessionMvpView {
         let label = format!("{verb} {summary}");
         let diff = invocation.diff().map(str::to_owned);
         let error = invocation.error_message.clone();
+        let output_error = invocation
+            .output_load_error
+            .clone()
+            .or_else(|| invocation.output_error.clone());
         // Command output is the tail, since the interesting part is the end.
         // The block scrolls, so it can hold considerably more than the
         // terminals panel preview.
@@ -3881,6 +3885,19 @@ impl SessionMvpView {
                     )
                     .when_some(error, |entry, error| {
                         entry.child(div().text_xs().text_color(rgb(RED)).child(error))
+                    })
+                    .when_some(output_error, |entry, error| {
+                        entry.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "tool-output-error-{}",
+                                    invocation.call_id
+                                )))
+                                .role(Role::Alert)
+                                .text_xs()
+                                .text_color(rgb(RED))
+                                .child(format!("Output unavailable: {error}")),
+                        )
                     })
                     .when_some(detail, |entry, detail| {
                         entry.child(self.detail_block(
@@ -4909,11 +4926,7 @@ impl SessionMvpView {
                 .into_any_element();
         }
         let cards = terminals.iter().rev().take(12).map(|terminal| {
-            let (state_label, state_color) = match terminal.state {
-                app_model::TerminalState::Running => ("running", GREEN),
-                app_model::TerminalState::Exited => ("exited", MUTED),
-                app_model::TerminalState::Cancelled => ("cancelled", RED),
-            };
+            let (state_label, state_color) = terminal_state_display(terminal.state);
             let exit = terminal
                 .exit_code
                 .map_or_else(String::new, |code| format!(" · exit {code}"));
@@ -4958,9 +4971,11 @@ impl SessionMvpView {
                         ),
                 )
                 .child(div().text_xs().text_color(rgb(MUTED)).child(format!(
-                    "shell {} · {} call(s)",
+                    "shell {} · {} call(s) · {} bytes in {} chunk(s)",
                     terminal.shell_id,
-                    terminal.tool_call_ids.len()
+                    terminal.tool_call_ids.len(),
+                    terminal.output_metadata.byte_count,
+                    terminal.output_metadata.chunk_count
                 )))
                 .child(
                     div()
@@ -4970,12 +4985,17 @@ impl SessionMvpView {
                         .text_color(rgb(PRIMARY))
                         .child(terminal_tail(&terminal.output)),
                 )
-                .when(terminal.output_truncated, |card| {
+                .when_some(terminal_output_error(terminal), |card, error| {
                     card.child(
                         div()
+                            .id(SharedString::from(format!(
+                                "terminal-output-error-{}",
+                                terminal.shell_id
+                            )))
+                            .role(Role::Alert)
                             .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child("Earlier output was trimmed."),
+                            .text_color(rgb(RED))
+                            .child(format!("Output unavailable: {error}")),
                     )
                 })
         });
@@ -5979,12 +5999,24 @@ impl Render for SessionMvpView {
     }
 }
 
-/// Trailing slice of terminal output kept for display.
-///
-/// Phase 3 renders a bounded tail; Phase 6 replaces this with the virtualized
-/// terminal and real scrollback.
+/// Trailing slice of terminal output displayed until transcript virtualization.
 fn terminal_tail(output: &str) -> String {
     tail_lines(output, 40)
+}
+
+fn terminal_state_display(state: app_model::TerminalState) -> (&'static str, u32) {
+    match state {
+        app_model::TerminalState::Running => ("running", GREEN),
+        app_model::TerminalState::Exited => ("exited", MUTED),
+        app_model::TerminalState::Cancelled => ("cancelled", RED),
+    }
+}
+
+fn terminal_output_error(terminal: &app_model::TerminalSession) -> Option<String> {
+    terminal
+        .output_load_error
+        .clone()
+        .or_else(|| terminal.output_error.clone())
 }
 
 /// The last `max_lines` lines of `output`.

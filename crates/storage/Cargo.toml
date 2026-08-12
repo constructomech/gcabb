@@ -14,7 +14,7 @@ thiserror.workspace = true
 
 [dev-dependencies]
 tempfile.workspace = true
+test-harness = { path = "../test-harness" }
 
 [lints]
 workspace = true
-
