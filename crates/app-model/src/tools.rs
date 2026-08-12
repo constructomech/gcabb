@@ -297,6 +297,15 @@ impl ToolInvocation {
         if let Some(command) = &self.display_command {
             return command.clone();
         }
+        if self.class == ToolClass::ShellControl {
+            return match self.tool_name.as_str() {
+                "read_bash" => "Check command output",
+                "stop_bash" => "Stop command",
+                "list_bash" => "List running commands",
+                _ => "Manage command",
+            }
+            .to_owned();
+        }
         let argument = self
             .file_path()
             .map(str::to_owned)
@@ -304,8 +313,7 @@ impl ToolInvocation {
             .or_else(|| self.string_argument("query"))
             .or_else(|| self.string_argument("command"))
             .or_else(|| self.string_argument("url"))
-            .or_else(|| self.string_argument("description"))
-            .or_else(|| self.string_argument("shellId"));
+            .or_else(|| self.string_argument("description"));
         argument.unwrap_or_else(|| self.tool_name.clone())
     }
 
@@ -667,10 +675,24 @@ fn project_start(activity: &mut ToolActivity, event: &crate::DomainEvent) {
                 server: server.to_owned(),
             });
     let shell_info = data.get("shellToolInfo");
-    let display_command = shell_info
-        .and_then(|info| info.get("displayCommand"))
+    let display_command = data
+        .get("arguments")
+        .and_then(|arguments| arguments.get("description"))
         .and_then(Value::as_str)
+        .filter(|description| !description.is_empty())
+        .or_else(|| {
+            shell_info
+                .and_then(|info| info.get("displayCommand"))
+                .and_then(Value::as_str)
+        })
         .map(str::to_owned);
+    let display_command = display_command.or_else(|| {
+        data.get("arguments")
+            .and_then(|arguments| arguments.get("command"))
+            .and_then(Value::as_str)
+            .filter(|command| !command.is_empty())
+            .map(str::to_owned)
+    });
     let possible_paths = shell_info
         .and_then(|info| info.get("possiblePaths"))
         .and_then(Value::as_array)
@@ -690,6 +712,12 @@ fn project_start(activity: &mut ToolActivity, event: &crate::DomainEvent) {
         .get("shellId")
         .and_then(Value::as_str)
         .map(str::to_owned);
+    let display_command = display_command.or_else(|| {
+        shell_id
+            .as_deref()
+            .and_then(|shell_id| activity.terminal(shell_id))
+            .and_then(|terminal| terminal.command.clone())
+    });
 
     let class = ToolClass::classify(&tool_name);
     activity.upsert_invocation(ToolInvocation {
