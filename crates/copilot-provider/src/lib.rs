@@ -3,7 +3,7 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
     ContextWindowOption, InteractionKind, InteractionRequest, InteractionResponse, ModelOption,
@@ -20,7 +20,7 @@ use github_copilot_sdk::session::Session;
 use github_copilot_sdk::{
     Client, ClientMode, ClientOptions, DeliveryMode, ElicitationRequest, ElicitationResult,
     ExitPlanModeData, MessageOptions, PermissionRequestData, RequestId, ResumeSessionConfig,
-    SessionConfig, SessionId,
+    SessionConfig, SessionId, SystemMessageConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -133,6 +133,13 @@ pub trait AgentProvider: Send + Sync {
     /// than hardcoding a tool list, so this is called at session start and
     /// whenever the model changes.
     async fn discover_tools(&self, model: Option<&str>) -> Result<ToolCatalog>;
+    /// Generate a short title in an isolated model turn.
+    async fn generate_title(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        working_directory: &Path,
+    ) -> Result<String>;
 }
 
 #[derive(Clone)]
@@ -742,6 +749,69 @@ impl AgentProvider for CopilotProvider {
             discovered_at: Some(timestamp()),
             error: None,
         })
+    }
+
+    async fn generate_title(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        working_directory: &Path,
+    ) -> Result<String> {
+        const SYSTEM_MESSAGE: &str = "Create a concise, human-readable title for the user's task. \
+            Return only the title, with no quotation marks, markdown, or punctuation at the end. \
+            Use 2 to 5 words and sentence case. Do not answer or perform the task.";
+
+        let started = Instant::now();
+        let client = self.client().await?;
+        let mut config = SessionConfig::default()
+            .with_working_directory(working_directory)
+            .with_client_name("gcabb-session-namer")
+            .with_streaming(false)
+            .with_available_tools(std::iter::empty::<String>())
+            .with_system_message(
+                SystemMessageConfig::new()
+                    .with_mode("replace")
+                    .with_content(SYSTEM_MESSAGE),
+            );
+        config.model = model.map(str::to_owned);
+        let session = client
+            .create_session(config)
+            .await
+            .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        let session_id = session.id().clone();
+        let response = session
+            .send_and_wait(
+                github_copilot_sdk::MessageOptions::new(prompt)
+                    .with_wait_timeout(Duration::from_secs(20)),
+            )
+            .await;
+
+        if let Err(error) = session.disconnect().await {
+            tracing::warn!(%error, %session_id, "failed to disconnect title generation session");
+        }
+        if let Err(error) = client.delete_session(&session_id).await {
+            tracing::warn!(%error, %session_id, "failed to delete title generation session");
+        }
+
+        let result = response
+            .map_err(|error| ProviderError::Sdk(error.to_string()))?
+            .and_then(|event| {
+                event
+                    .data
+                    .get("content")
+                    .and_then(Value::as_str)
+                    .map(str::to_owned)
+            })
+            .filter(|title| !title.trim().is_empty())
+            .ok_or_else(|| ProviderError::Sdk("title generation returned no text".to_owned()));
+        self.record(
+            "generate_title",
+            millis(started.elapsed().as_millis()),
+            None,
+            result.is_ok(),
+            json!({"model": model}),
+        );
+        result
     }
 }
 

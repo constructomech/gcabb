@@ -5,13 +5,14 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use app_model::{
-    DomainEvent, ProjectMetadata, SessionKind, SessionMetadata, SessionSnapshot, rebuild,
+    DomainEvent, ProjectMetadata, SessionKind, SessionMetadata, SessionSnapshot, TitleSource,
+    rebuild,
 };
 use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 6;
+const SCHEMA_VERSION: i64 = 7;
 
 #[derive(Debug, Error)]
 pub enum StorageError {
@@ -66,14 +67,15 @@ impl Storage {
     pub fn upsert_session(&self, metadata: &SessionMetadata) -> Result<()> {
         self.connection()?.execute(
             "INSERT INTO app_sessions (
-                id, sdk_session_id, project_path, repository_root, title, kind,
-                model, mode, base_ref, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
+                id, sdk_session_id, project_path, repository_root, title, title_source,
+                kind, model, mode, base_ref, created_at, updated_at
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
              ON CONFLICT(id) DO UPDATE SET
                 sdk_session_id = excluded.sdk_session_id,
                 project_path = excluded.project_path,
                 repository_root = excluded.repository_root,
                 title = excluded.title,
+                title_source = excluded.title_source,
                 kind = excluded.kind,
                 model = excluded.model,
                 mode = excluded.mode,
@@ -85,6 +87,7 @@ impl Storage {
                 metadata.project_path,
                 metadata.repository_root,
                 metadata.title,
+                metadata.title_source.as_str(),
                 metadata.kind.as_str(),
                 metadata.model,
                 metadata.mode,
@@ -215,7 +218,7 @@ impl Storage {
     pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, sdk_session_id, project_path, repository_root, title, kind, model, mode, base_ref, created_at, updated_at
+            "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, model, mode, base_ref, created_at, updated_at
              FROM app_sessions ORDER BY updated_at DESC, id",
         )?;
         let rows = statement.query_map([], metadata_from_row)?;
@@ -270,7 +273,7 @@ impl Storage {
         let connection = self.connection()?;
         let metadata = connection
             .query_row(
-                "SELECT id, sdk_session_id, project_path, repository_root, title, kind, model, mode, base_ref, created_at, updated_at
+                "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, model, mode, base_ref, created_at, updated_at
                  FROM app_sessions WHERE id = ?1",
                 [session_id],
                 metadata_from_row,
@@ -358,6 +361,7 @@ impl Storage {
                 sdk_session_id TEXT NOT NULL UNIQUE,
                 project_path TEXT NOT NULL,
                 title TEXT NOT NULL,
+                title_source TEXT NOT NULL DEFAULT 'manual',
                 model TEXT,
                 mode TEXT,
                 base_ref TEXT,
@@ -399,6 +403,12 @@ impl Storage {
         add_column_if_missing(&transaction, "app_sessions", "base_ref", "TEXT")?;
         add_column_if_missing(&transaction, "app_sessions", "repository_root", "TEXT")?;
         add_column_if_missing(&transaction, "app_sessions", "kind", "TEXT")?;
+        add_column_if_missing(
+            &transaction,
+            "app_sessions",
+            "title_source",
+            "TEXT NOT NULL DEFAULT 'manual'",
+        )?;
         // Earlier builds kept every snapshot a session ever wrote, and each
         // one embedded the whole event log. Only the newest is ever read, so
         // the rest are discarded on open. One database shrank from 499 MB to
@@ -458,12 +468,13 @@ fn metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMetadat
         project_path: row.get(2)?,
         repository_root: row.get(3)?,
         title: row.get(4)?,
-        kind: SessionKind::from_str_or_default(row.get::<_, Option<String>>(5)?.as_deref()),
-        model: row.get(6)?,
-        mode: row.get(7)?,
-        base_ref: row.get(8)?,
-        created_at: row.get(9)?,
-        updated_at: row.get(10)?,
+        title_source: TitleSource::from_str_or_default(row.get::<_, Option<String>>(5)?.as_deref()),
+        kind: SessionKind::from_str_or_default(row.get::<_, Option<String>>(6)?.as_deref()),
+        model: row.get(7)?,
+        mode: row.get(8)?,
+        base_ref: row.get(9)?,
+        created_at: row.get(10)?,
+        updated_at: row.get(11)?,
     })
 }
 
@@ -482,6 +493,7 @@ mod tests {
             project_path: "/tmp/project".to_owned(),
             repository_root: None,
             title: "Recovered session".to_owned(),
+            title_source: TitleSource::Manual,
             kind: SessionKind::Project,
             model: Some("test-model".to_owned()),
             mode: Some("interactive".to_owned()),
@@ -759,6 +771,7 @@ mod tests {
         assert_eq!(sessions.len(), 1);
         assert_eq!(sessions[0].id, "legacy");
         assert!(sessions[0].base_ref.is_none());
+        assert_eq!(sessions[0].title_source, TitleSource::Manual);
     }
 
     #[test]

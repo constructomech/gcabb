@@ -8,7 +8,8 @@ use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use app_model::{
     ContextWindowOption, InteractionKind, InteractionResponse, ProjectMetadata, PromptAttachment,
-    SessionKind, SessionLocation, SessionSnapshot, SessionStatus, TranscriptRole, TranscriptState,
+    SessionKind, SessionLocation, SessionSnapshot, SessionStatus, TitleSource, TranscriptRole,
+    TranscriptState,
 };
 use copilot_provider::{CopilotProvider, ProviderCompatibility};
 use diagnostics::{TracingDiagnostics, init_tracing};
@@ -418,12 +419,36 @@ impl AppService {
                         }
                         command => {
                             let is_submit = matches!(&command, ServiceCommand::Submit { .. });
+                            let naming_prompt = match &command {
+                                ServiceCommand::Submit {
+                                    app_session_id: None,
+                                    prompt,
+                                    ..
+                                } => Some(prompt.clone()),
+                                _ => None,
+                            };
                             match runtime.block_on(handle_service_command(
                                 &manager,
                                 command,
                                 &session_roots.worktrees.clone().unwrap_or_default(),
                             )) {
                                 Ok(Some(handle)) => {
+                                    if let Some(prompt) = naming_prompt {
+                                        let manager = manager.clone();
+                                        let session_id = handle.id().to_owned();
+                                        runtime.spawn(async move {
+                                            if let Err(error) = manager
+                                                .generate_session_title(&session_id, &prompt)
+                                                .await
+                                            {
+                                                tracing::warn!(
+                                                    %error,
+                                                    %session_id,
+                                                    "session title generation failed"
+                                                );
+                                            }
+                                        });
+                                    }
                                     let _ = update_tx.send(ServiceUpdate::SessionAdded(handle));
                                     if is_submit {
                                         let _ = update_tx.send(ServiceUpdate::PromptAccepted);
@@ -532,6 +557,7 @@ async fn handle_service_command(
                     .create_session(CreateSessionRequest {
                         project_path,
                         title,
+                        title_source: TitleSource::Fallback,
                         model,
                         mode: Some(mode),
                         reasoning_effort,
@@ -796,7 +822,9 @@ fn session_title(prompt: &str) -> String {
         .take(7)
         .collect::<Vec<_>>()
         .join(" ");
-    if title.chars().count() > 56 {
+    if title.is_empty() {
+        "New session".to_owned()
+    } else if title.chars().count() > 56 {
         title.chars().take(53).collect::<String>() + "..."
     } else {
         title
@@ -6832,7 +6860,9 @@ mod tests {
     /// which is the only way to catch event-wiring mistakes such as a dismiss
     /// overlay consuming the click meant for a menu item.
     mod interaction {
-        use app_model::{SessionKind, SessionMetadata, SessionSnapshot, SessionStatus};
+        use app_model::{
+            SessionKind, SessionMetadata, SessionSnapshot, SessionStatus, TitleSource,
+        };
         use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
         use session_manager::SessionHandle;
         use std::sync::Arc;
@@ -6846,6 +6876,7 @@ mod tests {
                 project_path: "/tmp/project".to_owned(),
                 repository_root: Some("/tmp/project".to_owned()),
                 title: title.to_owned(),
+                title_source: TitleSource::Manual,
                 kind: SessionKind::Project,
                 model: None,
                 mode: None,

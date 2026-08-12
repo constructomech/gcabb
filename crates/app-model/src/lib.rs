@@ -66,6 +66,35 @@ pub enum SessionStatus {
     Disconnected,
 }
 
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum TitleSource {
+    Fallback,
+    Generated,
+    #[default]
+    Manual,
+}
+
+impl TitleSource {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Fallback => "fallback",
+            Self::Generated => "generated",
+            Self::Manual => "manual",
+        }
+    }
+
+    #[must_use]
+    pub fn from_str_or_default(value: Option<&str>) -> Self {
+        match value {
+            Some("fallback") => Self::Fallback,
+            Some("generated") => Self::Generated,
+            _ => Self::Manual,
+        }
+    }
+}
+
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptRole {
@@ -447,6 +476,10 @@ pub struct SessionMetadata {
     #[serde(default)]
     pub repository_root: Option<String>,
     pub title: String,
+    /// Who last chose the title. Legacy sessions default to manual so an
+    /// automatic rename can never overwrite an existing user-visible name.
+    #[serde(default)]
+    pub title_source: TitleSource,
     #[serde(default)]
     pub kind: SessionKind,
     pub model: Option<String>,
@@ -969,6 +1002,7 @@ mod tests {
             project_path: "/tmp/project".to_owned(),
             repository_root: None,
             title: "Test".to_owned(),
+            title_source: TitleSource::Manual,
             kind: SessionKind::Project,
             model: None,
             mode: None,
