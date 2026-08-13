@@ -1112,6 +1112,13 @@ struct SessionMenu {
     position: gpui::Point<gpui::Pixels>,
 }
 
+/// Context menu for a project, anchored where the user right-clicked.
+struct ProjectMenu {
+    id: String,
+    name: String,
+    position: gpui::Point<gpui::Pixels>,
+}
+
 /// Phase 3 inspector tabs for the session side panel.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum SessionPanel {
@@ -1221,6 +1228,8 @@ struct SessionMvpView {
     open_control_menu: Option<ControlMenu>,
     /// Session whose context menu is open, and where to draw it.
     session_menu: Option<SessionMenu>,
+    /// Project whose context menu is open, and where to draw it.
+    project_menu: Option<ProjectMenu>,
     /// Session being renamed, if the rename dialog is open.
     renaming_session: Option<String>,
     rename_input: Entity<TextInput>,
@@ -1399,6 +1408,7 @@ impl SessionMvpView {
             selected_change: None,
             open_control_menu: None,
             session_menu: None,
+            project_menu: None,
             renaming_session: None,
             rename_input,
             action_error: None,
@@ -2181,11 +2191,34 @@ impl SessionMvpView {
     }
 
     fn remove_project(&mut self, project_id: String, cx: &mut Context<Self>) {
+        self.project_menu = None;
         self.action_error = None;
         let _ = self
             .commands
             .send(ServiceCommand::RemoveProject { project_id });
         cx.notify();
+    }
+
+    /// Open the context menu for a project at the pointer position.
+    fn open_project_menu(
+        &mut self,
+        id: String,
+        name: String,
+        position: gpui::Point<gpui::Pixels>,
+        cx: &mut Context<Self>,
+    ) {
+        self.open_control_menu = None;
+        self.session_menu = None;
+        self.project_menu = Some(ProjectMenu { id, name, position });
+        cx.notify();
+    }
+
+    fn dismiss_context_menu(&mut self, cx: &mut Context<Self>) {
+        let dismissed_session = self.session_menu.take().is_some();
+        let dismissed_project = self.project_menu.take().is_some();
+        if dismissed_session || dismissed_project {
+            cx.notify();
+        }
     }
 
     /// Open the context menu for a session at the pointer position.
@@ -2197,6 +2230,7 @@ impl SessionMvpView {
         cx: &mut Context<Self>,
     ) {
         self.open_control_menu = None;
+        self.project_menu = None;
         self.session_menu = Some(SessionMenu {
             id,
             title,
@@ -2206,9 +2240,7 @@ impl SessionMvpView {
     }
 
     fn dismiss_session_menu(&mut self, cx: &mut Context<Self>) {
-        if self.session_menu.take().is_some() {
-            cx.notify();
-        }
+        self.dismiss_context_menu(cx);
     }
 
     /// Open the rename dialog, seeded with the session's current title.
@@ -2347,6 +2379,56 @@ impl SessionMvpView {
         )
     }
 
+    /// Context menu for a project, anchored where the user right-clicked.
+    fn project_context_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let menu = self.project_menu.as_ref()?;
+        let project_id = menu.id.clone();
+        let label = menu.name.clone();
+        Some(
+            div()
+                .id("project-menu")
+                .accessibility_id("project-menu")
+                .role(Role::Menu)
+                .aria_label(format!("Actions for {label}"))
+                .absolute()
+                .left(menu.position.x)
+                .top(menu.position.y)
+                .w(px(200.0))
+                .flex()
+                .flex_col()
+                .p_1()
+                .rounded_lg()
+                .bg(rgb(ELEVATED))
+                .border_1()
+                .border_color(rgb(BORDER))
+                .shadow_lg()
+                .child(
+                    div()
+                        .id("project-menu-remove")
+                        .debug_selector(|| "project-menu-remove".to_owned())
+                        .accessibility_id("project-menu-remove")
+                        .role(Role::MenuItem)
+                        .aria_label(format!("Remove {label}"))
+                        .focusable()
+                        .tab_stop(true)
+                        .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .text_sm()
+                        .text_color(rgb(RED))
+                        .child("Remove project")
+                        .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.remove_project(project_id.clone(), cx);
+                        })),
+                ),
+        )
+    }
+
     /// Rename dialog for the session chosen from the context menu.
     fn rename_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         self.renaming_session.as_ref()?;
@@ -2458,6 +2540,14 @@ impl SessionMvpView {
         self.action_error = None;
         self.composer.update(cx, TextInput::clear);
         cx.notify();
+    }
+
+    fn new_session_for_project(&mut self, path: &str, cx: &mut Context<Self>) {
+        self.composing_chat = false;
+        self.selected_project = PathBuf::from(path);
+        self.workspace_root = PathBuf::from(path);
+        self.project_branch = git_output(Path::new(path), &["branch", "--show-current"]);
+        self.new_session(cx);
     }
 
     fn toggle_sidebar(&mut self, cx: &mut Context<Self>) {
@@ -3345,12 +3435,16 @@ impl SessionMvpView {
             });
         let projects = self.projects.iter().map(|project| {
             let path = project.path.clone();
+            let new_session_path = path.clone();
             let project_id = project.id.clone();
+            let menu_project_id = project_id.clone();
             let selected = project.path == selected_path;
             let label = project.name.clone();
+            let menu_label = label.clone();
             let missing = !Path::new(&project.path).is_dir();
             div()
                 .id(SharedString::from(format!("project-{path}")))
+                .debug_selector(|| "project-row".to_owned())
                 .accessibility_id(path.clone())
                 .role(Role::ListItem)
                 .aria_label(if missing {
@@ -3382,26 +3476,43 @@ impl SessionMvpView {
                 )
                 .child(
                     div()
-                        .id(SharedString::from(format!("remove-project-{project_id}")))
-                        .accessibility_id(format!("remove-project-{project_id}"))
+                        .id(SharedString::from(format!("new-session-{project_id}")))
+                        .debug_selector(|| "project-new-session".to_owned())
+                        .accessibility_id(format!("new-session-{project_id}"))
                         .role(Role::Button)
-                        .aria_label(format!("Remove {label}"))
+                        .aria_label(format!("New session for {label}"))
                         .focusable()
                         .tab_stop(true)
                         .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
-                        .px_1()
-                        .text_xs()
+                        .w(px(20.0))
+                        .h(px(20.0))
+                        .flex()
+                        .items_center()
+                        .justify_center()
+                        .rounded_md()
                         .text_color(rgb(MUTED))
-                        .child("✕")
-                        .hover(|style| style.text_color(rgb(RED)).cursor_pointer())
+                        .child("+")
+                        .hover(|style| style.bg(rgb(SUBTLE)).text_color(rgb(PRIMARY)))
                         .on_click(cx.listener(move |view, _, _, cx| {
-                            view.remove_project(project_id.clone(), cx);
+                            cx.stop_propagation();
+                            view.new_session_for_project(&new_session_path, cx);
                         })),
                 )
                 .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                 .on_click(cx.listener(move |view, _, _, cx| {
                     view.select_project(&path, cx);
                 }))
+                .on_mouse_down(
+                    MouseButton::Right,
+                    cx.listener(move |view, event: &gpui::MouseDownEvent, _, cx| {
+                        view.open_project_menu(
+                            menu_project_id.clone(),
+                            menu_label.clone(),
+                            event.position,
+                            cx,
+                        );
+                    }),
+                )
         });
         div()
             .id("sidebar")
@@ -6343,27 +6454,31 @@ impl Render for SessionMvpView {
                         ),
                 )
             })
-            .when(self.session_menu.is_some(), |root| {
-                root.child(
-                    div()
-                        .id("dismiss-session-menu")
-                        .absolute()
-                        .inset_0()
-                        // Dismiss on mouse up, not mouse down: tearing the menu
-                        // down on press removes the item before its click can
-                        // complete on release.
-                        //
-                        // Only the left button dismisses. The right-click that
-                        // opens the menu releases *after* this overlay exists,
-                        // so a right-button handler here would immediately
-                        // close the menu the same click just opened.
-                        .on_mouse_up(
-                            MouseButton::Left,
-                            cx.listener(|view, _, _, cx| view.dismiss_session_menu(cx)),
-                        ),
-                )
-            })
+            .when(
+                self.session_menu.is_some() || self.project_menu.is_some(),
+                |root| {
+                    root.child(
+                        div()
+                            .id("dismiss-context-menu")
+                            .absolute()
+                            .inset_0()
+                            // Dismiss on mouse up, not mouse down: tearing the menu
+                            // down on press removes the item before its click can
+                            // complete on release.
+                            //
+                            // Only the left button dismisses. The right-click that
+                            // opens the menu releases *after* this overlay exists,
+                            // so a right-button handler here would immediately
+                            // close the menu the same click just opened.
+                            .on_mouse_up(
+                                MouseButton::Left,
+                                cx.listener(|view, _, _, cx| view.dismiss_context_menu(cx)),
+                            ),
+                    )
+                },
+            )
             .when_some(self.session_context_menu(cx), gpui::ParentElement::child)
+            .when_some(self.project_context_menu(cx), gpui::ParentElement::child)
             .when_some(self.rename_dialog(cx), gpui::ParentElement::child)
             .when_some(self.settings_dialog(cx), gpui::ParentElement::child)
             .when_some(self.image_preview_overlay(cx), gpui::ParentElement::child)
@@ -7888,6 +8003,76 @@ mod tests {
                     assert_eq!(app_session_id, "session-1");
                 }
                 _ => panic!("expected a DeleteSession command"),
+            }
+        }
+
+        #[gpui::test]
+        fn project_plus_starts_a_new_session_for_that_project(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.projects = vec![app_model::ProjectMetadata {
+                    id: "project-id".to_owned(),
+                    path: "/tmp/project".to_owned(),
+                    name: "Project".to_owned(),
+                    default_branch: Some("main".to_owned()),
+                    last_opened_at: "1".to_owned(),
+                }];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let button = cx
+                .debug_bounds("project-new-session")
+                .expect("project new-session button rendered");
+            cx.simulate_click(button.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected_project, std::path::Path::new("/tmp/project"));
+                assert_eq!(view.workspace_root, std::path::Path::new("/tmp/project"));
+                assert!(view.selected_session.is_none());
+            });
+            match commands.try_recv().expect("a command was sent") {
+                ServiceCommand::Select { app_session_id } => assert!(app_session_id.is_none()),
+                _ => panic!("expected a Select command"),
+            }
+        }
+
+        #[gpui::test]
+        fn project_removal_is_available_from_the_right_click_menu(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.projects = vec![app_model::ProjectMetadata {
+                    id: "project-id".to_owned(),
+                    path: "/tmp/project".to_owned(),
+                    name: "Project".to_owned(),
+                    default_branch: Some("main".to_owned()),
+                    last_opened_at: "1".to_owned(),
+                }];
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let row = cx
+                .debug_bounds("project-row")
+                .expect("project row rendered");
+            cx.simulate_mouse_down(row.center(), MouseButton::Right, Modifiers::none());
+            cx.simulate_mouse_up(row.center(), MouseButton::Right, Modifiers::none());
+            cx.run_until_parked();
+
+            let item = cx
+                .debug_bounds("project-menu-remove")
+                .expect("remove-project item rendered");
+            cx.simulate_click(item.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| assert!(view.project_menu.is_none()));
+            match commands.try_recv().expect("a command was sent") {
+                ServiceCommand::RemoveProject { project_id } => {
+                    assert_eq!(project_id, "project-id");
+                }
+                _ => panic!("expected a RemoveProject command"),
             }
         }
 
