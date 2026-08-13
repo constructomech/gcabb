@@ -1021,6 +1021,8 @@ struct SessionProjection {
     _handle: Option<SessionHandle>,
     receiver: Option<watch::Receiver<Arc<SessionSnapshot>>>,
     snapshot: Arc<SessionSnapshot>,
+    /// When the current active turn began, retained across Starting -> Running.
+    running_since: Option<Instant>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1113,10 +1115,12 @@ impl SessionProjection {
     fn new(handle: SessionHandle) -> Self {
         let receiver = handle.subscribe();
         let snapshot = receiver.borrow().clone();
+        let running_since = session_is_running(snapshot.status).then(Instant::now);
         Self {
             _handle: Some(handle),
             receiver: Some(receiver),
             snapshot,
+            running_since,
         }
     }
 
@@ -1127,7 +1131,19 @@ impl SessionProjection {
             _handle: None,
             receiver: None,
             snapshot: Arc::new(snapshot),
+            running_since: None,
         }
+    }
+
+    fn set_snapshot(&mut self, snapshot: Arc<SessionSnapshot>) {
+        let was_running = session_is_running(self.snapshot.status);
+        let is_running = session_is_running(snapshot.status);
+        match (was_running, is_running) {
+            (false, true) => self.running_since = Some(Instant::now()),
+            (true, false) => self.running_since = None,
+            _ => {}
+        }
+        self.snapshot = snapshot;
     }
 
     fn id(&self) -> &str {
@@ -1307,6 +1323,7 @@ struct SessionMvpView {
     update_service: Option<UpdateService>,
     settings_visibility: SettingsVisibility,
     _poll_task: gpui::Task<()>,
+    _running_tick_task: gpui::Task<()>,
     _update_poll_task: gpui::Task<()>,
 }
 
@@ -1391,6 +1408,24 @@ impl SessionMvpView {
                         let refreshed = view.refresh_snapshots();
                         let banner_changed = view.apply_update_events();
                         if updated || refreshed || banner_changed {
+                            cx.notify();
+                        }
+                    })
+                    .is_err()
+                {
+                    break;
+                }
+            }
+        });
+        let running_tick_task = cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(Duration::from_secs(1)).await;
+                if view
+                    .update(cx, |view, cx| {
+                        if view
+                            .selected()
+                            .is_some_and(|session| session.running_since.is_some())
+                        {
                             cx.notify();
                         }
                     })
@@ -1485,6 +1520,7 @@ impl SessionMvpView {
             update_service,
             settings_visibility: SettingsVisibility::Closed,
             _poll_task: poll_task,
+            _running_tick_task: running_tick_task,
             _update_poll_task: update_poll_task,
         };
         if let Some(bootstrap) = bootstrap {
@@ -1877,7 +1913,7 @@ impl SessionMvpView {
                 let mut snapshot = (*session.snapshot).clone();
                 snapshot.status = SessionStatus::Failed;
                 snapshot.last_error = Some(failure.error.clone());
-                session.snapshot = Arc::new(snapshot);
+                session.set_snapshot(Arc::new(snapshot));
             }
         }
         self.restore_failures.extend(failures);
@@ -1949,12 +1985,13 @@ impl SessionMvpView {
                 .as_ref()
                 .is_some_and(|receiver| receiver.has_changed().unwrap_or(false))
             {
-                projection.snapshot = projection
+                let snapshot = projection
                     .receiver
                     .as_mut()
                     .expect("changed receiver is present")
                     .borrow_and_update()
                     .clone();
+                projection.set_snapshot(snapshot);
                 changed = true;
             }
         }
@@ -2358,7 +2395,7 @@ impl SessionMvpView {
                 // follows once the command is applied.
                 let mut snapshot = (*session.snapshot).clone();
                 snapshot.metadata.title = title;
-                session.snapshot = Arc::new(snapshot);
+                session.set_snapshot(Arc::new(snapshot));
             }
         }
         self.rename_input.update(cx, TextInput::clear);
@@ -3437,7 +3474,7 @@ impl SessionMvpView {
                         }),
                     )
                     .child(if is_deleting {
-                        deleting_spinner(spinner_id).into_any_element()
+                        progress_spinner(spinner_id).into_any_element()
                     } else {
                         div()
                             .w(px(7.0))
@@ -3506,7 +3543,7 @@ impl SessionMvpView {
                         }),
                     )
                     .child(if is_deleting {
-                        deleting_spinner(spinner_id).into_any_element()
+                        progress_spinner(spinner_id).into_any_element()
                     } else {
                         div()
                             .w(px(7.0))
@@ -5239,6 +5276,7 @@ impl SessionMvpView {
         let group = SharedString::from("scroll-transcript");
         let view = cx.entity();
         let list_state = self.transcript_list.clone();
+        let running_indicator = self.running_indicator();
         let scrollbar = self.transcript_scrollbar(group.clone(), cx);
         let transcript = list(list_state, move |index, _, cx| {
             view.update(cx, |view, cx| view.render_timeline_row(index, cx))
@@ -5265,9 +5303,48 @@ impl SessionMvpView {
                     .flex_col()
                     .flex_1()
                     .min_h_0()
-                    .child(div().flex().flex_col().flex_1().min_h_0().child(transcript)),
+                    .child(
+                        div()
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h_0()
+                            .child(transcript)
+                            .children(running_indicator),
+                    ),
             )
             .children(scrollbar)
+    }
+
+    /// Running state at the conversation tail, where the user is already
+    /// watching for the next activity.
+    fn running_indicator(&self) -> Option<impl IntoElement + use<>> {
+        let session = self.selected()?;
+        let running_since = session.running_since?;
+        if !session_is_running(session.snapshot.status) {
+            return None;
+        }
+        let elapsed = running_since.elapsed().as_secs();
+        Some(
+            div()
+                .id("running-indicator")
+                .debug_selector(|| "running-indicator".to_owned())
+                .accessibility_id("running-indicator")
+                .role(Role::Status)
+                .aria_label(format!("Agent running, {elapsed} seconds"))
+                .mx_auto()
+                .w_full()
+                .max_w(px(CONVERSATION_COLUMN_WIDTH))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_6()
+                .pb_3()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(progress_spinner("running-indicator-spinner".into()))
+                .child(format!("{elapsed}s")),
+        )
     }
 
     /// Phase 3 inspector: changes, terminals, and capability state.
@@ -6903,18 +6980,20 @@ fn status_color(status: SessionStatus) -> gpui::Rgba {
     }
 }
 
-/// Frames of a small braille spinner, cycled while a session delete is in
-/// flight so the row visibly stays busy instead of appearing frozen.
+fn session_is_running(status: SessionStatus) -> bool {
+    matches!(status, SessionStatus::Running | SessionStatus::Starting)
+}
+
+/// Frames of the shared progress spinner.
 const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
 
-/// Replaces the status dot with an animated spinner while `id`'s delete
-/// command is in flight, so removal feels immediate rather than delayed.
+/// Animated progress glyph used for both deletion and active agent work.
 #[allow(
     clippy::cast_possible_truncation,
     clippy::cast_sign_loss,
     clippy::cast_precision_loss
 )]
-fn deleting_spinner(id: SharedString) -> impl IntoElement {
+fn progress_spinner(id: SharedString) -> impl IntoElement {
     div()
         .w(px(14.0))
         .h(px(14.0))
@@ -8161,11 +8240,12 @@ mod tests {
                 view.selected_session = Some("session-1".to_owned());
                 let mut snapshot = (*view.sessions[0].snapshot).clone();
                 snapshot.status = SessionStatus::Running;
-                view.sessions[0].snapshot = Arc::new(snapshot);
+                view.sessions[0].set_snapshot(Arc::new(snapshot));
                 cx.notify();
             });
             cx.run_until_parked();
 
+            assert!(cx.debug_bounds("running-indicator").is_some());
             assert!(cx.debug_bounds("stop-session").is_some());
             assert!(cx.debug_bounds("submit-prompt").is_none());
             assert!(cx.debug_bounds("close-session").is_none());
@@ -8190,7 +8270,7 @@ mod tests {
                 view.selected_session = Some("session-1".to_owned());
                 let mut snapshot = (*view.sessions[0].snapshot).clone();
                 snapshot.status = SessionStatus::Running;
-                view.sessions[0].snapshot = Arc::new(snapshot);
+                view.sessions[0].set_snapshot(Arc::new(snapshot));
                 cx.notify();
             });
             cx.run_until_parked();
@@ -8216,6 +8296,33 @@ mod tests {
                 }
                 _ => panic!("expected a Submit command"),
             }
+        }
+
+        #[gpui::test]
+        fn running_indicator_clears_when_the_turn_stops(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                let mut snapshot = (*view.sessions[0].snapshot).clone();
+                snapshot.status = SessionStatus::Running;
+                view.sessions[0].set_snapshot(Arc::new(snapshot));
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("running-indicator").is_some());
+
+            view.update(cx, |view, cx| {
+                let mut snapshot = (*view.sessions[0].snapshot).clone();
+                snapshot.status = SessionStatus::Cancelled;
+                view.sessions[0].set_snapshot(Arc::new(snapshot));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("running-indicator").is_none());
+            view.read_with(cx, |view, _| {
+                assert!(view.sessions[0].running_since.is_none());
+            });
         }
 
         /// Regression: the right-click that opens the menu releases after the
