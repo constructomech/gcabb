@@ -2834,6 +2834,13 @@ impl SessionMvpView {
         let directory = self.attachments_root.clone();
         for image in images {
             let index = self.draft_attachments.len() + 1;
+            let (bytes, mime_type) = match normalize_pasted_image(&image.bytes, &image.mime_type) {
+                Ok(normalized) => normalized,
+                Err(error) => {
+                    self.action_error = Some(error);
+                    continue;
+                }
+            };
             // Written to disk and sent as a file, matching what a picked or
             // dropped image does. Sending bytes inline instead meant the
             // runtime echoed back a blob with no path, so the transcript could
@@ -2841,12 +2848,8 @@ impl SessionMvpView {
             // persisted in the event log and in every later snapshot.
             let attachment = directory
                 .as_deref()
-                .and_then(|directory| {
-                    write_pasted_image(directory, &image.bytes, &image.mime_type, index)
-                })
-                .unwrap_or_else(|| {
-                    PromptAttachment::from_image_bytes(&image.bytes, image.mime_type.clone(), index)
-                });
+                .and_then(|directory| write_pasted_image(directory, &bytes, &mime_type, index))
+                .unwrap_or_else(|| PromptAttachment::from_image_bytes(&bytes, mime_type, index));
             self.draft_attachments.push(attachment);
         }
         cx.notify();
@@ -6328,6 +6331,9 @@ impl Render for SessionMvpView {
             || self.workspace_root.clone(),
             |session| PathBuf::from(&session.snapshot.metadata.project_path),
         );
+        let session_error = self
+            .selected()
+            .and_then(|session| session.snapshot.last_error.clone());
         div()
             .id("gcabb")
             .accessibility_id("gcabb")
@@ -6496,6 +6502,20 @@ impl Render for SessionMvpView {
                                         .min_w_0()
                                         .min_h_0()
                                         .child(self.transcript(cx))
+                                        .when_some(session_error, |column, error| {
+                                            column.child(
+                                                div()
+                                                    .id("session-error")
+                                                    .debug_selector(|| "session-error".to_owned())
+                                                    .role(Role::Alert)
+                                                    .aria_label(error.clone())
+                                                    .mx_auto()
+                                                    .mb_2()
+                                                    .text_sm()
+                                                    .text_color(rgb(RED))
+                                                    .child(error),
+                                            )
+                                        })
                                         .when_some(self.action_error.clone(), |column, error| {
                                             column.child(
                                                 div()
@@ -7067,6 +7087,24 @@ fn attachments_directory() -> Option<PathBuf> {
     Some(path)
 }
 
+/// Normalize clipboard images to the format accepted across vision providers.
+fn normalize_pasted_image(bytes: &[u8], mime_type: &str) -> Result<(Vec<u8>, String), String> {
+    let format = image::guess_format(bytes)
+        .ok()
+        .or_else(|| image::ImageFormat::from_mime_type(mime_type))
+        .ok_or_else(|| format!("Unsupported pasted image format: {mime_type}"))?;
+    if format == image::ImageFormat::Png {
+        return Ok((bytes.to_vec(), "image/png".to_owned()));
+    }
+    let decoded = image::load_from_memory_with_format(bytes, format)
+        .map_err(|error| format!("Could not decode pasted {mime_type} image: {error}"))?;
+    let mut png = std::io::Cursor::new(Vec::new());
+    decoded
+        .write_to(&mut png, image::ImageFormat::Png)
+        .map_err(|error| format!("Could not convert pasted {mime_type} image to PNG: {error}"))?;
+    Ok((png.into_inner(), "image/png".to_owned()))
+}
+
 /// Write a pasted image to disk so it can be referenced by path.
 fn write_pasted_image(
     directory: &Path,
@@ -7074,15 +7112,10 @@ fn write_pasted_image(
     mime_type: &str,
     index: usize,
 ) -> Option<PromptAttachment> {
-    let extension = match mime_type {
-        "image/png" => "png",
-        "image/jpeg" => "jpg",
-        "image/webp" => "webp",
-        "image/gif" => "gif",
-        "image/bmp" => "bmp",
-        _ => return None,
-    };
-    let path = directory.join(format!("{}-clipboard.{extension}", uuid::Uuid::new_v4()));
+    if mime_type != "image/png" {
+        return None;
+    }
+    let path = directory.join(format!("{}-clipboard.png", uuid::Uuid::new_v4()));
     std::fs::write(&path, bytes).ok()?;
     Some(PromptAttachment::File {
         path: path.to_string_lossy().into_owned(),
@@ -9002,6 +9035,85 @@ mod tests {
                     .extension()
                     .is_some_and(|extension| extension == "png"),
                 "the extension names the format"
+            );
+        }
+
+        /// macOS commonly places screenshots on the clipboard as TIFF even
+        /// when the source image was a PNG. Models accept PNG but reject TIFF.
+        #[gpui::test]
+        fn a_pasted_tiff_is_converted_to_png(cx: &mut TestAppContext) {
+            let (view, cx, commands, _attachments) = setup_with_attachments(cx);
+            let mut tiff = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgba8(1, 1)
+                .write_to(&mut tiff, image::ImageFormat::Tiff)
+                .expect("encode test TIFF");
+            view.update(cx, |view, cx| {
+                view.attach_pasted_images(
+                    &[super::super::PastedImage {
+                        bytes: tiff.into_inner(),
+                        mime_type: "image/tiff".to_owned(),
+                    }],
+                    cx,
+                );
+                view.submit_prompt("look".to_owned());
+            });
+
+            let sent = commands
+                .try_iter()
+                .find_map(|command| match command {
+                    ServiceCommand::Submit { attachments, .. } => Some(attachments),
+                    _ => None,
+                })
+                .expect("a submit command was sent");
+            let path = sent[0]
+                .path()
+                .expect("a converted image must be sent as a file");
+            assert_eq!(
+                std::path::Path::new(path)
+                    .extension()
+                    .and_then(|value| value.to_str()),
+                Some("png")
+            );
+            let png = std::fs::read(path).expect("read converted PNG");
+            assert!(png.starts_with(&[0x89, 0x50, 0x4E, 0x47]));
+            assert_eq!(
+                image::load_from_memory_with_format(&png, image::ImageFormat::Png)
+                    .expect("decode converted PNG")
+                    .width(),
+                1
+            );
+        }
+
+        #[test]
+        fn a_pasted_jpeg_is_also_normalized_to_png() {
+            let mut jpeg = std::io::Cursor::new(Vec::new());
+            image::DynamicImage::new_rgb8(1, 1)
+                .write_to(&mut jpeg, image::ImageFormat::Jpeg)
+                .expect("encode test JPEG");
+
+            let (png, mime_type) =
+                super::super::normalize_pasted_image(&jpeg.into_inner(), "image/jpeg")
+                    .expect("normalize JPEG");
+            assert_eq!(mime_type, "image/png");
+            assert!(png.starts_with(&[0x89, 0x50, 0x4E, 0x47]));
+        }
+
+        #[gpui::test]
+        fn a_session_error_is_visible_after_the_runtime_returns_to_idle(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "Failed image");
+                state.status = SessionStatus::Idle;
+                state.last_error = Some("The model could not process this image.".to_owned());
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("session-error").is_some(),
+                "the terminal session error was hidden by the idle status"
             );
         }
 

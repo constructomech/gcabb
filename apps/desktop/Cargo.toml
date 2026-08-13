@@ -14,6 +14,7 @@ uuid.workspace = true
 git-service.workspace = true
 gpui.workspace = true
 gpui_platform.workspace = true
+image.workspace = true
 pulldown-cmark.workspace = true
 session-manager.workspace = true
 serde_json.workspace = true

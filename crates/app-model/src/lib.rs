@@ -659,6 +659,9 @@ impl SessionSnapshot {
         }
 
         self.last_sequence = event.sequence;
+        if event.source_type == "user.message" {
+            self.last_error = None;
+        }
         if let Some(event_status) = status_for_event(&event) {
             self.status = if self.pending_interactions.is_empty()
                 || matches!(
@@ -677,8 +680,15 @@ impl SessionSnapshot {
             tools::mark_running_terminals_cancelled(&mut self.tool_activity, &event.timestamp);
         }
         tools::project(&mut self.tool_activity, &event);
-        if self.status == SessionStatus::Failed {
-            self.last_error = Some(event.summary.clone());
+        if event.source_type == "session.error" {
+            self.last_error = Some(
+                event
+                    .details
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&event.summary)
+                    .to_owned(),
+            );
         }
         self.seen_event_ids.insert(event.id.clone());
         ApplyOutcome::Applied
@@ -1079,6 +1089,45 @@ mod tests {
             ApplyOutcome::Applied
         );
         assert_eq!(state.status, SessionStatus::Running);
+    }
+
+    #[test]
+    fn terminal_session_error_survives_idle_until_the_next_turn() {
+        let mut state = SessionSnapshot::new(metadata());
+        let error = DomainEvent::from_sdk_event_for(
+            "app-session",
+            1,
+            &json!({
+                "id": "error",
+                "type": "session.error",
+                "data": {"message": "The model could not process this image."}
+            }),
+        );
+
+        assert_eq!(state.apply(error), ApplyOutcome::Applied);
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("The model could not process this image.")
+        );
+        assert_eq!(
+            state.apply(event(2, "assistant-idle", "assistant.idle")),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            state.apply(event(3, "idle", "session.idle")),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(state.status, SessionStatus::Idle);
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("The model could not process this image.")
+        );
+
+        assert_eq!(
+            state.apply(event(4, "next-turn", "user.message")),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(state.last_error, None);
     }
 
     #[test]

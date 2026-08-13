@@ -2226,6 +2226,7 @@ dependencies = [
  "git-service",
  "gpui",
  "gpui_platform",
+ "image",
  "pulldown-cmark",
  "serde_json",
  "session-manager",
