@@ -242,7 +242,7 @@ checksum = "330a5ed07fa54e4702c9d6c4174f74427fc0ef6e214bbd677ae50a5099946470"
 
 [[package]]
 name = "app-model"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 dependencies = [
  "base64",
  "serde",
@@ -1170,7 +1170,7 @@ dependencies = [
 
 [[package]]
 name = "copilot-provider"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 dependencies = [
  "app-model",
  "async-trait",
@@ -1531,7 +1531,7 @@ dependencies = [
 
 [[package]]
 name = "diagnostics"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 dependencies = [
  "serde",
  "serde_json",
@@ -2216,7 +2216,7 @@ dependencies = [
 
 [[package]]
 name = "gcabb-desktop"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 dependencies = [
  "app-model",
  "copilot-provider",
@@ -2226,6 +2226,7 @@ dependencies = [
  "git-service",
  "gpui",
  "gpui_platform",
+ "image",
  "pulldown-cmark",
  "serde_json",
  "session-manager",
@@ -2240,7 +2241,7 @@ dependencies = [
 
 [[package]]
 name = "gcabb-release"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 dependencies = [
  "anyhow",
  "base64",
@@ -2331,7 +2332,7 @@ checksum = "e629b9b98ef3dd8afe6ca2bd0f89306cec16d43d907889945bc5d6687f2f13c7"
 
 [[package]]
 name = "git-service"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 dependencies = [
  "app-model",
  "tempfile",
@@ -5596,7 +5597,7 @@ dependencies = [
 
 [[package]]
 name = "sdk-probe"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 dependencies = [
  "anyhow",
  "app-model",
@@ -5772,7 +5773,7 @@ dependencies = [
 
 [[package]]
 name = "session-manager"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 dependencies = [
  "app-model",
  "copilot-provider",
@@ -6045,7 +6046,7 @@ checksum = "a2eb9349b6444b326872e140eb1cf5e7c522154d69e7a0ffb0fb81c06b37543f"
 
 [[package]]
 name = "storage"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 dependencies = [
  "app-model",
  "diagnostics",
@@ -6351,7 +6352,7 @@ dependencies = [
 
 [[package]]
 name = "test-harness"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 dependencies = [
  "app-model",
  "async-trait",
@@ -6848,7 +6849,7 @@ dependencies = [
 
 [[package]]
 name = "ui-components"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 dependencies = [
  "gpui",
  "unicode-segmentation",
@@ -6940,7 +6941,7 @@ checksum = "8ecb6da28b8a351d773b68d5825ac39017e680750f980f3a1a85cd8dd28a47c1"
 
 [[package]]
 name = "updater"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 dependencies = [
  "base64",
  "ed25519-dalek",

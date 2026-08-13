@@ -107,6 +107,8 @@ pub enum TranscriptRole {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptState {
+    /// A steering message has been accepted but has not entered model context.
+    Pending,
     Streaming,
     Complete,
     /// Streaming stopped before the runtime committed the message.
@@ -657,6 +659,9 @@ impl SessionSnapshot {
         }
 
         self.last_sequence = event.sequence;
+        if event.source_type == "user.message" {
+            self.last_error = None;
+        }
         if let Some(event_status) = status_for_event(&event) {
             self.status = if self.pending_interactions.is_empty()
                 || matches!(
@@ -675,8 +680,15 @@ impl SessionSnapshot {
             tools::mark_running_terminals_cancelled(&mut self.tool_activity, &event.timestamp);
         }
         tools::project(&mut self.tool_activity, &event);
-        if self.status == SessionStatus::Failed {
-            self.last_error = Some(event.summary.clone());
+        if event.source_type == "session.error" {
+            self.last_error = Some(
+                event
+                    .details
+                    .get("message")
+                    .and_then(Value::as_str)
+                    .unwrap_or(&event.summary)
+                    .to_owned(),
+            );
         }
         self.seen_event_ids.insert(event.id.clone());
         ApplyOutcome::Applied
@@ -809,6 +821,13 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
         return;
     }
     match event.source_type.as_str() {
+        "assistant.turn_start" => {
+            for message in transcript.iter_mut().filter(|message| {
+                message.role == TranscriptRole::User && message.state == TranscriptState::Pending
+            }) {
+                message.state = TranscriptState::Complete;
+            }
+        }
         "user.message" => {
             let content = event
                 .details
@@ -823,7 +842,13 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                     id: event.id.clone(),
                     role: TranscriptRole::User,
                     content: content.to_owned(),
-                    state: TranscriptState::Complete,
+                    state: if event.details.get("delivery").and_then(Value::as_str)
+                        == Some("steering")
+                    {
+                        TranscriptState::Pending
+                    } else {
+                        TranscriptState::Complete
+                    },
                     timestamp: event.timestamp.clone(),
                     sequence: event.sequence,
                     attachments,
@@ -1067,6 +1092,45 @@ mod tests {
     }
 
     #[test]
+    fn terminal_session_error_survives_idle_until_the_next_turn() {
+        let mut state = SessionSnapshot::new(metadata());
+        let error = DomainEvent::from_sdk_event_for(
+            "app-session",
+            1,
+            &json!({
+                "id": "error",
+                "type": "session.error",
+                "data": {"message": "The model could not process this image."}
+            }),
+        );
+
+        assert_eq!(state.apply(error), ApplyOutcome::Applied);
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("The model could not process this image.")
+        );
+        assert_eq!(
+            state.apply(event(2, "assistant-idle", "assistant.idle")),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(
+            state.apply(event(3, "idle", "session.idle")),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(state.status, SessionStatus::Idle);
+        assert_eq!(
+            state.last_error.as_deref(),
+            Some("The model could not process this image.")
+        );
+
+        assert_eq!(
+            state.apply(event(4, "next-turn", "user.message")),
+            ApplyOutcome::Applied
+        );
+        assert_eq!(state.last_error, None);
+    }
+
+    #[test]
     fn restart_cancels_activity_left_running_by_the_previous_runtime() {
         let mut state = SessionSnapshot::new(metadata());
         let events = [
@@ -1179,6 +1243,43 @@ mod tests {
         assert_eq!(state.transcript.len(), 2);
         assert_eq!(state.transcript[0].role, TranscriptRole::User);
         assert_eq!(state.transcript[1].content, "hi there");
+        assert_eq!(state.transcript[1].state, TranscriptState::Complete);
+    }
+
+    #[test]
+    fn steering_message_stays_pending_until_the_next_root_turn_starts() {
+        let mut state = SessionSnapshot::new(metadata());
+        let events = [
+            json!({"id":"u1","type":"user.message","data":{
+                "content":"start the work",
+                "delivery":"idle"
+            }}),
+            json!({"id":"turn-1","type":"assistant.turn_start","data":{"turnId":"1"}}),
+            json!({"id":"u2","type":"user.message","data":{
+                "content":"change direction",
+                "delivery":"steering"
+            }}),
+            json!({"id":"nested","agentId":"agent-1","type":"assistant.turn_start",
+                "data":{"turnId":"nested"}}),
+            json!({"id":"tool","type":"tool.execution_complete","data":{
+                "toolCallId":"call-1",
+                "success":true
+            }}),
+        ];
+        for (index, raw) in events.iter().enumerate() {
+            let event = DomainEvent::from_sdk_event_for("app-session", index as u64 + 1, raw);
+            assert_eq!(state.apply(event), ApplyOutcome::Applied);
+        }
+
+        assert_eq!(state.transcript[0].state, TranscriptState::Complete);
+        assert_eq!(state.transcript[1].state, TranscriptState::Pending);
+
+        let acknowledged = DomainEvent::from_sdk_event_for(
+            "app-session",
+            6,
+            &json!({"id":"turn-2","type":"assistant.turn_start","data":{"turnId":"2"}}),
+        );
+        assert_eq!(state.apply(acknowledged), ApplyOutcome::Applied);
         assert_eq!(state.transcript[1].state, TranscriptState::Complete);
     }
 

@@ -22,7 +22,7 @@ resolver = "2"
 edition = "2024"
 license = "MIT"
 rust-version = "1.95"
-version = "0.1.0-rc.7"
+version = "0.1.0-rc.8"
 
 [workspace.dependencies]
 anyhow = "1.0.100"
@@ -37,6 +37,7 @@ git-service = { path = "crates/git-service" }
 github-copilot-sdk = "=1.0.9"
 gpui = { git = "https://github.com/zed-industries/zed", rev = "027cf0def75e5c027504f402a6a6c0dcac11f178", default-features = false }
 gpui_platform = { git = "https://github.com/zed-industries/zed", rev = "027cf0def75e5c027504f402a6a6c0dcac11f178", features = ["font-kit", "wayland", "x11"] }
+image = { version = "0.25.10", default-features = false, features = ["bmp", "gif", "ico", "jpeg", "png", "pnm", "tiff", "webp"] }
 pulldown-cmark = { version = "0.13.0", default-features = false }
 rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
