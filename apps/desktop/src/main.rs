@@ -1,5 +1,5 @@
 use std::cell::RefCell;
-use std::collections::{HashMap, VecDeque};
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
@@ -17,10 +17,11 @@ use git_service::GitService;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, FollowMode,
-    InteractiveElement, IntoElement, KeyBinding, ListAlignment, ListState, MouseButton,
-    ParentElement, PathPromptOptions, Render, Role, SharedString, StatefulInteractiveElement,
-    Styled, TitlebarOptions, Window, WindowBounds, WindowOptions, actions, div, list, px, relative,
-    rgb, size,
+    FontStyle, HighlightStyle, InteractiveElement, InteractiveText, IntoElement, KeyBinding,
+    ListAlignment, ListState, MouseButton, ParentElement, PathPromptOptions, Render, Role,
+    SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled, StyledText,
+    TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, list, px,
+    relative, rgb, size,
 };
 use session_manager::{
     CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, SessionRoots,
@@ -102,6 +103,9 @@ const TRANSCRIPT_OVERDRAW: f32 = 720.0;
 /// row. Measured dynamic heights replace it as rows enter the window.
 const TRANSCRIPT_ROW_HEIGHT_HINT: f32 = 144.0;
 const MARKDOWN_CACHE_CAPACITY: usize = 128;
+/// Maximum live shell output shaped on the UI thread for one tool row.
+const LIVE_OUTPUT_PREVIEW_BYTES: usize = 16 * 1_024;
+const LIVE_OUTPUT_PREVIEW_LINES: usize = 64;
 /// The command never takes more than a third of that budget, so output — the
 /// part worth reading — always gets the majority.
 const COMMAND_BLOCK_HEIGHT: f32 = ENTRY_DETAIL_BUDGET / 3.0;
@@ -121,11 +125,61 @@ const MARKDOWN_STRIKETHROUGH: u8 = 1 << 2;
 struct MarkdownInlineStyle {
     marks: u8,
     link: Option<String>,
+    code: bool,
+    monospace: bool,
 }
 
 impl MarkdownInlineStyle {
     fn has(&self, mark: u8) -> bool {
         self.marks & mark != 0
+    }
+}
+
+#[derive(Default)]
+struct MarkdownInlineContent {
+    text: String,
+    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    font_family_overrides: Vec<(std::ops::Range<usize>, SharedString)>,
+    links: Vec<(std::ops::Range<usize>, String)>,
+}
+
+impl MarkdownInlineContent {
+    fn push(&mut self, text: &str, style: &MarkdownInlineStyle) {
+        if text.is_empty() {
+            return;
+        }
+        let range = self.text.len()..self.text.len() + text.len();
+        self.text.push_str(text);
+
+        let mut highlight = HighlightStyle::default();
+        if style.has(MARKDOWN_STRONG) {
+            highlight.font_weight = Some(gpui::FontWeight::BOLD);
+        }
+        if style.has(MARKDOWN_EMPHASIS) {
+            highlight.font_style = Some(FontStyle::Italic);
+        }
+        if style.has(MARKDOWN_STRIKETHROUGH) {
+            highlight.strikethrough = Some(StrikethroughStyle {
+                thickness: px(1.),
+                ..Default::default()
+            });
+        }
+        if style.monospace {
+            self.font_family_overrides
+                .push((range.clone(), ".ZedMono".into()));
+        }
+        if style.code {
+            highlight.background_color = Some(rgb(SUBTLE).into());
+        }
+        if let Some(target) = &style.link {
+            highlight.color = Some(rgb(BLUE).into());
+            highlight.underline = Some(UnderlineStyle {
+                thickness: px(1.),
+                ..Default::default()
+            });
+            self.links.push((range.clone(), target.clone()));
+        }
+        self.highlights.push((range, highlight));
     }
 }
 
@@ -1197,6 +1251,8 @@ struct SessionMvpView {
     /// Last rendered content length for each detail block, used to follow
     /// streaming shell output without resetting blocks the user scrolled up.
     detail_extents: RefCell<HashMap<String, usize>>,
+    /// Large completed outputs the user explicitly chose to lay out in full.
+    expanded_tool_outputs: HashSet<String>,
     /// Scrollbar currently being dragged, if any.
     ///
     /// Tracked on the view rather than the thumb so a drag keeps working once
@@ -1381,6 +1437,7 @@ impl SessionMvpView {
             transcript_snapshot_ptr: 0,
             detail_scrolls: RefCell::new(HashMap::new()),
             detail_extents: RefCell::new(HashMap::new()),
+            expanded_tool_outputs: HashSet::new(),
             dragging_scrollbar: None,
             transcript_extent: (String::new(), 0, 0, 0, 0),
             restore_failures: Vec::new(),
@@ -4018,11 +4075,25 @@ impl SessionMvpView {
             .or_else(|| invocation.output_error.clone());
         // Restored command output is already a bounded chunk window. When the
         // user explicitly prepends older windows, keep them reachable here.
-        let output = (matches!(
+        let has_output = matches!(
             invocation.class,
             app_model::ToolClass::Shell | app_model::ToolClass::ShellControl
-        ) && !invocation.output.is_empty())
-        .then(|| invocation.output.clone());
+        ) && !invocation.output.is_empty();
+        let output_is_large = has_output && output_needs_preview(&invocation.output);
+        let output_is_expanded = invocation.state != app_model::InvocationState::Running
+            && self.expanded_tool_outputs.contains(&invocation.call_id);
+        let output = has_output.then(|| {
+            if invocation.state == app_model::InvocationState::Running
+                || (output_is_large && !output_is_expanded)
+            {
+                live_output_preview(&invocation.output)
+            } else {
+                invocation.output.clone()
+            }
+        });
+        let output_toggle = (output_is_large
+            && invocation.state != app_model::InvocationState::Running)
+            .then(|| (invocation.call_id.clone(), output_is_expanded));
         let earlier_output = (invocation.output_start_chunk > 0).then(|| {
             (
                 self.selected_session.clone().unwrap_or_default(),
@@ -4203,6 +4274,44 @@ impl SessionMvpView {
                             cx,
                         ))
                     })
+                    .when_some(output_toggle, |entry, (call_id, expanded)| {
+                        entry.child(
+                            div()
+                                .id(SharedString::from(format!("toggle-output-{call_id}")))
+                                .debug_selector(|| "toggle-tool-output".to_owned())
+                                .role(Role::Button)
+                                .aria_label(if expanded {
+                                    "Show latest output"
+                                } else {
+                                    "Show complete output"
+                                })
+                                .focusable()
+                                .tab_stop(true)
+                                .mt_1()
+                                .px_2()
+                                .py_1()
+                                .rounded_sm()
+                                .text_xs()
+                                .text_color(rgb(BLUE))
+                                .child(if expanded {
+                                    "Show latest output".to_owned()
+                                } else {
+                                    format!(
+                                        "Show complete output ({} bytes)",
+                                        invocation.output_metadata.byte_count
+                                    )
+                                })
+                                .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    if expanded {
+                                        view.expanded_tool_outputs.remove(&call_id);
+                                    } else {
+                                        view.expanded_tool_outputs.insert(call_id.clone());
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
                     .when(!nested.is_empty(), |entry| {
                         entry.child(
                             div()
@@ -4283,14 +4392,11 @@ impl SessionMvpView {
             .collect()
     }
 
-    fn markdown_inline(
+    fn collect_markdown_inline(
         nodes: &[MarkdownNode],
         style: &MarkdownInlineStyle,
-        message_id: &str,
-        element_index: &mut usize,
-        cx: &mut Context<Self>,
-    ) -> Vec<gpui::AnyElement> {
-        let mut elements = Vec::new();
+        content: &mut MarkdownInlineContent,
+    ) {
         for node in nodes {
             match node {
                 MarkdownNode::Container(tag, children) => {
@@ -4306,120 +4412,76 @@ impl SessionMvpView {
                         }
                         _ => {}
                     }
-                    elements.extend(Self::markdown_inline(
-                        children,
-                        &child_style,
-                        message_id,
-                        element_index,
-                        cx,
-                    ));
+                    Self::collect_markdown_inline(children, &child_style, content);
                 }
-                MarkdownNode::Text(text) | MarkdownNode::Code(text) | MarkdownNode::Html(text) => {
-                    let is_code = matches!(node, MarkdownNode::Code(_));
-                    let link = style.link.clone();
-                    // Code/HTML runs (and link labels, which must stay intact
-                    // for click targets to make sense) render as a single
-                    // flex item. Plain text is split into individual words so
-                    // the wrapping flex container can reflow it word-by-word
-                    // like normal inline text, instead of treating the whole
-                    // run as one atomic block that jumps to the next line
-                    // wholesale whenever it doesn't fit the remaining space
-                    // (which is what produced the spurious line breaks right
-                    // after short inline elements like bolded links).
-                    let words: Vec<&str> = if is_code || link.is_some() {
-                        vec![text.as_str()]
-                    } else {
-                        text.split(' ').collect()
-                    };
-                    let word_count = words.len();
-                    for (word_index, word) in words.into_iter().enumerate() {
-                        if word_index > 0 {
-                            elements.push(div().child(" ").into_any_element());
-                        }
-                        if word.is_empty() && word_count > 1 {
-                            continue;
-                        }
-                        let link = link.clone();
-                        // `.id()` allocates a `SharedString` and is only
-                        // needed for elements with interactive/stateful
-                        // behavior (here, link click handling). Plain prose
-                        // and code words are stateless, so skip the id and
-                        // its allocation for them -- this matters once
-                        // per-word splitting is in play, since a long
-                        // message can produce hundreds of word elements.
-                        let base = div()
-                            .min_w_0()
-                            .when(style.has(MARKDOWN_STRONG), |text| {
-                                text.font_weight(gpui::FontWeight::BOLD)
-                            })
-                            .when(style.has(MARKDOWN_EMPHASIS), gpui::Styled::italic)
-                            .when(
-                                style.has(MARKDOWN_STRIKETHROUGH),
-                                gpui::Styled::line_through,
-                            )
-                            .when(is_code, |text| {
-                                text.px_1()
-                                    .rounded_sm()
-                                    .bg(rgb(SUBTLE))
-                                    .font_family(".ZedMono")
-                            })
-                            .child(word.to_owned());
-                        elements.push(if let Some(target) = link {
-                            let element_id = SharedString::from(format!(
-                                "markdown-{message_id}-{}",
-                                *element_index
-                            ));
-                            *element_index += 1;
-                            base.id(element_id)
-                                .text_color(rgb(BLUE))
-                                .underline()
-                                .hover(gpui::Styled::cursor_pointer)
-                                .on_click(cx.listener(move |_, _, _, cx| {
-                                    cx.open_url(&target);
-                                }))
-                                .into_any_element()
-                        } else {
-                            base.into_any_element()
-                        });
-                    }
+                MarkdownNode::Text(text) | MarkdownNode::Html(text) => {
+                    content.push(text, style);
+                }
+                MarkdownNode::Code(text) => {
+                    let mut code_style = style.clone();
+                    code_style.code = true;
+                    code_style.monospace = true;
+                    content.push(text, &code_style);
                 }
                 MarkdownNode::SoftBreak => {
-                    elements.push(div().child(" ").into_any_element());
+                    content.push(" ", style);
                 }
                 MarkdownNode::HardBreak => {
-                    elements.push(div().w_full().h(px(0.)).into_any_element());
+                    content.push("\n", style);
                 }
                 MarkdownNode::TaskMarker(checked) => {
-                    elements.push(
-                        div()
-                            .font_family(".ZedMono")
-                            .child(if *checked { "[x] " } else { "[ ] " })
-                            .into_any_element(),
-                    );
+                    let mut marker_style = style.clone();
+                    marker_style.monospace = true;
+                    content.push(if *checked { "[x] " } else { "[ ] " }, &marker_style);
                 }
                 MarkdownNode::Rule => {}
             }
         }
-        elements
+    }
+
+    fn markdown_inline_content(nodes: &[MarkdownNode]) -> MarkdownInlineContent {
+        let mut content = MarkdownInlineContent::default();
+        Self::collect_markdown_inline(nodes, &MarkdownInlineStyle::default(), &mut content);
+        content
     }
 
     fn markdown_inline_block(
         nodes: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
-        cx: &mut Context<Self>,
+        _cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
+        let content = Self::markdown_inline_content(nodes);
+        let links = content.links;
+        let clickable_ranges = links
+            .iter()
+            .map(|(range, _)| range.clone())
+            .collect::<Vec<_>>();
+        let targets = links
+            .into_iter()
+            .map(|(_, target)| target)
+            .collect::<Vec<_>>();
+        let text = StyledText::new(content.text)
+            .with_highlights(content.highlights)
+            .with_font_family_overrides(content.font_family_overrides);
+        let text = if clickable_ranges.is_empty() {
+            text.into_any_element()
+        } else {
+            let inline_index = *element_index;
+            *element_index += 1;
+            InteractiveText::new(
+                SharedString::from(format!("markdown-{message_id}-{inline_index}")),
+                text,
+            )
+            .on_click(clickable_ranges, move |index, _, cx| {
+                cx.open_url(&targets[index]);
+            })
+            .into_any_element()
+        };
         div()
-            .flex()
-            .flex_wrap()
+            .debug_selector(|| "markdown-inline".to_owned())
             .min_w_0()
-            .children(Self::markdown_inline(
-                nodes,
-                &MarkdownInlineStyle::default(),
-                message_id,
-                element_index,
-                cx,
-            ))
+            .child(text)
             .into_any_element()
     }
 
@@ -6378,6 +6440,42 @@ fn terminal_tail(output: &str) -> String {
     tail_lines(output, 40)
 }
 
+fn output_needs_preview(output: &str) -> bool {
+    output.len() > LIVE_OUTPUT_PREVIEW_BYTES
+        || output
+            .lines()
+            .rev()
+            .take(LIVE_OUTPUT_PREVIEW_LINES + 1)
+            .count()
+            > LIVE_OUTPUT_PREVIEW_LINES
+}
+
+fn live_output_preview(output: &str) -> String {
+    let mut byte_start = output.len().saturating_sub(LIVE_OUTPUT_PREVIEW_BYTES);
+    while !output.is_char_boundary(byte_start) {
+        byte_start += 1;
+    }
+    let window = &output[byte_start..];
+    let newline_index = if window.ends_with('\n') {
+        LIVE_OUTPUT_PREVIEW_LINES
+    } else {
+        LIVE_OUTPUT_PREVIEW_LINES - 1
+    };
+    let line_start = window
+        .match_indices('\n')
+        .rev()
+        .nth(newline_index)
+        .map_or(0, |(index, _)| index + 1);
+    let start = byte_start + line_start;
+    if start == 0 {
+        return output.to_owned();
+    }
+    format!(
+        "[showing latest output; earlier output is retained]\n{}",
+        &output[start..]
+    )
+}
+
 fn terminal_state_display(state: app_model::TerminalState) -> (&'static str, u32) {
     match state {
         app_model::TerminalState::Running => ("Still running", GREEN),
@@ -6402,11 +6500,16 @@ fn terminal_output_error(terminal: &app_model::TerminalSession) -> Option<String
 
 /// The last `max_lines` lines of `output`.
 fn tail_lines(output: &str, max_lines: usize) -> String {
-    let lines: Vec<&str> = output.lines().collect();
+    if max_lines == 0 {
+        return String::new();
+    }
+    let mut lines = output.lines().rev().take(max_lines + 1).collect::<Vec<_>>();
     if lines.len() <= max_lines {
         return output.to_owned();
     }
-    lines[lines.len() - max_lines..].join("\n")
+    lines.truncate(max_lines);
+    lines.reverse();
+    lines.join("\n")
 }
 
 /// Label for the inspector toggle, summarizing changed files at a glance.
@@ -7123,6 +7226,83 @@ mod tests {
 
         assert_eq!(update_poll_delay_for(0), minimum);
         assert!(update_poll_delay_for(u64::MAX) <= maximum);
+    }
+
+    #[test]
+    fn markdown_inline_styles_share_one_text_layout() {
+        let document = crate::markdown::parse(
+            "[#55](https://github.com/constructomech/gcabb/issues/55) Show **steering** [comments](https://example.com/comments)",
+        );
+        let content = super::SessionMvpView::markdown_inline_content(&document.children);
+
+        assert_eq!(content.text, "#55 Show steering comments");
+        assert_eq!(content.links.len(), 2);
+        assert_eq!(&content.text[content.links[0].0.clone()], "#55");
+        assert_eq!(
+            content.links[0].1,
+            "https://github.com/constructomech/gcabb/issues/55"
+        );
+        assert_eq!(&content.text[content.links[1].0.clone()], "comments");
+        assert_eq!(content.links[1].1, "https://example.com/comments");
+    }
+
+    #[test]
+    fn markdown_task_markers_are_monospace_without_code_background() {
+        let document = crate::markdown::parse("- [x] done");
+        let content = super::SessionMvpView::markdown_inline_content(&document.children);
+
+        assert_eq!(content.text, "[x] done");
+        assert_eq!(content.font_family_overrides[0].0, 0..4);
+        assert_eq!(content.highlights[0].1.background_color, None);
+    }
+
+    #[test]
+    fn live_output_preview_bounds_ui_text_work() {
+        let output = (0..2_000)
+            .map(|line| format!("compiler output line {line:04}\n"))
+            .collect::<String>();
+        let preview = super::live_output_preview(&output);
+
+        assert!(preview.starts_with("[showing latest output; earlier output is retained]\n"));
+        assert!(preview.ends_with("compiler output line 1999\n"));
+        assert!(
+            preview.len()
+                <= super::LIVE_OUTPUT_PREVIEW_BYTES
+                    + "[showing latest output; earlier output is retained]\n".len()
+        );
+        assert!(preview.lines().count() <= super::LIVE_OUTPUT_PREVIEW_LINES + 1);
+    }
+
+    #[test]
+    fn live_output_preview_keeps_a_utf8_safe_long_line_suffix() {
+        let output = "é".repeat(super::LIVE_OUTPUT_PREVIEW_BYTES);
+        let preview = super::live_output_preview(&output);
+
+        assert!(preview.starts_with("[showing latest output; earlier output is retained]\n"));
+        assert!(preview.ends_with('é'));
+        assert!(
+            preview.len()
+                <= super::LIVE_OUTPUT_PREVIEW_BYTES
+                    + "[showing latest output; earlier output is retained]\n".len()
+        );
+    }
+
+    #[test]
+    fn live_output_preview_counts_an_unterminated_line_toward_the_limit() {
+        let output = (0..100)
+            .map(|line| format!("line {line}"))
+            .collect::<Vec<_>>()
+            .join("\n");
+        let preview = super::live_output_preview(&output);
+
+        assert_eq!(
+            preview
+                .lines()
+                .skip_while(|line| line.starts_with("[showing latest output;"))
+                .count(),
+            super::LIVE_OUTPUT_PREVIEW_LINES
+        );
+        assert!(preview.ends_with("line 99"));
     }
 
     /// Adding a worktree folder must resolve to its repository, so adding a
@@ -8337,6 +8517,35 @@ mod tests {
             );
         }
 
+        #[gpui::test]
+        fn markdown_link_and_following_text_stay_on_one_line(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "inline-markdown-message".to_owned(),
+                    role: app_model::TranscriptRole::Assistant,
+                    content: "- [#55](https://github.com/constructomech/gcabb/issues/55) Show steering comments greyed out until the model acknowledges them".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let inline = cx
+                .debug_bounds("markdown-inline")
+                .expect("inline markdown rendered");
+            assert!(
+                f32::from(inline.size.height) < 32.,
+                "link boundary introduced a line break: {inline:?}"
+            );
+        }
+
         /// Clicking an image chip in the transcript shows the picture.
         #[gpui::test]
         fn clicking_a_transcript_image_opens_a_preview(cx: &mut TestAppContext) {
@@ -8859,6 +9068,45 @@ mod tests {
                 output.origin.x >= tool.origin.x && output.right() <= tool.right(),
                 "terminal output escaped its card: {output:?} vs {tool:?}"
             );
+        }
+
+        #[gpui::test]
+        fn large_completed_output_is_collapsed_until_requested(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for (sequence, raw) in [
+                    serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"bash",
+                                "arguments":{"command":"cargo build"}}}),
+                    serde_json::json!({"id":"p","type":"tool.execution_partial_result",
+                        "data":{"toolCallId":"c1","partialOutput":"compiler output\n".repeat(2_000)}}),
+                    serde_json::json!({"id":"c","type":"tool.execution_complete",
+                        "data":{"toolCallId":"c1","success":true,"result":{"content":""}}}),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    state.apply(app_model::DomainEvent::from_sdk_event_for(
+                        "session-1",
+                        u64::try_from(sequence).unwrap_or(0) + 1,
+                        &raw,
+                    ));
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let toggle = cx
+                .debug_bounds("toggle-tool-output")
+                .expect("large completed output is collapsed");
+            cx.simulate_click(toggle.center(), Modifiers::none());
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(view.expanded_tool_outputs.contains("c1"));
+            });
         }
 
         #[gpui::test]
