@@ -2448,7 +2448,7 @@ impl SessionMvpView {
         )
     }
 
-    fn new_session(&mut self, cx: &mut Context<Self>) {
+    fn new_session(&mut self, window: &mut Window, cx: &mut Context<Self>) {
         self.open_control_menu = None;
         self.selected_session = None;
         self.startup_navigation = StartupNavigation::Changed;
@@ -2457,6 +2457,7 @@ impl SessionMvpView {
         });
         self.action_error = None;
         self.composer.update(cx, TextInput::clear);
+        window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
     }
 
@@ -3484,8 +3485,8 @@ impl SessionMvpView {
                             .child(div().text_color(rgb(MUTED)).child("⌂"))
                             .child("Home")
                             .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.new_session(cx);
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.new_session(window, cx);
                             })),
                     )
                     .child(disabled_destination("destination-my-work", "☷", "My work"))
@@ -3510,6 +3511,7 @@ impl SessionMvpView {
                     .child(
                         div()
                             .id("new-session")
+                            .debug_selector(|| "new-session".to_owned())
                             .accessibility_id("new-session")
                             .role(Role::Button)
                             .aria_label("New session")
@@ -3526,8 +3528,8 @@ impl SessionMvpView {
                             .text_lg()
                             .child("+")
                             .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                            .on_click(cx.listener(|view, _, _, cx| {
-                                view.new_session(cx);
+                            .on_click(cx.listener(|view, _, window, cx| {
+                                view.new_session(window, cx);
                             })),
                     ),
             )
@@ -7612,7 +7614,7 @@ mod tests {
         #[gpui::test]
         fn navigation_before_bootstrap_is_never_overwritten(cx: &mut TestAppContext) {
             let (view, cx, _commands, _updates) = setup_for_bootstrap(cx);
-            view.update(cx, SessionMvpView::new_session);
+            view.update_in(cx, SessionMvpView::new_session);
             view.update(cx, |view, _| {
                 view.apply_bootstrap(super::super::BootstrapState {
                     projects: Vec::new(),
@@ -7637,7 +7639,7 @@ mod tests {
                     selected_session: Some("session-1".to_owned()),
                 });
             });
-            view.update(cx, SessionMvpView::new_session);
+            view.update_in(cx, SessionMvpView::new_session);
             updates
                 .send(ServiceUpdate::SessionHydrated(SessionHandle::for_test(
                     snapshot("session-1", "Hydrated session"),
@@ -8614,6 +8616,22 @@ mod tests {
             cx.simulate_click(plus.center(), Modifiers::none());
             cx.run_until_parked();
             view.read_with(cx, |view, _| assert!(view.composing_chat));
+        }
+
+        #[gpui::test]
+        fn clicking_new_session_focuses_the_composer(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let plus = cx
+                .debug_bounds("new-session")
+                .expect("new session button rendered");
+
+            cx.simulate_click(plus.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            view.update_in(cx, |view, window, cx| {
+                let handle = gpui::Focusable::focus_handle(view.composer.read(cx), cx);
+                assert!(handle.is_focused(window));
+            });
         }
 
         /// Regression: choosing Chat updated internal state but the composer
