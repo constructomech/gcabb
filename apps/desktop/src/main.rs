@@ -6286,9 +6286,7 @@ impl SessionMvpView {
         let interaction = session.snapshot.pending_interactions.first()?.clone();
         let app_session_id = session.id().to_owned();
         let interaction_id = interaction.id.clone();
-        let approve = interaction_id.clone();
         let reject = interaction_id.clone();
-        let approve_session = app_session_id.clone();
         let cancel_session = app_session_id.clone();
         let choices = interaction
             .choices
@@ -6323,6 +6321,12 @@ impl SessionMvpView {
                         });
                     }))
             });
+                let permission_choices = interaction
+                    .choices
+                    .iter()
+                    .filter(|choice| choice.as_str() != "Deny")
+                    .cloned()
+                    .collect::<Vec<_>>();
         Some(
             div()
                 .id("interaction-dialog")
@@ -6358,7 +6362,27 @@ impl SessionMvpView {
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .child(interaction.title),
                         )
-                        .child(div().text_color(rgb(MUTED)).child(interaction.message))
+                        .when(interaction.kind == InteractionKind::Permission, |dialog| {
+                            dialog.child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .gap_1()
+                                    .child(div().text_xs().text_color(rgb(MUTED)).child("REQUESTED ACTION"))
+                                    .child(
+                                        div()
+                                            .p_3()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(rgb(BORDER))
+                                            .bg(rgb(SUBTLE))
+                                            .child(interaction.message.clone()),
+                                    ),
+                            )
+                        })
+                        .when(interaction.kind != InteractionKind::Permission, |dialog| {
+                            dialog.child(div().text_color(rgb(MUTED)).child(interaction.message))
+                        })
                         .children(choices)
                         .when(interaction.allow_freeform, |dialog| {
                             dialog.child(
@@ -6371,28 +6395,94 @@ impl SessionMvpView {
                         })
                         .when(interaction.kind == InteractionKind::Permission, |dialog| {
                             let session_id = app_session_id.clone();
-                            dialog.child(
-                                div()
-                                    .flex()
-                                    .justify_end()
-                                    .gap_2()
-                                    .child(action_button("Deny", RED, cx, move |view| {
-                                        let _ = view.commands.send(ServiceCommand::Respond {
-                                            app_session_id: session_id.clone(),
-                                            interaction_id: reject.clone(),
-                                            response: InteractionResponse::Reject {
-                                                feedback: None,
-                                            },
-                                        });
-                                    }))
-                                    .child(action_button("Allow once", GREEN, cx, move |view| {
-                                        let _ = view.commands.send(ServiceCommand::Respond {
-                                            app_session_id: approve_session.clone(),
-                                            interaction_id: approve.clone(),
-                                            response: InteractionResponse::Approve,
-                                        });
-                                    })),
-                            )
+                            let scope_choices = permission_choices
+                                .iter()
+                                .enumerate()
+                                .map(|(index, choice)| {
+                                    let choice = choice.clone();
+                                    let description = permission_scope_description(&choice);
+                                    let response_choice = choice.clone();
+                                    let response_session = app_session_id.clone();
+                                    let response_id = interaction_id.clone();
+                                    div()
+                                        .id(("permission-scope", index))
+                                        .accessibility_id(format!("permission-scope-{index}"))
+                                        .role(Role::Button)
+                                        .aria_label(format!("{choice}. {description}"))
+                                        .focusable()
+                                        .tab_stop(true)
+                                        .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                                        .flex()
+                                        .items_center()
+                                        .justify_between()
+                                        .gap_4()
+                                        .px_3()
+                                        .py_3()
+                                        .rounded_md()
+                                        .border_1()
+                                        .border_color(rgb(BORDER))
+                                        .child(
+                                            div()
+                                                .flex()
+                                                .flex_col()
+                                                .gap_1()
+                                                .child(div().font_weight(gpui::FontWeight::MEDIUM).child(choice))
+                                                .child(
+                                                    div()
+                                                        .text_xs()
+                                                        .text_color(rgb(MUTED))
+                                                        .child(description),
+                                                ),
+                                        )
+                                        .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                                        .on_click(cx.listener(move |view, _, _, _| {
+                                            let _ = view.commands.send(ServiceCommand::Respond {
+                                                app_session_id: response_session.clone(),
+                                                interaction_id: response_id.clone(),
+                                                response: choice_response(
+                                                    InteractionKind::Permission,
+                                                    &response_choice,
+                                                ),
+                                            });
+                                        }))
+                                });
+                            dialog
+                                .child(
+                                    div()
+                                        .flex()
+                                        .flex_col()
+                                        .gap_2()
+                                        .mt_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(MUTED))
+                                                .child("ALLOW THIS ACTION"),
+                                        )
+                                        .children(scope_choices),
+                                )
+                                .child(
+                                    div()
+                                        .flex()
+                                        .justify_between()
+                                        .items_center()
+                                        .mt_1()
+                                        .child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(MUTED))
+                                                .child("Project rules can be changed in Copilot settings."),
+                                        )
+                                        .child(action_button("Deny", RED, cx, move |view| {
+                                            let _ = view.commands.send(ServiceCommand::Respond {
+                                                app_session_id: session_id.clone(),
+                                                interaction_id: reject.clone(),
+                                                response: InteractionResponse::Reject {
+                                                    feedback: None,
+                                                },
+                                            });
+                                        })),
+                                )
                         })
                         .when(interaction.kind != InteractionKind::Permission, |dialog| {
                             dialog.child(div().flex().justify_end().child(action_button(
@@ -7056,10 +7146,27 @@ fn progress_spinner(id: SharedString) -> impl IntoElement {
         )
 }
 
+fn permission_scope_description(choice: &str) -> &'static str {
+    match choice {
+        "Allow once" => "Only this request will be approved.",
+        "Allow for this session" => "Remember this approval until the session ends.",
+        "Always allow for this project" => "Remember this approval for this project.",
+        "Always allow this domain" => "Remember this website approval across sessions.",
+        _ => "Approve this request.",
+    }
+}
+
 fn choice_response(kind: InteractionKind, choice: &str) -> InteractionResponse {
     match (kind, choice) {
-        (InteractionKind::Permission, value) if value.starts_with("Allow") => {
-            InteractionResponse::Approve
+        (InteractionKind::Permission, "Allow once") => InteractionResponse::Approve,
+        (InteractionKind::Permission, "Allow for this session") => {
+            InteractionResponse::ApproveForSession
+        }
+        (InteractionKind::Permission, "Always allow for this project") => {
+            InteractionResponse::ApproveForLocation
+        }
+        (InteractionKind::Permission, "Always allow this domain") => {
+            InteractionResponse::ApprovePermanently
         }
         (InteractionKind::AutoModeSwitch, "Switch once") => InteractionResponse::Approve,
         (InteractionKind::AutoModeSwitch, "Always switch") => InteractionResponse::Submit {

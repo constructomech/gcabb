@@ -225,6 +225,9 @@ pub struct InteractionRequest {
 #[serde(tag = "type", rename_all = "snake_case")]
 pub enum InteractionResponse {
     Approve,
+    ApproveForSession,
+    ApproveForLocation,
+    ApprovePermanently,
     Reject { feedback: Option<String> },
     Submit { value: Value, freeform: bool },
     Cancel,

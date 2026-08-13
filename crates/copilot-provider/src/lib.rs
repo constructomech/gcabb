@@ -15,12 +15,22 @@ use github_copilot_sdk::handler::{
     AutoModeSwitchHandler, AutoModeSwitchResponse, ElicitationHandler, ExitPlanModeHandler,
     ExitPlanModeResult, PermissionHandler, PermissionResult, UserInputHandler, UserInputResponse,
 };
-use github_copilot_sdk::rpc::ToolsListRequest;
+use github_copilot_sdk::rpc::{
+    PermissionDecision, PermissionDecisionApproveForLocation,
+    PermissionDecisionApproveForLocationApproval,
+    PermissionDecisionApproveForLocationApprovalCommands,
+    PermissionDecisionApproveForLocationApprovalRead,
+    PermissionDecisionApproveForLocationApprovalWrite, PermissionDecisionApproveForSession,
+    PermissionDecisionApproveForSessionApproval,
+    PermissionDecisionApproveForSessionApprovalCommands,
+    PermissionDecisionApproveForSessionApprovalRead,
+    PermissionDecisionApproveForSessionApprovalWrite, ToolsListRequest,
+};
 use github_copilot_sdk::session::Session;
 use github_copilot_sdk::{
     Client, ClientMode, ClientOptions, DeliveryMode, ElicitationRequest, ElicitationResult,
-    ExitPlanModeData, MessageOptions, PermissionRequestData, RequestId, ResumeSessionConfig,
-    SessionConfig, SessionId, SystemMessageConfig,
+    ExitPlanModeData, MessageOptions, PermissionRequestData, PermissionRequestKind, RequestId,
+    ResumeSessionConfig, SessionConfig, SessionId, SystemMessageConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -146,6 +156,7 @@ pub trait AgentProvider: Send + Sync {
 struct InteractionBroker {
     sender: mpsc::Sender<ProviderInteraction>,
     auto_approve_tools: bool,
+    permission_location: String,
 }
 
 impl InteractionBroker {
@@ -183,12 +194,23 @@ impl PermissionHandler for InteractionBroker {
             kind: InteractionKind::Permission,
             title: "Permission required".to_owned(),
             message: permission_message(&data),
-            choices: vec!["Allow once".to_owned(), "Deny".to_owned()],
+            choices: permission_choices(&data),
             allow_freeform: false,
             details: serde_json::to_value(&data).unwrap_or(Value::Null),
         };
         match self.request(request).await {
             Some(InteractionResponse::Approve) => PermissionResult::approve_once(),
+            Some(InteractionResponse::ApproveForSession) => permission_for_session(&data)
+                .map(PermissionResult::from)
+                .unwrap_or_else(PermissionResult::user_not_available),
+            Some(InteractionResponse::ApproveForLocation) => {
+                permission_for_location(&data, &self.permission_location)
+                    .map(PermissionResult::from)
+                    .unwrap_or_else(PermissionResult::user_not_available)
+            }
+            Some(InteractionResponse::ApprovePermanently) => permission_for_domain(&data)
+                .map(PermissionResult::from)
+                .unwrap_or_else(PermissionResult::user_not_available),
             Some(InteractionResponse::Reject { feedback }) => PermissionResult::reject(feedback),
             _ => PermissionResult::user_not_available(),
         }
@@ -542,6 +564,7 @@ impl AgentProvider for CopilotProvider {
         let broker = Arc::new(InteractionBroker {
             sender: interaction_tx,
             auto_approve_tools: request.auto_approve_tools,
+            permission_location: request.working_directory.to_string_lossy().into_owned(),
         });
         let session = self
             .client()
@@ -578,6 +601,7 @@ impl AgentProvider for CopilotProvider {
         let broker = Arc::new(InteractionBroker {
             sender: interaction_tx,
             auto_approve_tools: request.auto_approve_tools,
+            permission_location: request.working_directory.to_string_lossy().into_owned(),
         });
         let session = self
             .client()
@@ -937,6 +961,120 @@ fn permission_message(data: &PermissionRequestData) -> String {
     )
 }
 
+fn permission_choices(data: &PermissionRequestData) -> Vec<String> {
+    let mut choices = vec!["Allow once".to_owned()];
+    if permission_for_session(data).is_some() {
+        choices.push("Allow for this session".to_owned());
+    }
+    if permission_for_location(data, "location").is_some() {
+        choices.push("Always allow for this project".to_owned());
+    }
+    if permission_for_domain(data).is_some() {
+        choices.push("Always allow this domain".to_owned());
+    }
+    choices.push("Deny".to_owned());
+    choices
+}
+
+fn permission_for_session(data: &PermissionRequestData) -> Option<PermissionDecision> {
+    let approval = match data.kind? {
+        PermissionRequestKind::Read => PermissionDecisionApproveForSessionApproval::Read(
+            PermissionDecisionApproveForSessionApprovalRead::default(),
+        ),
+        PermissionRequestKind::Write => PermissionDecisionApproveForSessionApproval::Write(
+            PermissionDecisionApproveForSessionApprovalWrite::default(),
+        ),
+        PermissionRequestKind::Shell => PermissionDecisionApproveForSessionApproval::Commands(
+            PermissionDecisionApproveForSessionApprovalCommands {
+                command_identifiers: vec![command_identifier(data)?],
+                ..Default::default()
+            },
+        ),
+        PermissionRequestKind::Url => {
+            return Some(PermissionDecision::ApproveForSession(
+                PermissionDecisionApproveForSession {
+                    approval: None,
+                    domain: Some(permission_domain(data)?),
+                    ..Default::default()
+                },
+            ));
+        }
+        _ => return None,
+    };
+    Some(PermissionDecision::ApproveForSession(
+        PermissionDecisionApproveForSession {
+            approval: Some(approval),
+            domain: None,
+            ..Default::default()
+        },
+    ))
+}
+
+fn permission_for_location(
+    data: &PermissionRequestData,
+    location_key: &str,
+) -> Option<PermissionDecision> {
+    let approval = match data.kind? {
+        PermissionRequestKind::Read => PermissionDecisionApproveForLocationApproval::Read(
+            PermissionDecisionApproveForLocationApprovalRead::default(),
+        ),
+        PermissionRequestKind::Write => PermissionDecisionApproveForLocationApproval::Write(
+            PermissionDecisionApproveForLocationApprovalWrite::default(),
+        ),
+        PermissionRequestKind::Shell => PermissionDecisionApproveForLocationApproval::Commands(
+            PermissionDecisionApproveForLocationApprovalCommands {
+                command_identifiers: vec![command_identifier(data)?],
+                ..Default::default()
+            },
+        ),
+        _ => return None,
+    };
+    Some(PermissionDecision::ApproveForLocation(
+        PermissionDecisionApproveForLocation {
+            approval,
+            kind: Default::default(),
+            location_key: location_key.to_owned(),
+        },
+    ))
+}
+
+fn permission_for_domain(data: &PermissionRequestData) -> Option<PermissionDecision> {
+    if data.kind != Some(PermissionRequestKind::Url) {
+        return None;
+    }
+    Some(PermissionDecision::ApprovePermanently(
+        github_copilot_sdk::rpc::PermissionDecisionApprovePermanently {
+            domain: permission_domain(data)?,
+            ..Default::default()
+        },
+    ))
+}
+
+fn command_identifier(data: &PermissionRequestData) -> Option<String> {
+    permission_string(data, &["commandIdentifier"])
+        .or_else(|| permission_string(data, &["request", "commandIdentifier"]))
+        .or_else(|| permission_string(data, &["command_identifier"]))
+}
+
+fn permission_domain(data: &PermissionRequestData) -> Option<String> {
+    let url = permission_string(data, &["url"])
+        .or_else(|| permission_string(data, &["request", "url"]))?;
+    let host = url
+        .split_once("://")
+        .map_or(url.as_str(), |(_, value)| value)
+        .split('/')
+        .next()?;
+    (!host.is_empty()).then(|| host.to_owned())
+}
+
+fn permission_string(data: &PermissionRequestData, path: &[&str]) -> Option<String> {
+    let mut value = &data.extra;
+    for key in path {
+        value = value.get(*key)?;
+    }
+    value.as_str().map(str::to_owned)
+}
+
 fn model_option(value: &Value) -> Option<ModelOption> {
     let id = value
         .get("id")
@@ -1131,13 +1269,15 @@ mod tests {
 
     use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
     use github_copilot_sdk::rpc::PermissionDecision;
-    use github_copilot_sdk::{DeliveryMode, PermissionRequestData, RequestId, SessionId};
+    use github_copilot_sdk::{
+        DeliveryMode, PermissionRequestData, PermissionRequestKind, RequestId, SessionId,
+    };
     use serde_json::json;
     use tokio::sync::mpsc;
 
     use super::{
         CopilotProvider, InteractionBroker, SessionRequest, message_options, model_option,
-        sdk_context_windows,
+        permission_choices, permission_for_location, permission_for_session, sdk_context_windows,
     };
 
     fn interaction_broker() -> Arc<InteractionBroker> {
@@ -1145,6 +1285,7 @@ mod tests {
         Arc::new(InteractionBroker {
             sender,
             auto_approve_tools: false,
+            permission_location: std::env::temp_dir().to_string_lossy().into_owned(),
         })
     }
 
@@ -1175,6 +1316,7 @@ mod tests {
         let broker = InteractionBroker {
             sender,
             auto_approve_tools: true,
+            permission_location: "C:/worktree".to_owned(),
         };
 
         let result = broker
@@ -1198,6 +1340,7 @@ mod tests {
         let broker = InteractionBroker {
             sender,
             auto_approve_tools: true,
+            permission_location: "C:/worktree".to_owned(),
         };
         let task = tokio::spawn(async move {
             broker
@@ -1221,6 +1364,44 @@ mod tests {
             task.await.expect("permission handler completed"),
             PermissionResult::Decision(PermissionDecision::ApproveOnce(_))
         ));
+    }
+
+    #[test]
+    fn read_permissions_offer_session_and_project_scopes() {
+        let request = PermissionRequestData {
+            kind: Some(PermissionRequestKind::Read),
+            ..PermissionRequestData::default()
+        };
+
+        assert_eq!(
+            permission_choices(&request),
+            vec![
+                "Allow once",
+                "Allow for this session",
+                "Always allow for this project",
+                "Deny",
+            ]
+        );
+        assert!(matches!(
+            permission_for_session(&request),
+            Some(PermissionDecision::ApproveForSession(_))
+        ));
+        assert!(matches!(
+            permission_for_location(&request, "C:/worktree"),
+            Some(PermissionDecision::ApproveForLocation(_))
+        ));
+    }
+
+    #[test]
+    fn shell_permissions_require_a_command_identifier_for_remembered_scopes() {
+        let request = PermissionRequestData {
+            kind: Some(PermissionRequestKind::Shell),
+            ..PermissionRequestData::default()
+        };
+
+        assert_eq!(permission_choices(&request), vec!["Allow once", "Deny"]);
+        assert!(permission_for_session(&request).is_none());
+        assert!(permission_for_location(&request, "C:/worktree").is_none());
     }
 
     #[test]
