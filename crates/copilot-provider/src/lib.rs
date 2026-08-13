@@ -417,6 +417,7 @@ impl CopilotProvider {
         let mut config = SessionConfig::default()
             .with_working_directory(&request.working_directory)
             .with_client_name("gcabb")
+            .with_enable_skills(true)
             .with_permission_handler(broker.clone())
             .with_elicitation_handler(broker.clone())
             .with_user_input_handler(broker.clone())
@@ -438,6 +439,7 @@ impl CopilotProvider {
         let mut config = ResumeSessionConfig::new(sdk_session_id.into())
             .with_working_directory(&request.working_directory)
             .with_client_name("gcabb")
+            .with_enable_skills(true)
             .with_permission_handler(broker.clone())
             .with_elicitation_handler(broker.clone())
             .with_user_input_handler(broker.clone())
@@ -547,6 +549,14 @@ impl AgentProvider for CopilotProvider {
             .create_session(Self::session_config(&request, broker))
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        if let Err(error) = session.rpc().skills().ensure_loaded().await {
+            if let Err(disconnect_error) = session.disconnect().await {
+                tracing::warn!(%disconnect_error, "failed to disconnect session after skill loading failed");
+            }
+            return Err(ProviderError::Sdk(format!(
+                "failed to load session skills: {error}"
+            )));
+        }
         let sdk_session_id = session.id().to_string();
         self.record(
             "create_session",
@@ -575,6 +585,16 @@ impl AgentProvider for CopilotProvider {
             .resume_session(Self::resume_config(sdk_session_id, &request, broker))
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        // The SDK's automatic resume reload is best-effort and only logs errors.
+        // Reload explicitly so a stale or missing skill registry blocks the session.
+        if let Err(error) = session.rpc().skills().reload().await {
+            if let Err(disconnect_error) = session.disconnect().await {
+                tracing::warn!(%disconnect_error, "failed to disconnect session after skill reload failed");
+            }
+            return Err(ProviderError::Sdk(format!(
+                "failed to reload session skills: {error}"
+            )));
+        }
         self.record(
             "resume_session",
             millis(started.elapsed().as_millis()),
@@ -1107,13 +1127,40 @@ pub fn default_database_path(root: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::sync::Arc;
+
     use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
     use github_copilot_sdk::rpc::PermissionDecision;
     use github_copilot_sdk::{DeliveryMode, PermissionRequestData, RequestId, SessionId};
     use serde_json::json;
     use tokio::sync::mpsc;
 
-    use super::{InteractionBroker, message_options, model_option, sdk_context_windows};
+    use super::{
+        CopilotProvider, InteractionBroker, SessionRequest, message_options, model_option,
+        sdk_context_windows,
+    };
+
+    fn interaction_broker() -> Arc<InteractionBroker> {
+        let (sender, _interactions) = mpsc::channel(1);
+        Arc::new(InteractionBroker {
+            sender,
+            auto_approve_tools: false,
+        })
+    }
+
+    #[test]
+    fn session_configs_explicitly_enable_skills() {
+        let request = SessionRequest {
+            working_directory: std::env::temp_dir(),
+            ..SessionRequest::default()
+        };
+
+        let create = CopilotProvider::session_config(&request, interaction_broker());
+        let resume = CopilotProvider::resume_config("session", &request, interaction_broker());
+
+        assert_eq!(create.enable_skills, Some(true));
+        assert_eq!(resume.enable_skills, Some(true));
+    }
 
     #[test]
     fn user_messages_request_immediate_delivery_for_steering() {
