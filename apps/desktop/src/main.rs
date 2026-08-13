@@ -16,12 +16,12 @@ use diagnostics::{DiagnosticEvent, DiagnosticsSink, TracingDiagnostics, init_tra
 use git_service::GitService;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle, Focusable, FollowMode,
-    FontStyle, HighlightStyle, InteractiveElement, InteractiveText, IntoElement, KeyBinding,
-    ListAlignment, ListState, MouseButton, ParentElement, PathPromptOptions, Render, Role,
-    SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled, StyledText,
-    TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, list, px,
-    relative, rgb, size,
+    Animation, AnimationExt, App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle,
+    Focusable, FollowMode, FontStyle, HighlightStyle, InteractiveElement, InteractiveText,
+    IntoElement, KeyBinding, ListAlignment, ListState, MouseButton, ParentElement,
+    PathPromptOptions, Render, Role, SharedString, StatefulInteractiveElement, StrikethroughStyle,
+    Styled, StyledText, TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowOptions,
+    actions, div, list, px, relative, rgb, size,
 };
 use session_manager::{
     CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, SessionRoots,
@@ -255,6 +255,12 @@ enum ServiceUpdate {
     SessionsDiscovered(Vec<SessionHandle>),
     /// A session was deleted and must be dropped from the UI.
     SessionDeleted(String),
+    /// A session deletion failed; the spinner shown while it was in flight
+    /// must be cleared and the error surfaced.
+    SessionDeleteFailed {
+        app_session_id: String,
+        error: String,
+    },
     /// The configured project list changed, with the project to select next.
     ProjectsChanged {
         projects: Vec<ProjectMetadata>,
@@ -539,8 +545,10 @@ impl AppService {
                                     }
                                 }
                                 Err(error) => {
-                                    let _ = update_tx
-                                        .send(ServiceUpdate::ActionFailed(error.to_string()));
+                                    let _ = update_tx.send(ServiceUpdate::SessionDeleteFailed {
+                                        app_session_id,
+                                        error: error.to_string(),
+                                    });
                                 }
                             }
                         }
@@ -1289,6 +1297,9 @@ struct SessionMvpView {
     /// Session being renamed, if the rename dialog is open.
     renaming_session: Option<String>,
     rename_input: Entity<TextInput>,
+    /// Sessions with a delete in flight, shown with a spinner in place of
+    /// the status dot until the backend confirms removal.
+    deleting_sessions: HashSet<String>,
     action_error: Option<String>,
     /// What the update banner is showing.
     update_ui: UpdateUi,
@@ -1468,6 +1479,7 @@ impl SessionMvpView {
             project_menu: None,
             renaming_session: None,
             rename_input,
+            deleting_sessions: HashSet::new(),
             action_error: None,
             update_ui: UpdateUi::default(),
             update_service,
@@ -1808,6 +1820,7 @@ impl SessionMvpView {
                 }
                 ServiceUpdate::SessionDeleted(id) => {
                     self.sessions.retain(|session| session.id() != id);
+                    self.deleting_sessions.remove(&id);
                     if self.selected_session.as_deref() == Some(id.as_str()) {
                         self.selected_session = None;
                     }
@@ -1817,6 +1830,13 @@ impl SessionMvpView {
                     if self.renaming_session.as_deref() == Some(id.as_str()) {
                         self.renaming_session = None;
                     }
+                }
+                ServiceUpdate::SessionDeleteFailed {
+                    app_session_id,
+                    error,
+                } => {
+                    self.deleting_sessions.remove(&app_session_id);
+                    self.action_error = Some(error);
                 }
                 ServiceUpdate::PromptAccepted => {
                     self.composer.update(cx, TextInput::clear);
@@ -2354,6 +2374,7 @@ impl SessionMvpView {
     fn delete_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
         self.session_menu = None;
         self.action_error = None;
+        self.deleting_sessions.insert(app_session_id.clone());
         let _ = self
             .commands
             .send(ServiceCommand::DeleteSession { app_session_id });
@@ -3373,6 +3394,8 @@ impl SessionMvpView {
                 let menu_id = id.clone();
                 let menu_label = label.clone();
                 let selected = self.selected_session.as_deref() == Some(id.as_str());
+                let is_deleting = self.deleting_sessions.contains(&id);
+                let spinner_id = SharedString::from(format!("session-spinner-{id}"));
                 div()
                     .id(SharedString::from(format!("session-{id}")))
                     .debug_selector(|| "session-row".to_owned())
@@ -3410,13 +3433,16 @@ impl SessionMvpView {
                             );
                         }),
                     )
-                    .child(
+                    .child(if is_deleting {
+                        deleting_spinner(spinner_id).into_any_element()
+                    } else {
                         div()
                             .w(px(7.0))
                             .h(px(7.0))
                             .rounded_full()
-                            .bg(status_color(session.snapshot.status)),
-                    )
+                            .bg(status_color(session.snapshot.status))
+                            .into_any_element()
+                    })
                     .child(
                         div()
                             .min_w_0()
@@ -3437,6 +3463,8 @@ impl SessionMvpView {
                 let menu_id = id.clone();
                 let menu_label = label.clone();
                 let selected = self.selected_session.as_deref() == Some(id.as_str());
+                let is_deleting = self.deleting_sessions.contains(&id);
+                let spinner_id = SharedString::from(format!("chat-spinner-{id}"));
                 div()
                     .id(SharedString::from(format!("chat-{id}")))
                     .debug_selector(|| "chat-row".to_owned())
@@ -3474,13 +3502,16 @@ impl SessionMvpView {
                             );
                         }),
                     )
-                    .child(
+                    .child(if is_deleting {
+                        deleting_spinner(spinner_id).into_any_element()
+                    } else {
                         div()
                             .w(px(7.0))
                             .h(px(7.0))
                             .rounded_full()
-                            .bg(status_color(session.snapshot.status)),
-                    )
+                            .bg(status_color(session.snapshot.status))
+                            .into_any_element()
+                    })
                     .child(
                         div()
                             .flex_1()
@@ -6842,6 +6873,39 @@ fn status_color(status: SessionStatus) -> gpui::Rgba {
     }
 }
 
+/// Frames of a small braille spinner, cycled while a session delete is in
+/// flight so the row visibly stays busy instead of appearing frozen.
+const SPINNER_FRAMES: [&str; 10] = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"];
+
+/// Replaces the status dot with an animated spinner while `id`'s delete
+/// command is in flight, so removal feels immediate rather than delayed.
+#[allow(
+    clippy::cast_possible_truncation,
+    clippy::cast_sign_loss,
+    clippy::cast_precision_loss
+)]
+fn deleting_spinner(id: SharedString) -> impl IntoElement {
+    div()
+        .w(px(14.0))
+        .h(px(14.0))
+        .flex()
+        .items_center()
+        .justify_center()
+        .text_size(px(14.0))
+        .line_height(px(14.0))
+        .text_color(rgb(MUTED))
+        .with_animation(
+            id,
+            Animation::new(Duration::from_millis(800)).repeat(),
+            |this, delta| {
+                let frame_ix = ((delta * SPINNER_FRAMES.len() as f32) as usize)
+                    .min(SPINNER_FRAMES.len() - 1);
+                this.child(SPINNER_FRAMES[frame_ix])
+            },
+        )
+}
+
+
 fn choice_response(kind: InteractionKind, choice: &str) -> InteractionResponse {
     match (kind, choice) {
         (InteractionKind::Permission, value) if value.starts_with("Allow") => {
@@ -8178,7 +8242,13 @@ mod tests {
             cx.simulate_click(item.center(), Modifiers::none());
             cx.run_until_parked();
 
-            view.read_with(cx, |view, _| assert!(view.session_menu.is_none()));
+            view.read_with(cx, |view, _| {
+                assert!(view.session_menu.is_none());
+                assert!(
+                    view.deleting_sessions.contains("session-1"),
+                    "row shows a spinner while the delete is in flight"
+                );
+            });
             let command = commands.try_recv().expect("a command was sent");
             match command {
                 ServiceCommand::DeleteSession { app_session_id } => {
