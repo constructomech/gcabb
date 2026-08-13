@@ -6321,12 +6321,12 @@ impl SessionMvpView {
                         });
                     }))
             });
-                let permission_choices = interaction
-                    .choices
-                    .iter()
-                    .filter(|choice| choice.as_str() != "Deny")
-                    .cloned()
-                    .collect::<Vec<_>>();
+        let permission_choices = interaction
+            .choices
+            .iter()
+            .filter(|choice| choice.as_str() != "Deny")
+            .cloned()
+            .collect::<Vec<_>>();
         Some(
             div()
                 .id("interaction-dialog")
@@ -6368,7 +6368,12 @@ impl SessionMvpView {
                                     .flex()
                                     .flex_col()
                                     .gap_1()
-                                    .child(div().text_xs().text_color(rgb(MUTED)).child("REQUESTED ACTION"))
+                                    .child(
+                                        div()
+                                            .text_xs()
+                                            .text_color(rgb(MUTED))
+                                            .child("REQUESTED ACTION"),
+                                    )
                                     .child(
                                         div()
                                             .p_3()
@@ -6395,57 +6400,65 @@ impl SessionMvpView {
                         })
                         .when(interaction.kind == InteractionKind::Permission, |dialog| {
                             let session_id = app_session_id.clone();
-                            let scope_choices = permission_choices
-                                .iter()
-                                .enumerate()
-                                .map(|(index, choice)| {
-                                    let choice = choice.clone();
-                                    let description = permission_scope_description(&choice);
-                                    let response_choice = choice.clone();
-                                    let response_session = app_session_id.clone();
-                                    let response_id = interaction_id.clone();
-                                    div()
-                                        .id(("permission-scope", index))
-                                        .accessibility_id(format!("permission-scope-{index}"))
-                                        .role(Role::Button)
-                                        .aria_label(format!("{choice}. {description}"))
-                                        .focusable()
-                                        .tab_stop(true)
-                                        .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
-                                        .flex()
-                                        .items_center()
-                                        .justify_between()
-                                        .gap_4()
-                                        .px_3()
-                                        .py_3()
-                                        .rounded_md()
-                                        .border_1()
-                                        .border_color(rgb(BORDER))
-                                        .child(
-                                            div()
-                                                .flex()
-                                                .flex_col()
-                                                .gap_1()
-                                                .child(div().font_weight(gpui::FontWeight::MEDIUM).child(choice))
-                                                .child(
-                                                    div()
-                                                        .text_xs()
-                                                        .text_color(rgb(MUTED))
-                                                        .child(description),
-                                                ),
-                                        )
-                                        .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                                        .on_click(cx.listener(move |view, _, _, _| {
-                                            let _ = view.commands.send(ServiceCommand::Respond {
-                                                app_session_id: response_session.clone(),
-                                                interaction_id: response_id.clone(),
-                                                response: choice_response(
-                                                    InteractionKind::Permission,
-                                                    &response_choice,
-                                                ),
-                                            });
-                                        }))
-                                });
+                            let scope_choices =
+                                permission_choices
+                                    .iter()
+                                    .enumerate()
+                                    .map(|(index, choice)| {
+                                        let choice = choice.clone();
+                                        let description = permission_scope_description(&choice);
+                                        let response_choice = choice.clone();
+                                        let response_session = app_session_id.clone();
+                                        let response_id = interaction_id.clone();
+                                        div()
+                                            .id(("permission-scope", index))
+                                            .accessibility_id(format!("permission-scope-{index}"))
+                                            .role(Role::Button)
+                                            .aria_label(format!("{choice}. {description}"))
+                                            .focusable()
+                                            .tab_stop(true)
+                                            .focus_visible(|style| {
+                                                style.border_1().border_color(rgb(BLUE))
+                                            })
+                                            .flex()
+                                            .items_center()
+                                            .justify_between()
+                                            .gap_4()
+                                            .px_3()
+                                            .py_3()
+                                            .rounded_md()
+                                            .border_1()
+                                            .border_color(rgb(BORDER))
+                                            .child(
+                                                div()
+                                                    .flex()
+                                                    .flex_col()
+                                                    .gap_1()
+                                                    .child(
+                                                        div()
+                                                            .font_weight(gpui::FontWeight::MEDIUM)
+                                                            .child(choice),
+                                                    )
+                                                    .child(
+                                                        div()
+                                                            .text_xs()
+                                                            .text_color(rgb(MUTED))
+                                                            .child(description),
+                                                    ),
+                                            )
+                                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                                            .on_click(cx.listener(move |view, _, _, _| {
+                                                let _ =
+                                                    view.commands.send(ServiceCommand::Respond {
+                                                        app_session_id: response_session.clone(),
+                                                        interaction_id: response_id.clone(),
+                                                        response: choice_response(
+                                                            InteractionKind::Permission,
+                                                            &response_choice,
+                                                        ),
+                                                    });
+                                            }))
+                                    });
                             dialog
                                 .child(
                                     div()
@@ -6467,12 +6480,9 @@ impl SessionMvpView {
                                         .justify_between()
                                         .items_center()
                                         .mt_1()
-                                        .child(
-                                            div()
-                                                .text_xs()
-                                                .text_color(rgb(MUTED))
-                                                .child("Project rules can be changed in Copilot settings."),
-                                        )
+                                        .child(div().text_xs().text_color(rgb(MUTED)).child(
+                                            "Project rules can be changed in Copilot settings.",
+                                        ))
                                         .child(action_button("Deny", RED, cx, move |view| {
                                             let _ = view.commands.send(ServiceCommand::Respond {
                                                 app_session_id: session_id.clone(),
@@ -7158,7 +7168,6 @@ fn permission_scope_description(choice: &str) -> &'static str {
 
 fn choice_response(kind: InteractionKind, choice: &str) -> InteractionResponse {
     match (kind, choice) {
-        (InteractionKind::Permission, "Allow once") => InteractionResponse::Approve,
         (InteractionKind::Permission, "Allow for this session") => {
             InteractionResponse::ApproveForSession
         }
@@ -7168,7 +7177,8 @@ fn choice_response(kind: InteractionKind, choice: &str) -> InteractionResponse {
         (InteractionKind::Permission, "Always allow this domain") => {
             InteractionResponse::ApprovePermanently
         }
-        (InteractionKind::AutoModeSwitch, "Switch once") => InteractionResponse::Approve,
+        (InteractionKind::Permission, "Allow once")
+        | (InteractionKind::AutoModeSwitch, "Switch once") => InteractionResponse::Approve,
         (InteractionKind::AutoModeSwitch, "Always switch") => InteractionResponse::Submit {
             value: "always".into(),
             freeform: false,

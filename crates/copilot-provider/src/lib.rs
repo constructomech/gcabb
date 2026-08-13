@@ -20,8 +20,8 @@ use github_copilot_sdk::rpc::{
     PermissionDecisionApproveForLocationApproval,
     PermissionDecisionApproveForLocationApprovalCommands,
     PermissionDecisionApproveForLocationApprovalRead,
-    PermissionDecisionApproveForLocationApprovalWrite, PermissionDecisionApproveForSession,
-    PermissionDecisionApproveForSessionApproval,
+    PermissionDecisionApproveForLocationApprovalWrite, PermissionDecisionApproveForLocationKind,
+    PermissionDecisionApproveForSession, PermissionDecisionApproveForSessionApproval,
     PermissionDecisionApproveForSessionApprovalCommands,
     PermissionDecisionApproveForSessionApprovalRead,
     PermissionDecisionApproveForSessionApprovalWrite, ToolsListRequest,
@@ -201,16 +201,13 @@ impl PermissionHandler for InteractionBroker {
         match self.request(request).await {
             Some(InteractionResponse::Approve) => PermissionResult::approve_once(),
             Some(InteractionResponse::ApproveForSession) => permission_for_session(&data)
-                .map(PermissionResult::from)
-                .unwrap_or_else(PermissionResult::user_not_available),
+                .map_or_else(PermissionResult::user_not_available, PermissionResult::from),
             Some(InteractionResponse::ApproveForLocation) => {
                 permission_for_location(&data, &self.permission_location)
-                    .map(PermissionResult::from)
-                    .unwrap_or_else(PermissionResult::user_not_available)
+                    .map_or_else(PermissionResult::user_not_available, PermissionResult::from)
             }
             Some(InteractionResponse::ApprovePermanently) => permission_for_domain(&data)
-                .map(PermissionResult::from)
-                .unwrap_or_else(PermissionResult::user_not_available),
+                .map_or_else(PermissionResult::user_not_available, PermissionResult::from),
             Some(InteractionResponse::Reject { feedback }) => PermissionResult::reject(feedback),
             _ => PermissionResult::user_not_available(),
         }
@@ -1032,7 +1029,7 @@ fn permission_for_location(
     Some(PermissionDecision::ApproveForLocation(
         PermissionDecisionApproveForLocation {
             approval,
-            kind: Default::default(),
+            kind: PermissionDecisionApproveForLocationKind::default(),
             location_key: location_key.to_owned(),
         },
     ))
@@ -1059,12 +1056,31 @@ fn command_identifier(data: &PermissionRequestData) -> Option<String> {
 fn permission_domain(data: &PermissionRequestData) -> Option<String> {
     let url = permission_string(data, &["url"])
         .or_else(|| permission_string(data, &["request", "url"]))?;
-    let host = url
+    let authority = url
         .split_once("://")
         .map_or(url.as_str(), |(_, value)| value)
-        .split('/')
+        .split(['/', '?', '#'])
         .next()?;
-    (!host.is_empty()).then(|| host.to_owned())
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, value)| value);
+    let host = host_without_port(host)?;
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Trims a trailing `:port`, keeping the brackets around an IPv6 literal so its
+/// inner colons are not mistaken for a port separator.
+fn host_without_port(authority: &str) -> Option<&str> {
+    if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        let host = &authority[..=end];
+        return (host.len() > 2).then_some(host);
+    }
+    Some(
+        authority
+            .split_once(':')
+            .map_or(authority, |(host, _)| host),
+    )
 }
 
 fn permission_string(data: &PermissionRequestData, path: &[&str]) -> Option<String> {
@@ -1277,7 +1293,8 @@ mod tests {
 
     use super::{
         CopilotProvider, InteractionBroker, SessionRequest, message_options, model_option,
-        permission_choices, permission_for_location, permission_for_session, sdk_context_windows,
+        permission_choices, permission_for_domain, permission_for_location, permission_for_session,
+        sdk_context_windows,
     };
 
     fn interaction_broker() -> Arc<InteractionBroker> {
@@ -1402,6 +1419,31 @@ mod tests {
         assert_eq!(permission_choices(&request), vec!["Allow once", "Deny"]);
         assert!(permission_for_session(&request).is_none());
         assert!(permission_for_location(&request, "C:/worktree").is_none());
+    }
+
+    #[test]
+    fn url_permissions_normalise_the_domain() {
+        let domain = |url: &str| {
+            permission_for_domain(&PermissionRequestData {
+                kind: Some(PermissionRequestKind::Url),
+                extra: json!({ "url": url }),
+                ..PermissionRequestData::default()
+            })
+        };
+
+        assert!(matches!(
+            domain("https://Example.COM:8443/path?q=1"),
+            Some(PermissionDecision::ApprovePermanently(decision)) if decision.domain == "example.com"
+        ));
+        assert!(matches!(
+            domain("https://user:pass@example.com/path"),
+            Some(PermissionDecision::ApprovePermanently(decision)) if decision.domain == "example.com"
+        ));
+        assert!(matches!(
+            domain("http://[::1]:8080/path"),
+            Some(PermissionDecision::ApprovePermanently(decision)) if decision.domain == "[::1]"
+        ));
+        assert!(domain("https:///path").is_none());
     }
 
     #[test]
