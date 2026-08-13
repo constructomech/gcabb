@@ -7181,6 +7181,7 @@ mod tests {
         repository_root, toggled_menu, token_label, update_poll_delay_for,
     };
     use app_model::SessionLocation;
+    use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
     use std::process::Command;
 
@@ -7258,9 +7259,10 @@ mod tests {
 
     #[test]
     fn live_output_preview_bounds_ui_text_work() {
-        let output = (0..2_000)
-            .map(|line| format!("compiler output line {line:04}\n"))
-            .collect::<String>();
+        let output = (0..2_000).fold(String::new(), |mut output, line| {
+            writeln!(output, "compiler output line {line:04}").expect("write fixture");
+            output
+        });
         let preview = super::live_output_preview(&output);
 
         assert!(preview.starts_with("[showing latest output; earlier output is retained]\n"));
