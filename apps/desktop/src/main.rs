@@ -5016,7 +5016,12 @@ impl SessionMvpView {
         } else {
             "Copilot"
         };
-        format!("{speaker}: {}", message.content)
+        let pending = if message.state == TranscriptState::Pending {
+            " (pending acknowledgement)"
+        } else {
+            ""
+        };
+        format!("{speaker}{pending}: {}", message.content)
     }
 
     fn transcript_message_header(
@@ -5087,6 +5092,11 @@ impl SessionMvpView {
             .child(
                 div()
                     .debug_selector(|| "transcript-message".to_owned())
+                    .when(message.state == TranscriptState::Pending, |bubble| {
+                        bubble
+                            .debug_selector(|| "pending-steering-message".to_owned())
+                            .opacity(0.55)
+                    })
                     .when(is_user, |bubble| {
                         // User messages are capped narrower than the agent's
                         // and pushed right by the parent's `justify_end`, so
@@ -9459,6 +9469,32 @@ mod tests {
                 "user message was not capped at 85%: {message:?} vs {composer:?}"
             );
             assert!(message.origin.x > composer.origin.x);
+        }
+
+        #[gpui::test]
+        fn pending_steering_messages_use_pending_styling(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "steering".to_owned(),
+                    role: app_model::TranscriptRole::User,
+                    content: "Change direction.".to_owned(),
+                    state: app_model::TranscriptState::Pending,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("pending-steering-message").is_some(),
+                "pending steering message did not use de-emphasized styling"
+            );
         }
 
         /// The command block is capped at a third of the entry budget, so a
