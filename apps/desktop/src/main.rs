@@ -206,7 +206,7 @@ enum ServiceUpdate {
         projects: Vec<ProjectMetadata>,
         selected: Option<String>,
     },
-    PromptAccepted,
+    PromptAccepted(Option<String>),
     ActionFailed(String),
     Failed(String),
 }
@@ -516,7 +516,12 @@ impl AppService {
                             }
                         }
                         command => {
-                            let is_submit = matches!(&command, ServiceCommand::Submit { .. });
+                            let submit_origin = match &command {
+                                ServiceCommand::Submit { app_session_id, .. } => {
+                                    Some(app_session_id.clone())
+                                }
+                                _ => None,
+                            };
                             let naming_prompt = match &command {
                                 ServiceCommand::Submit {
                                     app_session_id: None,
@@ -548,13 +553,15 @@ impl AppService {
                                         });
                                     }
                                     let _ = update_tx.send(ServiceUpdate::SessionAdded(handle));
-                                    if is_submit {
-                                        let _ = update_tx.send(ServiceUpdate::PromptAccepted);
+                                    if let Some(origin) = submit_origin {
+                                        let _ =
+                                            update_tx.send(ServiceUpdate::PromptAccepted(origin));
                                     }
                                 }
                                 Ok(None) => {
-                                    if is_submit {
-                                        let _ = update_tx.send(ServiceUpdate::PromptAccepted);
+                                    if let Some(origin) = submit_origin {
+                                        let _ =
+                                            update_tx.send(ServiceUpdate::PromptAccepted(origin));
                                     }
                                 }
                                 Err(error) => {
@@ -1209,6 +1216,10 @@ struct SessionMvpView {
     commands: Sender<ServiceCommand>,
     branch: String,
     composer: Entity<TextInput>,
+    /// Incomplete prompt entered before a session is selected.
+    home_draft: String,
+    /// Incomplete prompts keyed by the session they belong to.
+    session_drafts: HashMap<String, String>,
     interaction_input: Entity<TextInput>,
     draft_mode: String,
     draft_model: Option<String>,
@@ -1388,6 +1399,8 @@ impl SessionMvpView {
             commands,
             branch,
             composer,
+            home_draft: String::new(),
+            session_drafts: HashMap::new(),
             interaction_input,
             draft_mode: "interactive".to_owned(),
             draft_model: None,
@@ -1721,19 +1734,19 @@ impl SessionMvpView {
                     self.apply_restore_failures(failures);
                 }
                 ServiceUpdate::SessionHydrated(handle) => {
-                    self.upsert_hydrated_session(handle);
+                    self.upsert_hydrated_session(handle, cx);
                 }
                 ServiceUpdate::RestorationFinished(failures) => {
                     self.apply_restore_failures(failures);
                 }
                 ServiceUpdate::SessionAdded(handle) => {
                     let id = handle.id().to_owned();
-                    self.upsert_hydrated_session(handle);
-                    self.selected_session = Some(id);
+                    self.upsert_hydrated_session(handle, cx);
+                    self.switch_composer_draft(Some(id), cx);
                 }
                 ServiceUpdate::SessionsDiscovered(handles) => {
                     for handle in handles {
-                        self.upsert_hydrated_session(handle);
+                        self.upsert_hydrated_session(handle, cx);
                     }
                 }
                 ServiceUpdate::ProjectsChanged { projects, selected } => {
@@ -1742,8 +1755,9 @@ impl SessionMvpView {
                 ServiceUpdate::SessionDeleted(id) => {
                     self.sessions.retain(|session| session.id() != id);
                     if self.selected_session.as_deref() == Some(id.as_str()) {
-                        self.selected_session = None;
+                        self.switch_composer_draft(None, cx);
                     }
+                    self.session_drafts.remove(&id);
                     if self.session_menu.as_ref().is_some_and(|menu| menu.id == id) {
                         self.session_menu = None;
                     }
@@ -1751,8 +1765,15 @@ impl SessionMvpView {
                         self.renaming_session = None;
                     }
                 }
-                ServiceUpdate::PromptAccepted => {
-                    self.composer.update(cx, TextInput::clear);
+                ServiceUpdate::PromptAccepted(origin) => {
+                    if let Some(id) = origin.as_deref() {
+                        self.session_drafts.remove(id);
+                    } else {
+                        self.home_draft.clear();
+                    }
+                    if self.selected_session == origin {
+                        self.composer.update(cx, TextInput::clear);
+                    }
                 }
                 ServiceUpdate::ActionFailed(error) => self.action_error = Some(error),
                 ServiceUpdate::Failed(error) => self.startup = StartupState::Failed(error),
@@ -1796,7 +1817,7 @@ impl SessionMvpView {
         self.restore_failures.extend(failures);
     }
 
-    fn upsert_hydrated_session(&mut self, handle: SessionHandle) {
+    fn upsert_hydrated_session(&mut self, handle: SessionHandle, cx: &mut Context<Self>) {
         let id = handle.id().to_owned();
         if let Some(index) = self.sessions.iter().position(|session| session.id() == id) {
             self.sessions[index] = SessionProjection::new(handle);
@@ -1805,10 +1826,32 @@ impl SessionMvpView {
         }
         if self.startup_navigation == StartupNavigation::Untouched {
             if self.selected_session.is_none() {
-                self.selected_session = Some(id);
+                self.switch_composer_draft(Some(id), cx);
             }
             self.adopt_selected_session_location();
         }
+    }
+
+    /// Save the current composer text and restore the draft for `target`.
+    fn switch_composer_draft(&mut self, target: Option<String>, cx: &mut Context<Self>) {
+        let value = self.composer.read(cx).value().clone();
+        if let Some(id) = self.selected_session.as_ref() {
+            if value.is_empty() {
+                self.session_drafts.remove(id);
+            } else {
+                self.session_drafts.insert(id.clone(), value);
+            }
+        } else {
+            self.home_draft = value;
+        }
+
+        self.selected_session = target;
+        let draft = self.selected_session.as_ref().map_or_else(
+            || self.home_draft.clone(),
+            |id| self.session_drafts.get(id).cloned().unwrap_or_default(),
+        );
+        self.composer
+            .update(cx, |input, cx| input.set_value(draft, cx));
     }
 
     fn adopt_selected_session_location(&mut self) {
@@ -1846,7 +1889,7 @@ impl SessionMvpView {
         self.composing_chat = true;
         self.selected_project.clone_from(&self.launch_workspace);
         self.workspace_root.clone_from(&self.launch_workspace);
-        self.selected_session = None;
+        self.switch_composer_draft(None, cx);
         self.startup_navigation = StartupNavigation::Changed;
         let _ = self.commands.send(ServiceCommand::Select {
             app_session_id: None,
@@ -2035,10 +2078,9 @@ impl SessionMvpView {
     fn new_chat(&mut self, cx: &mut Context<Self>) {
         self.open_control_menu = None;
         self.composing_chat = true;
-        self.selected_session = None;
+        self.switch_composer_draft(None, cx);
         self.startup_navigation = StartupNavigation::Changed;
         self.action_error = None;
-        self.composer.update(cx, TextInput::clear);
         let _ = self.commands.send(ServiceCommand::Select {
             app_session_id: None,
         });
@@ -2078,7 +2120,7 @@ impl SessionMvpView {
 
     fn select_session(&mut self, id: String, cx: &mut Context<Self>) {
         self.open_control_menu = None;
-        self.selected_session = Some(id);
+        self.switch_composer_draft(Some(id), cx);
         self.startup_navigation = StartupNavigation::Changed;
         let _ = self.commands.send(ServiceCommand::Select {
             app_session_id: self.selected_session.clone(),
@@ -2124,11 +2166,12 @@ impl SessionMvpView {
         self.project_branch = git_output(Path::new(path), &["branch", "--show-current"]);
         // New sessions run in the project directory the user chose.
         self.workspace_root = PathBuf::from(path);
-        self.selected_session = self
+        let selected_session = self
             .sessions
             .iter()
             .find(|session| session.snapshot.metadata.project_key() == path)
             .map(|session| session.id().to_owned());
+        self.switch_composer_draft(selected_session, cx);
         if let Some(workspace) = self
             .selected()
             .map(|session| PathBuf::from(&session.snapshot.metadata.project_path))
@@ -2450,13 +2493,12 @@ impl SessionMvpView {
 
     fn new_session(&mut self, cx: &mut Context<Self>) {
         self.open_control_menu = None;
-        self.selected_session = None;
+        self.switch_composer_draft(None, cx);
         self.startup_navigation = StartupNavigation::Changed;
         let _ = self.commands.send(ServiceCommand::Select {
             app_session_id: None,
         });
         self.action_error = None;
-        self.composer.update(cx, TextInput::clear);
         cx.notify();
     }
 
@@ -7748,6 +7790,72 @@ mod tests {
                     session.snapshot.last_error.as_deref(),
                     Some("saved worktree is missing")
                 );
+            });
+        }
+
+        #[gpui::test]
+        fn composer_drafts_are_restored_per_session_and_home(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.sessions
+                    .push(SessionProjection::for_test(SessionHandle::for_test(
+                        snapshot("session-2", "Second session"),
+                    )));
+                view.composer
+                    .update(cx, |input, cx| input.set_value("home draft", cx));
+
+                view.select_session("session-1".to_owned(), cx);
+                assert!(view.composer.read(cx).value().is_empty());
+                view.composer
+                    .update(cx, |input, cx| input.set_value("first draft", cx));
+
+                view.select_session("session-2".to_owned(), cx);
+                assert!(view.composer.read(cx).value().is_empty());
+                view.composer
+                    .update(cx, |input, cx| input.set_value("second draft", cx));
+
+                view.select_session("session-1".to_owned(), cx);
+                assert_eq!(view.composer.read(cx).value(), "first draft");
+
+                view.new_session(cx);
+                assert_eq!(view.composer.read(cx).value(), "home draft");
+
+                view.select_session("session-2".to_owned(), cx);
+                assert_eq!(view.composer.read(cx).value(), "second draft");
+            });
+        }
+
+        #[gpui::test]
+        fn accepted_prompt_only_clears_its_originating_session(cx: &mut TestAppContext) {
+            let (view, cx, _commands, updates) = setup_for_bootstrap(cx);
+            view.update(cx, |view, cx| {
+                view.sessions = vec![
+                    SessionProjection::for_test(SessionHandle::for_test(snapshot(
+                        "session-1",
+                        "First session",
+                    ))),
+                    SessionProjection::for_test(SessionHandle::for_test(snapshot(
+                        "session-2",
+                        "Second session",
+                    ))),
+                ];
+                view.select_session("session-1".to_owned(), cx);
+                view.composer
+                    .update(cx, |input, cx| input.set_value("submitted draft", cx));
+                view.select_session("session-2".to_owned(), cx);
+                view.composer
+                    .update(cx, |input, cx| input.set_value("untouched draft", cx));
+            });
+            updates
+                .send(ServiceUpdate::PromptAccepted(Some("session-1".to_owned())))
+                .unwrap();
+
+            view.update(cx, SessionMvpView::apply_service_updates);
+
+            view.update(cx, |view, cx| {
+                assert_eq!(view.composer.read(cx).value(), "untouched draft");
+                view.select_session("session-1".to_owned(), cx);
+                assert!(view.composer.read(cx).value().is_empty());
             });
         }
 
