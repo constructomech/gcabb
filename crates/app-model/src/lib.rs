@@ -107,6 +107,8 @@ pub enum TranscriptRole {
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TranscriptState {
+    /// A steering message has been accepted but has not entered model context.
+    Pending,
     Streaming,
     Complete,
     /// Streaming stopped before the runtime committed the message.
@@ -809,6 +811,13 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
         return;
     }
     match event.source_type.as_str() {
+        "assistant.turn_start" => {
+            for message in transcript.iter_mut().filter(|message| {
+                message.role == TranscriptRole::User && message.state == TranscriptState::Pending
+            }) {
+                message.state = TranscriptState::Complete;
+            }
+        }
         "user.message" => {
             let content = event
                 .details
@@ -823,7 +832,13 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                     id: event.id.clone(),
                     role: TranscriptRole::User,
                     content: content.to_owned(),
-                    state: TranscriptState::Complete,
+                    state: if event.details.get("delivery").and_then(Value::as_str)
+                        == Some("steering")
+                    {
+                        TranscriptState::Pending
+                    } else {
+                        TranscriptState::Complete
+                    },
                     timestamp: event.timestamp.clone(),
                     sequence: event.sequence,
                     attachments,
@@ -1179,6 +1194,43 @@ mod tests {
         assert_eq!(state.transcript.len(), 2);
         assert_eq!(state.transcript[0].role, TranscriptRole::User);
         assert_eq!(state.transcript[1].content, "hi there");
+        assert_eq!(state.transcript[1].state, TranscriptState::Complete);
+    }
+
+    #[test]
+    fn steering_message_stays_pending_until_the_next_root_turn_starts() {
+        let mut state = SessionSnapshot::new(metadata());
+        let events = [
+            json!({"id":"u1","type":"user.message","data":{
+                "content":"start the work",
+                "delivery":"idle"
+            }}),
+            json!({"id":"turn-1","type":"assistant.turn_start","data":{"turnId":"1"}}),
+            json!({"id":"u2","type":"user.message","data":{
+                "content":"change direction",
+                "delivery":"steering"
+            }}),
+            json!({"id":"nested","agentId":"agent-1","type":"assistant.turn_start",
+                "data":{"turnId":"nested"}}),
+            json!({"id":"tool","type":"tool.execution_complete","data":{
+                "toolCallId":"call-1",
+                "success":true
+            }}),
+        ];
+        for (index, raw) in events.iter().enumerate() {
+            let event = DomainEvent::from_sdk_event_for("app-session", index as u64 + 1, raw);
+            assert_eq!(state.apply(event), ApplyOutcome::Applied);
+        }
+
+        assert_eq!(state.transcript[0].state, TranscriptState::Complete);
+        assert_eq!(state.transcript[1].state, TranscriptState::Pending);
+
+        let acknowledged = DomainEvent::from_sdk_event_for(
+            "app-session",
+            6,
+            &json!({"id":"turn-2","type":"assistant.turn_start","data":{"turnId":"2"}}),
+        );
+        assert_eq!(state.apply(acknowledged), ApplyOutcome::Applied);
         assert_eq!(state.transcript[1].state, TranscriptState::Complete);
     }
 
