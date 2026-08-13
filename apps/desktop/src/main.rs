@@ -6898,13 +6898,12 @@ fn deleting_spinner(id: SharedString) -> impl IntoElement {
             id,
             Animation::new(Duration::from_millis(800)).repeat(),
             |this, delta| {
-                let frame_ix = ((delta * SPINNER_FRAMES.len() as f32) as usize)
-                    .min(SPINNER_FRAMES.len() - 1);
+                let frame_ix =
+                    ((delta * SPINNER_FRAMES.len() as f32) as usize).min(SPINNER_FRAMES.len() - 1);
                 this.child(SPINNER_FRAMES[frame_ix])
             },
         )
 }
-
 
 fn choice_response(kind: InteractionKind, choice: &str) -> InteractionResponse {
     match (kind, choice) {
