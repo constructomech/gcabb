@@ -7,9 +7,9 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    ContextWindowOption, InteractionKind, InteractionResponse, OutputStreamKind, ProjectMetadata,
-    PromptAttachment, SessionKind, SessionLocation, SessionMetadata, SessionSnapshot,
-    SessionStatus, TitleSource, TranscriptRole, TranscriptState,
+    ChangeStatus, ChangedFile, ContextWindowOption, InteractionKind, InteractionResponse,
+    OutputStreamKind, ProjectMetadata, PromptAttachment, SessionKind, SessionLocation,
+    SessionMetadata, SessionSnapshot, SessionStatus, TitleSource, TranscriptRole, TranscriptState,
 };
 use copilot_provider::{CopilotProvider, ProviderCompatibility};
 use diagnostics::{DiagnosticEvent, DiagnosticsSink, TracingDiagnostics, init_tracing};
@@ -96,6 +96,8 @@ const SCROLLBAR_WIDTH: f32 = 14.0;
 const THUMB_WIDTH: f32 = 10.0;
 /// Scrollbar id for the conversation itself.
 const TRANSCRIPT_SCROLL_ID: &str = "transcript";
+/// Scroll region behind the Changes panel's single scrollbar.
+const CHANGES_SCROLL_ID: &str = "changes-scroll";
 /// Extra content laid out above and below the viewport to avoid blank flashes
 /// during fast trackpad and scrollbar movement.
 const TRANSCRIPT_OVERDRAW: f32 = 720.0;
@@ -1324,7 +1326,12 @@ struct SessionMvpView {
     sidebar_open: bool,
     panel_open: bool,
     active_panel: SessionPanel,
-    selected_change: Option<String>,
+    /// Changed files whose diff is expanded in the Changes panel, keyed by
+    /// session so switching sessions or panel tabs keeps each one's state.
+    expanded_changes: HashMap<String, HashSet<String>>,
+    /// Focus handles for changed-file rows, keyed by session and path so a row
+    /// keeps its focus identity while change data refreshes.
+    change_focus: RefCell<HashMap<String, FocusHandle>>,
     open_control_menu: Option<ControlMenu>,
     /// Session whose context menu is open, and where to draw it.
     session_menu: Option<SessionMenu>,
@@ -1530,7 +1537,8 @@ impl SessionMvpView {
             sidebar_open: true,
             panel_open: false,
             active_panel: SessionPanel::Changes,
-            selected_change: None,
+            expanded_changes: HashMap::new(),
+            change_focus: RefCell::new(HashMap::new()),
             open_control_menu: None,
             session_menu: None,
             project_menu: None,
@@ -1883,6 +1891,7 @@ impl SessionMvpView {
                         self.switch_composer_draft(None, cx);
                     }
                     self.session_drafts.remove(&id);
+                    self.expanded_changes.remove(&id);
                     if self.session_menu.as_ref().is_some_and(|menu| menu.id == id) {
                         self.session_menu = None;
                     }
@@ -5578,73 +5587,19 @@ impl SessionMvpView {
         }
 
         let totals = changes.totals();
-        let selected_path = self
-            .selected_change
-            .clone()
-            .or_else(|| changes.files.first().map(|file| file.path.clone()));
-        let rows = changes.files.iter().map(|file| {
-            let path = file.path.clone();
-            let is_selected = selected_path.as_deref() == Some(path.as_str());
-            let label = format!(
-                "{} {} +{} -{}",
-                file.status.label(),
-                path,
-                file.stats.insertions,
-                file.stats.deletions
-            );
-            div()
-                .id(SharedString::from(format!("change-{path}")))
-                .role(Role::ListItem)
-                .aria_label(label)
-                .aria_selected(is_selected)
-                .focusable()
-                .tab_stop(true)
-                .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
-                .flex()
-                .justify_between()
-                .gap_2()
-                .px_2()
-                .py_1()
-                .rounded_md()
-                .when(is_selected, |row| row.bg(rgb(ELEVATED)))
-                .child(
-                    div()
-                        .flex_1()
-                        .min_w_0()
-                        .text_xs()
-                        .text_color(rgb(PRIMARY))
-                        .child(path.clone()),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(GREEN))
-                        .child(format!("+{}", file.stats.insertions)),
-                )
-                .child(
-                    div()
-                        .text_xs()
-                        .text_color(rgb(RED))
-                        .child(format!("-{}", file.stats.deletions)),
-                )
-                .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    view.selected_change = Some(path.clone());
-                    cx.notify();
-                }))
-        });
-
-        let diff = selected_path
-            .as_deref()
-            .and_then(|path| changes.file(path))
-            .map(|file| {
-                file.diff.clone().unwrap_or_else(|| {
-                    file.diff_omitted_reason
-                        .clone()
-                        .unwrap_or_else(|| "No diff available.".to_owned())
-                })
-            })
-            .unwrap_or_default();
+        let session_id = snapshot.metadata.id.clone();
+        let handle = self
+            .detail_scrolls
+            .borrow_mut()
+            .entry(CHANGES_SCROLL_ID.to_owned())
+            .or_default()
+            .clone();
+        let group = SharedString::from("scroll-changes");
+        let mut entries = Vec::with_capacity(changes.files.len());
+        for file in &changes.files {
+            entries.push(self.change_entry(&session_id, file, cx).into_any_element());
+        }
+        let scrollbar = Self::scrollbar(CHANGES_SCROLL_ID, &handle, group.clone(), cx);
 
         div()
             .flex()
@@ -5666,7 +5621,7 @@ impl SessionMvpView {
                     .text_xs()
                     .text_color(rgb(MUTED))
                     .child(format!(
-                        "{} file(s) · +{} −{} · vs {}",
+                        "{} file(s) \u{b7} +{} \u{2212}{} \u{b7} vs {}",
                         changes.files.len(),
                         totals.insertions,
                         totals.deletions,
@@ -5674,36 +5629,252 @@ impl SessionMvpView {
                     )),
             )
             .child(
+                // One scrolling surface for rows and their expanded diffs, so
+                // the panel never stacks a diff viewport inside a file list.
                 div()
-                    .id("changes-list")
-                    .role(Role::List)
-                    .aria_label("Changed files")
+                    .id("changes-scroll-frame")
+                    .group(group)
+                    .relative()
                     .flex()
                     .flex_col()
-                    .gap_1()
-                    .max_h(px(220.0))
-                    .overflow_hidden()
-                    .children(rows),
-            )
-            .child(
-                div()
-                    .id("changes-diff")
-                    .role(Role::Group)
-                    .aria_label("Unified diff")
-                    .flex()
                     .flex_1()
                     .min_h_0()
-                    .overflow_hidden()
-                    .p_2()
-                    .rounded_md()
-                    .bg(rgb(PANEL))
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .text_xs()
-                    .text_color(rgb(PRIMARY))
-                    .child(diff),
+                    .child(
+                        div()
+                            .id("changes-list")
+                            .debug_selector(|| "changes-list".to_owned())
+                            .role(Role::List)
+                            .aria_label("Changed files")
+                            .track_scroll(&handle)
+                            .flex()
+                            .flex_col()
+                            .flex_1()
+                            .min_h_0()
+                            .gap_1()
+                            .pr_2()
+                            .overflow_y_scroll()
+                            .children(entries),
+                    )
+                    .children(scrollbar),
             )
             .into_any_element()
+    }
+
+    /// Whether a file's diff is currently expanded in the Changes panel.
+    fn change_expanded(&self, session_id: &str, path: &str) -> bool {
+        self.expanded_changes
+            .get(session_id)
+            .is_some_and(|paths| paths.contains(path))
+    }
+
+    /// Expand a collapsed file's diff, or collapse an expanded one.
+    fn toggle_change(&mut self, session_id: &str, path: &str) {
+        let expanded = self
+            .expanded_changes
+            .entry(session_id.to_owned())
+            .or_default();
+        if !expanded.remove(path) {
+            expanded.insert(path.to_owned());
+        }
+    }
+
+    /// How a changed file is named in the panel, with both names for renames.
+    fn change_display_path(file: &ChangedFile) -> String {
+        match (file.status, file.original_path.as_deref()) {
+            (ChangeStatus::Renamed, Some(original)) => {
+                format!("{original} \u{2192} {}", file.path)
+            }
+            _ => file.path.clone(),
+        }
+    }
+
+    /// The accessible name of a changed-file row.
+    fn change_row_label(file: &ChangedFile) -> String {
+        format!(
+            "{} {} +{} -{}",
+            file.status.label(),
+            Self::change_display_path(file),
+            file.stats.insertions,
+            file.stats.deletions
+        )
+    }
+
+    /// What an expanded file shows, and whether it is a placeholder rather
+    /// than a diff. Binary, omitted, and failed diffs report beneath their own
+    /// row instead of replacing the panel.
+    fn change_diff_text(file: &ChangedFile) -> (String, bool) {
+        if file.binary {
+            return ("Binary file. No diff to show.".to_owned(), true);
+        }
+        if let Some(diff) = file.diff.clone().filter(|diff| !diff.trim().is_empty()) {
+            return (diff, false);
+        }
+        if let Some(reason) = file.diff_omitted_reason.clone() {
+            return (reason, true);
+        }
+        ("Diff unavailable.".to_owned(), true)
+    }
+
+    /// The focus handle for a changed-file row, created on first render.
+    fn change_row_focus(
+        &self,
+        session_id: &str,
+        path: &str,
+        cx: &mut Context<Self>,
+    ) -> FocusHandle {
+        self.change_focus
+            .borrow_mut()
+            .entry(format!("{session_id}\u{1f}{path}"))
+            .or_insert_with(|| cx.focus_handle())
+            .clone()
+    }
+
+    /// A changed file row plus, when expanded, its complete diff in flow.
+    fn change_entry(
+        &self,
+        session_id: &str,
+        file: &ChangedFile,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let path = file.path.clone();
+        let expanded = self.change_expanded(session_id, &path);
+        let focus = self.change_row_focus(session_id, &path, cx);
+        let display_path = Self::change_display_path(file);
+        let label = Self::change_row_label(file);
+        let row_session = session_id.to_owned();
+        let row_path = path.clone();
+        let toggle_session = session_id.to_owned();
+        let toggle_path = path.clone();
+        let disclosure_label = if expanded {
+            format!("Collapse diff for {path}")
+        } else {
+            format!("Expand diff for {path}")
+        };
+        let selector_path = path.clone();
+        let status_color = match file.status {
+            ChangeStatus::Added | ChangeStatus::Untracked => rgb(GREEN),
+            ChangeStatus::Deleted => rgb(RED),
+            ChangeStatus::Renamed => rgb(BLUE),
+            ChangeStatus::Modified => rgb(MUTED),
+        };
+
+        div()
+            .id(SharedString::from(format!("change-entry-{path}")))
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .child(
+                div()
+                    .id(SharedString::from(format!("change-{path}")))
+                    .debug_selector(move || format!("change-row-{selector_path}"))
+                    .role(Role::ListItem)
+                    .aria_label(label)
+                    .aria_expanded(expanded)
+                    .track_focus(&focus)
+                    .tab_stop(true)
+                    .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .when(expanded, |row| row.bg(rgb(ELEVATED)))
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("change-toggle-{path}")))
+                            .debug_selector({
+                                let path = path.clone();
+                                move || format!("change-toggle-{path}")
+                            })
+                            .role(Role::Button)
+                            .aria_label(disclosure_label)
+                            .aria_expanded(expanded)
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(if expanded { "\u{25be}" } else { "\u{25b8}" })
+                            .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.toggle_change(&toggle_session, &toggle_path);
+                                // Without this the row behind the control
+                                // toggles a second time and nothing moves.
+                                cx.stop_propagation();
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(status_color)
+                            .child(file.status.label()),
+                    )
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(rgb(PRIMARY))
+                            .child(display_path),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(GREEN))
+                            .child(format!("+{}", file.stats.insertions)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(RED))
+                            .child(format!("-{}", file.stats.deletions)),
+                    )
+                    .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.toggle_change(&row_session, &row_path);
+                        cx.notify();
+                    })),
+            )
+            .when(expanded, |entry| entry.child(Self::change_diff(file)))
+    }
+
+    /// A file's complete diff, laid out in the panel's own scroll flow.
+    ///
+    /// Only the horizontal axis scrolls here: a vertical scroller would trap
+    /// the wheel and give the panel a second competing scrollbar.
+    fn change_diff(file: &ChangedFile) -> impl IntoElement {
+        let path = file.path.clone();
+        let (body, muted) = Self::change_diff_text(file);
+
+        div()
+            .id(SharedString::from(format!("change-diff-{path}")))
+            .debug_selector({
+                let path = path.clone();
+                move || format!("change-diff-{path}")
+            })
+            .role(Role::Group)
+            .aria_label(format!("Diff for {path}"))
+            .mt_1()
+            .mb_1()
+            .ml_4()
+            .min_w_0()
+            .p_2()
+            .rounded_md()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(BORDER))
+            .text_xs()
+            .font_family(".ZedMono")
+            .whitespace_nowrap()
+            .overflow_x_scroll()
+            // Without this a vertical wheel over a diff is remapped onto the
+            // horizontal axis instead of scrolling the panel.
+            .restrict_scroll_to_axis()
+            .text_color(if muted { rgb(MUTED) } else { rgb(PRIMARY) })
+            .child(body)
     }
 
     fn terminals_panel(snapshot: &SessionSnapshot) -> impl IntoElement {
@@ -8222,6 +8393,79 @@ mod tests {
     /// These drive the real GPUI element tree with simulated mouse input,
     /// which is the only way to catch event-wiring mistakes such as a dismiss
     /// overlay consuming the click meant for a menu item.
+    fn change_file(path: &str, status: app_model::ChangeStatus) -> app_model::ChangedFile {
+        app_model::ChangedFile {
+            path: path.to_owned(),
+            original_path: None,
+            status,
+            stage: app_model::ChangeStage::Unstaged,
+            stats: app_model::DiffStats {
+                insertions: 3,
+                deletions: 4,
+            },
+            diff: None,
+            binary: false,
+            diff_omitted_reason: None,
+        }
+    }
+
+    /// A rename that only showed the new path hid what was actually renamed.
+    #[test]
+    fn a_renamed_file_is_labelled_with_both_paths() {
+        let mut file = change_file("src/new.rs", app_model::ChangeStatus::Renamed);
+        file.original_path = Some("src/old.rs".to_owned());
+
+        assert_eq!(
+            crate::SessionMvpView::change_display_path(&file),
+            "src/old.rs \u{2192} src/new.rs"
+        );
+        assert_eq!(
+            crate::SessionMvpView::change_row_label(&file),
+            "renamed src/old.rs \u{2192} src/new.rs +3 -4"
+        );
+    }
+
+    #[test]
+    fn a_deleted_file_keeps_its_status_in_the_row_label() {
+        let file = change_file("src/gone.rs", app_model::ChangeStatus::Deleted);
+
+        assert_eq!(
+            crate::SessionMvpView::change_row_label(&file),
+            "deleted src/gone.rs +3 -4"
+        );
+    }
+
+    /// Files with no diff must still say why under their own row rather than
+    /// expanding to nothing.
+    #[test]
+    fn files_without_a_diff_report_why() {
+        let mut binary = change_file("assets/logo.png", app_model::ChangeStatus::Added);
+        binary.binary = true;
+        let mut omitted = change_file("src/huge.rs", app_model::ChangeStatus::Modified);
+        omitted.diff_omitted_reason = Some("File is too large to diff.".to_owned());
+        let mut blank = change_file("src/empty.rs", app_model::ChangeStatus::Modified);
+        blank.diff = Some("   \n".to_owned());
+        let mut diffed = change_file("src/lib.rs", app_model::ChangeStatus::Modified);
+        diffed.diff = Some("@@ -1 +1 @@\n-old\n+new\n".to_owned());
+
+        assert_eq!(
+            crate::SessionMvpView::change_diff_text(&binary),
+            ("Binary file. No diff to show.".to_owned(), true)
+        );
+        assert_eq!(
+            crate::SessionMvpView::change_diff_text(&omitted),
+            ("File is too large to diff.".to_owned(), true)
+        );
+        assert_eq!(
+            crate::SessionMvpView::change_diff_text(&blank),
+            ("Diff unavailable.".to_owned(), true)
+        );
+        assert_eq!(
+            crate::SessionMvpView::change_diff_text(&diffed),
+            ("@@ -1 +1 @@\n-old\n+new\n".to_owned(), false)
+        );
+    }
+
     mod interaction {
         use app_model::{
             SessionKind, SessionMetadata, SessionSnapshot, SessionStatus, TitleSource,
@@ -11153,6 +11397,431 @@ mod tests {
             view.read_with(cx, |view, _| {
                 let (message, _, _) = view.update_banner_text().expect("banner text rendered");
                 assert!(message.contains("restart"), "got {message}");
+            });
+        }
+
+        // --- Changes panel -------------------------------------------------
+
+        fn changed_file(
+            path: &str,
+            status: app_model::ChangeStatus,
+            diff: Option<&str>,
+        ) -> app_model::ChangedFile {
+            app_model::ChangedFile {
+                path: path.to_owned(),
+                original_path: None,
+                status,
+                stage: app_model::ChangeStage::Unstaged,
+                stats: app_model::DiffStats {
+                    insertions: 2,
+                    deletions: 1,
+                },
+                diff: diff.map(str::to_owned),
+                binary: false,
+                diff_omitted_reason: None,
+            }
+        }
+
+        fn snapshot_with_changes(files: Vec<app_model::ChangedFile>) -> SessionSnapshot {
+            let mut state = snapshot("session-1", "First session");
+            state.changes = app_model::ChangesView {
+                base: Some("abc1234".to_owned()),
+                base_label: Some("main".to_owned()),
+                head: Some("def5678".to_owned()),
+                branch: Some("feature".to_owned()),
+                files,
+                generated_at: Some("1".to_owned()),
+                error: None,
+            };
+            state
+        }
+
+        /// Render the Changes panel for one session with the given files.
+        fn open_changes(
+            view: &gpui::Entity<SessionMvpView>,
+            cx: &mut VisualTestContext,
+            files: Vec<app_model::ChangedFile>,
+        ) {
+            view.update(cx, |view, cx| {
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
+                    snapshot_with_changes(files),
+                ))];
+                view.selected_session = Some("session-1".to_owned());
+                view.panel_open = true;
+                view.active_panel = crate::SessionPanel::Changes;
+                cx.notify();
+            });
+            cx.simulate_resize(gpui::size(gpui::px(1_400.0), gpui::px(800.0)));
+            cx.run_until_parked();
+        }
+
+        fn changes_scroll(
+            view: &gpui::Entity<SessionMvpView>,
+            cx: &mut VisualTestContext,
+        ) -> gpui::ScrollHandle {
+            view.read_with(cx, |view, _| {
+                view.scroll_handle(crate::CHANGES_SCROLL_ID)
+                    .expect("the changes panel tracks a scroll handle")
+            })
+        }
+
+        fn long_diff(lines: usize) -> String {
+            use std::fmt::Write as _;
+
+            let mut diff = String::from("@@ -1,1 +1,1 @@\n");
+            for line in 0..lines {
+                let _ = writeln!(diff, "+line {line}");
+            }
+            diff
+        }
+
+        #[gpui::test]
+        fn a_file_row_expands_and_collapses_its_diff(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            open_changes(
+                &view,
+                cx,
+                vec![changed_file(
+                    "src/lib.rs",
+                    app_model::ChangeStatus::Modified,
+                    Some("@@ -1 +1 @@\n-old\n+new\n"),
+                )],
+            );
+
+            assert!(
+                cx.debug_bounds("change-diff-src/lib.rs").is_none(),
+                "files start collapsed"
+            );
+            let row = cx
+                .debug_bounds("change-row-src/lib.rs")
+                .expect("the file row is rendered");
+            cx.simulate_click(row.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("change-diff-src/lib.rs").is_some(),
+                "clicking a row expands its diff"
+            );
+            view.read_with(cx, |view, _| {
+                assert!(view.change_expanded("session-1", "src/lib.rs"));
+            });
+
+            let row = cx
+                .debug_bounds("change-row-src/lib.rs")
+                .expect("the file row is still rendered");
+            cx.simulate_click(row.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("change-diff-src/lib.rs").is_none(),
+                "clicking an expanded row collapses it"
+            );
+        }
+
+        #[gpui::test]
+        fn the_disclosure_control_toggles_the_diff(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            open_changes(
+                &view,
+                cx,
+                vec![changed_file(
+                    "src/lib.rs",
+                    app_model::ChangeStatus::Modified,
+                    Some("@@ -1 +1 @@\n-old\n+new\n"),
+                )],
+            );
+
+            let toggle = cx
+                .debug_bounds("change-toggle-src/lib.rs")
+                .expect("the disclosure control is rendered");
+            cx.simulate_click(toggle.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(view.change_expanded("session-1", "src/lib.rs"));
+            });
+            assert!(cx.debug_bounds("change-diff-src/lib.rs").is_some());
+        }
+
+        /// Rows must be reachable without a pointer, so focus plus Enter has to
+        /// expand exactly the focused file.
+        #[gpui::test]
+        fn a_focused_row_expands_with_the_keyboard(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            open_changes(
+                &view,
+                cx,
+                vec![changed_file(
+                    "src/lib.rs",
+                    app_model::ChangeStatus::Modified,
+                    Some("@@ -1 +1 @@\n-old\n+new\n"),
+                )],
+            );
+
+            let focus = view.read_with(cx, |view, _| {
+                view.change_focus
+                    .borrow()
+                    .get("session-1\u{1f}src/lib.rs")
+                    .cloned()
+                    .expect("the row owns a focus handle")
+            });
+            cx.update(|window, cx| window.focus(&focus, cx));
+            cx.run_until_parked();
+            cx.simulate_event(gpui::KeyDownEvent {
+                keystroke: gpui::Keystroke::parse("enter").expect("keystroke"),
+                is_held: false,
+                prefer_character_input: false,
+            });
+            cx.simulate_event(gpui::KeyUpEvent {
+                keystroke: gpui::Keystroke::parse("enter").expect("keystroke"),
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(
+                    view.change_expanded("session-1", "src/lib.rs"),
+                    "Enter on a focused row must expand it"
+                );
+            });
+        }
+
+        /// The point of the redesign: diffs live in the panel's own scroll
+        /// flow, so expanding files extends one document instead of creating
+        /// per-file viewports.
+        #[gpui::test]
+        fn expanded_diffs_extend_the_panels_own_scroll_flow(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            open_changes(
+                &view,
+                cx,
+                vec![
+                    changed_file(
+                        "src/lib.rs",
+                        app_model::ChangeStatus::Modified,
+                        Some(&long_diff(60)),
+                    ),
+                    changed_file(
+                        "src/main.rs",
+                        app_model::ChangeStatus::Added,
+                        Some(&long_diff(60)),
+                    ),
+                ],
+            );
+
+            let collapsed = f32::from(changes_scroll(&view, cx).max_offset().y);
+            assert!(
+                collapsed.abs() < f32::EPSILON,
+                "two collapsed rows must fit without scrolling, got {collapsed}"
+            );
+
+            for path in ["src/lib.rs", "src/main.rs"] {
+                view.update(cx, |view, cx| {
+                    view.toggle_change("session-1", path);
+                    cx.notify();
+                });
+            }
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("change-diff-src/lib.rs").is_some()
+                    && cx.debug_bounds("change-diff-src/main.rs").is_some(),
+                "multiple files stay expanded at once"
+            );
+            let expanded = changes_scroll(&view, cx).max_offset().y;
+            assert!(
+                f32::from(expanded) > 0.0,
+                "expanded diffs must extend the outer scroll flow"
+            );
+        }
+
+        #[gpui::test]
+        fn many_changed_files_scroll_as_one_list(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let files = (0..120)
+                .map(|index| {
+                    changed_file(
+                        Box::leak(format!("src/file_{index}.rs").into_boxed_str()),
+                        app_model::ChangeStatus::Modified,
+                        Some("@@ -1 +1 @@\n-old\n+new\n"),
+                    )
+                })
+                .collect();
+            open_changes(&view, cx, files);
+
+            let handle = changes_scroll(&view, cx);
+            assert!(
+                f32::from(handle.max_offset().y) > 0.0,
+                "a long file list must be scrollable"
+            );
+            assert!(
+                cx.debug_bounds("change-row-src/file_0.rs").is_some(),
+                "the first row is rendered"
+            );
+        }
+
+        /// A very large diff must lay out in full instead of being trapped in
+        /// its own viewport.
+        #[gpui::test]
+        fn a_very_large_diff_is_not_given_its_own_viewport(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            open_changes(
+                &view,
+                cx,
+                vec![changed_file(
+                    "src/huge.rs",
+                    app_model::ChangeStatus::Modified,
+                    Some(&format!("+{}\n{}", "x".repeat(4_000), long_diff(2_000))),
+                )],
+            );
+            view.update(cx, |view, cx| {
+                view.toggle_change("session-1", "src/huge.rs");
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let list = cx
+                .debug_bounds("changes-list")
+                .expect("the changes list is rendered");
+            let diff = cx
+                .debug_bounds("change-diff-src/huge.rs")
+                .expect("the diff is rendered");
+            assert!(
+                diff.size.height > list.size.height,
+                "a large diff must lay out beyond the viewport instead of scrolling inside it"
+            );
+            assert!(
+                diff.size.width <= list.size.width,
+                "a long diff line must not widen the panel"
+            );
+            assert!(f32::from(changes_scroll(&view, cx).max_offset().y) > 0.0);
+        }
+
+        /// Refreshed change data must not throw away what the user opened, or
+        /// where they had scrolled to.
+        #[gpui::test]
+        fn expansion_and_scroll_survive_refreshes_and_tab_switches(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let files: Vec<_> = (0..40)
+                .map(|index| {
+                    changed_file(
+                        Box::leak(format!("src/file_{index}.rs").into_boxed_str()),
+                        app_model::ChangeStatus::Modified,
+                        Some("@@ -1 +1 @@\n-old\n+new\n"),
+                    )
+                })
+                .collect();
+            open_changes(&view, cx, files.clone());
+            view.update(cx, |view, cx| {
+                view.toggle_change("session-1", "src/file_1.rs");
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let handle = changes_scroll(&view, cx);
+            handle.set_offset(gpui::point(gpui::px(0.0), gpui::px(-60.0)));
+            cx.run_until_parked();
+
+            let mut refreshed = files;
+            refreshed[1].stats.insertions = 9;
+            refreshed.push(changed_file(
+                "src/new.rs",
+                app_model::ChangeStatus::Added,
+                Some("@@ -0,0 +1 @@\n+fresh\n"),
+            ));
+            view.update(cx, |view, cx| {
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
+                    snapshot_with_changes(refreshed),
+                ))];
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("change-diff-src/file_1.rs").is_some(),
+                "a refresh must not collapse a file that still exists"
+            );
+            let offset = f32::from(changes_scroll(&view, cx).offset().y);
+            assert!(
+                (offset + 60.0).abs() < f32::EPSILON,
+                "a refresh must not move the panel's scroll position, got {offset}"
+            );
+
+            view.update(cx, |view, cx| {
+                view.active_panel = crate::SessionPanel::Terminals;
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.update(cx, |view, cx| {
+                view.active_panel = crate::SessionPanel::Changes;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("change-diff-src/file_1.rs").is_some(),
+                "switching panel tabs must not collapse expanded diffs"
+            );
+        }
+
+        /// Renames, deletions, and binary files still need a row, and the
+        /// states that have no diff report under their own row.
+        #[gpui::test]
+        fn renamed_deleted_and_binary_files_report_under_their_own_row(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let mut renamed = changed_file("src/new.rs", app_model::ChangeStatus::Renamed, None);
+            renamed.original_path = Some("src/old.rs".to_owned());
+            let deleted = changed_file(
+                "src/gone.rs",
+                app_model::ChangeStatus::Deleted,
+                Some("@@ -1 +0,0 @@\n-old\n"),
+            );
+            let mut binary = changed_file("assets/logo.png", app_model::ChangeStatus::Added, None);
+            binary.binary = true;
+            open_changes(&view, cx, vec![renamed, deleted, binary]);
+
+            for path in ["src/new.rs", "src/gone.rs", "assets/logo.png"] {
+                view.update(cx, |view, cx| {
+                    view.toggle_change("session-1", path);
+                    cx.notify();
+                });
+            }
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("change-row-src/new.rs").is_some());
+            assert!(cx.debug_bounds("change-row-src/gone.rs").is_some());
+            assert!(cx.debug_bounds("change-row-assets/logo.png").is_some());
+            assert!(
+                cx.debug_bounds("change-diff-assets/logo.png").is_some(),
+                "a binary file reports beneath its own row"
+            );
+            assert!(cx.debug_bounds("change-diff-src/gone.rs").is_some());
+        }
+
+        /// Deleting a session must not leave its expansion state behind for a
+        /// later session to inherit.
+        #[gpui::test]
+        fn deleting_a_session_drops_its_expansion_state(cx: &mut TestAppContext) {
+            let (view, cx, _commands, updates) = setup_for_bootstrap(cx);
+            open_changes(
+                &view,
+                cx,
+                vec![changed_file(
+                    "src/lib.rs",
+                    app_model::ChangeStatus::Modified,
+                    Some("@@ -1 +1 @@\n-old\n+new\n"),
+                )],
+            );
+            view.update(cx, |view, cx| {
+                view.toggle_change("session-1", "src/lib.rs");
+                cx.notify();
+            });
+            updates
+                .send(ServiceUpdate::SessionDeleted("session-1".to_owned()))
+                .unwrap();
+
+            view.update(cx, SessionMvpView::apply_service_updates);
+
+            view.read_with(cx, |view, _| {
+                assert!(!view.change_expanded("session-1", "src/lib.rs"));
             });
         }
 
