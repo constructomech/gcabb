@@ -423,6 +423,7 @@ impl CopilotProvider {
             .with_user_input_handler(broker.clone())
             .with_exit_plan_mode_handler(broker.clone())
             .with_auto_mode_switch_handler(broker);
+        config.skill_directories = repository_skill_directories(&request.working_directory);
         config.model.clone_from(&request.model);
         config
             .reasoning_effort
@@ -445,6 +446,7 @@ impl CopilotProvider {
             .with_user_input_handler(broker.clone())
             .with_exit_plan_mode_handler(broker.clone())
             .with_auto_mode_switch_handler(broker);
+        config.skill_directories = repository_skill_directories(&request.working_directory);
         config.model.clone_from(&request.model);
         config
             .reasoning_effort
@@ -1120,6 +1122,11 @@ fn timestamp() -> String {
     )
 }
 
+fn repository_skill_directories(working_directory: &Path) -> Option<Vec<PathBuf>> {
+    let directory = working_directory.join(".github").join("skills");
+    directory.is_dir().then_some(vec![directory])
+}
+
 #[must_use]
 pub fn default_database_path(root: &Path) -> PathBuf {
     root.join(".gcabb").join("gcabb.db")
@@ -1149,9 +1156,13 @@ mod tests {
     }
 
     #[test]
-    fn session_configs_explicitly_enable_skills() {
+    fn session_configs_load_repository_skills() {
+        let working_directory =
+            std::env::temp_dir().join(format!("gcabb-skill-test-{}", uuid::Uuid::new_v4()));
+        let skill_directory = working_directory.join(".github").join("skills");
+        std::fs::create_dir_all(&skill_directory).expect("create repository skill directory");
         let request = SessionRequest {
-            working_directory: std::env::temp_dir(),
+            working_directory: working_directory.clone(),
             ..SessionRequest::default()
         };
 
@@ -1160,6 +1171,31 @@ mod tests {
 
         assert_eq!(create.enable_skills, Some(true));
         assert_eq!(resume.enable_skills, Some(true));
+        assert_eq!(
+            create.skill_directories.as_deref(),
+            Some(std::slice::from_ref(&skill_directory))
+        );
+        assert_eq!(
+            resume.skill_directories.as_deref(),
+            Some(std::slice::from_ref(&skill_directory))
+        );
+
+        std::fs::remove_dir_all(working_directory).expect("remove test repository");
+    }
+
+    #[test]
+    fn session_configs_skip_missing_repository_skill_directory() {
+        let request = SessionRequest {
+            working_directory: std::env::temp_dir()
+                .join(format!("gcabb-no-skills-{}", uuid::Uuid::new_v4())),
+            ..SessionRequest::default()
+        };
+
+        let create = CopilotProvider::session_config(&request, interaction_broker());
+        let resume = CopilotProvider::resume_config("session", &request, interaction_broker());
+
+        assert_eq!(create.skill_directories, None);
+        assert_eq!(resume.skill_directories, None);
     }
 
     #[test]
