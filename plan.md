@@ -422,6 +422,27 @@ can resolve the application icon:
 ./scripts/install-linux-desktop-entry.sh
 ```
 
+On macOS the icon comes from the application bundle, so a `cargo run` binary
+has no icon. Assemble a bundle around a build to see the packaged presentation
+Finder, the Dock, and the switcher use:
+
+```sh
+cargo build --release -p gcabb-desktop
+./scripts/package-macos-app.sh          # writes target/macos/GCABB.app
+open target/macos/GCABB.app
+```
+
+`apps/desktop/resources/macos/GCABB.icns` is a build product of the same
+`gcabb-icon.svg`/`gcabb-icon.png` artwork Linux and Windows use. Regenerate it
+on macOS whenever the artwork changes:
+
+```sh
+./scripts/make-macos-icns.sh
+```
+
+`apps/desktop/tests/macos_bundle.rs` fails on every platform if the icon asset
+or its `Info.plist` reference is dropped.
+
 Releases are tag-driven. The workspace version is declared in the root
 `Cargo.toml`; release candidates use tags such as `v0.2.0-rc.1`, while stable
 releases use tags such as `v0.2.0`. The release workflow validates every

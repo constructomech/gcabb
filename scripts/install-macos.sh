@@ -112,11 +112,19 @@ curl --fail --show-error --location --retry 3 \
 
 mkdir "$staging"
 tar -xzf "$work/$asset" -C "$staging"
-if [ ! -f "$staging/gcabb-desktop" ]; then
-  echo "error: $asset does not contain gcabb-desktop" >&2
+app="$staging/GCABB.app"
+executable="$app/Contents/MacOS/gcabb-desktop"
+if [ ! -f "$executable" ]; then
+  echo "error: $asset does not contain GCABB.app" >&2
   exit 1
 fi
-chmod +x "$staging/gcabb-desktop"
+# The icon is what Finder, the Dock, and the switcher read from the bundle, so
+# an archive missing it would install a generic-looking application.
+if [ ! -f "$app/Contents/Resources/GCABB.icns" ]; then
+  echo "error: GCABB.app in $asset has no application icon" >&2
+  exit 1
+fi
+chmod +x "$executable"
 
 had_install=false
 if [ -e "$INSTALL_DIR" ]; then
@@ -134,6 +142,11 @@ if [ "$had_install" = true ]; then
   rm -rf "$backup"
 fi
 
+# Launch Services caches the icon per bundle path; touching the installed bundle
+# makes it re-read Info.plist instead of showing the previous build's icon.
+touch "$INSTALL_DIR/GCABB.app"
+
 echo "Installed GCABB $version at $INSTALL_DIR"
 echo "Run:"
-printf '  %q\n' "$INSTALL_DIR/gcabb-desktop"
+printf '  open %q\n' "$INSTALL_DIR/GCABB.app"
+printf '  %q\n' "$INSTALL_DIR/GCABB.app/Contents/MacOS/gcabb-desktop"

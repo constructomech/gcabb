@@ -19,8 +19,6 @@ use updater::settings::UpdateSettings;
 use updater::source::{GitHubReleaseSource, ProgressCallback, ReqwestClient};
 use updater::verify::TrustStore;
 use updater::version::BuildStamp;
-#[cfg(windows)]
-use updater::version::executable_name;
 use updater::{AvailableUpdate, UpdateStatus, Updater};
 
 /// Repository that releases are published to.
@@ -467,8 +465,16 @@ pub fn restart_into_updated_build(version: &str) -> Result<(), String> {
     #[cfg(not(windows))]
     {
         let _ = version;
-        let exe = std::env::current_exe()
+        let current = std::env::current_exe()
             .map_err(|error| format!("could not locate the installed executable: {error}"))?;
+        // An update can move the executable within the installation — a macOS
+        // build installed before bundling now lives inside GCABB.app — so the
+        // relaunch prefers where the applied update actually put it.
+        let exe = InstallLayout::for_running_executable()
+            .map(|layout| layout.executable_path())
+            .ok()
+            .filter(|path| path.is_file())
+            .unwrap_or(current);
         std::process::Command::new(&exe)
             .spawn()
             .map_err(|error| format!("could not start {}: {error}", exe.display()))?;
@@ -558,7 +564,7 @@ pub fn run_update_helper_if_requested() -> Option<i32> {
     if let Err(error) = updater::install::apply(&layout, &staged) {
         eprintln!("applying failed: {error}");
         if launch {
-            let executable = layout.install_dir.join(executable_name());
+            let executable = layout.executable_path();
             if let Err(restart_error) = std::process::Command::new(&executable).spawn() {
                 eprintln!(
                     "could not restart {} after the update failed: {restart_error}",
@@ -570,7 +576,7 @@ pub fn run_update_helper_if_requested() -> Option<i32> {
     }
 
     if launch {
-        let executable = layout.install_dir.join(executable_name());
+        let executable = layout.executable_path();
         if let Err(error) = std::process::Command::new(&executable).spawn() {
             eprintln!("could not start {}: {error}", executable.display());
             return Some(1);

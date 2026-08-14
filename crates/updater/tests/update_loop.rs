@@ -17,11 +17,11 @@ use base64::engine::general_purpose::STANDARD as BASE64;
 use ed25519_dalek::{Signer as _, SigningKey};
 use rand::rngs::OsRng;
 use semver::Version;
-use updater::install::InstallLayout;
+use updater::install::{InstallLayout, payload_executable};
 use updater::settings::UpdateSettings;
 use updater::source::{BoxFuture, GitHubReleaseSource, HttpClient, ProgressCallback, SourceError};
 use updater::verify::{TrustStore, TrustedKey, sha256_hex};
-use updater::version::{BuildStamp, Channel, current_target, executable_name};
+use updater::version::{BuildStamp, Channel, current_target, executable_relative_path};
 use updater::{UpdateStatus, Updater};
 
 const KEY_ID: &str = "release-2026";
@@ -59,7 +59,7 @@ fn build_artifact(marker: &[u8]) -> Vec<u8> {
     header.set_mode(0o755);
     header.set_cksum();
     builder
-        .append_data(&mut header, executable_name(), marker)
+        .append_data(&mut header, executable_relative_path(), marker)
         .expect("append executable");
     let tar = builder.into_inner().expect("finish tar");
     let mut encoder = flate2::write::GzEncoder::new(Vec::new(), flate2::Compression::fast());
@@ -168,7 +168,9 @@ fn updater_for(
 
 fn install_existing(dir: &Path, marker: &[u8]) {
     std::fs::create_dir_all(dir).expect("create install dir");
-    std::fs::write(dir.join(executable_name()), marker).expect("write executable");
+    let executable = payload_executable(dir);
+    std::fs::create_dir_all(executable.parent().expect("executable parent")).expect("create dirs");
+    std::fs::write(executable, marker).expect("write executable");
 }
 
 fn no_progress() -> ProgressCallback {
@@ -196,7 +198,7 @@ async fn an_installation_discovers_verifies_and_applies_the_next_release() {
     updater.apply(&staged).expect("apply");
 
     assert_eq!(
-        std::fs::read(install.join(executable_name())).expect("read installed"),
+        std::fs::read(payload_executable(&install)).expect("read installed"),
         b"version 0.2.0"
     );
     // The replaced installation is retained so the update can be undone.
@@ -227,7 +229,7 @@ async fn a_forged_manifest_never_reaches_the_installation() {
         "unexpected error: {error}"
     );
     assert_eq!(
-        std::fs::read(install.join(executable_name())).expect("read installed"),
+        std::fs::read(payload_executable(&install)).expect("read installed"),
         b"version 0.1.0"
     );
 }
@@ -255,7 +257,7 @@ async fn a_corrupted_artifact_never_reaches_the_installation() {
         "unexpected error: {error}"
     );
     assert_eq!(
-        std::fs::read(install.join(executable_name())).expect("read installed"),
+        std::fs::read(payload_executable(&install)).expect("read installed"),
         b"version 0.1.0"
     );
 }
@@ -310,7 +312,7 @@ async fn an_update_can_be_rolled_back_after_it_is_applied() {
     updater::install::rollback(updater.layout()).expect("rollback");
 
     assert_eq!(
-        std::fs::read(install.join(executable_name())).expect("read installed"),
+        std::fs::read(payload_executable(&install)).expect("read installed"),
         b"version 0.1.0"
     );
 }
