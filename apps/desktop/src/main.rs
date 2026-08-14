@@ -183,6 +183,15 @@ impl MarkdownInlineContent {
     }
 }
 
+/// One rendering unit inside a sequence of Markdown sibling nodes: either a
+/// stretch of adjacent inline nodes that must share a single text layout, or a
+/// single node that renders as its own block.
+#[derive(Clone, Debug, PartialEq)]
+enum MarkdownRun {
+    Inline(std::ops::Range<usize>),
+    Block(usize),
+}
+
 fn safe_markdown_url(target: &str) -> Option<String> {
     let target = target.trim();
     let lowercase = target.to_ascii_lowercase();
@@ -4824,11 +4833,12 @@ impl SessionMvpView {
             .flex()
             .flex_col()
             .gap_2()
-            .children(
-                children
-                    .iter()
-                    .map(|child| Self::markdown_block(child, message_id, element_index, cx)),
-            )
+            .children(Self::markdown_blocks(
+                children,
+                message_id,
+                element_index,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -4930,13 +4940,9 @@ impl SessionMvpView {
                             .text_color(rgb(MUTED))
                             .child(marker),
                     )
-                    .child(
-                        div().min_w_0().flex_1().flex().flex_col().gap_1().children(
-                            content.iter().map(|item| {
-                                Self::markdown_block(item, message_id, element_index, cx)
-                            }),
-                        ),
-                    )
+                    .child(div().min_w_0().flex_1().flex().flex_col().gap_1().children(
+                        Self::markdown_blocks(content, message_id, element_index, cx),
+                    ))
             }))
             .into_any_element()
     }
@@ -5027,11 +5033,12 @@ impl SessionMvpView {
                 .flex()
                 .flex_col()
                 .gap_1()
-                .children(
-                    children
-                        .iter()
-                        .map(|child| Self::markdown_block(child, message_id, element_index, cx)),
-                )
+                .children(Self::markdown_blocks(
+                    children,
+                    message_id,
+                    element_index,
+                    cx,
+                ))
                 .into_any_element(),
             _ => Self::markdown_inline_block(
                 std::slice::from_ref(node),
@@ -5040,6 +5047,75 @@ impl SessionMvpView {
                 cx,
             ),
         }
+    }
+
+    /// Whether a node belongs to the inline text flow rather than being a
+    /// block of its own. Markdown lists and other containers frequently hold
+    /// bare inline nodes (a "tight" list item is not wrapped in a paragraph),
+    /// so these have to be regrouped into one text run before rendering or
+    /// every emphasis, link, and inline code span would land on its own line.
+    fn is_markdown_inline(node: &MarkdownNode) -> bool {
+        match node {
+            MarkdownNode::Container(tag, _) => matches!(
+                tag,
+                MarkdownTag::Emphasis
+                    | MarkdownTag::Strong
+                    | MarkdownTag::Strikethrough
+                    | MarkdownTag::Link(_)
+                    | MarkdownTag::Image(_)
+            ),
+            MarkdownNode::Text(_)
+            | MarkdownNode::Code(_)
+            | MarkdownNode::Html(_)
+            | MarkdownNode::SoftBreak
+            | MarkdownNode::HardBreak
+            | MarkdownNode::TaskMarker(_) => true,
+            MarkdownNode::Rule => false,
+        }
+    }
+
+    /// Splits sibling nodes into stretches of adjacent inline nodes and
+    /// standalone block nodes, dropping inline stretches that carry no visible
+    /// text (whitespace separators between blocks).
+    fn markdown_runs(nodes: &[MarkdownNode]) -> Vec<MarkdownRun> {
+        let mut runs = Vec::new();
+        let mut index = 0;
+        while index < nodes.len() {
+            if Self::is_markdown_inline(&nodes[index]) {
+                let start = index;
+                while index < nodes.len() && Self::is_markdown_inline(&nodes[index]) {
+                    index += 1;
+                }
+                if !markdown::plain_text(&nodes[start..index]).trim().is_empty() {
+                    runs.push(MarkdownRun::Inline(start..index));
+                }
+            } else {
+                runs.push(MarkdownRun::Block(index));
+                index += 1;
+            }
+        }
+        runs
+    }
+
+    /// Renders a sequence of sibling nodes, merging each stretch of adjacent
+    /// inline nodes into a single wrapped text block.
+    fn markdown_blocks(
+        nodes: &[MarkdownNode],
+        message_id: &str,
+        element_index: &mut usize,
+        cx: &mut Context<Self>,
+    ) -> Vec<gpui::AnyElement> {
+        Self::markdown_runs(nodes)
+            .into_iter()
+            .map(|run| match run {
+                MarkdownRun::Inline(range) => {
+                    Self::markdown_inline_block(&nodes[range], message_id, element_index, cx)
+                }
+                MarkdownRun::Block(index) => {
+                    Self::markdown_block(&nodes[index], message_id, element_index, cx)
+                }
+            })
+            .collect()
     }
 
     fn markdown_content(
@@ -5054,12 +5130,12 @@ impl SessionMvpView {
             .flex()
             .flex_col()
             .gap_2()
-            .children(
-                document
-                    .children
-                    .iter()
-                    .map(|node| Self::markdown_block(node, message_id, &mut element_index, cx)),
-            )
+            .children(Self::markdown_blocks(
+                &document.children,
+                message_id,
+                &mut element_index,
+                cx,
+            ))
             .into_any_element()
     }
 
@@ -7600,6 +7676,44 @@ mod tests {
     }
 
     #[test]
+    fn tight_list_item_inline_nodes_share_one_text_layout() {
+        let document = crate::markdown::parse("- Source: `Minecraft/`, `src/`, `handheld/`");
+        let crate::markdown::MarkdownNode::Container(_, items) = &document.children[0] else {
+            panic!("expected a list container");
+        };
+        let crate::markdown::MarkdownNode::Container(_, content) = &items[0] else {
+            panic!("expected a list item container");
+        };
+
+        // Without grouping, every `Text` and `Code` node here would become its
+        // own stacked block and the item would render one fragment per line.
+        assert!(content.len() > 1);
+        assert_eq!(
+            super::SessionMvpView::markdown_runs(content),
+            vec![super::MarkdownRun::Inline(0..content.len())]
+        );
+
+        let inline = super::SessionMvpView::markdown_inline_content(content);
+        assert_eq!(inline.text, "Source: Minecraft/, src/, handheld/");
+    }
+
+    #[test]
+    fn loose_list_item_keeps_nested_blocks_separate() {
+        let document = crate::markdown::parse("- intro `code`\n\n  ```\nfenced\n```\n");
+        let crate::markdown::MarkdownNode::Container(_, items) = &document.children[0] else {
+            panic!("expected a list container");
+        };
+        let crate::markdown::MarkdownNode::Container(_, content) = &items[0] else {
+            panic!("expected a list item container");
+        };
+
+        assert_eq!(
+            super::SessionMvpView::markdown_runs(content),
+            vec![super::MarkdownRun::Block(0), super::MarkdownRun::Block(1)]
+        );
+    }
+
+    #[test]
     fn live_output_preview_bounds_ui_text_work() {
         let output = (0..2_000).fold(String::new(), |mut output, line| {
             writeln!(output, "compiler output line {line:04}").expect("write fixture");
@@ -9057,6 +9171,37 @@ mod tests {
             assert!(
                 f32::from(inline.size.height) < 32.,
                 "link boundary introduced a line break: {inline:?}"
+            );
+        }
+
+        /// Inline code inside a tight list item must flow with the surrounding
+        /// text instead of being stacked one fragment per line.
+        #[gpui::test]
+        fn list_item_inline_code_stays_on_one_line(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "list-markdown-message".to_owned(),
+                    role: app_model::TranscriptRole::Assistant,
+                    content: "- Source: `Minecraft/`, `src/`, `handheld/`".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let inline = cx
+                .debug_bounds("markdown-inline")
+                .expect("inline markdown rendered");
+            assert!(
+                f32::from(inline.size.height) < 32.,
+                "inline code split the list item across lines: {inline:?}"
             );
         }
 
