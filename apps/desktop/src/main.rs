@@ -96,8 +96,13 @@ const SCROLLBAR_WIDTH: f32 = 14.0;
 const THUMB_WIDTH: f32 = 10.0;
 /// Scrollbar id for the conversation itself.
 const TRANSCRIPT_SCROLL_ID: &str = "transcript";
+/// A wheel listener that claims the gesture only when its region moved.
+type ScrollWheelGuard = Box<dyn Fn(&gpui::ScrollWheelEvent, &mut Window, &mut App)>;
+
 /// Scroll region behind the Changes panel's single scrollbar.
 const CHANGES_SCROLL_ID: &str = "changes-scroll";
+/// Scroll region of the composer's mode, model, and effort menus.
+const CONTROL_MENU_SCROLL_ID: &str = "control-menu-scroll";
 /// Extra content laid out above and below the viewport to avoid blank flashes
 /// during fast trackpad and scrollbar movement.
 const TRANSCRIPT_OVERDRAW: f32 = 720.0;
@@ -1300,6 +1305,9 @@ struct SessionMvpView {
     /// Last rendered content length for each detail block, used to follow
     /// streaming shell output without resetting blocks the user scrolled up.
     detail_extents: RefCell<HashMap<String, usize>>,
+    /// Where each scroll region sat before the wheel event being handled, so a
+    /// region can tell whether it actually moved.
+    scroll_positions: RefCell<HashMap<String, gpui::Point<gpui::Pixels>>>,
     /// Large completed outputs the user explicitly chose to lay out in full.
     expanded_tool_outputs: HashSet<String>,
     /// Scrollbar currently being dragged, if any.
@@ -1519,6 +1527,7 @@ impl SessionMvpView {
             transcript_snapshot_ptr: 0,
             detail_scrolls: RefCell::new(HashMap::new()),
             detail_extents: RefCell::new(HashMap::new()),
+            scroll_positions: RefCell::new(HashMap::new()),
             expanded_tool_outputs: HashSet::new(),
             dragging_scrollbar: None,
             transcript_extent: (String::new(), 0, 0, 0, 0),
@@ -3402,6 +3411,12 @@ impl SessionMvpView {
         } else {
             px(260.0)
         };
+        let handle = self
+            .detail_scrolls
+            .borrow_mut()
+            .entry(CONTROL_MENU_SCROLL_ID.to_owned())
+            .or_default()
+            .clone();
         Some(
             div()
                 .id("composer-control-menu")
@@ -3410,7 +3425,9 @@ impl SessionMvpView {
                 .aria_label(title)
                 .w(width)
                 .max_h(px(460.0))
+                .track_scroll(&handle)
                 .overflow_y_scroll()
+                .on_scroll_wheel(self.claim_scroll_when_moved(CONTROL_MENU_SCROLL_ID, &handle, cx))
                 .p_2()
                 .rounded_lg()
                 .border_1()
@@ -4225,6 +4242,73 @@ impl SessionMvpView {
             )
     }
 
+    /// Hand the wheel to a scroll region only while the region can use it.
+    ///
+    /// GPUI applies a wheel event to every scrollable container under the
+    /// pointer and leaves it propagating, so a nested region and the surface
+    /// behind it both move. Claiming the event unconditionally is just as
+    /// wrong, and is what this replaces: a region with nothing to scroll, or
+    /// one already at its extent, swallowed the wheel and the surface behind
+    /// it never moved.
+    ///
+    /// GPUI has already applied this event by the time the returned listener
+    /// runs, so comparing where the region sat before with where it sits now
+    /// says whether it consumed the gesture.
+    fn claim_scroll_when_moved(
+        &self,
+        id: &str,
+        handle: &gpui::ScrollHandle,
+        cx: &Context<Self>,
+    ) -> ScrollWheelGuard {
+        self.scroll_positions
+            .borrow_mut()
+            .insert(id.to_owned(), Self::clamped_offset(handle));
+        let id = id.to_owned();
+        let handle = handle.clone();
+        Box::new(cx.listener(move |view, _: &gpui::ScrollWheelEvent, _, cx| {
+            let after = Self::clamped_offset(&handle);
+            let before = view
+                .scroll_positions
+                .borrow()
+                .get(&id)
+                .copied()
+                .unwrap_or(after);
+            view.scroll_positions.borrow_mut().insert(id.clone(), after);
+            // GPUI lets the offset run past the extent and only clamps it at
+            // the next paint, which would read as movement next time.
+            if handle.offset() != after {
+                handle.set_offset(after);
+            }
+            if before != after {
+                cx.stop_propagation();
+            }
+        }))
+    }
+
+    /// Where a scroll region sits, with the overscroll GPUI allows removed.
+    fn clamped_offset(handle: &gpui::ScrollHandle) -> gpui::Point<gpui::Pixels> {
+        let max = handle.max_offset();
+        let offset = handle.offset();
+        gpui::point(
+            offset.x.clamp(-max.x, px(0.0)),
+            offset.y.clamp(-max.y, px(0.0)),
+        )
+    }
+
+    /// Claim the wheel for a horizontally scrolling region, but only for a
+    /// horizontal gesture.
+    ///
+    /// Code blocks, tables, and diffs scroll sideways inside surfaces that
+    /// scroll down. Paired with `restrict_scroll_to_axis`, this keeps a
+    /// vertical wheel over one of them scrolling the surface behind it rather
+    /// than being swallowed or, worse, turned into sideways movement.
+    fn claim_horizontal_scroll(event: &gpui::ScrollWheelEvent, window: &mut Window, cx: &mut App) {
+        let delta = event.delta.pixel_delta(window.line_height());
+        if delta.x != px(0.0) && delta.x.abs() > delta.y.abs() {
+            cx.stop_propagation();
+        }
+    }
+
     /// A bounded, scrollable block of detail inside a tool entry.
     ///
     /// Commands, diffs, and output are frequently taller than any sensible
@@ -4257,6 +4341,7 @@ impl SessionMvpView {
         }
 
         let group = SharedString::from(format!("scroll-{id}"));
+        let claim_scroll = self.claim_scroll_when_moved(id, &handle, cx);
         let scrollbar = Self::scrollbar(id, &handle, group.clone(), cx);
 
         div()
@@ -4277,7 +4362,10 @@ impl SessionMvpView {
                     .overflow_y_scroll()
                     // Without this the transcript scrolls too, so reading a
                     // command's output dragged the whole conversation along.
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    // Claiming it outright was its own bug: a block short
+                    // enough to need no scrolling, or already at its end, left
+                    // the transcript stuck under the pointer.
+                    .on_scroll_wheel(claim_scroll)
                     .px_2()
                     .py_1()
                     .rounded_md()
@@ -4910,6 +4998,8 @@ impl SessionMvpView {
                     .debug_selector(|| "markdown-code".to_owned())
                     .p_3()
                     .overflow_x_scroll()
+                    .restrict_scroll_to_axis()
+                    .on_scroll_wheel(Self::claim_horizontal_scroll)
                     .whitespace_nowrap()
                     .font_family(".ZedMono")
                     .text_sm()
@@ -4996,6 +5086,8 @@ impl SessionMvpView {
             )))
             .debug_selector(|| "markdown-table".to_owned())
             .overflow_x_scroll()
+            .restrict_scroll_to_axis()
+            .on_scroll_wheel(Self::claim_horizontal_scroll)
             .rounded_md()
             .border_1()
             .border_color(rgb(BORDER))
@@ -5595,6 +5687,7 @@ impl SessionMvpView {
             .or_default()
             .clone();
         let group = SharedString::from("scroll-changes");
+        let claim_scroll = self.claim_scroll_when_moved(CHANGES_SCROLL_ID, &handle, cx);
         let mut entries = Vec::with_capacity(changes.files.len());
         for file in &changes.files {
             entries.push(self.change_entry(&session_id, file, cx).into_any_element());
@@ -5653,6 +5746,7 @@ impl SessionMvpView {
                             .gap_1()
                             .pr_2()
                             .overflow_y_scroll()
+                            .on_scroll_wheel(claim_scroll)
                             .children(entries),
                     )
                     .children(scrollbar),
@@ -5873,6 +5967,7 @@ impl SessionMvpView {
             // Without this a vertical wheel over a diff is remapped onto the
             // horizontal axis instead of scrolling the panel.
             .restrict_scroll_to_axis()
+            .on_scroll_wheel(Self::claim_horizontal_scroll)
             .text_color(if muted { rgb(MUTED) } else { rgb(PRIMARY) })
             .child(body)
     }
@@ -11823,6 +11918,246 @@ mod tests {
             view.read_with(cx, |view, _| {
                 assert!(!view.change_expanded("session-1", "src/lib.rs"));
             });
+        }
+
+        // --- Wheel handoff between nested scroll regions ---------------------
+
+        /// A session whose transcript is long enough to scroll, with one tool
+        /// entry whose output is `lines` long.
+        fn transcript_with_tool_output(lines: usize) -> SessionSnapshot {
+            let mut state = snapshot("session-1", "First session");
+            for index in 0..80 {
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: format!("m{index}"),
+                    role: app_model::TranscriptRole::Assistant,
+                    content: format!("message {index} with enough text to take a line"),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: u64::try_from(index).unwrap_or(0) + 1,
+                    attachments: Vec::new(),
+                });
+            }
+            let mut sequence = 1_000;
+            let mut apply = |raw: &serde_json::Value, state: &mut app_model::SessionSnapshot| {
+                sequence += 1;
+                state.apply(app_model::DomainEvent::from_sdk_event_for(
+                    "session-1",
+                    sequence,
+                    raw,
+                ));
+            };
+            apply(
+                &serde_json::json!({"id":"t","type":"tool.execution_start",
+                    "data":{"toolCallId":"c1","toolName":"bash",
+                            "arguments":{"command":"seq"},
+                            "shellToolInfo":{"displayCommand":"seq",
+                                             "hasWriteFileRedirection":false,
+                                             "possiblePaths":[]}}}),
+                &mut state,
+            );
+            let output = (1..=lines)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            apply(
+                &serde_json::json!({"id":"p","type":"tool.execution_partial_result",
+                    "data":{"toolCallId":"c1","partialOutput": output}}),
+                &mut state,
+            );
+            state
+        }
+
+        fn show(
+            view: &gpui::Entity<SessionMvpView>,
+            cx: &mut VisualTestContext,
+            state: SessionSnapshot,
+        ) {
+            view.update(cx, |view, cx| {
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+        }
+
+        fn wheel(cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>, x: f32, y: f32) {
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: at,
+                delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(x), gpui::px(y))),
+                modifiers: Modifiers::none(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+
+        fn transcript_offset(
+            view: &gpui::Entity<SessionMvpView>,
+            cx: &mut VisualTestContext,
+        ) -> gpui::Pixels {
+            view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            })
+        }
+
+        fn detail_offset(
+            view: &gpui::Entity<SessionMvpView>,
+            cx: &mut VisualTestContext,
+        ) -> gpui::Pixels {
+            view.read_with(cx, |view, _| {
+                view.scroll_handle("tool-output-c1")
+                    .expect("the output block tracks a scroll handle")
+                    .offset()
+                    .y
+            })
+        }
+
+        /// A block short enough to need no scrolling used to swallow the wheel,
+        /// which left the transcript stuck wherever the pointer happened to be.
+        #[gpui::test]
+        fn a_detail_block_with_nothing_to_scroll_leaves_the_wheel_alone(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            show(&view, cx, transcript_with_tool_output(1));
+
+            let block = cx
+                .debug_bounds("tool-detail")
+                .expect("the output block is rendered");
+            let before = transcript_offset(&view, cx);
+            wheel(cx, block.center(), 0.0, 400.0);
+
+            assert!(
+                transcript_offset(&view, cx) > before,
+                "a block with nothing to scroll must let the transcript move"
+            );
+        }
+
+        #[gpui::test]
+        fn a_scrollable_detail_block_takes_the_wheel_from_the_transcript(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            show(&view, cx, transcript_with_tool_output(500));
+            let block = cx
+                .debug_bounds("tool-detail")
+                .expect("the output block is rendered");
+            // Streaming output follows its tail, so start from the top.
+            view.update(cx, |view, cx| {
+                view.scroll_handle("tool-output-c1")
+                    .expect("scroll handle")
+                    .set_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let transcript_before = transcript_offset(&view, cx);
+            wheel(cx, block.center(), 0.0, -200.0);
+
+            assert!(
+                detail_offset(&view, cx) < gpui::px(0.0),
+                "the block under the pointer must scroll"
+            );
+            assert_eq!(
+                transcript_offset(&view, cx),
+                transcript_before,
+                "the transcript must not scroll along with the block"
+            );
+        }
+
+        /// The handoff: once the inner block has nothing left to give, the
+        /// surface behind it takes over instead of the gesture dying.
+        #[gpui::test]
+        fn a_detail_block_at_its_end_hands_the_wheel_back(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            show(&view, cx, transcript_with_tool_output(500));
+            let block = cx
+                .debug_bounds("tool-detail")
+                .expect("the output block is rendered");
+            // Park the block against its top edge, with the transcript sitting
+            // at its tail so there is room above it to take over.
+            view.update(cx, |view, cx| {
+                view.scroll_handle("tool-output-c1")
+                    .expect("scroll handle")
+                    .set_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let transcript_before = transcript_offset(&view, cx);
+            wheel(cx, block.center(), 0.0, 200.0);
+
+            assert_eq!(
+                detail_offset(&view, cx),
+                gpui::px(0.0),
+                "the block is already at its end"
+            );
+            assert!(
+                transcript_offset(&view, cx) > transcript_before,
+                "a block at its end must hand the wheel to the transcript"
+            );
+        }
+
+        /// Diffs scroll sideways inside a panel that scrolls down, so a
+        /// vertical wheel over one belongs to the panel.
+        #[gpui::test]
+        fn a_vertical_wheel_over_a_diff_scrolls_the_changes_panel(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let files: Vec<_> = (0..40)
+                .map(|index| {
+                    changed_file(
+                        Box::leak(format!("src/file_{index}.rs").into_boxed_str()),
+                        app_model::ChangeStatus::Modified,
+                        Some(&long_diff(40)),
+                    )
+                })
+                .collect();
+            open_changes(&view, cx, files);
+            view.update(cx, |view, cx| {
+                view.toggle_change("session-1", "src/file_0.rs");
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let diff = cx
+                .debug_bounds("change-diff-src/file_0.rs")
+                .expect("the diff is rendered");
+            let before = changes_scroll(&view, cx).offset().y;
+            wheel(cx, diff.center(), 0.0, -120.0);
+
+            assert!(
+                changes_scroll(&view, cx).offset().y < before,
+                "a vertical wheel over a diff must scroll the panel"
+            );
+        }
+
+        /// The diff still owns sideways gestures, and must not pass them on for
+        /// the panel to turn into vertical movement.
+        #[gpui::test]
+        fn a_horizontal_wheel_over_a_diff_stays_in_the_diff(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let files: Vec<_> = (0..40)
+                .map(|index| {
+                    changed_file(
+                        Box::leak(format!("src/file_{index}.rs").into_boxed_str()),
+                        app_model::ChangeStatus::Modified,
+                        Some(&format!("+{}\n", "x".repeat(400))),
+                    )
+                })
+                .collect();
+            open_changes(&view, cx, files);
+            view.update(cx, |view, cx| {
+                view.toggle_change("session-1", "src/file_0.rs");
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let diff = cx
+                .debug_bounds("change-diff-src/file_0.rs")
+                .expect("the diff is rendered");
+            let before = changes_scroll(&view, cx).offset().y;
+            wheel(cx, diff.center(), -80.0, 0.0);
+
+            let after = changes_scroll(&view, cx).offset().y;
+            assert!(
+                (f32::from(after - before)).abs() < f32::EPSILON,
+                "a sideways gesture must not scroll the panel: {before:?} -> {after:?}"
+            );
         }
 
         #[gpui::test]
