@@ -15,12 +15,22 @@ use github_copilot_sdk::handler::{
     AutoModeSwitchHandler, AutoModeSwitchResponse, ElicitationHandler, ExitPlanModeHandler,
     ExitPlanModeResult, PermissionHandler, PermissionResult, UserInputHandler, UserInputResponse,
 };
-use github_copilot_sdk::rpc::ToolsListRequest;
+use github_copilot_sdk::rpc::{
+    PermissionDecision, PermissionDecisionApproveForLocation,
+    PermissionDecisionApproveForLocationApproval,
+    PermissionDecisionApproveForLocationApprovalCommands,
+    PermissionDecisionApproveForLocationApprovalRead,
+    PermissionDecisionApproveForLocationApprovalWrite, PermissionDecisionApproveForLocationKind,
+    PermissionDecisionApproveForSession, PermissionDecisionApproveForSessionApproval,
+    PermissionDecisionApproveForSessionApprovalCommands,
+    PermissionDecisionApproveForSessionApprovalRead,
+    PermissionDecisionApproveForSessionApprovalWrite, ToolsListRequest,
+};
 use github_copilot_sdk::session::Session;
 use github_copilot_sdk::{
     Client, ClientMode, ClientOptions, DeliveryMode, ElicitationRequest, ElicitationResult,
-    ExitPlanModeData, MessageOptions, PermissionRequestData, RequestId, ResumeSessionConfig,
-    SessionConfig, SessionId, SystemMessageConfig,
+    ExitPlanModeData, MessageOptions, PermissionRequestData, PermissionRequestKind, RequestId,
+    ResumeSessionConfig, SessionConfig, SessionId, SystemMessageConfig,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -54,7 +64,8 @@ pub struct SessionRequest {
     pub mode: Option<String>,
     pub reasoning_effort: Option<String>,
     pub context_tier: Option<String>,
-    /// Automatically approve tool permissions for an isolated, GCABB-owned worktree.
+    /// Approve tool permissions that stay inside an isolated, GCABB-owned
+    /// worktree. Requests that reach outside it are still prompted for.
     pub auto_approve_tools: bool,
 }
 
@@ -145,10 +156,23 @@ pub trait AgentProvider: Send + Sync {
 #[derive(Clone)]
 struct InteractionBroker {
     sender: mpsc::Sender<ProviderInteraction>,
-    auto_approve_tools: bool,
+    /// Canonical worktree root whose contents may be approved without prompting.
+    /// `None` prompts for everything.
+    auto_approve_root: Option<PathBuf>,
+    permission_location: String,
 }
 
 impl InteractionBroker {
+    fn new(sender: mpsc::Sender<ProviderInteraction>, request: &SessionRequest) -> Self {
+        Self {
+            sender,
+            auto_approve_root: request
+                .auto_approve_tools
+                .then(|| resolve_root(&request.working_directory)),
+            permission_location: request.working_directory.to_string_lossy().into_owned(),
+        }
+    }
+
     async fn request(&self, request: InteractionRequest) -> Option<InteractionResponse> {
         let (response, receiver) = oneshot::channel();
         if self
@@ -171,9 +195,10 @@ impl PermissionHandler for InteractionBroker {
         request_id: RequestId,
         data: PermissionRequestData,
     ) -> PermissionResult {
-        if self.auto_approve_tools
+        if let Some(root) = self.auto_approve_root.as_deref()
             && !data.managed_settings_enabled
             && data.managed_approval_required != Some(true)
+            && permission_stays_in_worktree(&data, root)
         {
             return PermissionResult::approve_once();
         }
@@ -183,12 +208,20 @@ impl PermissionHandler for InteractionBroker {
             kind: InteractionKind::Permission,
             title: "Permission required".to_owned(),
             message: permission_message(&data),
-            choices: vec!["Allow once".to_owned(), "Deny".to_owned()],
+            choices: permission_choices(&data),
             allow_freeform: false,
             details: serde_json::to_value(&data).unwrap_or(Value::Null),
         };
         match self.request(request).await {
             Some(InteractionResponse::Approve) => PermissionResult::approve_once(),
+            Some(InteractionResponse::ApproveForSession) => permission_for_session(&data)
+                .map_or_else(PermissionResult::user_not_available, PermissionResult::from),
+            Some(InteractionResponse::ApproveForLocation) => {
+                permission_for_location(&data, &self.permission_location)
+                    .map_or_else(PermissionResult::user_not_available, PermissionResult::from)
+            }
+            Some(InteractionResponse::ApprovePermanently) => permission_for_domain(&data)
+                .map_or_else(PermissionResult::user_not_available, PermissionResult::from),
             Some(InteractionResponse::Reject { feedback }) => PermissionResult::reject(feedback),
             _ => PermissionResult::user_not_available(),
         }
@@ -541,10 +574,7 @@ impl AgentProvider for CopilotProvider {
     async fn create_session(&self, request: SessionRequest) -> Result<ProviderSession> {
         let started = Instant::now();
         let (interaction_tx, interactions) = mpsc::channel(16);
-        let broker = Arc::new(InteractionBroker {
-            sender: interaction_tx,
-            auto_approve_tools: request.auto_approve_tools,
-        });
+        let broker = Arc::new(InteractionBroker::new(interaction_tx, &request));
         let session = self
             .client()
             .await?
@@ -577,10 +607,7 @@ impl AgentProvider for CopilotProvider {
     ) -> Result<ProviderSession> {
         let started = Instant::now();
         let (interaction_tx, interactions) = mpsc::channel(16);
-        let broker = Arc::new(InteractionBroker {
-            sender: interaction_tx,
-            auto_approve_tools: request.auto_approve_tools,
-        });
+        let broker = Arc::new(InteractionBroker::new(interaction_tx, &request));
         let session = self
             .client()
             .await?
@@ -939,6 +966,228 @@ fn permission_message(data: &PermissionRequestData) -> String {
     )
 }
 
+/// Whether a permission request is confined to the isolated worktree, which is
+/// the only reason auto-approval is safe. Anything reaching outside it — another
+/// directory, the network, an MCP server — is prompted for even in a worktree
+/// session.
+fn permission_stays_in_worktree(data: &PermissionRequestData, root: &Path) -> bool {
+    match data.kind {
+        Some(PermissionRequestKind::Read) => {
+            permission_path(data, "path").is_some_and(|path| path_stays_in_worktree(&path, root))
+        }
+        Some(PermissionRequestKind::Write) => permission_path(data, "fileName")
+            .is_some_and(|path| path_stays_in_worktree(&path, root)),
+        Some(PermissionRequestKind::Shell) => shell_stays_in_worktree(data, root),
+        _ => false,
+    }
+}
+
+fn shell_stays_in_worktree(data: &PermissionRequestData, root: &Path) -> bool {
+    // Running outside the sandbox is exactly the case a human should see.
+    if permission_bool(data, "requestSandboxBypass") {
+        return false;
+    }
+    // Network access is not bounded by the worktree.
+    if permission_value(data, "possibleUrls")
+        .and_then(Value::as_array)
+        .is_some_and(|urls| !urls.is_empty())
+    {
+        return false;
+    }
+    // Without the CLI's path analysis there is nothing bounding the command.
+    let Some(paths) = permission_value(data, "possiblePaths").and_then(Value::as_array) else {
+        return false;
+    };
+    paths.iter().all(|value| {
+        value
+            .as_str()
+            .is_some_and(|path| path_stays_in_worktree(path, root))
+    })
+}
+
+fn path_stays_in_worktree(raw: &str, root: &Path) -> bool {
+    // An unexpanded variable or `~` cannot be resolved here, so treat it as
+    // outside rather than guessing what it expands to.
+    if raw.contains('$') || raw.starts_with('~') {
+        return false;
+    }
+    let candidate = Path::new(raw);
+    let absolute = if candidate.is_absolute() {
+        candidate.to_path_buf()
+    } else {
+        root.join(candidate)
+    };
+    resolve_path(&absolute).is_some_and(|path| path.starts_with(root))
+}
+
+/// Resolves a path for containment checks, following symlinks so that `/tmp` and
+/// `/private/tmp` compare equal on macOS, and so `..` cannot walk out of the
+/// worktree. Paths that do not exist yet resolve through their nearest existing
+/// ancestor, which keeps new files checkable.
+fn resolve_path(path: &Path) -> Option<PathBuf> {
+    if let Ok(resolved) = path.canonicalize() {
+        return Some(resolved);
+    }
+    let parent = path.parent()?;
+    let name = path.file_name()?;
+    Some(resolve_path(parent)?.join(name))
+}
+
+fn resolve_root(path: &Path) -> PathBuf {
+    resolve_path(path).unwrap_or_else(|| path.to_owned())
+}
+
+fn permission_path(data: &PermissionRequestData, key: &str) -> Option<String> {
+    permission_string(data, &[key]).or_else(|| permission_string(data, &["request", key]))
+}
+
+fn permission_value<'a>(data: &'a PermissionRequestData, key: &str) -> Option<&'a Value> {
+    data.extra.get(key).or_else(|| {
+        data.extra
+            .get("request")
+            .and_then(|request| request.get(key))
+    })
+}
+
+fn permission_bool(data: &PermissionRequestData, key: &str) -> bool {
+    permission_value(data, key)
+        .and_then(Value::as_bool)
+        .unwrap_or(false)
+}
+
+fn permission_choices(data: &PermissionRequestData) -> Vec<String> {
+    let mut choices = vec!["Allow once".to_owned()];
+    if permission_for_session(data).is_some() {
+        choices.push("Allow for this session".to_owned());
+    }
+    if permission_for_location(data, "location").is_some() {
+        choices.push("Always allow for this project".to_owned());
+    }
+    if permission_for_domain(data).is_some() {
+        choices.push("Always allow this domain".to_owned());
+    }
+    choices.push("Deny".to_owned());
+    choices
+}
+
+fn permission_for_session(data: &PermissionRequestData) -> Option<PermissionDecision> {
+    let approval = match data.kind? {
+        PermissionRequestKind::Read => PermissionDecisionApproveForSessionApproval::Read(
+            PermissionDecisionApproveForSessionApprovalRead::default(),
+        ),
+        PermissionRequestKind::Write => PermissionDecisionApproveForSessionApproval::Write(
+            PermissionDecisionApproveForSessionApprovalWrite::default(),
+        ),
+        PermissionRequestKind::Shell => PermissionDecisionApproveForSessionApproval::Commands(
+            PermissionDecisionApproveForSessionApprovalCommands {
+                command_identifiers: vec![command_identifier(data)?],
+                ..Default::default()
+            },
+        ),
+        PermissionRequestKind::Url => {
+            return Some(PermissionDecision::ApproveForSession(
+                PermissionDecisionApproveForSession {
+                    approval: None,
+                    domain: Some(permission_domain(data)?),
+                    ..Default::default()
+                },
+            ));
+        }
+        _ => return None,
+    };
+    Some(PermissionDecision::ApproveForSession(
+        PermissionDecisionApproveForSession {
+            approval: Some(approval),
+            domain: None,
+            ..Default::default()
+        },
+    ))
+}
+
+fn permission_for_location(
+    data: &PermissionRequestData,
+    location_key: &str,
+) -> Option<PermissionDecision> {
+    let approval = match data.kind? {
+        PermissionRequestKind::Read => PermissionDecisionApproveForLocationApproval::Read(
+            PermissionDecisionApproveForLocationApprovalRead::default(),
+        ),
+        PermissionRequestKind::Write => PermissionDecisionApproveForLocationApproval::Write(
+            PermissionDecisionApproveForLocationApprovalWrite::default(),
+        ),
+        PermissionRequestKind::Shell => PermissionDecisionApproveForLocationApproval::Commands(
+            PermissionDecisionApproveForLocationApprovalCommands {
+                command_identifiers: vec![command_identifier(data)?],
+                ..Default::default()
+            },
+        ),
+        _ => return None,
+    };
+    Some(PermissionDecision::ApproveForLocation(
+        PermissionDecisionApproveForLocation {
+            approval,
+            kind: PermissionDecisionApproveForLocationKind::default(),
+            location_key: location_key.to_owned(),
+        },
+    ))
+}
+
+fn permission_for_domain(data: &PermissionRequestData) -> Option<PermissionDecision> {
+    if data.kind != Some(PermissionRequestKind::Url) {
+        return None;
+    }
+    Some(PermissionDecision::ApprovePermanently(
+        github_copilot_sdk::rpc::PermissionDecisionApprovePermanently {
+            domain: permission_domain(data)?,
+            ..Default::default()
+        },
+    ))
+}
+
+fn command_identifier(data: &PermissionRequestData) -> Option<String> {
+    permission_string(data, &["commandIdentifier"])
+        .or_else(|| permission_string(data, &["request", "commandIdentifier"]))
+        .or_else(|| permission_string(data, &["command_identifier"]))
+}
+
+fn permission_domain(data: &PermissionRequestData) -> Option<String> {
+    let url = permission_string(data, &["url"])
+        .or_else(|| permission_string(data, &["request", "url"]))?;
+    let authority = url
+        .split_once("://")
+        .map_or(url.as_str(), |(_, value)| value)
+        .split(['/', '?', '#'])
+        .next()?;
+    let host = authority
+        .rsplit_once('@')
+        .map_or(authority, |(_, value)| value);
+    let host = host_without_port(host)?;
+    (!host.is_empty()).then(|| host.to_ascii_lowercase())
+}
+
+/// Trims a trailing `:port`, keeping the brackets around an IPv6 literal so its
+/// inner colons are not mistaken for a port separator.
+fn host_without_port(authority: &str) -> Option<&str> {
+    if authority.starts_with('[') {
+        let end = authority.find(']')?;
+        let host = &authority[..=end];
+        return (host.len() > 2).then_some(host);
+    }
+    Some(
+        authority
+            .split_once(':')
+            .map_or(authority, |(host, _)| host),
+    )
+}
+
+fn permission_string(data: &PermissionRequestData, path: &[&str]) -> Option<String> {
+    let mut value = &data.extra;
+    for key in path {
+        value = value.get(*key)?;
+    }
+    value.as_str().map(str::to_owned)
+}
+
 fn model_option(value: &Value) -> Option<ModelOption> {
     let id = value
         .get("id")
@@ -1134,24 +1383,30 @@ pub fn default_database_path(root: &Path) -> PathBuf {
 
 #[cfg(test)]
 mod tests {
+    use std::path::Path;
     use std::sync::Arc;
 
     use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
     use github_copilot_sdk::rpc::PermissionDecision;
-    use github_copilot_sdk::{DeliveryMode, PermissionRequestData, RequestId, SessionId};
-    use serde_json::json;
+    use github_copilot_sdk::{
+        DeliveryMode, PermissionRequestData, PermissionRequestKind, RequestId, SessionId,
+    };
+    use serde_json::{Value, json};
     use tokio::sync::mpsc;
 
     use super::{
-        CopilotProvider, InteractionBroker, SessionRequest, message_options, model_option,
-        sdk_context_windows,
+        CopilotProvider, InteractionBroker, InteractionResponse, ProviderInteraction,
+        SessionRequest, message_options, model_option, permission_choices, permission_for_domain,
+        permission_for_location, permission_for_session, permission_stays_in_worktree,
+        resolve_root, sdk_context_windows,
     };
 
     fn interaction_broker() -> Arc<InteractionBroker> {
         let (sender, _interactions) = mpsc::channel(1);
         Arc::new(InteractionBroker {
             sender,
-            auto_approve_tools: false,
+            auto_approve_root: None,
+            permission_location: std::env::temp_dir().to_string_lossy().into_owned(),
         })
     }
 
@@ -1205,47 +1460,192 @@ mod tests {
         assert_eq!(options.mode, Some(DeliveryMode::Immediate));
     }
 
-    #[tokio::test]
-    async fn isolated_worktree_permissions_are_approved_without_prompting() {
-        let (sender, mut interactions) = mpsc::channel(1);
+    fn worktree_broker(root: &Path) -> (InteractionBroker, mpsc::Receiver<ProviderInteraction>) {
+        let (sender, interactions) = mpsc::channel(1);
         let broker = InteractionBroker {
             sender,
-            auto_approve_tools: true,
+            auto_approve_root: Some(resolve_root(root)),
+            permission_location: root.to_string_lossy().into_owned(),
         };
+        (broker, interactions)
+    }
 
-        let result = broker
+    async fn decide(broker: &InteractionBroker, data: PermissionRequestData) -> PermissionResult {
+        broker
             .handle(
                 SessionId::from("session"),
                 RequestId::new("permission"),
-                PermissionRequestData::default(),
+                data,
             )
-            .await;
+            .await
+    }
 
-        assert!(matches!(
+    fn approved(result: &PermissionResult) -> bool {
+        matches!(
             result,
             PermissionResult::Decision(PermissionDecision::ApproveOnce(_))
-        ));
+        )
+    }
+
+    #[tokio::test]
+    async fn reads_inside_the_worktree_are_approved_without_prompting() {
+        let worktree = tempfile::tempdir().expect("worktree");
+        let file = worktree.path().join("src/main.rs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("create dir");
+        std::fs::write(&file, "fn main() {}").expect("write file");
+        let (broker, mut interactions) = worktree_broker(worktree.path());
+
+        let result = decide(
+            &broker,
+            PermissionRequestData {
+                kind: Some(PermissionRequestKind::Read),
+                extra: json!({ "path": file.to_string_lossy() }),
+                ..PermissionRequestData::default()
+            },
+        )
+        .await;
+
+        assert!(approved(&result));
         assert!(interactions.try_recv().is_err());
     }
 
     #[tokio::test]
-    async fn managed_permissions_still_require_explicit_approval() {
-        let (sender, mut interactions) = mpsc::channel(1);
-        let broker = InteractionBroker {
-            sender,
-            auto_approve_tools: true,
-        };
+    async fn reads_outside_the_worktree_still_prompt() {
+        let worktree = tempfile::tempdir().expect("worktree");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let file = elsewhere.path().join("secrets.txt");
+        std::fs::write(&file, "secret").expect("write file");
+        let (broker, mut interactions) = worktree_broker(worktree.path());
+
         let task = tokio::spawn(async move {
-            broker
-                .handle(
-                    SessionId::from("session"),
-                    RequestId::new("permission"),
-                    PermissionRequestData {
-                        managed_approval_required: Some(true),
-                        ..PermissionRequestData::default()
-                    },
-                )
-                .await
+            decide(
+                &broker,
+                PermissionRequestData {
+                    kind: Some(PermissionRequestKind::Read),
+                    extra: json!({ "path": file.to_string_lossy() }),
+                    ..PermissionRequestData::default()
+                },
+            )
+            .await
+        });
+
+        let interaction = interactions.recv().await.expect("permission prompt");
+        interaction
+            .response
+            .send(InteractionResponse::Reject { feedback: None })
+            .expect("send response");
+        assert!(!approved(&task.await.expect("join")));
+    }
+
+    #[tokio::test]
+    async fn shell_commands_confined_to_the_worktree_are_approved() {
+        let worktree = tempfile::tempdir().expect("worktree");
+        let (broker, mut interactions) = worktree_broker(worktree.path());
+
+        let result = decide(
+            &broker,
+            PermissionRequestData {
+                kind: Some(PermissionRequestKind::Shell),
+                extra: json!({
+                    "possiblePaths": [worktree.path().join("Cargo.toml").to_string_lossy()],
+                    "possibleUrls": [],
+                }),
+                ..PermissionRequestData::default()
+            },
+        )
+        .await;
+
+        assert!(approved(&result));
+        assert!(interactions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn shell_commands_without_detected_paths_are_approved() {
+        let worktree = tempfile::tempdir().expect("worktree");
+        let (broker, mut interactions) = worktree_broker(worktree.path());
+
+        let result = decide(
+            &broker,
+            PermissionRequestData {
+                kind: Some(PermissionRequestKind::Shell),
+                extra: json!({ "possiblePaths": [], "possibleUrls": [] }),
+                ..PermissionRequestData::default()
+            },
+        )
+        .await;
+
+        assert!(approved(&result));
+        assert!(interactions.try_recv().is_err());
+    }
+
+    #[test]
+    fn requests_reaching_outside_the_worktree_are_not_confined() {
+        let worktree = tempfile::tempdir().expect("worktree");
+        let root = resolve_root(worktree.path());
+        let confined = |extra: Value, kind: PermissionRequestKind| {
+            permission_stays_in_worktree(
+                &PermissionRequestData {
+                    kind: Some(kind),
+                    extra,
+                    ..PermissionRequestData::default()
+                },
+                &root,
+            )
+        };
+
+        // The reported bug: a shell command reading the user's home directory.
+        assert!(!confined(
+            json!({ "possiblePaths": ["/Users/someone/Documents"], "possibleUrls": [] }),
+            PermissionRequestKind::Shell,
+        ));
+        // An unexpanded variable cannot be resolved, so it is not confined.
+        assert!(!confined(
+            json!({ "possiblePaths": ["$HOME/Documents"], "possibleUrls": [] }),
+            PermissionRequestKind::Shell,
+        ));
+        // `..` must not walk out of the worktree.
+        assert!(!confined(
+            json!({ "possiblePaths": ["../elsewhere"], "possibleUrls": [] }),
+            PermissionRequestKind::Shell,
+        ));
+        // Network access is not bounded by the worktree.
+        assert!(!confined(
+            json!({ "possiblePaths": [], "possibleUrls": [{ "url": "https://example.com" }] }),
+            PermissionRequestKind::Shell,
+        ));
+        // Escaping the sandbox is exactly what a human should see.
+        assert!(!confined(
+            json!({ "possiblePaths": [], "possibleUrls": [], "requestSandboxBypass": true }),
+            PermissionRequestKind::Shell,
+        ));
+        // Missing path analysis leaves the command unbounded.
+        assert!(!confined(json!({}), PermissionRequestKind::Shell));
+        // Opening a URL is never confined to the worktree.
+        assert!(!confined(
+            json!({ "url": "https://example.com" }),
+            PermissionRequestKind::Url,
+        ));
+    }
+
+    #[tokio::test]
+    async fn managed_permissions_still_require_explicit_approval() {
+        // A read that is confined to the worktree, so managed policy is the only
+        // reason this prompts.
+        let worktree = tempfile::tempdir().expect("worktree");
+        let file = worktree.path().join("main.rs");
+        std::fs::write(&file, "fn main() {}").expect("write file");
+        let (broker, mut interactions) = worktree_broker(worktree.path());
+        let task = tokio::spawn(async move {
+            decide(
+                &broker,
+                PermissionRequestData {
+                    kind: Some(PermissionRequestKind::Read),
+                    managed_approval_required: Some(true),
+                    extra: json!({ "path": file.to_string_lossy() }),
+                    ..PermissionRequestData::default()
+                },
+            )
+            .await
         });
 
         let interaction = interactions.recv().await.expect("permission prompt");
@@ -1257,6 +1657,69 @@ mod tests {
             task.await.expect("permission handler completed"),
             PermissionResult::Decision(PermissionDecision::ApproveOnce(_))
         ));
+    }
+
+    #[test]
+    fn read_permissions_offer_session_and_project_scopes() {
+        let request = PermissionRequestData {
+            kind: Some(PermissionRequestKind::Read),
+            ..PermissionRequestData::default()
+        };
+
+        assert_eq!(
+            permission_choices(&request),
+            vec![
+                "Allow once",
+                "Allow for this session",
+                "Always allow for this project",
+                "Deny",
+            ]
+        );
+        assert!(matches!(
+            permission_for_session(&request),
+            Some(PermissionDecision::ApproveForSession(_))
+        ));
+        assert!(matches!(
+            permission_for_location(&request, "C:/worktree"),
+            Some(PermissionDecision::ApproveForLocation(_))
+        ));
+    }
+
+    #[test]
+    fn shell_permissions_require_a_command_identifier_for_remembered_scopes() {
+        let request = PermissionRequestData {
+            kind: Some(PermissionRequestKind::Shell),
+            ..PermissionRequestData::default()
+        };
+
+        assert_eq!(permission_choices(&request), vec!["Allow once", "Deny"]);
+        assert!(permission_for_session(&request).is_none());
+        assert!(permission_for_location(&request, "C:/worktree").is_none());
+    }
+
+    #[test]
+    fn url_permissions_normalise_the_domain() {
+        let domain = |url: &str| {
+            permission_for_domain(&PermissionRequestData {
+                kind: Some(PermissionRequestKind::Url),
+                extra: json!({ "url": url }),
+                ..PermissionRequestData::default()
+            })
+        };
+
+        assert!(matches!(
+            domain("https://Example.COM:8443/path?q=1"),
+            Some(PermissionDecision::ApprovePermanently(decision)) if decision.domain == "example.com"
+        ));
+        assert!(matches!(
+            domain("https://user:pass@example.com/path"),
+            Some(PermissionDecision::ApprovePermanently(decision)) if decision.domain == "example.com"
+        ));
+        assert!(matches!(
+            domain("http://[::1]:8080/path"),
+            Some(PermissionDecision::ApprovePermanently(decision)) if decision.domain == "[::1]"
+        ));
+        assert!(domain("https:///path").is_none());
     }
 
     #[test]
