@@ -2696,7 +2696,6 @@ impl SessionMvpView {
             app_session_id: None,
         });
         self.action_error = None;
-        self.composer.update(cx, TextInput::clear);
         window.focus(&self.composer.focus_handle(cx), cx);
         cx.notify();
     }
