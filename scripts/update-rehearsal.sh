@@ -37,9 +37,12 @@ if [ -z "$python_bin" ]; then
 fi
 
 target=$(rustc -vV | awk '/^host: /{print $2}')
+# The payload layout has to match what the updater expects: macOS installs an
+# application bundle, because that is what carries the app icon.
 case "$target" in
-  *windows*) exe="gcabb-desktop.exe"; format="zip" ;;
-  *)         exe="gcabb-desktop";     format="tar.gz" ;;
+  *windows*) exe="gcabb-desktop.exe";                        format="zip" ;;
+  *darwin*)  exe="GCABB.app/Contents/MacOS/gcabb-desktop";   format="tar.gz" ;;
+  *)         exe="gcabb-desktop";                            format="tar.gz" ;;
 esac
 
 work=$(mktemp -d)
@@ -88,7 +91,15 @@ build_version() {
   GCABB_UPDATE_KEY_ID="$KEY_ID" \
     cargo build -q -p gcabb-desktop
   mkdir -p "$outdir"
-  cp "target/debug/$exe" "$outdir/"
+  case "$target" in
+    *darwin*)
+      scripts/package-macos-app.sh \
+        --binary "target/debug/gcabb-desktop" \
+        --version "$version" \
+        --out "$outdir"
+      ;;
+    *) cp "target/debug/$exe" "$outdir/" ;;
+  esac
 }
 
 package() {

@@ -144,6 +144,14 @@ jobs:
 
           if [ "${{ runner.os }}" = "Windows" ]; then
             cp "target/$target/release/gcabb-desktop.exe" "$staging/"
+          elif [ "${{ runner.os }}" = "macOS" ]; then
+            # macOS shows an application icon only for a bundle, so the payload
+            # is GCABB.app rather than a bare executable.
+            scripts/package-macos-app.sh \
+              --binary "target/$target/release/gcabb-desktop" \
+              --version "$version" \
+              --out "$staging"
+            test -f "$staging/GCABB.app/Contents/Resources/GCABB.icns"
           else
             cp "target/$target/release/gcabb-desktop" "$staging/"
           fi
@@ -154,7 +162,10 @@ jobs:
           if [ "${{ matrix.format }}" = "zip" ]; then
             (cd "$staging" && 7z a -tzip "../../dist/gcabb-$version-$target.zip" .)
           else
-            tar -czf "dist/gcabb-$version-$target.tar.gz" -C "$staging" .
+            # macOS tar stores extended attributes as AppleDouble entries, which
+            # unpack as ._ files beside the bundle and break its signature.
+            COPYFILE_DISABLE=1 \
+              tar -czf "dist/gcabb-$version-$target.tar.gz" -C "$staging" .
           fi
 
       - uses: actions/upload-artifact@v4

@@ -38,7 +38,9 @@ jobs:
       - uses: Swatinem/rust-cache@v2
 
       - name: Validate Unix installer syntax
-        run: bash -n scripts/install-macos.sh scripts/install-linux.sh
+        run: |
+          bash -n scripts/install-macos.sh scripts/install-linux.sh \
+            scripts/make-macos-icns.sh scripts/package-macos-app.sh
 
       - run: cargo fmt --all -- --check
       - run: cargo clippy --workspace --all-targets -- -D warnings

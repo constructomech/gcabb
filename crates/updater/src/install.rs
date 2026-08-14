@@ -11,7 +11,7 @@ use std::io::{Cursor, Read as _};
 use std::path::{Component, Path, PathBuf};
 
 use crate::manifest::ArtifactFormat;
-use crate::version::executable_name;
+use crate::version::{MACOS_APP_BUNDLE, executable_relative_path};
 
 #[derive(Debug, thiserror::Error)]
 pub enum InstallError {
@@ -96,7 +96,13 @@ impl InstallLayout {
         let dir = exe.parent().ok_or_else(|| {
             InstallError::UnknownInstallDir(format!("{} has no parent directory", exe.display()))
         })?;
-        Ok(Self::for_install_dir(dir))
+        Ok(Self::for_install_dir(payload_root(dir)))
+    }
+
+    /// Path of the application executable inside an installation.
+    #[must_use]
+    pub fn executable_path(&self) -> PathBuf {
+        payload_executable(&self.install_dir)
     }
 
     /// Path used by a copied executable that performs a Windows update after the
@@ -163,6 +169,31 @@ impl InstallLayout {
     }
 }
 
+/// Directory that an installation swaps as a unit, given the directory holding
+/// the running executable.
+///
+/// On macOS the executable lives inside an application bundle, and the bundle
+/// is what carries the icon and `Info.plist`, so the whole bundle — not the
+/// `MacOS` directory inside it — has to be replaced by an update.
+fn payload_root(executable_dir: &Path) -> PathBuf {
+    let bundled = executable_dir.ends_with(Path::new(MACOS_APP_BUNDLE).join("Contents/MacOS"));
+    if bundled && let Some(root) = executable_dir.ancestors().nth(3) {
+        return root.to_path_buf();
+    }
+    executable_dir.to_path_buf()
+}
+
+/// Path of the application executable inside a payload root.
+///
+/// A payload root is an installation directory, a staged update, or an
+/// unpacked release archive; all three hold the same layout.
+#[must_use]
+pub fn payload_executable(root: &Path) -> PathBuf {
+    let mut path = root.to_path_buf();
+    path.extend(executable_relative_path().split('/'));
+    path
+}
+
 /// An unpacked, verified update waiting to be swapped into place.
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct StagedUpdate {
@@ -197,10 +228,10 @@ pub fn stage(
         ArtifactFormat::Zip => extract_zip(archive, &root)?,
     }
 
-    let executable = root.join(executable_name());
+    let executable = payload_executable(&root);
     if !executable.is_file() {
         return Err(InstallError::MissingExecutable {
-            expected: executable_name().to_owned(),
+            expected: executable_relative_path().to_owned(),
         });
     }
     ensure_executable_bit(&executable)?;
@@ -453,9 +484,12 @@ mod tests {
     use std::io::Write as _;
     use std::path::Path;
 
-    use super::{InstallError, InstallLayout, apply, rollback, safe_join, stage};
+    use super::{
+        InstallError, InstallLayout, apply, payload_executable, payload_root, rollback, safe_join,
+        stage,
+    };
     use crate::manifest::ArtifactFormat;
-    use crate::version::executable_name;
+    use crate::version::{MACOS_APP_BUNDLE, executable_relative_path};
 
     fn tar_gz(files: &[(&str, &[u8])]) -> Vec<u8> {
         let mut builder = tar::Builder::new(Vec::new());
@@ -484,20 +518,24 @@ mod tests {
     }
 
     fn install_with(dir: &Path, marker: &[u8]) {
-        fs::create_dir_all(dir).unwrap();
-        fs::write(dir.join(executable_name()), marker).unwrap();
+        let executable = payload_executable(dir);
+        fs::create_dir_all(executable.parent().unwrap()).unwrap();
+        fs::write(executable, marker).unwrap();
     }
 
     #[test]
     fn a_tar_gz_update_stages_with_the_executable_present() {
         let temp = tempfile::tempdir().unwrap();
         let layout = InstallLayout::for_install_dir(temp.path().join("gcabb"));
-        let archive = tar_gz(&[(executable_name(), b"new build"), ("README.md", b"notes")]);
+        let archive = tar_gz(&[
+            (executable_relative_path(), b"new build"),
+            ("README.md", b"notes"),
+        ]);
 
         let staged = stage(&layout, &archive, ArtifactFormat::TarGz, "0.2.0").unwrap();
 
         assert_eq!(
-            fs::read(staged.root.join(executable_name())).unwrap(),
+            fs::read(payload_executable(&staged.root)).unwrap(),
             b"new build"
         );
         assert!(staged.root.join("README.md").is_file());
@@ -507,12 +545,12 @@ mod tests {
     fn a_zip_update_stages_with_the_executable_present() {
         let temp = tempfile::tempdir().unwrap();
         let layout = InstallLayout::for_install_dir(temp.path().join("gcabb"));
-        let archive = zip_archive(&[(executable_name(), b"new build")]);
+        let archive = zip_archive(&[(executable_relative_path(), b"new build")]);
 
         let staged = stage(&layout, &archive, ArtifactFormat::Zip, "0.2.0").unwrap();
 
         assert_eq!(
-            fs::read(staged.root.join(executable_name())).unwrap(),
+            fs::read(payload_executable(&staged.root)).unwrap(),
             b"new build"
         );
     }
@@ -545,17 +583,17 @@ mod tests {
         let install = temp.path().join("gcabb");
         install_with(&install, b"old build");
         let layout = InstallLayout::for_install_dir(&install);
-        let archive = tar_gz(&[(executable_name(), b"new build")]);
+        let archive = tar_gz(&[(executable_relative_path(), b"new build")]);
         let staged = stage(&layout, &archive, ArtifactFormat::TarGz, "0.2.0").unwrap();
 
         apply(&layout, &staged).unwrap();
 
         assert_eq!(
-            fs::read(install.join(executable_name())).unwrap(),
+            fs::read(payload_executable(&install)).unwrap(),
             b"new build"
         );
         assert_eq!(
-            fs::read(layout.backup_root.join(executable_name())).unwrap(),
+            fs::read(payload_executable(&layout.backup_root)).unwrap(),
             b"old build"
         );
     }
@@ -566,14 +604,14 @@ mod tests {
         let install = temp.path().join("gcabb");
         install_with(&install, b"old build");
         let layout = InstallLayout::for_install_dir(&install);
-        let archive = tar_gz(&[(executable_name(), b"new build")]);
+        let archive = tar_gz(&[(executable_relative_path(), b"new build")]);
         let staged = stage(&layout, &archive, ArtifactFormat::TarGz, "0.2.0").unwrap();
         apply(&layout, &staged).unwrap();
 
         rollback(&layout).unwrap();
 
         assert_eq!(
-            fs::read(install.join(executable_name())).unwrap(),
+            fs::read(payload_executable(&install)).unwrap(),
             b"old build"
         );
     }
@@ -584,7 +622,7 @@ mod tests {
         let install = temp.path().join("gcabb");
         install_with(&install, b"old build");
         let layout = InstallLayout::for_install_dir(&install);
-        let archive = tar_gz(&[(executable_name(), b"new build")]);
+        let archive = tar_gz(&[(executable_relative_path(), b"new build")]);
         let staged = stage(&layout, &archive, ArtifactFormat::TarGz, "0.2.0").unwrap();
         apply(&layout, &staged).unwrap();
         assert!(layout.backup_root.exists());
@@ -593,7 +631,7 @@ mod tests {
 
         assert!(!layout.backup_root.exists());
         assert!(!layout.staging_root.exists());
-        assert!(install.join(executable_name()).is_file());
+        assert!(payload_executable(&install).is_file());
     }
 
     #[test]
@@ -601,5 +639,21 @@ mod tests {
         let layout = InstallLayout::for_install_dir("/opt/gcabb");
         assert_eq!(layout.staging_root.parent().unwrap(), Path::new("/opt"));
         assert_eq!(layout.backup_root.parent().unwrap(), Path::new("/opt"));
+    }
+
+    #[test]
+    fn a_bundled_executable_resolves_to_the_directory_holding_the_bundle() {
+        let inside_bundle = Path::new("/Users/dev/Applications/GCABB")
+            .join(format!("{MACOS_APP_BUNDLE}/Contents/MacOS"));
+
+        assert_eq!(
+            payload_root(&inside_bundle),
+            Path::new("/Users/dev/Applications/GCABB"),
+            "an update has to replace the whole bundle, not the directory inside it"
+        );
+        assert_eq!(
+            payload_root(Path::new("/opt/gcabb")),
+            Path::new("/opt/gcabb")
+        );
     }
 }

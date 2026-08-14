@@ -28,11 +28,12 @@ candidates.
 
 ```sh
 curl -fsSL https://raw.githubusercontent.com/constructomech/gcabb/main/scripts/install-macos.sh | bash
-~/Applications/GCABB/gcabb-desktop
+open ~/Applications/GCABB/GCABB.app
 ```
 
-GCABB supports Apple Silicon Macs and installs in `~/Applications/GCABB`.
-Intel Macs are not supported.
+GCABB supports Apple Silicon Macs and installs `GCABB.app` in
+`~/Applications/GCABB`. Intel Macs are not supported. Run the executable
+directly with `~/Applications/GCABB/GCABB.app/Contents/MacOS/gcabb-desktop`.
 
 ### Linux
 

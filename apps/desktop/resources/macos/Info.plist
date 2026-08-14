@@ -1,0 +1,43 @@
+<?xml version="1.0" encoding="UTF-8"?>
+<!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+<!--
+  Bundle metadata for the packaged macOS application.
+
+  CFBundleIconFile is what makes Finder, the Dock, and the application switcher
+  show the GCABB icon instead of a generic executable icon; it names GCABB.icns
+  in Contents/Resources. GCABB_VERSION is replaced by scripts/package-macos-app.sh
+  with the workspace version, so the bundle can never claim a version the binary
+  does not have.
+-->
+<plist version="1.0">
+<dict>
+  <key>CFBundleDevelopmentRegion</key>
+  <string>en</string>
+  <key>CFBundleDisplayName</key>
+  <string>GCABB</string>
+  <key>CFBundleExecutable</key>
+  <string>gcabb-desktop</string>
+  <key>CFBundleIconFile</key>
+  <string>GCABB.icns</string>
+  <key>CFBundleIdentifier</key>
+  <string>com.constructomech.gcabb</string>
+  <key>CFBundleInfoDictionaryVersion</key>
+  <string>6.0</string>
+  <key>CFBundleName</key>
+  <string>GCABB</string>
+  <key>CFBundlePackageType</key>
+  <string>APPL</string>
+  <key>CFBundleShortVersionString</key>
+  <string>GCABB_VERSION</string>
+  <key>CFBundleVersion</key>
+  <string>GCABB_VERSION</string>
+  <key>LSApplicationCategoryType</key>
+  <string>public.app-category.developer-tools</string>
+  <key>LSMinimumSystemVersion</key>
+  <string>13.0</string>
+  <key>NSHighResolutionCapable</key>
+  <true/>
+  <key>NSSupportsAutomaticGraphicsSwitching</key>
+  <true/>
+</dict>
+</plist>

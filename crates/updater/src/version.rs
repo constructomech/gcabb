@@ -188,6 +188,29 @@ pub const fn executable_name() -> &'static str {
     }
 }
 
+/// Name of the macOS application bundle that carries the app icon.
+///
+/// macOS resolves the Finder, Dock, and switcher icon from the bundle's
+/// `Info.plist`, so the released payload is a bundle rather than a bare
+/// executable. Packaging scripts and the updater share this one name.
+pub const MACOS_APP_BUNDLE: &str = "GCABB.app";
+
+/// Path of the application executable relative to the payload root.
+///
+/// Release archives and installations hold the payload for one platform, which
+/// on macOS is an application bundle and elsewhere is the executable itself.
+/// Forward slashes are accepted as separators by every platform this targets.
+#[must_use]
+pub const fn executable_relative_path() -> &'static str {
+    if cfg!(target_os = "macos") {
+        "GCABB.app/Contents/MacOS/gcabb-desktop"
+    } else if cfg!(windows) {
+        "gcabb-desktop.exe"
+    } else {
+        "gcabb-desktop"
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{Channel, current_target};
@@ -228,5 +251,20 @@ mod tests {
     #[test]
     fn the_running_target_is_recognised() {
         assert_ne!(current_target(), "unknown");
+    }
+
+    #[test]
+    fn the_payload_executable_path_ends_with_the_executable_name() {
+        let relative = super::executable_relative_path();
+        assert!(
+            relative.ends_with(super::executable_name()),
+            "{relative} does not end with {}",
+            super::executable_name()
+        );
+        assert_eq!(
+            cfg!(target_os = "macos"),
+            relative.contains(super::MACOS_APP_BUNDLE),
+            "only macOS payloads are application bundles"
+        );
     }
 }
