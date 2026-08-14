@@ -127,8 +127,11 @@ Git runs on a blocking thread so a large diff cannot stall the actor loop.
 
 A session inspector panel beside the transcript exposes three tabs:
 
-- **Changes** — changed-file list with per-file insertions and deletions, and
-  the unified diff for the selected file.
+- **Changes** — changed-file list with per-file insertions and deletions, where
+  each row expands its complete unified diff inline. Rows and diffs share one
+  scrolling surface, so no diff gets its own viewport and several files can stay
+  expanded at once. Expansion is kept per session, so refreshes and tab switches
+  do not collapse what is open.
 - **Terminals** — one card per `shellId` with command, state, exit code,
   contributing call count, persisted output size, and a bounded display tail.
 - **Capabilities** — per-capability status and detail, plus recent tool
