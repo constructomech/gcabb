@@ -727,7 +727,31 @@ async fn handle_service_command(
                     .map_err(|error| error.to_string())?
             } else {
                 let initial_mode = mode.clone();
-                let title = session_title(&prompt);
+                let fallback_title = session_title(&prompt);
+                let repository = repository_root
+                    .as_deref()
+                    .map_or_else(|| project_path.as_path(), Path::new);
+                let generated_title = if kind == SessionKind::Project
+                    && location == SessionLocation::NewWorktree
+                    && GitService::new(repository).is_worktree()
+                {
+                    match manager
+                        .generate_task_title(&prompt, model.as_deref(), &project_path)
+                        .await
+                    {
+                        Ok(title) => title,
+                        Err(error) => {
+                            tracing::warn!(%error, "worktree name generation failed");
+                            None
+                        }
+                    }
+                } else {
+                    None
+                };
+                let (title, title_source) = generated_title.map_or_else(
+                    || (fallback_title, TitleSource::Fallback),
+                    |title| (title, TitleSource::Generated),
+                );
                 // A worktree session runs in its own checkout, created before
                 // the provider session so the CLI starts in the right place.
                 let project_path = resolve_session_workspace(
@@ -743,7 +767,7 @@ async fn handle_service_command(
                     .create_session(CreateSessionRequest {
                         project_path,
                         title,
-                        title_source: TitleSource::Fallback,
+                        title_source,
                         model,
                         mode: Some(mode),
                         reasoning_effort,
@@ -936,7 +960,7 @@ fn resolve_session_workspace(
         .map(str::to_owned)
         .or_else(|| default_branch(&repository))
         .unwrap_or_else(|| "HEAD".to_owned());
-    let branch = unique_worktree_branch(&service, title);
+    let branch = unique_worktree_branch(&service, title, worktrees_root, &repository);
     let path = worktree_path(worktrees_root, &repository, &branch)?;
     service
         .create_worktree(&path, &branch, &base)
@@ -944,20 +968,36 @@ fn resolve_session_workspace(
     Ok(path)
 }
 
-/// A branch name derived from the session title, made unique in the repository.
-fn unique_worktree_branch(service: &GitService, title: &str) -> String {
+/// A branch name derived from the semantic session title, made unique in both
+/// the repository and GCABB's managed worktree directory.
+fn unique_worktree_branch(
+    service: &GitService,
+    title: &str,
+    worktrees_root: &Path,
+    repository: &Path,
+) -> String {
     let slug = slugify(title);
     let candidate = format!("gcabb/{slug}");
-    if !service.branch_exists(&candidate) {
+    if worktree_name_available(service, &candidate, worktrees_root, repository) {
         return candidate;
     }
     for suffix in 2..100 {
         let candidate = format!("gcabb/{slug}-{suffix}");
-        if !service.branch_exists(&candidate) {
+        if worktree_name_available(service, &candidate, worktrees_root, repository) {
             return candidate;
         }
     }
     format!("gcabb/{slug}-{}", timestamp())
+}
+
+fn worktree_name_available(
+    service: &GitService,
+    branch: &str,
+    worktrees_root: &Path,
+    repository: &Path,
+) -> bool {
+    !service.branch_exists(branch)
+        && !worktree_candidate_path(worktrees_root, repository, branch).exists()
 }
 
 /// Location on disk for a session worktree, outside the repository so it never
@@ -967,15 +1007,22 @@ fn worktree_path(
     repository: &Path,
     branch: &str,
 ) -> Result<PathBuf, String> {
+    let path = worktree_candidate_path(worktrees_root, repository, branch);
+    let parent = path
+        .parent()
+        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
+    std::fs::create_dir_all(parent)
+        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
+    Ok(path)
+}
+
+fn worktree_candidate_path(worktrees_root: &Path, repository: &Path, branch: &str) -> PathBuf {
     let repository_name = repository
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("repository");
     let leaf = branch.replace('/', "-");
-    let path = worktrees_root.join(repository_name);
-    std::fs::create_dir_all(&path)
-        .map_err(|error| format!("failed to create {}: {error}", path.display()))?;
-    Ok(path.join(leaf))
+    worktrees_root.join(repository_name).join(leaf)
 }
 
 /// Root directory session worktrees are created under.
@@ -1009,7 +1056,7 @@ fn slugify(value: &str) -> String {
         }
     }
     let slug = slug.trim_matches('-');
-    let slug: String = slug.chars().take(40).collect();
+    let slug: String = slug.chars().take(50).collect();
     let slug = slug.trim_matches('-').to_owned();
     if slug.is_empty() {
         "session".to_owned()
@@ -8002,8 +8049,18 @@ mod tests {
     #[test]
     fn branch_slugs_are_git_safe() {
         assert_eq!(super::slugify("Fix the login bug!"), "fix-the-login-bug");
+        assert_eq!(
+            super::slugify("[Auth] Fix login/session handling"),
+            "auth-fix-login-session-handling"
+        );
         assert_eq!(super::slugify("   "), "session");
-        assert!(super::slugify(&"x".repeat(200)).len() <= 40);
+        assert_eq!(super::slugify(&"x".repeat(200)).len(), 50);
+    }
+
+    #[test]
+    fn fallback_session_titles_handle_low_information_prompts() {
+        assert_eq!(super::session_title(""), "New session");
+        assert_eq!(super::session_title("Help"), "Help");
     }
 
     /// A worktree session gets its own checkout on its own branch.
@@ -8123,6 +8180,33 @@ mod tests {
                 .current_branch()
                 .unwrap(),
             "gcabb/same-title-2"
+        );
+    }
+
+    /// A stale managed directory must not make an otherwise valid task fail.
+    #[test]
+    fn stale_worktree_directories_get_a_predictable_collision_suffix() {
+        let (_guard, main, _worktree) = repo_with_worktree();
+        let roots = tempfile::tempdir().expect("tempdir");
+        let stale = roots.path().join("main").join("gcabb-fix-auth-flow");
+        std::fs::create_dir_all(stale).expect("stale worktree directory");
+
+        let resolved = super::resolve_session_workspace(
+            SessionLocation::NewWorktree,
+            app_model::SessionKind::Project,
+            &main,
+            Some(&main.to_string_lossy()),
+            Some("main"),
+            "Fix auth flow",
+            roots.path(),
+        )
+        .expect("worktree resolved");
+
+        assert_eq!(
+            git_service::GitService::new(resolved)
+                .current_branch()
+                .unwrap(),
+            "gcabb/fix-auth-flow-2"
         );
     }
 
