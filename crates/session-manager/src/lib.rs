@@ -623,18 +623,31 @@ impl SessionManager {
         if snapshot.metadata.title_source != TitleSource::Fallback {
             return Ok(());
         }
-        let generated = self
-            .provider
-            .generate_title(
+        if let Some(title) = self
+            .generate_task_title(
                 prompt,
                 snapshot.metadata.model.as_deref(),
                 Path::new(&snapshot.metadata.project_path),
             )
-            .await?;
-        if let Some(title) = normalize_generated_title(&generated) {
+            .await?
+        {
             handle.apply_generated_title(title).await?;
         }
         Ok(())
+    }
+
+    /// Generate the concise task title used by a new session and its branch.
+    pub async fn generate_task_title(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        working_directory: &Path,
+    ) -> Result<Option<String>> {
+        let generated = self
+            .provider
+            .generate_title(prompt, model, working_directory)
+            .await?;
+        Ok(normalize_generated_title(&generated))
     }
 
     /// Delete a session, disconnecting it first when it is still live.
