@@ -88,6 +88,16 @@ struct ScrollbarDrag {
     grab_offset: f32,
 }
 
+/// A glide back to the conversation tail in progress.
+#[derive(Clone, Copy, Debug)]
+struct ScrollToBottom {
+    /// When the glide started. Progress is derived from wall time rather than
+    /// step count so the duration holds regardless of frame rate.
+    started: Instant,
+    /// Scroll offset the glide started from, in pixels below the top.
+    from: f32,
+}
+
 /// Smallest usable scrollbar thumb.
 const MIN_THUMB_HEIGHT: f32 = 24.0;
 /// Scrollbar track width; wide enough to aim at without crowding content.
@@ -104,6 +114,19 @@ const TRANSCRIPT_OVERDRAW: f32 = 720.0;
 /// Initial height estimate used to size the scrollbar without laying out every
 /// row. Measured dynamic heights replace it as rows enter the window.
 const TRANSCRIPT_ROW_HEIGHT_HINT: f32 = 144.0;
+/// How long the transcript takes to glide back to the tail.
+///
+/// Long enough that the intervening content is visibly flying past — which is
+/// what tells the reader how far the view moved and in which direction — and
+/// short enough that it reads as a snap that happens to be traceable rather
+/// than a trip to sit through.
+const SCROLL_TO_BOTTOM_DURATION: Duration = Duration::from_millis(250);
+/// Step interval for the glide, around 120Hz so the motion stays smooth on
+/// high refresh rate displays.
+const SCROLL_TO_BOTTOM_STEP: Duration = Duration::from_millis(8);
+/// Height of the fade that dims the conversation tail while the transcript is
+/// parked above it, marking the content the reader has scrolled past.
+const TRANSCRIPT_TAIL_FADE: f32 = 112.0;
 const MARKDOWN_CACHE_CAPACITY: usize = 128;
 /// Maximum live shell output shaped on the UI thread for one tool row.
 const LIVE_OUTPUT_PREVIEW_BYTES: usize = 16 * 1_024;
@@ -1331,6 +1354,11 @@ struct SessionMvpView {
     /// Geometry used to paint the transcript thumb, retained so hit testing
     /// cannot race later dynamic-height measurements.
     drawn_transcript_scrollbar: Option<ScrollbarGeometry>,
+    /// Glide back to the conversation tail in progress, if any.
+    scroll_to_bottom: Option<ScrollToBottom>,
+    /// Task stepping the glide. Dropping it stops the motion, so replacing it
+    /// is how a second press or a manual scroll takes over.
+    scroll_to_bottom_task: Option<gpui::Task<()>>,
     /// Stable, incrementally maintained order and child lookup for transcript rows.
     timeline: TimelineIndex,
     /// Parsed documents for immutable completed messages.
@@ -1558,6 +1586,8 @@ impl SessionMvpView {
             project_branch: None,
             transcript_list,
             drawn_transcript_scrollbar: None,
+            scroll_to_bottom: None,
+            scroll_to_bottom_task: None,
             timeline: TimelineIndex::default(),
             markdown_cache: HashMap::new(),
             markdown_cache_order: VecDeque::new(),
@@ -2193,6 +2223,7 @@ impl SessionMvpView {
         let old_session = self.timeline.session_id.clone();
         let changed_shape = self.timeline.sync(&snapshot);
         if old_session != snapshot.metadata.id {
+            self.cancel_scroll_to_bottom();
             self.transcript_list.reset_with_uniform_height(
                 self.timeline.items.len(),
                 px(TRANSCRIPT_ROW_HEIGHT_HINT),
@@ -4102,12 +4133,90 @@ impl SessionMvpView {
         })
     }
 
+    /// Whether the transcript is parked away from its tail, so newer output
+    /// sits below the viewport.
+    ///
+    /// Follow-tail is the source of truth rather than a fresh offset
+    /// comparison: the list re-engages it during layout once the true bottom
+    /// is reached, which accounts for rows whose height is still an estimate.
+    fn transcript_is_away_from_tail(&self) -> bool {
+        !self.transcript_list.is_following_tail()
+            && self.transcript_list.max_offset_for_scrollbar().y > px(0.0)
+    }
+
+    /// Glide the transcript back to the conversation tail.
+    ///
+    /// The view travels rather than snapping so the content flying past shows
+    /// how far it moved, which a jump cut cannot convey.
+    fn scroll_transcript_to_bottom(&mut self, cx: &mut Context<Self>) {
+        let from = -f32::from(self.transcript_list.scroll_px_offset_for_scrollbar().y);
+        self.scroll_to_bottom = Some(ScrollToBottom {
+            started: Instant::now(),
+            from,
+        });
+        self.scroll_to_bottom_task = Some(cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(SCROLL_TO_BOTTOM_STEP).await;
+                let still_gliding = view.update(cx, |view, cx| {
+                    let still_gliding = view.step_scroll_to_bottom(Instant::now());
+                    cx.notify();
+                    still_gliding
+                });
+                if !matches!(still_gliding, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    /// Advance the glide, reporting whether it is still running.
+    ///
+    /// The destination is re-read every step, so output arriving mid-flight
+    /// extends the glide instead of leaving it stranded above the new tail.
+    fn step_scroll_to_bottom(&mut self, now: Instant) -> bool {
+        let Some(glide) = self.scroll_to_bottom else {
+            return false;
+        };
+        let elapsed = now.saturating_duration_since(glide.started).as_secs_f32();
+        let progress = (elapsed / SCROLL_TO_BOTTOM_DURATION.as_secs_f32()).clamp(0.0, 1.0);
+        if progress >= 1.0 {
+            self.scroll_to_bottom = None;
+            // The measured maximum trails the true bottom while rows below the
+            // viewport are still estimated, so the landing re-engages
+            // follow-tail instead of settling on the estimate.
+            self.transcript_list.set_follow_mode(FollowMode::Tail);
+            return false;
+        }
+        // Ease out: quick departure, gentle arrival, so the tail is readable
+        // the instant it comes to rest.
+        let eased = 1.0 - (1.0 - progress).powi(5);
+        let target = f32::from(self.transcript_list.max_offset_for_scrollbar().y);
+        let offset = glide.from + (target - glide.from) * eased;
+        self.transcript_list
+            .set_offset_from_scrollbar(gpui::point(px(0.0), px(-offset)));
+        true
+    }
+
+    /// Abandon a glide in progress, leaving the transcript where it is.
+    ///
+    /// Scrolling by hand during the glide means the reader wants a different
+    /// destination, and fighting them for the scroll position would be worse
+    /// than arriving nowhere.
+    fn cancel_scroll_to_bottom(&mut self) {
+        self.scroll_to_bottom = None;
+        self.scroll_to_bottom_task = None;
+    }
+
     /// Begin a scrollbar drag, remembering where the thumb was grabbed.
     ///
     /// Pressing the track jumps the thumb under the pointer; pressing the
     /// thumb keeps it where it is so the content does not lurch on grab.
     fn begin_scrollbar_drag(&mut self, id: &str, pointer_y: gpui::Pixels) {
         if id == TRANSCRIPT_SCROLL_ID {
+            // Grabbing the thumb is another way of choosing a destination, so
+            // it takes over from a glide rather than competing with it.
+            self.cancel_scroll_to_bottom();
             let Some(geometry) = self
                 .drawn_transcript_scrollbar
                 .or_else(|| self.transcript_scrollbar_geometry())
@@ -4190,7 +4299,7 @@ impl SessionMvpView {
         &mut self,
         group: SharedString,
         cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
+    ) -> Option<impl IntoElement + use<>> {
         self.drawn_transcript_scrollbar = None;
         let geometry = self.transcript_scrollbar_geometry()?;
         self.drawn_transcript_scrollbar = Some(geometry);
@@ -4207,7 +4316,7 @@ impl SessionMvpView {
         geometry: ScrollbarGeometry,
         group: SharedString,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let track_id = id.to_owned();
         let thumb_id = id.to_owned();
 
@@ -5454,12 +5563,27 @@ impl SessionMvpView {
         let list_state = self.transcript_list.clone();
         let running_indicator = self.running_indicator();
         let scrollbar = self.transcript_scrollbar(group.clone(), cx);
+        let away_from_tail = self.transcript_is_away_from_tail();
         let transcript = list(list_state, move |index, _, cx| {
             view.update(cx, |view, cx| view.render_timeline_row(index, cx))
         })
         .flex_1()
         .min_h_0()
         .py_5();
+
+        // The fade and the button ride with the rows rather than the whole
+        // frame, so the running indicator below stays legible.
+        let rows = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(transcript)
+            .when(away_from_tail, |rows| {
+                rows.child(Self::transcript_tail_fade())
+                    .child(Self::scroll_to_bottom_button(cx))
+            });
 
         div()
             .id("transcript-frame")
@@ -5469,6 +5593,11 @@ impl SessionMvpView {
             .flex_col()
             .flex_1()
             .min_h_0()
+            // A glide is a request for one destination; steering by hand
+            // replaces it, so the two never fight over the scroll position.
+            .on_scroll_wheel(cx.listener(|view, _: &gpui::ScrollWheelEvent, _, _| {
+                view.cancel_scroll_to_bottom();
+            }))
             .child(
                 div()
                     .id("transcript")
@@ -5485,11 +5614,75 @@ impl SessionMvpView {
                             .flex_col()
                             .flex_1()
                             .min_h_0()
-                            .child(transcript)
+                            .child(rows)
                             .children(running_indicator),
                     ),
             )
             .children(scrollbar)
+    }
+
+    /// Dims the conversation tail while the transcript is parked above it.
+    ///
+    /// The unread bottom edge fading into the background is what makes "there
+    /// is more below" legible at a glance, before the button is even noticed.
+    fn transcript_tail_fade() -> impl IntoElement {
+        div()
+            .id("transcript-tail-fade")
+            .debug_selector(|| "transcript-tail-fade".to_owned())
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .h(px(TRANSCRIPT_TAIL_FADE))
+            // `BACKGROUND` carries no alpha channel, so shift it into place and
+            // fade from fully transparent to the surface behind the transcript.
+            .bg(gpui::linear_gradient(
+                180.0,
+                gpui::linear_color_stop(gpui::rgba(BACKGROUND << 8), 0.0),
+                gpui::linear_color_stop(gpui::rgba((BACKGROUND << 8) | 0xff), 0.85),
+            ))
+    }
+
+    /// The affordance that returns the transcript to the newest output.
+    fn scroll_to_bottom_button(cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        div()
+            .absolute()
+            .bottom(px(12.0))
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .id("scroll-to-bottom")
+                    .debug_selector(|| "scroll-to-bottom".to_owned())
+                    .accessibility_id("scroll-to-bottom")
+                    .role(Role::Button)
+                    .aria_label("Scroll to newest output")
+                    .focusable()
+                    .tab_stop(true)
+                    .focus_visible(|style| style.border_color(rgb(BLUE)))
+                    .w(px(32.0))
+                    .h(px(32.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(ELEVATED))
+                    .text_color(rgb(MUTED))
+                    .child("↓")
+                    .hover(|style| {
+                        style
+                            .bg(rgb(BORDER))
+                            .text_color(rgb(PRIMARY))
+                            .cursor_pointer()
+                    })
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.scroll_transcript_to_bottom(cx);
+                    })),
+            )
     }
 
     /// Running state at the conversation tail, where the user is already
@@ -8554,12 +8747,13 @@ mod tests {
         use app_model::{
             SessionKind, SessionMetadata, SessionSnapshot, SessionStatus, TitleSource,
         };
-        use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
+        use gpui::{FollowMode, Modifiers, MouseButton, TestAppContext, VisualTestContext};
         use session_manager::SessionHandle;
         use std::sync::Arc;
 
         use crate::{
-            AppService, ServiceCommand, ServiceUpdate, SessionMvpView, SessionProjection, UpdateUi,
+            AppService, SCROLL_TO_BOTTOM_DURATION, ServiceCommand, ServiceUpdate, SessionMvpView,
+            SessionProjection, UpdateUi,
         };
 
         fn snapshot(id: &str, title: &str) -> SessionSnapshot {
@@ -10955,6 +11149,163 @@ mod tests {
             // instantiated.
             view.read_with(cx, |view, _| {
                 assert_eq!(view.selected().unwrap().snapshot.transcript.len(), 80);
+            });
+        }
+
+        /// Fills the selected session with enough output to scroll, then parks
+        /// the transcript above the tail.
+        fn scroll_transcript_away_from_tail(
+            view: &gpui::Entity<SessionMvpView>,
+            cx: &mut gpui::VisualTestContext,
+        ) {
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for index in 0..80 {
+                    state.transcript.push(app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content: format!("message {index} with enough text to take a line"),
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
+                    });
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let bounds = cx.debug_bounds("transcript").expect("transcript rendered");
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: bounds.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(400.0))),
+                modifiers: Modifiers::none(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+
+        /// Reaching the newest output should never require a hunt for the
+        /// scrollbar, and the dimmed tail is what makes the gap obvious before
+        /// the button is even noticed. Neither belongs on screen while the
+        /// transcript already sits at the bottom.
+        #[gpui::test]
+        fn jumping_to_the_tail_is_offered_only_while_scrolled_away(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            scroll_transcript_away_from_tail(&view, cx);
+
+            assert!(
+                cx.debug_bounds("scroll-to-bottom").is_some(),
+                "scrolling up should offer a way back to the newest output"
+            );
+            assert!(
+                cx.debug_bounds("transcript-tail-fade").is_some(),
+                "the conversation tail should dim while it is scrolled past"
+            );
+
+            view.update(cx, |view, cx| {
+                view.transcript_list.set_follow_mode(FollowMode::Tail);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("scroll-to-bottom").is_none(),
+                "the affordance should retire once the transcript is at the tail"
+            );
+            assert!(
+                cx.debug_bounds("transcript-tail-fade").is_none(),
+                "nothing is being scrolled past, so nothing should be dimmed"
+            );
+        }
+
+        /// The jump glides rather than cutting: the intervening content flying
+        /// past is what tells the reader how far the view moved. A snap would
+        /// leave them re-orienting at the tail.
+        #[gpui::test]
+        fn jumping_to_the_tail_glides_instead_of_snapping(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            scroll_transcript_away_from_tail(&view, cx);
+
+            let parked = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
+            let button = cx
+                .debug_bounds("scroll-to-bottom")
+                .expect("the jump affordance should be rendered");
+            cx.simulate_click(button.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            let started = view
+                .read_with(cx, |view, _| view.scroll_to_bottom)
+                .expect("pressing the affordance should start a glide")
+                .started;
+
+            // Halfway through, the transcript has left where it was parked but
+            // has not yet reached the tail.
+            let midpoint = view.update(cx, |view, _| {
+                let still_gliding =
+                    view.step_scroll_to_bottom(started + SCROLL_TO_BOTTOM_DURATION / 2);
+                assert!(still_gliding, "the glide should still be running midway");
+                assert!(
+                    !view.transcript_list.is_following_tail(),
+                    "the glide should not arrive early"
+                );
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
+            assert!(
+                midpoint < parked,
+                "the glide should be travelling toward the tail: {parked:?} -> {midpoint:?}"
+            );
+
+            view.update(cx, |view, _| {
+                let still_gliding = view.step_scroll_to_bottom(started + SCROLL_TO_BOTTOM_DURATION);
+                assert!(!still_gliding, "the glide should end at its full duration");
+                assert!(
+                    view.transcript_list.is_following_tail(),
+                    "landing at the tail should resume following new output"
+                );
+                assert!(
+                    view.scroll_to_bottom.is_none(),
+                    "a landed glide should leave no state behind"
+                );
+            });
+        }
+
+        /// Steering by hand mid-glide means the reader wants somewhere else.
+        /// Continuing to drag them to the tail would be a fight they did not
+        /// ask for.
+        #[gpui::test]
+        fn scrolling_by_hand_abandons_the_glide(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            scroll_transcript_away_from_tail(&view, cx);
+
+            let button = cx
+                .debug_bounds("scroll-to-bottom")
+                .expect("the jump affordance should be rendered");
+            cx.simulate_click(button.center(), Modifiers::none());
+            cx.run_until_parked();
+            assert!(
+                view.read_with(cx, |view, _| view.scroll_to_bottom.is_some()),
+                "the glide should be running before the manual scroll"
+            );
+
+            let bounds = cx.debug_bounds("transcript").expect("transcript rendered");
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: bounds.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(200.0))),
+                modifiers: Modifiers::none(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(
+                    view.scroll_to_bottom.is_none(),
+                    "scrolling by hand should abandon the glide"
+                );
             });
         }
 
