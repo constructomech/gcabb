@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -17,9 +17,8 @@ pub use tools::{
 };
 
 pub const DOMAIN_EVENT_VERSION: u16 = 1;
-/// Version 5 drops the embedded event log, which duplicated `domain_events`
-/// and made every snapshot grow with the length of the session.
-pub const SNAPSHOT_VERSION: u16 = 6;
+/// Version 7 adds bounded SDK activity diagnostics for progress reporting.
+pub const SNAPSHOT_VERSION: u16 = 7;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -543,6 +542,56 @@ pub struct DomainEvent {
     pub raw: Value,
 }
 
+const DIAGNOSTIC_EVENT_LIMIT: usize = 40;
+
+/// Compact, user-facing telemetry projected from the SDK event stream.
+///
+/// The complete events remain in `domain_events`; this state keeps only the
+/// information needed to explain an in-flight pause without embedding another
+/// copy of the event log in every snapshot.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AgentDiagnostics {
+    pub turn_started_at: Option<String>,
+    pub last_event_at: Option<String>,
+    pub last_event_type: Option<String>,
+    pub latest_intent: Option<String>,
+    pub activity: Option<String>,
+    pub model: Option<String>,
+    pub turn_id: Option<String>,
+    pub response_bytes: Option<u64>,
+    pub compaction: Option<CompactionDiagnostics>,
+    pub last_usage: Option<UsageDiagnostics>,
+    #[serde(default)]
+    pub event_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub recent_events: Vec<DiagnosticSignal>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CompactionDiagnostics {
+    pub started_at: String,
+    pub trigger: Option<String>,
+    pub current_tokens: Option<u64>,
+    pub token_limit: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct UsageDiagnostics {
+    pub model: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct DiagnosticSignal {
+    pub sequence: u64,
+    pub timestamp: String,
+    pub event_type: String,
+    pub summary: String,
+}
+
 impl DomainEvent {
     #[must_use]
     pub fn from_sdk_event(raw: &Value) -> Self {
@@ -598,6 +647,9 @@ pub struct SessionSnapshot {
     /// Worktree changes against the session's recorded base.
     #[serde(default)]
     pub changes: ChangesView,
+    /// Latest SDK lifecycle and progress signals for user-facing diagnostics.
+    #[serde(default)]
+    pub diagnostics: AgentDiagnostics,
     pub last_error: Option<String>,
     #[serde(skip)]
     seen_event_ids: HashSet<String>,
@@ -623,6 +675,7 @@ impl SessionSnapshot {
             tool_activity: ToolActivity::default(),
             capabilities: CapabilityReport::default(),
             changes: ChangesView::default(),
+            diagnostics: AgentDiagnostics::default(),
             last_error: None,
             seen_event_ids: HashSet::new(),
         }
@@ -643,6 +696,8 @@ impl SessionSnapshot {
         mark_streaming_interrupted(&mut self.transcript);
         tools::mark_running_invocations_cancelled(&mut self.tool_activity, timestamp);
         tools::mark_running_terminals_cancelled(&mut self.tool_activity, timestamp);
+        self.diagnostics.activity = None;
+        self.diagnostics.compaction = None;
         self.status = SessionStatus::Idle;
     }
 
@@ -683,6 +738,7 @@ impl SessionSnapshot {
             tools::mark_running_terminals_cancelled(&mut self.tool_activity, &event.timestamp);
         }
         tools::project(&mut self.tool_activity, &event);
+        Self::project_diagnostics(&mut self.diagnostics, &event);
         if event.source_type == "session.error" {
             self.last_error = Some(
                 event
@@ -734,6 +790,216 @@ impl SessionSnapshot {
             self.pending_interactions.push(request);
             self.status = SessionStatus::Waiting;
         }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the event-to-diagnostic phase mapping is clearest as one exhaustive projection"
+    )]
+    fn project_diagnostics(diagnostics: &mut AgentDiagnostics, event: &DomainEvent) {
+        diagnostics.last_event_at = Some(event.timestamp.clone());
+        diagnostics.last_event_type = Some(event.source_type.clone());
+        *diagnostics
+            .event_counts
+            .entry(event.source_type.clone())
+            .or_default() += 1;
+        if event.agent_id.is_some() {
+            return;
+        }
+
+        let data = &event.details;
+        match event.source_type.as_str() {
+            "assistant.turn_start" => {
+                diagnostics.turn_started_at = Some(event.timestamp.clone());
+                diagnostics.latest_intent = None;
+                diagnostics.activity = Some("Preparing model request".to_owned());
+                diagnostics.model = string_field(data, "model");
+                diagnostics.turn_id = string_field(data, "turnId");
+                diagnostics.response_bytes = None;
+                diagnostics.compaction = None;
+            }
+            "assistant.turn_retry" => {
+                diagnostics.activity = Some(string_field(data, "reason").map_or_else(
+                    || "Retrying model request".to_owned(),
+                    |reason| format!("Retrying model request: {reason}"),
+                ));
+            }
+            "model.call_start" => {
+                diagnostics.activity = Some("Waiting for model response".to_owned());
+                if let Some(model) = string_field(data, "model") {
+                    diagnostics.model = Some(model);
+                }
+            }
+            "assistant.intent" => {
+                if let Some(intent) = string_field(data, "intent") {
+                    diagnostics.latest_intent = Some(intent.clone());
+                    diagnostics.activity = Some(intent);
+                }
+            }
+            "assistant.reasoning" | "assistant.reasoning_delta" => {
+                diagnostics.activity = Some("Model is reasoning".to_owned());
+            }
+            "assistant.server_tool_progress" => {
+                let kind = string_field(data, "kind").unwrap_or_else(|| "server tool".to_owned());
+                let status = string_field(data, "status").unwrap_or_else(|| "running".to_owned());
+                diagnostics.activity = Some(format!("{kind}: {status}"));
+            }
+            "assistant.streaming_delta" => {
+                diagnostics.activity = Some("Receiving model response".to_owned());
+                diagnostics.response_bytes =
+                    data.get("totalResponseSizeBytes").and_then(Value::as_u64);
+            }
+            "tool.execution_start" => {
+                diagnostics.activity = Some(format!(
+                    "Running {}",
+                    string_field(data, "toolName").unwrap_or_else(|| "tool".to_owned())
+                ));
+            }
+            "tool.execution_progress" => {
+                diagnostics.activity = string_field(data, "progressMessage")
+                    .or_else(|| Some("Tool is running".to_owned()));
+            }
+            "tool.execution_complete" => {
+                diagnostics.activity = Some("Processing tool result".to_owned());
+            }
+            "hook.start" => {
+                diagnostics.activity = Some(format!(
+                    "Running {} hook",
+                    string_field(data, "hookType").unwrap_or_else(|| "session".to_owned())
+                ));
+            }
+            "hook.progress" => {
+                diagnostics.activity =
+                    string_field(data, "message").or_else(|| Some("Hook is running".to_owned()));
+            }
+            "subagent.started" => {
+                diagnostics.activity = Some(format!(
+                    "Waiting for {}",
+                    string_field(data, "agentDisplayName").unwrap_or_else(|| "subagent".to_owned())
+                ));
+            }
+            "subagent.completed" | "subagent.failed" => {
+                diagnostics.activity = Some("Processing subagent result".to_owned());
+            }
+            "session.compaction_start" => {
+                diagnostics.activity = Some("Compacting conversation context".to_owned());
+                diagnostics.compaction = Some(CompactionDiagnostics {
+                    started_at: event.timestamp.clone(),
+                    trigger: string_field(data, "trigger"),
+                    current_tokens: data.get("currentTokens").and_then(Value::as_u64),
+                    token_limit: data.get("tokenLimit").and_then(Value::as_u64),
+                });
+            }
+            "session.compaction_complete" => {
+                diagnostics.activity = Some("Context compaction complete".to_owned());
+                diagnostics.compaction = None;
+            }
+            "assistant.usage" => {
+                diagnostics.last_usage = Some(UsageDiagnostics {
+                    model: string_field(data, "model"),
+                    duration_ms: data.get("duration").and_then(Value::as_u64),
+                    input_tokens: data.get("inputTokens").and_then(Value::as_u64),
+                    output_tokens: data.get("outputTokens").and_then(Value::as_u64),
+                    cache_read_tokens: data.get("cacheReadTokens").and_then(Value::as_u64),
+                });
+            }
+            "assistant.idle" => {
+                diagnostics.activity = Some("Waiting for background work".to_owned());
+            }
+            "session.idle" => {
+                diagnostics.activity = None;
+                diagnostics.compaction = None;
+            }
+            "session.error" => diagnostics.activity = Some("Agent encountered an error".to_owned()),
+            _ => {}
+        }
+
+        if let Some(summary) = Self::diagnostic_signal_summary(event) {
+            let signal = DiagnosticSignal {
+                sequence: event.sequence,
+                timestamp: event.timestamp.clone(),
+                event_type: event.source_type.clone(),
+                summary,
+            };
+            if diagnostics
+                .recent_events
+                .last()
+                .is_some_and(|previous| previous.event_type == signal.event_type)
+            {
+                diagnostics.recent_events.pop();
+            }
+            diagnostics.recent_events.push(signal);
+            let overflow = diagnostics
+                .recent_events
+                .len()
+                .saturating_sub(DIAGNOSTIC_EVENT_LIMIT);
+            if overflow > 0 {
+                diagnostics.recent_events.drain(..overflow);
+            }
+        }
+    }
+
+    fn diagnostic_signal_summary(event: &DomainEvent) -> Option<String> {
+        let data = &event.details;
+        let summary = match event.source_type.as_str() {
+            "assistant.turn_start" => string_field(data, "model").map_or_else(
+                || "Assistant turn started".to_owned(),
+                |model| format!("Using {model}"),
+            ),
+            "assistant.turn_retry" => string_field(data, "reason").map_or_else(
+                || "Model call retry".to_owned(),
+                |reason| format!("Retry: {reason}"),
+            ),
+            "model.call_start" => "Model request dispatched".to_owned(),
+            "assistant.intent" => string_field(data, "intent")?,
+            "assistant.reasoning" | "assistant.reasoning_delta" => "Reasoning activity".to_owned(),
+            "assistant.server_tool_progress" => format!(
+                "{}: {}",
+                string_field(data, "kind").unwrap_or_else(|| "Server tool".to_owned()),
+                string_field(data, "status").unwrap_or_else(|| "running".to_owned())
+            ),
+            "assistant.streaming_delta" => data
+                .get("totalResponseSizeBytes")
+                .and_then(Value::as_u64)
+                .map_or_else(
+                    || "Response stream active".to_owned(),
+                    |bytes| format!("{bytes} bytes received"),
+                ),
+            "tool.execution_start" => format!(
+                "Started {}",
+                string_field(data, "toolName").unwrap_or_else(|| "tool".to_owned())
+            ),
+            "tool.execution_progress" => string_field(data, "progressMessage")?,
+            "tool.execution_complete" => "Tool completed".to_owned(),
+            "hook.start" => format!(
+                "Started {} hook",
+                string_field(data, "hookType").unwrap_or_else(|| "session".to_owned())
+            ),
+            "hook.progress" => string_field(data, "message")?,
+            "hook.end" => "Hook completed".to_owned(),
+            "subagent.started" => format!(
+                "Started {}",
+                string_field(data, "agentDisplayName").unwrap_or_else(|| "subagent".to_owned())
+            ),
+            "subagent.completed" => "Subagent completed".to_owned(),
+            "subagent.failed" => string_field(data, "error").map_or_else(
+                || "Subagent failed".to_owned(),
+                |error| format!("Failed: {error}"),
+            ),
+            "session.compaction_start" => "Context compaction started".to_owned(),
+            "session.compaction_complete" => string_field(data, "error").map_or_else(
+                || "Context compaction completed".to_owned(),
+                |error| format!("Compaction failed: {error}"),
+            ),
+            "assistant.usage" => "Model usage reported".to_owned(),
+            "assistant.idle" => "Assistant loop idle; background work may remain".to_owned(),
+            "session.idle" => "Session idle".to_owned(),
+            "session.error" => string_field(data, "message")
+                .or_else(|| string_field(data, "error"))
+                .unwrap_or_else(|| "Session error".to_owned()),
+            _ => return None,
+        };
+        Some(truncate(&summary, 200))
     }
 
     pub fn remove_interaction(&mut self, interaction_id: &str) -> bool {
@@ -1072,6 +1338,81 @@ mod tests {
             ApplyOutcome::Duplicate
         );
         assert_eq!(replayed, first);
+    }
+
+    #[test]
+    fn diagnostics_project_progress_without_retaining_reasoning_content() {
+        let mut state = SessionSnapshot::new(metadata());
+        let events = [
+            json!({
+                "id": "turn",
+                "timestamp": "1",
+                "type": "assistant.turn_start",
+                "data": {"turnId": "turn-7", "model": "gpt-test"}
+            }),
+            json!({
+                "id": "intent",
+                "timestamp": "2",
+                "type": "assistant.intent",
+                "data": {"intent": "Inspecting the session state"}
+            }),
+            json!({
+                "id": "child-turn",
+                "agentId": "agent-1",
+                "timestamp": "2",
+                "type": "assistant.turn_start",
+                "data": {"turnId": "child-turn", "model": "child-model"}
+            }),
+            json!({
+                "id": "reasoning",
+                "timestamp": "3",
+                "type": "assistant.reasoning",
+                "data": {"reasoningId": "r", "content": "private chain of thought"}
+            }),
+            json!({
+                "id": "compact",
+                "timestamp": "4",
+                "type": "session.compaction_start",
+                "data": {"trigger": "threshold", "currentTokens": 900, "tokenLimit": 1000}
+            }),
+        ];
+        for (index, raw) in events.iter().enumerate() {
+            state.apply(DomainEvent::from_sdk_event_for(
+                "app-session",
+                index as u64 + 1,
+                raw,
+            ));
+        }
+
+        assert_eq!(
+            state.diagnostics.latest_intent.as_deref(),
+            Some("Inspecting the session state")
+        );
+        assert_eq!(state.diagnostics.model.as_deref(), Some("gpt-test"));
+        assert_eq!(state.diagnostics.turn_id.as_deref(), Some("turn-7"));
+        assert_eq!(
+            state.diagnostics.activity.as_deref(),
+            Some("Compacting conversation context")
+        );
+        assert_eq!(
+            state
+                .diagnostics
+                .compaction
+                .as_ref()
+                .and_then(|compaction| compaction.current_tokens),
+            Some(900)
+        );
+        assert_eq!(
+            state.diagnostics.event_counts.get("assistant.reasoning"),
+            Some(&1)
+        );
+        assert!(
+            state
+                .diagnostics
+                .recent_events
+                .iter()
+                .all(|event| !event.summary.contains("private chain of thought"))
+        );
     }
 
     #[test]
