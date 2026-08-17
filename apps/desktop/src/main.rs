@@ -35,9 +35,11 @@ use updater::install::InstallLayout;
 use updater::version::BuildStamp;
 
 mod markdown;
+mod settings;
 mod updates;
 
 use markdown::{MarkdownDocument, MarkdownNode, MarkdownTag};
+use settings::AppSettings;
 use updates::{UpdateRequest, UpdateService, UpdateUi};
 
 const BACKGROUND: u32 = 0x000d_1117;
@@ -54,6 +56,7 @@ const PERSISTENT_DATA_ENTRIES: &[&str] = &[
     "gcabb.db",
     "gcabb.db-shm",
     "gcabb.db-wal",
+    settings::SETTINGS_FILE,
     "update-settings.json",
     "attachments",
     "chats",
@@ -336,12 +339,16 @@ enum ServiceCommand {
         kind: SessionKind,
         /// Where a new project session should run.
         location: SessionLocation,
+        /// Root under which a new worktree should be created.
+        worktrees_root: PathBuf,
     },
     Cancel {
         app_session_id: String,
     },
     Resume {
         app_session_id: String,
+        /// Managed root used to recreate a missing worktree, when known.
+        worktrees_root: Option<PathBuf>,
     },
     RelocateSession {
         app_session_id: String,
@@ -384,6 +391,8 @@ enum ServiceCommand {
     },
     DeleteSession {
         app_session_id: String,
+        /// Root that owned this particular worktree, including a previous root.
+        worktrees_root: Option<PathBuf>,
     },
     /// Register a directory chosen by the user as a project.
     AddProject {
@@ -479,7 +488,7 @@ impl AppService {
                 let provider_factory =
                     CopilotProviderFactory::new(project_root.clone(), diagnostics.clone());
                 let session_roots = SessionRoots {
-                    worktrees: Some(worktrees_root()),
+                    worktrees: None,
                     attachments: attachments_directory(),
                     runtime_state: runtime_state_root(),
                 };
@@ -580,9 +589,14 @@ impl AppService {
                     // Project changes publish a project list rather than a
                     // session, so they are handled before the session commands.
                     match command {
-                        ServiceCommand::DeleteSession { app_session_id } => {
+                        ServiceCommand::DeleteSession {
+                            app_session_id,
+                            worktrees_root,
+                        } => {
+                            let mut deletion_roots = session_roots.clone();
+                            deletion_roots.worktrees = worktrees_root;
                             match runtime
-                                .block_on(manager.delete_session(&app_session_id, &session_roots))
+                                .block_on(manager.delete_session(&app_session_id, &deletion_roots))
                             {
                                 Ok(deletion) => {
                                     let _ =
@@ -644,12 +658,9 @@ impl AppService {
                                 } => Some(prompt.clone()),
                                 _ => None,
                             };
-                            match runtime.block_on(handle_service_command(
-                                &manager,
-                                command,
-                                &session_roots.worktrees.clone().unwrap_or_default(),
-                                &update_tx,
-                            )) {
+                            match runtime
+                                .block_on(handle_service_command(&manager, command, &update_tx))
+                            {
                                 Ok(Some(handle)) => {
                                     if let Some(prompt) = naming_prompt {
                                         let manager = manager.clone();
@@ -746,7 +757,6 @@ impl AppService {
 async fn handle_service_command(
     manager: &SessionManager,
     command: ServiceCommand,
-    worktrees_root: &Path,
     updates: &Sender<ServiceUpdate>,
 ) -> Result<Option<SessionHandle>, String> {
     let mut created = None;
@@ -764,6 +774,7 @@ async fn handle_service_command(
             repository_root,
             kind,
             location,
+            worktrees_root,
         } => {
             let handle = if let Some(id) = app_session_id {
                 manager
@@ -814,7 +825,7 @@ async fn handle_service_command(
                     repository_root.as_deref(),
                     base_ref.as_deref(),
                     &title,
-                    worktrees_root,
+                    &worktrees_root,
                 )?;
                 if creates_worktree {
                     let _ = updates.send(ServiceUpdate::SessionLaunchProgress(
@@ -858,10 +869,16 @@ async fn handle_service_command(
             .cancel()
             .await
             .map_err(|error| error.to_string())?,
-        ServiceCommand::Resume { app_session_id } => {
+        ServiceCommand::Resume {
+            app_session_id,
+            worktrees_root,
+        } => {
             created = Some(
                 manager
-                    .resume_closed_session(&app_session_id)
+                    .resume_closed_session_from_worktrees_root(
+                        &app_session_id,
+                        worktrees_root.as_deref(),
+                    )
                     .await
                     .map_err(|error| error.to_string())?,
             );
@@ -1107,7 +1124,7 @@ fn runtime_state_root() -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
-fn worktrees_root() -> PathBuf {
+fn default_worktrees_root() -> PathBuf {
     data_directory().map_or_else(
         |_| PathBuf::from(".gcabb").join("worktrees"),
         |base| base.join("worktrees"),
@@ -1131,6 +1148,18 @@ fn slugify(value: &str) -> String {
         "session".to_owned()
     } else {
         slug
+    }
+}
+
+fn summary_line(summary: &str) -> String {
+    let first = summary.lines().next().unwrap_or_default().trim();
+    let truncated: String = first.chars().take(120).collect();
+    if truncated.len() < first.len() {
+        format!("{truncated}…")
+    } else if summary.lines().count() > 1 {
+        format!("{truncated} …")
+    } else {
+        truncated
     }
 }
 
@@ -1394,6 +1423,29 @@ enum SettingsVisibility {
     Open,
 }
 
+#[derive(Clone)]
+struct WorktreeConfiguration {
+    data_dir: Option<PathBuf>,
+    settings: AppSettings,
+    default_root: PathBuf,
+}
+
+impl WorktreeConfiguration {
+    fn load(data_dir: &Result<PathBuf, String>) -> Self {
+        let default_root = data_dir
+            .as_ref()
+            .map_or_else(|_| default_worktrees_root(), |path| path.join("worktrees"));
+        let settings = data_dir
+            .as_ref()
+            .map_or_else(|_| AppSettings::default(), |path| AppSettings::load(path));
+        Self {
+            data_dir: data_dir.as_ref().ok().cloned(),
+            settings,
+            default_root,
+        }
+    }
+}
+
 struct SessionMvpView {
     startup: StartupState,
     projects: Vec<ProjectMetadata>,
@@ -1411,6 +1463,7 @@ struct SessionMvpView {
     chats_workspace: PathBuf,
     /// Where pasted images are written so they can be referenced by path.
     attachments_root: Option<PathBuf>,
+    worktree_configuration: WorktreeConfiguration,
     /// Whether the composer will start a chat rather than a project session.
     composing_chat: bool,
     /// Where the next project session will run.
@@ -1499,6 +1552,7 @@ struct SessionMvpView {
     /// Startup progress shown before the new session has an id or transcript.
     session_launch: Option<SessionLaunchProgress>,
     action_error: Option<String>,
+    settings_error: Option<String>,
     /// What the update banner is showing.
     update_ui: UpdateUi,
     /// Background update worker, absent for developer builds that never update.
@@ -1521,6 +1575,7 @@ impl SessionMvpView {
         branch: String,
         chats_workspace: PathBuf,
         attachments_root: Option<PathBuf>,
+        worktree_configuration: WorktreeConfiguration,
         cx: &mut Context<Self>,
     ) -> Self {
         let AppService {
@@ -1665,6 +1720,7 @@ impl SessionMvpView {
             launch_workspace: project_root,
             chats_workspace,
             attachments_root,
+            worktree_configuration,
             composing_chat: false,
             draft_location: SessionLocation::default(),
             draft_attachments: Vec::new(),
@@ -1712,6 +1768,7 @@ impl SessionMvpView {
             deleting_sessions: HashSet::new(),
             session_launch: None,
             action_error: None,
+            settings_error: None,
             update_ui: UpdateUi::default(),
             update_service,
             settings_visibility: SettingsVisibility::Closed,
@@ -1869,6 +1926,93 @@ impl SessionMvpView {
         }
     }
 
+    fn current_worktrees_root(&self) -> PathBuf {
+        self.worktree_configuration
+            .settings
+            .worktrees_root(&self.worktree_configuration.default_root)
+    }
+
+    fn display_worktree_path(&self, path: &Path) -> String {
+        self.worktree_configuration
+            .settings
+            .display_worktree_path(path, &self.worktree_configuration.default_root)
+    }
+
+    fn persist_worktrees_root(&mut self, root: Option<PathBuf>) -> Result<(), String> {
+        let mut settings = self.worktree_configuration.settings.clone();
+        match root {
+            Some(root) => {
+                settings.set_worktrees_root(root, &self.worktree_configuration.default_root);
+            }
+            None => settings.use_default_worktrees_root(&self.worktree_configuration.default_root),
+        }
+        if let Some(data_dir) = self.worktree_configuration.data_dir.as_deref() {
+            settings
+                .save(data_dir)
+                .map_err(|error| format!("could not save worktree location: {error}"))?;
+        }
+        self.worktree_configuration.settings = settings;
+        Ok(())
+    }
+
+    fn choose_worktrees_root(&mut self, cx: &mut Context<Self>) {
+        self.settings_error = None;
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose worktree location".into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let selection = match paths.await {
+                Ok(Ok(paths)) => paths.and_then(|paths| paths.into_iter().next()),
+                Ok(Err(error)) => {
+                    let _ = view.update(cx, |view, cx| {
+                        view.settings_error =
+                            Some(format!("could not open the folder picker: {error}"));
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_) => None,
+            };
+            let Some(path) = selection else {
+                return;
+            };
+            let path = path.canonicalize().unwrap_or(path);
+            let _ = view.update(cx, |view, cx| {
+                if let Err(error) = view.persist_worktrees_root(Some(path)) {
+                    view.settings_error = Some(error);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn settings_worktrees_button(cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .id("settings-change-worktrees")
+            .accessibility_id("settings-change-worktrees")
+            .role(Role::Button)
+            .aria_label("Change worktree location")
+            .focusable()
+            .tab_stop(true)
+            .px_4()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .text_sm()
+            .child("Change…")
+            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+            .on_click(cx.listener(|view, _, _, cx| {
+                view.choose_worktrees_root(cx);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     fn settings_check_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let updates_available = self.update_service.is_some();
         let checking = self.update_ui == UpdateUi::Checking;
@@ -1931,6 +2075,69 @@ impl SessionMvpView {
             .into_any_element()
     }
 
+    fn settings_worktrees_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let worktrees_root = self.current_worktrees_root();
+        let uses_default = self
+            .worktree_configuration
+            .settings
+            .uses_default_worktrees_root();
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().child("Worktree location"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(worktrees_root.to_string_lossy().into_owned()),
+                    )
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(
+                        "Changes apply to new worktrees only. Existing sessions keep their \
+                         current locations.",
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(!uses_default, |buttons| {
+                        buttons.child(
+                            div()
+                                .id("settings-default-worktrees")
+                                .accessibility_id("settings-default-worktrees")
+                                .role(Role::Button)
+                                .aria_label("Use default worktree location")
+                                .focusable()
+                                .tab_stop(true)
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .text_sm()
+                                .text_color(rgb(MUTED))
+                                .child("Use default")
+                                .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    if let Err(error) = view.persist_worktrees_root(None) {
+                                        view.settings_error = Some(error);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(Self::settings_worktrees_button(cx)),
+            )
+    }
+
     fn settings_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if self.settings_visibility != SettingsVisibility::Open {
             return None;
@@ -1952,7 +2159,7 @@ impl SessionMvpView {
                 .child(
                     div()
                         .id("settings-panel")
-                        .w(px(460.0))
+                        .w(px(620.0))
                         .flex()
                         .flex_col()
                         .gap_4()
@@ -1972,6 +2179,18 @@ impl SessionMvpView {
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .child("Settings"),
                         )
+                        .child(self.settings_worktrees_row(cx))
+                        .when_some(self.settings_error.clone(), |panel, error| {
+                            panel.child(
+                                div()
+                                    .id("settings-error")
+                                    .role(Role::Alert)
+                                    .aria_label(error.clone())
+                                    .text_xs()
+                                    .text_color(rgb(RED))
+                                    .child(error),
+                            )
+                        })
                         .child(
                             div()
                                 .flex()
@@ -2352,6 +2571,7 @@ impl SessionMvpView {
             repository_root,
             kind,
             location: self.draft_location,
+            worktrees_root: self.current_worktrees_root(),
         });
     }
 
@@ -2766,10 +2986,23 @@ impl SessionMvpView {
     fn delete_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
         self.session_menu = None;
         self.action_error = None;
+        let worktrees_root = self
+            .sessions
+            .iter()
+            .find(|session| session.id() == app_session_id)
+            .and_then(|session| {
+                self.worktree_configuration
+                    .settings
+                    .owning_root_for_worktree(
+                        Path::new(&session.snapshot.metadata.project_path),
+                        &self.worktree_configuration.default_root,
+                    )
+            });
         self.deleting_sessions.insert(app_session_id.clone());
-        let _ = self
-            .commands
-            .send(ServiceCommand::DeleteSession { app_session_id });
+        let _ = self.commands.send(ServiceCommand::DeleteSession {
+            app_session_id,
+            worktrees_root,
+        });
         cx.notify();
     }
 
@@ -4266,6 +4499,7 @@ impl SessionMvpView {
                             .child("Settings")
                             .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                             .on_click(cx.listener(|view, _, _, cx| {
+                                view.settings_error = None;
                                 view.settings_visibility = SettingsVisibility::Open;
                                 cx.notify();
                             })),
@@ -4758,8 +4992,12 @@ impl SessionMvpView {
             app_model::InvocationState::Failed => ("failed", RED),
             app_model::InvocationState::Cancelled => ("cancelled", MUTED),
         };
-        let summary = invocation.summary_line();
-        let detail = invocation.multiline_summary();
+        let full_summary = invocation.file_path().map_or_else(
+            || invocation.summary(),
+            |path| self.display_worktree_path(Path::new(path)),
+        );
+        let summary = summary_line(&full_summary);
+        let detail = (full_summary.lines().count() > 1).then_some(full_summary);
         let verb = invocation.verb();
         let label = format!("{verb} {summary}");
         let diff = invocation.diff().map(str::to_owned);
@@ -4803,6 +5041,10 @@ impl SessionMvpView {
         let nested: Vec<_> = children
             .iter()
             .map(|child| {
+                let child_summary = child.file_path().map_or_else(
+                    || child.summary(),
+                    |path| self.display_worktree_path(Path::new(path)),
+                );
                 let child_status = match child.state {
                     app_model::InvocationState::Running => GREEN,
                     app_model::InvocationState::Succeeded
@@ -4812,7 +5054,7 @@ impl SessionMvpView {
                 div()
                     .id(SharedString::from(format!("nested-{}", child.call_id)))
                     .role(Role::ListItem)
-                    .aria_label(format!("{} {}", child.verb(), child.summary()))
+                    .aria_label(format!("{} {child_summary}", child.verb()))
                     .flex()
                     .items_center()
                     .gap_2()
@@ -4830,7 +5072,7 @@ impl SessionMvpView {
                             .overflow_hidden()
                             .text_xs()
                             .text_color(rgb(MUTED))
-                            .child(format!("{} {}", child.verb(), child.summary())),
+                            .child(format!("{} {child_summary}", child.verb())),
                     )
             })
             .collect();
@@ -5783,9 +6025,10 @@ impl SessionMvpView {
         };
         self.transcript_rows_rendered += 1;
         let content = match item.kind {
-            TimelineItemKind::SessionStart(item) => {
-                Some(Self::session_start_row(item, &snapshot.metadata).into_any_element())
-            }
+            TimelineItemKind::SessionStart(item) => Some(
+                self.session_start_row(item, &snapshot.metadata)
+                    .into_any_element(),
+            ),
             TimelineItemKind::Message(message_index) => snapshot
                 .transcript
                 .get(message_index)
@@ -5825,13 +6068,17 @@ impl SessionMvpView {
             .into_any_element()
     }
 
-    fn session_start_row(item: SessionStartItem, metadata: &SessionMetadata) -> impl IntoElement {
+    fn session_start_row(
+        &self,
+        item: SessionStartItem,
+        metadata: &SessionMetadata,
+    ) -> impl IntoElement {
         let (id, label, detail) = match item {
             SessionStartItem::CreatingWorktree => ("creating-worktree", "Creating worktree", None),
             SessionStartItem::WorktreeReady => (
                 "worktree-ready",
                 "Worktree ready",
-                Some(metadata.project_path.clone()),
+                Some(self.display_worktree_path(Path::new(&metadata.project_path))),
             ),
             SessionStartItem::CopilotSessionStarted => {
                 ("copilot-session-started", "Copilot session started", None)
@@ -6959,8 +7206,14 @@ impl SessionMvpView {
         let delete_id = app_session_id.clone();
         let retry_id = app_session_id.clone();
         let working_directory = PathBuf::from(&session.snapshot.metadata.project_path);
-        let can_recreate = working_directory.starts_with(worktrees_root())
-            && session.snapshot.changes.branch.is_some();
+        let worktrees_root = self
+            .worktree_configuration
+            .settings
+            .owning_root_for_worktree(
+                &working_directory,
+                &self.worktree_configuration.default_root,
+            );
+        let can_recreate = worktrees_root.is_some() && session.snapshot.changes.branch.is_some();
 
         div()
             .id("session-unavailable")
@@ -7000,6 +7253,7 @@ impl SessionMvpView {
                     view.action_error = None;
                     let _ = view.commands.send(ServiceCommand::Resume {
                         app_session_id: retry_id.clone(),
+                        worktrees_root: worktrees_root.clone(),
                     });
                 }))
             })
@@ -7215,6 +7469,7 @@ impl SessionMvpView {
                                     .on_click(cx.listener(move |view, _, _, _| {
                                         let _ = view.commands.send(ServiceCommand::Resume {
                                             app_session_id: id.clone(),
+                                            worktrees_root: None,
                                         });
                                     })),
                             )
@@ -7442,10 +7697,10 @@ impl SessionMvpView {
             )
     }
 
-    fn session_launch_progress(progress: SessionLaunchProgress) -> impl IntoElement {
+    fn session_launch_progress(&self, progress: SessionLaunchProgress) -> impl IntoElement {
         let ready_path = match progress {
             SessionLaunchProgress::CreatingWorktree => None,
-            SessionLaunchProgress::WorktreeReady(path) => Some(path),
+            SessionLaunchProgress::WorktreeReady(path) => Some(self.display_worktree_path(&path)),
         };
         div()
             .id("session-launch-progress")
@@ -7491,12 +7746,7 @@ impl SessionMvpView {
                             .text_color(rgb(MUTED))
                             .child(div().w(px(18.0)).text_color(rgb(GREEN)).child("✓"))
                             .child("Worktree ready")
-                            .child(
-                                div()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .child(path.to_string_lossy().into_owned()),
-                            ),
+                            .child(div().min_w_0().overflow_hidden().child(path)),
                     )
                     .child(
                         div()
@@ -7567,7 +7817,7 @@ impl SessionMvpView {
                         )
                     })
                     .when_some(launch, |column, launch| {
-                        column.child(Self::session_launch_progress(launch))
+                        column.child(self.session_launch_progress(launch))
                     })
                     .when(!launching, |column| column.child(self.home_composer(cx))),
             )
@@ -9012,7 +9262,12 @@ fn main() {
     let window_title = format!("GCABB {}", build.display());
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let branch = git_branch(&project_root);
-    let service = match data_dir.and_then(|path| database_path(&path)) {
+    let worktree_configuration = WorktreeConfiguration::load(&data_dir);
+    let service = match data_dir
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|path| database_path(path))
+    {
         Ok(path) => AppService::start(project_root.clone(), &path),
         Err(error) => AppService::failed(error),
     };
@@ -9031,6 +9286,7 @@ fn main() {
         let project_root = project_root.clone();
         let branch = branch.clone();
         let chats_workspace = chats_workspace.clone();
+        let worktree_configuration = worktree_configuration.clone();
         let window = cx
             .open_window(
                 WindowOptions {
@@ -9051,6 +9307,7 @@ fn main() {
                             branch,
                             chats_workspace,
                             attachments_directory(),
+                            worktree_configuration,
                             cx,
                         )
                     })
@@ -9773,6 +10030,11 @@ mod tests {
                     "main".to_owned(),
                     std::path::PathBuf::from("/tmp/chats"),
                     None,
+                    crate::WorktreeConfiguration {
+                        data_dir: None,
+                        settings: crate::AppSettings::default(),
+                        default_root: std::path::PathBuf::from("/tmp/worktrees"),
+                    },
                     cx,
                 )
             });
@@ -9800,6 +10062,11 @@ mod tests {
                     "main".to_owned(),
                     std::path::PathBuf::from("/tmp/chats"),
                     Some(attachments_root),
+                    crate::WorktreeConfiguration {
+                        data_dir: None,
+                        settings: crate::AppSettings::default(),
+                        default_root: std::path::PathBuf::from("/tmp/worktrees"),
+                    },
                     cx,
                 );
                 view.selected_project = std::path::PathBuf::from("/tmp/project");
@@ -9823,6 +10090,33 @@ mod tests {
                 left_delta < 0.5 && width_delta < 0.5,
                 "{label} is not aligned: {actual:?} vs {expected:?}"
             );
+        }
+
+        #[gpui::test]
+        fn configured_worktree_location_is_sent_with_new_sessions(cx: &mut TestAppContext) {
+            let repository = tempfile::tempdir().expect("repository");
+            super::git(repository.path(), &["init", "-q"]);
+            let custom = repository.path().join("custom-worktrees");
+            let (view, cx, commands, _) = setup_for_bootstrap(cx);
+            view.update(cx, |view, _| {
+                let configuration = &mut view.worktree_configuration;
+                configuration
+                    .settings
+                    .set_worktrees_root(custom.clone(), &configuration.default_root);
+                view.composing_chat = false;
+                view.selected_project = repository.path().to_owned();
+                view.workspace_root = repository.path().to_owned();
+                view.submit_prompt("Start a session".to_owned());
+            });
+
+            let root = commands
+                .try_iter()
+                .find_map(|command| match command {
+                    ServiceCommand::Submit { worktrees_root, .. } => Some(worktrees_root),
+                    _ => None,
+                })
+                .expect("a submit command was sent");
+            assert_eq!(root, custom);
         }
 
         #[gpui::test]
@@ -9924,6 +10218,11 @@ mod tests {
                     "main".to_owned(),
                     std::path::PathBuf::from("/tmp/chats"),
                     None,
+                    crate::WorktreeConfiguration {
+                        data_dir: None,
+                        settings: crate::AppSettings::default(),
+                        default_root: std::path::PathBuf::from("/tmp/worktrees"),
+                    },
                     cx,
                 )
             });
@@ -10023,9 +10322,11 @@ mod tests {
             view.update(cx, |view, cx| {
                 let mut unavailable = snapshot("session-1", "Archived session");
                 unavailable.status = SessionStatus::Unavailable;
-                unavailable.metadata.project_path = super::super::worktrees_root()
+                unavailable.metadata.project_path = view
+                    .worktree_configuration
+                    .default_root
                     .join("project")
-                    .join("archived")
+                    .join("gcabb-archived")
                     .to_string_lossy()
                     .into_owned();
                 unavailable.changes.branch = Some("gcabb/archived".to_owned());
@@ -10048,7 +10349,11 @@ mod tests {
             cx.simulate_click(recreate.center(), Modifiers::none());
             assert!(matches!(
                 commands.recv().expect("resume command"),
-                ServiceCommand::Resume { app_session_id } if app_session_id == "session-1"
+                ServiceCommand::Resume {
+                    app_session_id,
+                    worktrees_root: Some(worktrees_root),
+                } if app_session_id == "session-1"
+                    && worktrees_root == std::path::Path::new("/tmp/worktrees")
             ));
 
             let delete = cx
@@ -10057,7 +10362,8 @@ mod tests {
             cx.simulate_click(delete.center(), Modifiers::none());
             assert!(matches!(
                 commands.recv().expect("delete command"),
-                ServiceCommand::DeleteSession { app_session_id } if app_session_id == "session-1"
+                ServiceCommand::DeleteSession { app_session_id, .. }
+                    if app_session_id == "session-1"
             ));
         }
 
@@ -10512,7 +10818,7 @@ mod tests {
             });
             let command = commands.try_recv().expect("a command was sent");
             match command {
-                ServiceCommand::DeleteSession { app_session_id } => {
+                ServiceCommand::DeleteSession { app_session_id, .. } => {
                     assert_eq!(app_session_id, "session-1");
                 }
                 _ => panic!("expected a DeleteSession command"),
