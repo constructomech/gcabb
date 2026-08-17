@@ -1578,8 +1578,9 @@ fn resolve_session_workspace(
         .map(str::to_owned)
         .or_else(|| default_branch(&repository))
         .unwrap_or_else(|| "HEAD".to_owned());
-    let branch = unique_worktree_branch(&service, title, worktrees_root, &repository);
-    let path = worktree_path(worktrees_root, &repository, &branch)?;
+    let namespace = repository_worktree_namespace(worktrees_root, &repository)?;
+    let branch = unique_worktree_branch(&service, title, &namespace);
+    let path = worktree_path(&namespace, &branch)?;
     service
         .create_worktree(&path, &branch, &base)
         .map_err(|error| format!("failed to create session worktree: {error}"))?;
@@ -1588,44 +1589,29 @@ fn resolve_session_workspace(
 
 /// A branch name derived from the semantic session title, made unique in both
 /// the repository and GCABB's managed worktree directory.
-fn unique_worktree_branch(
-    service: &GitService,
-    title: &str,
-    worktrees_root: &Path,
-    repository: &Path,
-) -> String {
+fn unique_worktree_branch(service: &GitService, title: &str, namespace: &Path) -> String {
     let slug = slugify(title);
     let candidate = format!("gcabb/{slug}");
-    if worktree_name_available(service, &candidate, worktrees_root, repository) {
+    if worktree_name_available(service, &candidate, namespace) {
         return candidate;
     }
     for suffix in 2..100 {
         let candidate = format!("gcabb/{slug}-{suffix}");
-        if worktree_name_available(service, &candidate, worktrees_root, repository) {
+        if worktree_name_available(service, &candidate, namespace) {
             return candidate;
         }
     }
     format!("gcabb/{slug}-{}", timestamp())
 }
 
-fn worktree_name_available(
-    service: &GitService,
-    branch: &str,
-    worktrees_root: &Path,
-    repository: &Path,
-) -> bool {
-    !service.branch_exists(branch)
-        && !worktree_candidate_path(worktrees_root, repository, branch).exists()
+fn worktree_name_available(service: &GitService, branch: &str, namespace: &Path) -> bool {
+    !service.branch_exists(branch) && !worktree_candidate_path(namespace, branch).exists()
 }
 
 /// Location on disk for a session worktree, outside the repository so it never
 /// appears as untracked content in the changes view.
-fn worktree_path(
-    worktrees_root: &Path,
-    repository: &Path,
-    branch: &str,
-) -> Result<PathBuf, String> {
-    let path = worktree_candidate_path(worktrees_root, repository, branch);
+fn worktree_path(namespace: &Path, branch: &str) -> Result<PathBuf, String> {
+    let path = worktree_candidate_path(namespace, branch);
     let parent = path
         .parent()
         .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
@@ -1634,13 +1620,87 @@ fn worktree_path(
     Ok(path)
 }
 
-fn worktree_candidate_path(worktrees_root: &Path, repository: &Path, branch: &str) -> PathBuf {
-    let repository_name = repository
+fn worktree_candidate_path(namespace: &Path, branch: &str) -> PathBuf {
+    namespace.join(branch.replace('/', "-"))
+}
+
+/// Stable, readable directory assigned to one repository.
+///
+/// Repositories named `gcabb` receive `gcabb`, `gcabb-2`, and so on. The
+/// hidden owner file keeps that assignment stable without putting path hashes
+/// into every worktree name.
+fn repository_worktree_namespace(
+    worktrees_root: &Path,
+    repository: &Path,
+) -> Result<PathBuf, String> {
+    let canonical_repository = repository
+        .canonicalize()
+        .unwrap_or_else(|_| repository.to_owned());
+    let repository_name = canonical_repository
         .file_name()
         .and_then(|name| name.to_str())
         .unwrap_or("repository");
-    let leaf = branch.replace('/', "-");
-    worktrees_root.join(repository_name).join(leaf)
+    let base = repository_name.to_owned();
+    let owner = canonical_repository.to_string_lossy();
+
+    for suffix in 1_u32.. {
+        let name = if suffix == 1 {
+            base.clone()
+        } else {
+            format!("{base}-{suffix}")
+        };
+        let namespace = worktrees_root.join(name);
+        let marker = namespace.join(".gcabb-repository");
+        let created = !namespace.exists();
+        if created {
+            std::fs::create_dir_all(&namespace)
+                .map_err(|error| format!("failed to create {}: {error}", namespace.display()))?;
+        }
+        if std::fs::read_to_string(&marker).is_ok_and(|stored| stored == owner) {
+            return Ok(namespace);
+        }
+
+        let may_claim = if created {
+            true
+        } else {
+            let entries = std::fs::read_dir(&namespace)
+                .map_err(|error| format!("failed to read {}: {error}", namespace.display()))?;
+            let mut roots = entries
+                .filter_map(Result::ok)
+                .map(|entry| entry.path())
+                .filter(|path| path.is_dir())
+                .filter(|path| GitService::new(path).is_worktree())
+                .map(|path| repository_root(&path));
+            roots
+                .next()
+                .is_some_and(|root| root == canonical_repository)
+                && roots.all(|root| root == canonical_repository)
+        };
+        if may_claim && claim_repository_namespace(&marker, owner.as_bytes())? {
+            return Ok(namespace);
+        }
+    }
+    unreachable!("an unbounded numeric namespace always has a candidate")
+}
+
+fn claim_repository_namespace(marker: &Path, owner: &[u8]) -> Result<bool, String> {
+    match std::fs::OpenOptions::new()
+        .write(true)
+        .create_new(true)
+        .open(marker)
+    {
+        Ok(mut file) => {
+            if let Err(error) = std::io::Write::write_all(&mut file, owner) {
+                let _ = std::fs::remove_file(marker);
+                return Err(format!("failed to write {}: {error}", marker.display()));
+            }
+            Ok(true)
+        }
+        Err(error) if error.kind() == std::io::ErrorKind::AlreadyExists => {
+            Ok(std::fs::read(marker).is_ok_and(|stored| stored == owner))
+        }
+        Err(error) => Err(format!("failed to create {}: {error}", marker.display())),
+    }
 }
 
 /// Root directory session worktrees are created under.
@@ -1731,6 +1791,7 @@ enum TimelineItemKind {
     SessionStart(SessionStartItem),
     Message(usize),
     Tool(usize),
+    Interaction(usize),
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -1753,6 +1814,7 @@ struct TimelineIndex {
     items: Vec<TimelineItem>,
     scanned_messages: usize,
     scanned_invocations: usize,
+    scanned_interactions: usize,
     children: HashMap<String, Vec<usize>>,
 }
 
@@ -1762,6 +1824,7 @@ impl TimelineIndex {
         self.items.clear();
         self.scanned_messages = 0;
         self.scanned_invocations = 0;
+        self.scanned_interactions = 0;
         self.children.clear();
         if session_uses_worktree(&snapshot.metadata) {
             self.items.extend(
@@ -1810,16 +1873,33 @@ impl TimelineIndex {
                 });
             }
         }
+        additions.extend(
+            snapshot.interaction_history[self.scanned_interactions..]
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| record.request.kind == InteractionKind::Permission)
+                .map(|(offset, record)| TimelineItem {
+                    id: format!(
+                        "permission-{}-{}",
+                        self.scanned_interactions + offset,
+                        record.request.id
+                    ),
+                    sequence: record.sequence,
+                    kind: TimelineItemKind::Interaction(self.scanned_interactions + offset),
+                }),
+        );
         additions.sort_by_key(|item| item.sequence);
         self.items.extend(additions);
         self.scanned_messages = snapshot.transcript.len();
         self.scanned_invocations = snapshot.tool_activity.invocations.len();
+        self.scanned_interactions = snapshot.interaction_history.len();
     }
 
     fn sync(&mut self, snapshot: &SessionSnapshot) -> bool {
         let reset = self.session_id != snapshot.metadata.id
             || self.scanned_messages > snapshot.transcript.len()
-            || self.scanned_invocations > snapshot.tool_activity.invocations.len();
+            || self.scanned_invocations > snapshot.tool_activity.invocations.len()
+            || self.scanned_interactions > snapshot.interaction_history.len();
         let previous_len = self.items.len();
         if reset {
             self.reset(snapshot);
@@ -3271,7 +3351,12 @@ impl SessionMvpView {
         let Some(session) = self.selected() else {
             return;
         };
-        let Some(interaction) = session.snapshot.pending_interactions.first() else {
+        let Some(interaction) = session
+            .snapshot
+            .pending_interactions
+            .iter()
+            .find(|interaction| interaction.kind != InteractionKind::Permission)
+        else {
             return;
         };
         let _ = self.commands.send(ServiceCommand::Respond {
@@ -6955,6 +7040,134 @@ impl SessionMvpView {
             )
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn permission_entry(
+        interaction_index: usize,
+        record: &app_model::InteractionRecord,
+        snapshot: &SessionSnapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let request = &record.request;
+        let details = (!request.details.is_null()).then(|| {
+            serde_json::to_string_pretty(&request.details)
+                .unwrap_or_else(|_| request.details.to_string())
+        });
+        let status = record.response.as_ref().map(|response| match response {
+            InteractionResponse::Approve
+            | InteractionResponse::ApproveForSession
+            | InteractionResponse::ApproveForLocation
+            | InteractionResponse::ApprovePermanently => "Allowed",
+            InteractionResponse::Reject { .. } => "Denied",
+            InteractionResponse::Cancel => "Cancelled",
+            InteractionResponse::Submit { .. } => "Answered",
+        });
+        let turn = snapshot
+            .transcript
+            .iter()
+            .filter(|message| {
+                message.role == TranscriptRole::User && message.sequence <= record.sequence
+            })
+            .count();
+        let context = if turn == 0 {
+            format!("Session: {}", snapshot.metadata.title)
+        } else {
+            format!("Session: {} · Turn {turn}", snapshot.metadata.title)
+        };
+        let choices = request.choices.iter().enumerate().map(|(index, choice)| {
+            let choice = choice.clone();
+            let response_choice = choice.clone();
+            let session_id = snapshot.metadata.id.clone();
+            let interaction_id = request.id.clone();
+            let description = permission_scope_description(&choice);
+            let selector = format!("permission-scope-{index}");
+            div()
+                .id(("permission-scope", index))
+                .debug_selector({
+                    let selector = selector.clone();
+                    move || selector.clone()
+                })
+                .accessibility_id(selector)
+                .role(Role::Button)
+                .aria_label(format!("{choice}. {description}"))
+                .focusable()
+                .tab_stop(true)
+                .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .child(div().flex_1().child(choice))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(description))
+                .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                .on_click(cx.listener(move |view, _, _, _| {
+                    let _ = view.commands.send(ServiceCommand::Respond {
+                        app_session_id: session_id.clone(),
+                        interaction_id: interaction_id.clone(),
+                        response: choice_response(InteractionKind::Permission, &response_choice),
+                    });
+                }))
+        });
+
+        div()
+            .id(SharedString::from(format!(
+                "permission-{interaction_index}-{}",
+                request.id
+            )))
+            .debug_selector(|| "permission-entry".to_owned())
+            .accessibility_id(format!("permission-{interaction_index}-{}", request.id))
+            .role(Role::ListItem)
+            .aria_label(format!("Permission required: {}", request.message))
+            .w_full()
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(AMBER))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(AMBER))
+                            .child(request.title.clone()),
+                    )
+                    .when_some(status, |heading, status| {
+                        heading.child(div().text_xs().text_color(rgb(MUTED)).child(status))
+                    }),
+            )
+            .child(div().mt_1().text_xs().text_color(rgb(MUTED)).child(context))
+            .child(
+                div()
+                    .mt_3()
+                    .text_color(rgb(PRIMARY))
+                    .child(request.message.clone()),
+            )
+            .when_some(details, |card, details| {
+                card.child(
+                    div()
+                        .mt_3()
+                        .p_3()
+                        .rounded_md()
+                        .bg(rgb(SUBTLE))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .text_sm()
+                        .child(details),
+                )
+            })
+            .when(record.response.is_none(), |card| {
+                card.child(div().mt_3().flex().flex_col().gap_2().children(choices))
+            })
+    }
+
     fn render_timeline_row(&mut self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(item) = self.timeline.items.get(index).cloned() else {
             return div().into_any_element();
@@ -6966,7 +7179,7 @@ impl SessionMvpView {
         let bottom_padding = match item.kind {
             TimelineItemKind::SessionStart(_) => 0.0,
             TimelineItemKind::Tool(_) => 4.0,
-            TimelineItemKind::Message(_) => 12.0,
+            TimelineItemKind::Message(_) | TimelineItemKind::Interaction(_) => 12.0,
         };
         let content = match item.kind {
             TimelineItemKind::SessionStart(item) => Some(
@@ -6991,6 +7204,13 @@ impl SessionMvpView {
                         .filter_map(|index| snapshot.tool_activity.invocations.get(*index))
                         .collect::<Vec<_>>();
                     self.tool_entry(invocation, &children, cx)
+                        .into_any_element()
+                }),
+            TimelineItemKind::Interaction(interaction_index) => snapshot
+                .interaction_history
+                .get(interaction_index)
+                .map(|record| {
+                    Self::permission_entry(interaction_index, record, &snapshot, cx)
                         .into_any_element()
                 }),
         };
@@ -8851,7 +9071,12 @@ impl SessionMvpView {
     #[allow(clippy::too_many_lines)]
     fn interaction_prompt(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let session = self.selected()?;
-        let interaction = session.snapshot.pending_interactions.first()?.clone();
+        let interaction = session
+            .snapshot
+            .pending_interactions
+            .iter()
+            .find(|interaction| interaction.kind != InteractionKind::Permission)?
+            .clone();
         let app_session_id = session.id().to_owned();
         let interaction_id = interaction.id.clone();
         let reject = interaction_id.clone();
@@ -10853,11 +11078,57 @@ mod tests {
         .expect("second worktree");
 
         assert_ne!(first, second);
+        assert_eq!(first.parent(), second.parent());
         assert_eq!(
             git_service::GitService::new(&second)
                 .current_branch()
                 .unwrap(),
             "gcabb/same-title-2"
+        );
+    }
+
+    #[test]
+    fn same_named_sessions_in_same_named_repositories_get_distinct_worktrees() {
+        let (_first_guard, first_repository, _first_worktree) = repo_with_worktree();
+        let (_second_guard, second_repository, _second_worktree) = repo_with_worktree();
+        let roots = tempfile::tempdir().expect("tempdir");
+        assert_eq!(first_repository.file_name(), second_repository.file_name());
+
+        let first = super::resolve_session_workspace(
+            SessionLocation::NewWorktree,
+            app_model::SessionKind::Project,
+            &first_repository,
+            Some(&first_repository.to_string_lossy()),
+            Some("main"),
+            "Same title",
+            roots.path(),
+        )
+        .expect("first repository worktree");
+        let second = super::resolve_session_workspace(
+            SessionLocation::NewWorktree,
+            app_model::SessionKind::Project,
+            &second_repository,
+            Some(&second_repository.to_string_lossy()),
+            Some("main"),
+            "Same title",
+            roots.path(),
+        )
+        .expect("second repository worktree");
+
+        assert_ne!(first, second);
+        assert_eq!(
+            first
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str()),
+            Some("main")
+        );
+        assert_eq!(
+            second
+                .parent()
+                .and_then(Path::file_name)
+                .and_then(|name| name.to_str()),
+            Some("main-2")
         );
     }
 
@@ -10881,10 +11152,14 @@ mod tests {
         .expect("worktree resolved");
 
         assert_eq!(
+            resolved.parent().and_then(Path::file_name),
+            Some("main-2".as_ref())
+        );
+        assert_eq!(
             git_service::GitService::new(resolved)
                 .current_branch()
                 .unwrap(),
-            "gcabb/fix-auth-flow-2"
+            "gcabb/fix-auth-flow"
         );
     }
 
@@ -11770,20 +12045,25 @@ mod tests {
             let (view, cx, commands) = setup(cx);
             view.update(cx, |view, cx| {
                 view.selected_session = Some("session-1".to_owned());
-                Arc::make_mut(&mut view.sessions[0].snapshot)
-                    .pending_interactions
-                    .push(interaction(
-                        InteractionKind::Permission,
-                        "Permission required",
-                        "Run cargo test",
-                        &["Allow once", "Allow for this session", "Deny"],
-                        false,
-                    ));
+                let mut request = interaction(
+                    InteractionKind::Permission,
+                    "Permission required",
+                    "Run cargo test",
+                    &["Allow once", "Allow for this session", "Deny"],
+                    false,
+                );
+                request.details = serde_json::json!({
+                    "command": "cargo test",
+                    "arguments": ["--workspace"],
+                    "path": "/tmp/project"
+                });
+                Arc::make_mut(&mut view.sessions[0].snapshot).add_interaction(request);
                 cx.notify();
             });
             cx.run_until_parked();
 
-            assert!(cx.debug_bounds("interaction-prompt").is_some());
+            assert!(cx.debug_bounds("permission-entry").is_some());
+            assert!(cx.debug_bounds("interaction-prompt").is_none());
             assert!(cx.debug_bounds("composer").is_none());
             let scope = cx
                 .debug_bounds("permission-scope-1")
@@ -11801,6 +12081,20 @@ mod tests {
                 }
                 _ => panic!("expected an interaction response"),
             }
+
+            view.update(cx, |view, cx| {
+                let snapshot = Arc::make_mut(&mut view.sessions[0].snapshot);
+                snapshot.record_interaction_response(
+                    "interaction-1",
+                    InteractionResponse::ApproveForSession,
+                );
+                snapshot.remove_interaction("interaction-1");
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("permission-entry").is_some());
+            assert!(cx.debug_bounds("permission-scope-1").is_none());
         }
 
         #[gpui::test]
