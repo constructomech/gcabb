@@ -18,6 +18,7 @@ gpui_platform.workspace = true
 image.workspace = true
 pulldown-cmark.workspace = true
 session-manager.workspace = true
+serde.workspace = true
 serde_json.workspace = true
 storage.workspace = true
 tokio.workspace = true
