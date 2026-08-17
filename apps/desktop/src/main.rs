@@ -306,9 +306,16 @@ enum ServiceUpdate {
         projects: Vec<ProjectMetadata>,
         selected: Option<String>,
     },
+    SessionLaunchProgress(SessionLaunchProgress),
     PromptAccepted(Option<String>),
     ActionFailed(String),
     Failed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SessionLaunchProgress {
+    CreatingWorktree,
+    WorktreeReady(PathBuf),
 }
 
 enum ServiceCommand {
@@ -636,6 +643,7 @@ impl AppService {
                                 &manager,
                                 command,
                                 &session_roots.worktrees.clone().unwrap_or_default(),
+                                &update_tx,
                             )) {
                                 Ok(Some(handle)) => {
                                     if let Some(prompt) = naming_prompt {
@@ -734,6 +742,7 @@ async fn handle_service_command(
     manager: &SessionManager,
     command: ServiceCommand,
     worktrees_root: &Path,
+    updates: &Sender<ServiceUpdate>,
 ) -> Result<Option<SessionHandle>, String> {
     let mut created = None;
     match command {
@@ -783,6 +792,14 @@ async fn handle_service_command(
                     || (fallback_title, TitleSource::Fallback),
                     |title| (title, TitleSource::Generated),
                 );
+                let creates_worktree = kind == SessionKind::Project
+                    && location == SessionLocation::NewWorktree
+                    && GitService::new(repository).is_worktree();
+                if creates_worktree {
+                    let _ = updates.send(ServiceUpdate::SessionLaunchProgress(
+                        SessionLaunchProgress::CreatingWorktree,
+                    ));
+                }
                 // A worktree session runs in its own checkout, created before
                 // the provider session so the CLI starts in the right place.
                 let project_path = resolve_session_workspace(
@@ -794,6 +811,11 @@ async fn handle_service_command(
                     &title,
                     worktrees_root,
                 )?;
+                if creates_worktree {
+                    let _ = updates.send(ServiceUpdate::SessionLaunchProgress(
+                        SessionLaunchProgress::WorktreeReady(project_path.clone()),
+                    ));
+                }
                 let handle = manager
                     .create_session(CreateSessionRequest {
                         project_path,
@@ -1111,6 +1133,14 @@ fn session_title(prompt: &str) -> String {
     }
 }
 
+fn session_uses_worktree(metadata: &SessionMetadata) -> bool {
+    !metadata.is_chat()
+        && metadata
+            .repository_root
+            .as_deref()
+            .is_some_and(|root| Path::new(root) != Path::new(&metadata.project_path))
+}
+
 struct SessionProjection {
     _handle: Option<SessionHandle>,
     receiver: Option<watch::Receiver<Arc<SessionSnapshot>>>,
@@ -1121,8 +1151,16 @@ struct SessionProjection {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TimelineItemKind {
+    SessionStart(SessionStartItem),
     Message(usize),
     Tool(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionStartItem {
+    CreatingWorktree,
+    WorktreeReady,
+    CopilotSessionStarted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1148,6 +1186,21 @@ impl TimelineIndex {
         self.scanned_messages = 0;
         self.scanned_invocations = 0;
         self.children.clear();
+        if session_uses_worktree(&snapshot.metadata) {
+            self.items.extend(
+                [
+                    SessionStartItem::CreatingWorktree,
+                    SessionStartItem::WorktreeReady,
+                    SessionStartItem::CopilotSessionStarted,
+                ]
+                .into_iter()
+                .map(|item| TimelineItem {
+                    id: format!("session-start-{item:?}"),
+                    sequence: 0,
+                    kind: TimelineItemKind::SessionStart(item),
+                }),
+            );
+        }
         self.append(snapshot);
     }
 
@@ -1427,6 +1480,8 @@ struct SessionMvpView {
     /// Sessions with a delete in flight, shown with a spinner in place of
     /// the status dot until the backend confirms removal.
     deleting_sessions: HashSet<String>,
+    /// Startup progress shown before the new session has an id or transcript.
+    session_launch: Option<SessionLaunchProgress>,
     action_error: Option<String>,
     /// What the update banner is showing.
     update_ui: UpdateUi,
@@ -1639,6 +1694,7 @@ impl SessionMvpView {
             renaming_session: None,
             rename_input,
             deleting_sessions: HashSet::new(),
+            session_launch: None,
             action_error: None,
             update_ui: UpdateUi::default(),
             update_service,
@@ -1971,6 +2027,7 @@ impl SessionMvpView {
                 }
                 ServiceUpdate::SessionAdded(handle) => {
                     let id = handle.id().to_owned();
+                    self.session_launch = None;
                     self.upsert_hydrated_session(handle, cx);
                     self.switch_composer_draft(Some(id), cx);
                 }
@@ -1981,6 +2038,9 @@ impl SessionMvpView {
                 }
                 ServiceUpdate::ProjectsChanged { projects, selected } => {
                     self.apply_projects_changed(projects, selected, cx);
+                }
+                ServiceUpdate::SessionLaunchProgress(progress) => {
+                    self.session_launch = Some(progress);
                 }
                 ServiceUpdate::SessionDeleted(id) => {
                     self.sessions.retain(|session| session.id() != id);
@@ -2014,7 +2074,10 @@ impl SessionMvpView {
                         self.composer.update(cx, TextInput::clear);
                     }
                 }
-                ServiceUpdate::ActionFailed(error) => self.action_error = Some(error),
+                ServiceUpdate::ActionFailed(error) => {
+                    self.session_launch = None;
+                    self.action_error = Some(error);
+                }
                 ServiceUpdate::Failed(error) => self.startup = StartupState::Failed(error),
             }
         }
@@ -2221,6 +2284,9 @@ impl SessionMvpView {
     }
 
     fn submit_prompt(&mut self, prompt: String) {
+        if self.session_launch.is_some() {
+            return;
+        }
         let attachments = std::mem::take(&mut self.draft_attachments);
         self.action_error = None;
         let supported_efforts = self
@@ -2239,6 +2305,15 @@ impl SessionMvpView {
                 SessionKind::Project,
             )
         };
+        if self.selected_session.is_none()
+            && kind == SessionKind::Project
+            && self.draft_location == SessionLocation::NewWorktree
+            && repository_root
+                .as_deref()
+                .is_some_and(|root| GitService::new(root).is_worktree())
+        {
+            self.session_launch = Some(SessionLaunchProgress::CreatingWorktree);
+        }
         let _ = self.commands.send(ServiceCommand::Submit {
             app_session_id: self.selected_session.clone(),
             prompt,
@@ -5646,6 +5721,9 @@ impl SessionMvpView {
         };
         self.transcript_rows_rendered += 1;
         let content = match item.kind {
+            TimelineItemKind::SessionStart(item) => {
+                Some(Self::session_start_row(item, &snapshot.metadata).into_any_element())
+            }
             TimelineItemKind::Message(message_index) => snapshot
                 .transcript
                 .get(message_index)
@@ -5683,6 +5761,45 @@ impl SessionMvpView {
                     .children(content),
             )
             .into_any_element()
+    }
+
+    fn session_start_row(item: SessionStartItem, metadata: &SessionMetadata) -> impl IntoElement {
+        let (id, label, detail) = match item {
+            SessionStartItem::CreatingWorktree => ("creating-worktree", "Creating worktree", None),
+            SessionStartItem::WorktreeReady => (
+                "worktree-ready",
+                "Worktree ready",
+                Some(metadata.project_path.clone()),
+            ),
+            SessionStartItem::CopilotSessionStarted => {
+                ("copilot-session-started", "Copilot session started", None)
+            }
+        };
+        let aria_label = detail
+            .as_ref()
+            .map_or_else(|| label.to_owned(), |detail| format!("{label}: {detail}"));
+        div()
+            .id(SharedString::from(format!("session-start-{id}")))
+            .debug_selector(move || format!("session-start-{id}"))
+            .role(Role::Status)
+            .aria_label(aria_label)
+            .flex()
+            .items_center()
+            .gap_3()
+            .py_1()
+            .text_sm()
+            .text_color(rgb(MUTED))
+            .child(div().w(px(18.0)).text_color(rgb(GREEN)).child("✓"))
+            .child(label)
+            .when_some(detail, |row, detail| {
+                row.child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_color(rgb(MUTED))
+                        .child(detail),
+                )
+            })
     }
 
     fn transcript(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -7196,9 +7313,81 @@ impl SessionMvpView {
             )
     }
 
+    fn session_launch_progress(progress: SessionLaunchProgress) -> impl IntoElement {
+        let ready_path = match progress {
+            SessionLaunchProgress::CreatingWorktree => None,
+            SessionLaunchProgress::WorktreeReady(path) => Some(path),
+        };
+        div()
+            .id("session-launch-progress")
+            .role(Role::Status)
+            .aria_label(if ready_path.is_some() {
+                "Worktree created; starting Copilot session"
+            } else {
+                "Creating worktree"
+            })
+            .w_full()
+            .max_w(px(CONVERSATION_COLUMN_WIDTH))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .id("launch-creating-worktree")
+                    .debug_selector(|| "launch-creating-worktree".to_owned())
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .text_color(rgb(MUTED))
+                    .child(if ready_path.is_some() {
+                        div()
+                            .w(px(18.0))
+                            .text_color(rgb(GREEN))
+                            .child("✓")
+                            .into_any_element()
+                    } else {
+                        progress_spinner("launch-worktree-spinner".into()).into_any_element()
+                    })
+                    .child("Creating worktree..."),
+            )
+            .when_some(ready_path, |column, path| {
+                column
+                    .child(
+                        div()
+                            .id("launch-worktree-ready")
+                            .debug_selector(|| "launch-worktree-ready".to_owned())
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .text_color(rgb(MUTED))
+                            .child(div().w(px(18.0)).text_color(rgb(GREEN)).child("✓"))
+                            .child("Worktree ready")
+                            .child(
+                                div()
+                                    .min_w_0()
+                                    .overflow_hidden()
+                                    .child(path.to_string_lossy().into_owned()),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id("launch-copilot-session")
+                            .debug_selector(|| "launch-copilot-session".to_owned())
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .text_color(rgb(MUTED))
+                            .child(progress_spinner("launch-session-spinner".into()))
+                            .child("Starting Copilot session..."),
+                    )
+            })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn home(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let (provider_status, provider_color) = self.provider_status();
+        let launch = self.session_launch.clone();
+        let launching = launch.is_some();
 
         div()
             .id("home")
@@ -7230,23 +7419,28 @@ impl SessionMvpView {
                     .items_center()
                     .w_full()
                     .pt(if compact { px(92.0) } else { px(118.0) })
-                    .child(
-                        div()
-                            .id("gcabb-mark")
-                            .w(px(72.0))
-                            .h(px(72.0))
-                            .mb_10()
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(rgb(MUTED))
-                            .text_color(rgb(BACKGROUND))
-                            .text_xl()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("GC"),
-                    )
-                    .child(self.home_composer(cx)),
+                    .when(!launching, |column| {
+                        column.child(
+                            div()
+                                .id("gcabb-mark")
+                                .w(px(72.0))
+                                .h(px(72.0))
+                                .mb_10()
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(rgb(MUTED))
+                                .text_color(rgb(BACKGROUND))
+                                .text_xl()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child("GC"),
+                        )
+                    })
+                    .when_some(launch, |column, launch| {
+                        column.child(Self::session_launch_progress(launch))
+                    })
+                    .when(!launching, |column| column.child(self.home_composer(cx))),
             )
     }
 
@@ -9316,8 +9510,8 @@ mod tests {
         use std::sync::Arc;
 
         use crate::{
-            AppService, SCROLL_TO_BOTTOM_DURATION, ServiceCommand, ServiceUpdate, SessionMvpView,
-            SessionProjection, UpdateUi,
+            AppService, SCROLL_TO_BOTTOM_DURATION, ServiceCommand, ServiceUpdate,
+            SessionLaunchProgress, SessionMvpView, SessionProjection, UpdateUi,
         };
 
         fn snapshot(id: &str, title: &str) -> SessionSnapshot {
@@ -9418,6 +9612,87 @@ mod tests {
                 left_delta < 0.5 && width_delta < 0.5,
                 "{label} is not aligned: {actual:?} vs {expected:?}"
             );
+        }
+
+        #[gpui::test]
+        fn worktree_launch_shows_creation_before_ready(cx: &mut TestAppContext) {
+            let repository = tempfile::tempdir().expect("repository");
+            super::git(repository.path(), &["init", "-q"]);
+            let (view, cx, _commands, updates) = setup_for_bootstrap(cx);
+            view.update(cx, |view, cx| {
+                view.composing_chat = false;
+                view.selected_project = repository.path().to_owned();
+                view.workspace_root = repository.path().to_owned();
+                view.submit_prompt("Start a session".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("launch-creating-worktree").is_some());
+            assert!(cx.debug_bounds("launch-worktree-ready").is_none());
+
+            updates
+                .send(ServiceUpdate::SessionLaunchProgress(
+                    SessionLaunchProgress::WorktreeReady(std::path::PathBuf::from(
+                        "/tmp/worktrees/session",
+                    )),
+                ))
+                .unwrap();
+            view.update(cx, |view, cx| {
+                view.apply_service_updates(cx);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let creating = cx
+                .debug_bounds("launch-creating-worktree")
+                .expect("creation status rendered");
+            let ready = cx
+                .debug_bounds("launch-worktree-ready")
+                .expect("ready status rendered");
+            assert!(
+                creating.origin.y < ready.origin.y,
+                "creation status must precede worktree ready"
+            );
+            assert!(cx.debug_bounds("launch-copilot-session").is_some());
+        }
+
+        #[gpui::test]
+        fn completed_worktree_start_steps_precede_the_prompt(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.metadata.project_path = "/tmp/worktrees/session".to_owned();
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "prompt".to_owned(),
+                    role: app_model::TranscriptRole::User,
+                    content: "Start a session".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let creating = cx
+                .debug_bounds("session-start-creating-worktree")
+                .expect("creation status rendered");
+            let ready = cx
+                .debug_bounds("session-start-worktree-ready")
+                .expect("ready status rendered");
+            let started = cx
+                .debug_bounds("session-start-copilot-session-started")
+                .expect("session status rendered");
+            let prompt = cx
+                .debug_bounds("transcript-message")
+                .expect("submitted prompt rendered");
+            assert!(creating.origin.y < ready.origin.y);
+            assert!(ready.origin.y < started.origin.y);
+            assert!(started.origin.y < prompt.origin.y);
         }
 
         #[gpui::test]
