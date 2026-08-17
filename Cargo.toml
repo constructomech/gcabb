@@ -9,6 +9,7 @@ members = [
     "crates/git-service",
     "crates/gpui-shared-string",
     "crates/gpui-util",
+    "crates/session-orchestrator",
     "crates/session-manager",
     "crates/storage",
     "crates/test-harness",
@@ -44,6 +45,7 @@ rusqlite = { version = "0.37.0", features = ["bundled"] }
 serde = { version = "1.0.228", features = ["derive"] }
 serde_json = "1.0.149"
 session-manager = { path = "crates/session-manager" }
+session-orchestrator = { path = "crates/session-orchestrator" }
 storage = { path = "crates/storage" }
 syntect = { version = "5.3.0", default-features = false, features = ["default-fancy"] }
 tempfile = "3.27.0"

@@ -81,6 +81,12 @@ selectable.
 │    └─ selectable-base changes view                                      │
 │             │ immutable snapshots and compact deltas                    │
 │             ▼                                                           │
+│  SessionOrchestrator                                                    │
+│    ├─ worktree and branch naming / creation                             │
+│    ├─ runtime configuration and kickoff                                 │
+│    └─ explicit interactive activation or headless launch                │
+│             │                                                           │
+│             ▼                                                           │
 │  SessionManager                                                         │
 │    ├─ SessionActor per active session                                   │
 │    ├─ normalized DomainEvent log                                        │
@@ -100,6 +106,29 @@ selectable.
 │    └─ Diagnostics: tracing, metrics, exportable bundles                 │
 └─────────────────────────────────────────────────────────────────────────┘
 ```
+
+### Session launch boundary
+
+`crates/session-orchestrator` is the single application-level launch path.
+Desktop actions and future agent-created child sessions provide the same typed
+request: project and repository paths, project/chat kind, worktree/local
+location, prompt and attachments, model, mode, reasoning effort, context tier,
+base ref, title policy, and launch origin.
+
+The origin is intentionally about activation, not persistence. A
+`UserActivation` launch explicitly selects the new session as part of launch. A
+`Headless` launch creates the same isolated runtime and delivers the same
+kickoff without changing `selected_session` or UI focus. Parent/child
+relationships remain out of the model until the dedicated schema work.
+
+The orchestrator owns compensation because it knows which resources were
+created for one launch. If a later stage fails, it removes the failed runtime
+and persisted session, then removes only a clean worktree created under the
+configured GCABB worktree root and deletes only a safely merged branch. Dirty
+worktrees and unmerged branches are preserved, and incomplete compensation is
+returned as part of the launch error. `SessionManager` remains responsible for
+per-session SDK events, projections, persistence, and strong runtime isolation;
+it does not choose worktrees or UI selection.
 
 ## Technology
 
