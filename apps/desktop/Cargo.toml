@@ -20,6 +20,7 @@ pulldown-cmark.workspace = true
 session-manager.workspace = true
 serde_json.workspace = true
 storage.workspace = true
+syntect.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 ui-components.workspace = true
