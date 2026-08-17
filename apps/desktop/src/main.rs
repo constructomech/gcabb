@@ -7251,7 +7251,7 @@ impl SessionMvpView {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn interaction_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn interaction_prompt(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let session = self.selected()?;
         let interaction = session.snapshot.pending_interactions.first()?.clone();
         let app_session_id = session.id().to_owned();
@@ -7268,20 +7268,33 @@ impl SessionMvpView {
                 let kind = interaction.kind;
                 let id = interaction_id.clone();
                 let session_id = app_session_id.clone();
+                let selector = format!("interaction-choice-{index}");
                 div()
                     .id(("interaction-choice", index))
-                    .accessibility_id(format!("interaction-choice-{index}"))
+                    .debug_selector({
+                        let selector = selector.clone();
+                        move || selector.clone()
+                    })
+                    .accessibility_id(selector)
                     .role(Role::Button)
                     .aria_label(choice.clone())
                     .focusable()
                     .tab_stop(true)
                     .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .px_3()
                     .py_2()
                     .rounded_md()
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .child(choice.clone())
+                    .when(index == 0, |row| row.bg(rgb(SUBTLE)))
+                    .child(
+                        div()
+                            .w(px(28.0))
+                            .text_color(rgb(MUTED))
+                            .child(format!("{}.", index + 1)),
+                    )
+                    .child(div().flex_1().child(choice.clone()))
                     .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                     .on_click(cx.listener(move |view, _, _, _| {
                         let _ = view.commands.send(ServiceCommand::Respond {
@@ -7299,37 +7312,36 @@ impl SessionMvpView {
             .collect::<Vec<_>>();
         Some(
             div()
-                .id("interaction-dialog")
-                .accessibility_id("interaction-dialog")
-                .role(Role::Dialog)
+                .id("interaction-prompt")
+                .debug_selector(|| "interaction-prompt".to_owned())
+                .accessibility_id("interaction-prompt")
+                .role(Role::Group)
                 .aria_label(interaction.title.clone())
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(gpui::rgba(0x0000_00a8))
+                .w_full()
+                .px_5()
+                .pb_3()
                 .child(
                     div()
                         .id("interaction-panel")
-                        .w(px(560.0))
+                        .mx_auto()
+                        .w_full()
+                        .max_w(px(CONVERSATION_COLUMN_WIDTH))
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .p_5()
+                        .p_4()
                         .rounded_lg()
                         .bg(rgb(PANEL))
                         .border_1()
                         .border_color(rgb(BORDER))
-                        .shadow_lg()
                         .child(
                             div()
                                 .id("interaction-heading")
                                 .role(Role::Heading)
                                 .aria_level(2)
                                 .aria_label(interaction.title.clone())
-                                .text_xl()
-                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_lg()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .child(interaction.title),
                         )
                         .when(interaction.kind == InteractionKind::Permission, |dialog| {
@@ -7358,6 +7370,11 @@ impl SessionMvpView {
                         .when(interaction.kind != InteractionKind::Permission, |dialog| {
                             dialog.child(div().text_color(rgb(MUTED)).child(interaction.message))
                         })
+                        .when(
+                            interaction.kind != InteractionKind::Permission
+                                && !interaction.choices.is_empty(),
+                            |dialog| dialog.child(div().h(px(1.0)).bg(rgb(BORDER)).mx(px(-16.0))),
+                        )
                         .children(choices)
                         .when(interaction.allow_freeform, |dialog| {
                             dialog.child(
@@ -7380,9 +7397,14 @@ impl SessionMvpView {
                                         let response_choice = choice.clone();
                                         let response_session = app_session_id.clone();
                                         let response_id = interaction_id.clone();
+                                        let selector = format!("permission-scope-{index}");
                                         div()
                                             .id(("permission-scope", index))
-                                            .accessibility_id(format!("permission-scope-{index}"))
+                                            .debug_selector({
+                                                let selector = selector.clone();
+                                                move || selector.clone()
+                                            })
+                                            .accessibility_id(selector)
                                             .role(Role::Button)
                                             .aria_label(format!("{choice}. {description}"))
                                             .focusable()
@@ -7392,17 +7414,22 @@ impl SessionMvpView {
                                             })
                                             .flex()
                                             .items_center()
-                                            .justify_between()
-                                            .gap_4()
+                                            .gap_2()
                                             .px_3()
                                             .py_3()
                                             .rounded_md()
-                                            .border_1()
-                                            .border_color(rgb(BORDER))
+                                            .when(index == 0, |row| row.bg(rgb(SUBTLE)))
+                                            .child(
+                                                div()
+                                                    .w(px(28.0))
+                                                    .text_color(rgb(MUTED))
+                                                    .child(format!("{}.", index + 1)),
+                                            )
                                             .child(
                                                 div()
                                                     .flex()
                                                     .flex_col()
+                                                    .flex_1()
                                                     .gap_1()
                                                     .child(
                                                         div()
@@ -7723,8 +7750,21 @@ impl Render for SessionMvpView {
                                                     .child(error),
                                             )
                                         })
-                                        .child(
-                                            div().w_full().px_5().child(self.session_composer(cx)),
+                                        .when_some(self.interaction_prompt(cx), |column, prompt| {
+                                            column.child(prompt)
+                                        })
+                                        .when(
+                                            self.selected().is_some_and(|session| {
+                                                session.snapshot.pending_interactions.is_empty()
+                                            }),
+                                            |column| {
+                                                column.child(
+                                                    div()
+                                                        .w_full()
+                                                        .px_5()
+                                                        .child(self.session_composer(cx)),
+                                                )
+                                            },
                                         ),
                                 )
                                 .when_some(
@@ -7800,9 +7840,6 @@ impl Render for SessionMvpView {
             .when_some(self.settings_dialog(cx), gpui::ParentElement::child)
             .when_some(self.diagnostics_dialog(cx), gpui::ParentElement::child)
             .when_some(self.image_preview_overlay(cx), gpui::ParentElement::child)
-            .when_some(self.interaction_dialog(cx), |root, dialog| {
-                root.child(dialog)
-            })
     }
 }
 
@@ -9309,7 +9346,8 @@ mod tests {
 
     mod interaction {
         use app_model::{
-            SessionKind, SessionMetadata, SessionSnapshot, SessionStatus, TitleSource,
+            InteractionKind, InteractionRequest, InteractionResponse, SessionKind, SessionMetadata,
+            SessionSnapshot, SessionStatus, TitleSource,
         };
         use gpui::{FollowMode, Modifiers, MouseButton, TestAppContext, VisualTestContext};
         use session_manager::SessionHandle;
@@ -9337,6 +9375,25 @@ mod tests {
             });
             state.status = app_model::SessionStatus::Idle;
             state
+        }
+
+        fn interaction(
+            kind: InteractionKind,
+            title: &str,
+            message: &str,
+            choices: &[&str],
+            allow_freeform: bool,
+        ) -> InteractionRequest {
+            InteractionRequest {
+                id: "interaction-1".to_owned(),
+                session_id: "sdk-session-1".to_owned(),
+                kind,
+                title: title.to_owned(),
+                message: message.to_owned(),
+                choices: choices.iter().map(|choice| (*choice).to_owned()).collect(),
+                allow_freeform,
+                details: serde_json::Value::Null,
+            }
         }
 
         /// Build the real view with one session row rendered.
@@ -9731,6 +9788,99 @@ mod tests {
             cx.simulate_click(close.center(), Modifiers::none());
             cx.run_until_parked();
             assert!(cx.debug_bounds("diagnostics-dialog").is_none());
+        }
+
+        #[gpui::test]
+        fn pending_question_is_inline_and_replaces_the_composer(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                Arc::make_mut(&mut view.sessions[0].snapshot)
+                    .pending_interactions
+                    .push(interaction(
+                        InteractionKind::UserInput,
+                        "Choose a direction",
+                        "Which approach should I take?",
+                        &["Keep it simple", "Add configuration"],
+                        true,
+                    ));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let transcript = cx.debug_bounds("transcript").expect("transcript rendered");
+            let prompt = cx
+                .debug_bounds("interaction-prompt")
+                .expect("inline interaction rendered");
+            assert!(
+                prompt.origin.y >= transcript.origin.y + transcript.size.height,
+                "interaction should follow the transcript instead of covering it"
+            );
+            assert!(
+                cx.debug_bounds("composer").is_none(),
+                "the regular composer should not compete with a pending question"
+            );
+
+            let choice = cx
+                .debug_bounds("interaction-choice-0")
+                .expect("question choice rendered");
+            cx.simulate_click(choice.center(), Modifiers::none());
+            match commands.try_recv().expect("a response was sent") {
+                ServiceCommand::Respond {
+                    app_session_id,
+                    interaction_id,
+                    response,
+                } => {
+                    assert_eq!(app_session_id, "session-1");
+                    assert_eq!(interaction_id, "interaction-1");
+                    assert_eq!(
+                        response,
+                        InteractionResponse::Submit {
+                            value: "Keep it simple".into(),
+                            freeform: false,
+                        }
+                    );
+                }
+                _ => panic!("expected an interaction response"),
+            }
+        }
+
+        #[gpui::test]
+        fn pending_permission_is_inline_and_keeps_scope_actions(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                Arc::make_mut(&mut view.sessions[0].snapshot)
+                    .pending_interactions
+                    .push(interaction(
+                        InteractionKind::Permission,
+                        "Permission required",
+                        "Run cargo test",
+                        &["Allow once", "Allow for this session", "Deny"],
+                        false,
+                    ));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("interaction-prompt").is_some());
+            assert!(cx.debug_bounds("composer").is_none());
+            let scope = cx
+                .debug_bounds("permission-scope-1")
+                .expect("session permission rendered");
+            cx.simulate_click(scope.center(), Modifiers::none());
+            match commands.try_recv().expect("a response was sent") {
+                ServiceCommand::Respond {
+                    app_session_id,
+                    interaction_id,
+                    response,
+                } => {
+                    assert_eq!(app_session_id, "session-1");
+                    assert_eq!(interaction_id, "interaction-1");
+                    assert_eq!(response, InteractionResponse::ApproveForSession);
+                }
+                _ => panic!("expected an interaction response"),
+            }
         }
 
         #[gpui::test]
