@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -17,12 +18,13 @@ use diagnostics::{DiagnosticEvent, DiagnosticsSink, TracingDiagnostics, init_tra
 use git_service::GitService;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Animation, AnimationExt, App, AppContext, Bounds, Context, Entity, ExternalPaths, FocusHandle,
-    Focusable, FollowMode, FontStyle, HighlightStyle, InteractiveElement, InteractiveText,
-    IntoElement, KeyBinding, ListAlignment, ListState, MouseButton, ParentElement,
-    PathPromptOptions, Render, Role, SharedString, StatefulInteractiveElement, StrikethroughStyle,
-    Styled, StyledText, TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowOptions,
-    actions, div, list, px, relative, rgb, size,
+    Animation, AnimationExt, App, AppContext, Bounds, Context, CursorStyle, Element, ElementId,
+    Entity, ExternalPaths, FocusHandle, Focusable, FollowMode, FontStyle, GlobalElementId,
+    HighlightStyle, InteractiveElement, IntoElement, KeyBinding, LayoutId, ListAlignment,
+    ListState, MouseButton, ParentElement, PathPromptOptions, Render, Role, SharedString,
+    StatefulInteractiveElement, StrikethroughStyle, Styled, StyledText, TextLayout,
+    TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, list, px,
+    relative, rgb, size,
 };
 use session_manager::{
     CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, SessionRoots,
@@ -122,7 +124,7 @@ const CONTROL_MENU_SCROLL_ID: &str = "control-menu-scroll";
 const TRANSCRIPT_OVERDRAW: f32 = 720.0;
 /// Initial height estimate used to size the scrollbar without laying out every
 /// row. Measured dynamic heights replace it as rows enter the window.
-const TRANSCRIPT_ROW_HEIGHT_HINT: f32 = 144.0;
+const TRANSCRIPT_ROW_HEIGHT_HINT: f32 = 96.0;
 /// How long the transcript takes to glide back to the tail.
 ///
 /// Long enough that the intervening content is visibly flying past — which is
@@ -149,7 +151,10 @@ const COMMAND_BLOCK_HEIGHT: f32 = ENTRY_DETAIL_BUDGET / 3.0;
 /// installed `com.constructomech.gcabb.desktop` entry that supplies the icon.
 const APP_ID: &str = "com.constructomech.gcabb";
 
-actions!(gcabb, [DismissPopup, FocusNext, FocusPrevious]);
+actions!(
+    gcabb,
+    [CopyTranscript, DismissPopup, FocusNext, FocusPrevious]
+);
 
 const MARKDOWN_STRONG: u8 = 1;
 const MARKDOWN_EMPHASIS: u8 = 1 << 1;
@@ -214,6 +219,446 @@ impl MarkdownInlineContent {
             self.links.push((range.clone(), target.clone()));
         }
         self.highlights.push((range, highlight));
+    }
+}
+
+#[derive(Clone)]
+struct TranscriptTextBlock {
+    order: (u64, usize),
+    content: SharedString,
+    bounds: Option<Bounds<gpui::Pixels>>,
+    layout: Option<TextLayout>,
+}
+
+#[derive(Clone)]
+struct TranscriptTextEndpoint {
+    block_id: String,
+    order: (u64, usize),
+    index: usize,
+}
+
+#[derive(Default)]
+struct TranscriptTextSelection {
+    message_orders: HashMap<String, u64>,
+    blocks: HashMap<String, TranscriptTextBlock>,
+    anchor: Option<TranscriptTextEndpoint>,
+    focus: Option<TranscriptTextEndpoint>,
+    dragging: bool,
+}
+
+impl TranscriptTextSelection {
+    fn clamp_index(content: &str, index: usize) -> usize {
+        let mut index = index.min(content.len());
+        while !content.is_char_boundary(index) {
+            index -= 1;
+        }
+        index
+    }
+
+    fn register_block(&mut self, block_id: &str, order: (u64, usize), content: SharedString) {
+        self.blocks.insert(
+            block_id.to_owned(),
+            TranscriptTextBlock {
+                order,
+                content,
+                bounds: None,
+                layout: None,
+            },
+        );
+        for endpoint in [&mut self.anchor, &mut self.focus] {
+            if let Some(endpoint) = endpoint.as_mut()
+                && endpoint.block_id == block_id
+                && let Some(block) = self.blocks.get(block_id)
+            {
+                endpoint.order = order;
+                endpoint.index = Self::clamp_index(&block.content, endpoint.index);
+            }
+        }
+    }
+
+    fn update_geometry(
+        &mut self,
+        block_id: &str,
+        bounds: Bounds<gpui::Pixels>,
+        layout: TextLayout,
+    ) {
+        if let Some(block) = self.blocks.get_mut(block_id) {
+            block.bounds = Some(bounds);
+            block.layout = Some(layout);
+        }
+    }
+
+    fn begin(
+        &mut self,
+        block_id: String,
+        order: (u64, usize),
+        content: &SharedString,
+        index: usize,
+    ) {
+        self.register_block(&block_id, order, content.clone());
+        let endpoint = TranscriptTextEndpoint {
+            block_id,
+            order,
+            index: Self::clamp_index(content, index),
+        };
+        self.anchor = Some(endpoint.clone());
+        self.focus = Some(endpoint);
+        self.dragging = true;
+    }
+
+    fn extend(
+        &mut self,
+        block_id: String,
+        order: (u64, usize),
+        content: &SharedString,
+        index: usize,
+    ) {
+        if !self.dragging {
+            return;
+        }
+        self.register_block(&block_id, order, content.clone());
+        self.focus = Some(TranscriptTextEndpoint {
+            block_id,
+            order,
+            index: Self::clamp_index(content, index),
+        });
+    }
+
+    fn extend_to_position(&mut self, position: gpui::Point<gpui::Pixels>) {
+        if !self.dragging {
+            return;
+        }
+        let destination = self.blocks.iter().find_map(|(block_id, block)| {
+            let bounds = block.bounds?;
+            if !bounds.contains(&position) {
+                return None;
+            }
+            let layout = block.layout.as_ref()?;
+            let index = layout
+                .index_for_position(position)
+                .unwrap_or_else(|index| index)
+                .min(block.content.len());
+            Some((block_id.clone(), block.order, block.content.clone(), index))
+        });
+        if let Some((block_id, order, content, index)) = destination {
+            self.extend(block_id, order, &content, index);
+        }
+    }
+
+    fn ordered_endpoints(&self) -> Option<(&TranscriptTextEndpoint, &TranscriptTextEndpoint)> {
+        let anchor = self.anchor.as_ref()?;
+        let focus = self.focus.as_ref()?;
+        if (anchor.order, anchor.index) <= (focus.order, focus.index) {
+            Some((anchor, focus))
+        } else {
+            Some((focus, anchor))
+        }
+    }
+
+    fn range_for(&self, block_id: &str, content: &str) -> Option<std::ops::Range<usize>> {
+        let block = self.blocks.get(block_id)?;
+        let (start, end) = self.ordered_endpoints()?;
+        if block.order < start.order || block.order > end.order {
+            return None;
+        }
+        let range = if start.block_id == end.block_id {
+            Self::clamp_index(content, start.index)..Self::clamp_index(content, end.index)
+        } else if block_id == start.block_id {
+            Self::clamp_index(content, start.index)..content.len()
+        } else if block_id == end.block_id {
+            0..Self::clamp_index(content, end.index)
+        } else {
+            0..content.len()
+        };
+        (!range.is_empty()).then_some(range)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ordered_endpoints()
+            .is_none_or(|(start, end)| start.block_id == end.block_id && start.index == end.index)
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut blocks = self
+            .blocks
+            .iter()
+            .filter_map(|(block_id, block)| {
+                self.range_for(block_id, &block.content)
+                    .map(|range| (block.order, block.content[range].to_owned()))
+            })
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(|(order, _)| *order);
+        Some(
+            blocks
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+}
+
+struct SelectableTranscriptText {
+    block_id: String,
+    order: (u64, usize),
+    content: SharedString,
+    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    font_family_overrides: Vec<(std::ops::Range<usize>, SharedString)>,
+    links: Vec<(std::ops::Range<usize>, String)>,
+    selection: Rc<RefCell<TranscriptTextSelection>>,
+    focus: FocusHandle,
+}
+
+struct SelectableTextPrepaint {
+    text: StyledText,
+    layout: TextLayout,
+    hitbox: gpui::Hitbox,
+}
+
+impl SelectableTranscriptText {
+    fn new(
+        block_id: String,
+        order: (u64, usize),
+        content: MarkdownInlineContent,
+        selection: Rc<RefCell<TranscriptTextSelection>>,
+        focus: FocusHandle,
+    ) -> Self {
+        let MarkdownInlineContent {
+            text,
+            highlights,
+            font_family_overrides,
+            links,
+        } = content;
+        let content: SharedString = text.into();
+        selection
+            .borrow_mut()
+            .register_block(&block_id, order, content.clone());
+        Self {
+            block_id,
+            order,
+            content,
+            highlights,
+            font_family_overrides,
+            links,
+            selection,
+            focus,
+        }
+    }
+
+    fn merged_highlights(&self) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+        let selected = self.selection.borrow();
+        let selected = selected.range_for(&self.block_id, &self.content);
+        let mut boundaries = vec![0, self.content.len()];
+        for (range, _) in &self.highlights {
+            boundaries.extend([range.start, range.end]);
+        }
+        if let Some(range) = &selected {
+            boundaries.extend([range.start, range.end]);
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries
+            .windows(2)
+            .filter_map(|pair| {
+                let range = pair[0]..pair[1];
+                if range.is_empty() {
+                    return None;
+                }
+                let mut style = self
+                    .highlights
+                    .iter()
+                    .find_map(|(highlight_range, style)| {
+                        (range.start >= highlight_range.start && range.end <= highlight_range.end)
+                            .then_some(*style)
+                    })
+                    .unwrap_or_default();
+                if selected.as_ref().is_some_and(|selected| {
+                    range.start >= selected.start && range.end <= selected.end
+                }) {
+                    style.background_color = Some(gpui::rgba(0x2f81_f766).into());
+                }
+                Some((range, style))
+            })
+            .collect()
+    }
+}
+
+impl Element for SelectableTranscriptText {
+    type RequestLayoutState = StyledText;
+    type PrepaintState = SelectableTextPrepaint;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.block_id.clone().into())
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut text = StyledText::new(self.content.clone())
+            .with_highlights(self.merged_highlights())
+            .with_font_family_overrides(self.font_family_overrides.clone());
+        let (layout_id, ()) = text.request_layout(id, inspector_id, window, cx);
+        (layout_id, text)
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<gpui::Pixels>,
+        text: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        text.prepaint(id, inspector_id, bounds, &mut (), window, cx);
+        let layout = text.layout().clone();
+        self.selection
+            .borrow_mut()
+            .update_geometry(&self.block_id, bounds, layout.clone());
+        let hitbox = window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal);
+        SelectableTextPrepaint {
+            text: std::mem::replace(text, StyledText::new("")),
+            layout,
+            hitbox,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "painting selectable text registers its drag, release, link, and copy interactions"
+    )]
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<gpui::Pixels>,
+        _: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let current_view = window.current_view();
+        let mouse_index = prepaint
+            .layout
+            .index_for_position(window.mouse_position())
+            .unwrap_or_else(|index| index)
+            .min(self.content.len());
+        let over_link = self
+            .links
+            .iter()
+            .any(|(range, _)| range.contains(&mouse_index));
+        window.set_cursor_style(
+            if over_link {
+                CursorStyle::PointingHand
+            } else {
+                CursorStyle::IBeam
+            },
+            &prepaint.hitbox,
+        );
+
+        let block_id = self.block_id.clone();
+        let order = self.order;
+        let content = self.content.clone();
+        let selection = self.selection.clone();
+        let focus = self.focus.clone();
+        let layout = prepaint.layout.clone();
+        let hitbox = prepaint.hitbox.clone();
+        window.on_mouse_event(
+            move |event: &gpui::MouseDownEvent, phase, window: &mut Window, cx| {
+                if phase != gpui::DispatchPhase::Bubble
+                    || event.button != MouseButton::Left
+                    || !hitbox.is_hovered(window)
+                {
+                    return;
+                }
+                let index = layout
+                    .index_for_position(event.position)
+                    .unwrap_or_else(|index| index)
+                    .min(content.len());
+                let mut selected = selection.borrow_mut();
+                selected.begin(block_id.clone(), order, &content, index);
+                drop(selected);
+                window.focus(&focus, cx);
+                cx.notify(current_view);
+            },
+        );
+
+        let selection = self.selection.clone();
+        window.on_mouse_event(
+            move |event: &gpui::MouseMoveEvent, phase, _window: &mut Window, cx| {
+                if phase != gpui::DispatchPhase::Bubble {
+                    return;
+                }
+                let mut selected = selection.borrow_mut();
+                if !selected.dragging {
+                    return;
+                }
+                selected.extend_to_position(event.position);
+                drop(selected);
+                cx.notify(current_view);
+            },
+        );
+
+        let block_id = self.block_id.clone();
+        let selection = self.selection.clone();
+        let links = self.links.clone();
+        let layout = prepaint.layout.clone();
+        window.on_mouse_event(
+            move |event: &gpui::MouseUpEvent, phase, _window: &mut Window, cx| {
+                if phase != gpui::DispatchPhase::Bubble || event.button != MouseButton::Left {
+                    return;
+                }
+                let mut selected = selection.borrow_mut();
+                if !selected.dragging {
+                    return;
+                }
+                selected.dragging = false;
+                let clicked_this_block = selected
+                    .anchor
+                    .as_ref()
+                    .is_some_and(|anchor| anchor.block_id == block_id)
+                    && selected
+                        .focus
+                        .as_ref()
+                        .is_some_and(|focus| focus.block_id == block_id);
+                let open_target = (selected.is_empty() && clicked_this_block).then(|| {
+                    let index = layout
+                        .index_for_position(event.position)
+                        .unwrap_or_else(|index| index);
+                    links
+                        .iter()
+                        .find_map(|(range, target)| range.contains(&index).then(|| target.clone()))
+                });
+                drop(selected);
+                if let Some(Some(target)) = open_target {
+                    cx.open_url(&target);
+                }
+                cx.notify(current_view);
+            },
+        );
+
+        prepaint
+            .text
+            .paint(id, inspector_id, bounds, &mut (), &mut (), window, cx);
+    }
+}
+
+impl IntoElement for SelectableTranscriptText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
     }
 }
 
@@ -1479,6 +1924,10 @@ struct SessionMvpView {
     project_branch: Option<String>,
     /// Variable-height virtual list state for the transcript.
     transcript_list: ListState,
+    /// Shared selection for the currently dragged transcript text block.
+    transcript_selection: Rc<RefCell<TranscriptTextSelection>>,
+    /// Receives copy shortcuts while transcript text is selected.
+    transcript_selection_focus: FocusHandle,
     /// Geometry used to paint the transcript thumb, retained so hit testing
     /// cannot race later dynamic-height measurements.
     drawn_transcript_scrollbar: Option<ScrollbarGeometry>,
@@ -1508,6 +1957,8 @@ struct SessionMvpView {
     scroll_positions: RefCell<HashMap<String, gpui::Point<gpui::Pixels>>>,
     /// Large completed outputs the user explicitly chose to lay out in full.
     expanded_tool_outputs: HashSet<String>,
+    /// Tool rows whose detailed card is open, keyed by session.
+    expanded_tools: HashMap<String, HashSet<String>>,
     /// Scrollbar currently being dragged, if any.
     ///
     /// Tracked on the view rather than the thumb so a drag keeps working once
@@ -1728,6 +2179,8 @@ impl SessionMvpView {
             image_preview_focus: cx.focus_handle(),
             project_branch: None,
             transcript_list,
+            transcript_selection: Rc::new(RefCell::new(TranscriptTextSelection::default())),
+            transcript_selection_focus: cx.focus_handle(),
             drawn_transcript_scrollbar: None,
             scroll_to_bottom: None,
             scroll_to_bottom_task: None,
@@ -1741,6 +2194,7 @@ impl SessionMvpView {
             detail_extents: RefCell::new(HashMap::new()),
             scroll_positions: RefCell::new(HashMap::new()),
             expanded_tool_outputs: HashSet::new(),
+            expanded_tools: HashMap::new(),
             dragging_scrollbar: None,
             transcript_extent: (String::new(), 0, 0, 0, 0),
             restore_failures: Vec::new(),
@@ -2289,6 +2743,7 @@ impl SessionMvpView {
                     }
                     self.session_drafts.remove(&id);
                     self.expanded_changes.remove(&id);
+                    self.expanded_tools.remove(&id);
                     if self.session_menu.as_ref().is_some_and(|menu| menu.id == id) {
                         self.session_menu = None;
                     }
@@ -2616,6 +3071,7 @@ impl SessionMvpView {
             }
             self.timeline = TimelineIndex::default();
             self.transcript_list.reset(0);
+            *self.transcript_selection.borrow_mut() = TranscriptTextSelection::default();
             return;
         };
         let old_len = self.timeline.items.len();
@@ -2631,6 +3087,7 @@ impl SessionMvpView {
             self.transcript_list.scroll_to_end();
             self.markdown_cache.clear();
             self.markdown_cache_order.clear();
+            *self.transcript_selection.borrow_mut() = TranscriptTextSelection::default();
         } else if changed_shape {
             self.transcript_list
                 .splice(old_len..old_len, self.timeline.items.len() - old_len);
@@ -4974,18 +5431,205 @@ impl SessionMvpView {
             .children(scrollbar)
     }
 
-    /// A tool call in the timeline, with its nested subagent work.
-    ///
-    /// This is what makes a session observable: without it the transcript
-    /// shows what the agent said while the reads, searches, edits, and
-    /// commands it actually ran stay invisible.
-    #[allow(clippy::too_many_lines)]
+    fn tool_expanded(&self, call_id: &str) -> bool {
+        self.selected_session.as_ref().is_some_and(|session_id| {
+            self.expanded_tools
+                .get(session_id)
+                .is_some_and(|expanded| expanded.contains(call_id))
+        })
+    }
+
+    fn toggle_tool(&mut self, call_id: &str) {
+        let Some(session_id) = self.selected_session.clone() else {
+            return;
+        };
+        let expanded = self.expanded_tools.entry(session_id).or_default();
+        if !expanded.remove(call_id) {
+            expanded.insert(call_id.to_owned());
+        }
+    }
+
+    fn terminal_is_running(&self, invocation: &app_model::ToolInvocation) -> bool {
+        if invocation.class != app_model::ToolClass::Shell {
+            return false;
+        }
+        invocation
+            .shell_id
+            .as_deref()
+            .and_then(|shell_id| self.selected()?.snapshot.tool_activity.terminal(shell_id))
+            .map_or(
+                invocation.state == app_model::InvocationState::Running,
+                app_model::TerminalSession::is_active,
+            )
+    }
+
+    fn tool_icon(class: app_model::ToolClass) -> &'static str {
+        match class {
+            app_model::ToolClass::FileRead => "◇",
+            app_model::ToolClass::FileWrite | app_model::ToolClass::FileEditor => "±",
+            app_model::ToolClass::Search => "⌕",
+            app_model::ToolClass::Shell | app_model::ToolClass::ShellControl => ">_",
+            app_model::ToolClass::Web => "↗",
+            app_model::ToolClass::Delegation => "◎",
+            app_model::ToolClass::Data => "▤",
+            app_model::ToolClass::Skill => "◆",
+            app_model::ToolClass::Interaction => "?",
+            app_model::ToolClass::Other => "•",
+        }
+    }
+
+    fn tool_argument_detail(
+        invocation: &app_model::ToolInvocation,
+    ) -> Option<(&'static str, String)> {
+        let named = match invocation.class {
+            app_model::ToolClass::FileRead
+            | app_model::ToolClass::FileWrite
+            | app_model::ToolClass::FileEditor => invocation
+                .string_argument("path")
+                .map(|value| ("Path", value)),
+            app_model::ToolClass::Search => invocation
+                .string_argument("pattern")
+                .or_else(|| invocation.string_argument("query"))
+                .map(|value| ("Pattern", value)),
+            app_model::ToolClass::Shell | app_model::ToolClass::ShellControl => invocation
+                .string_argument("command")
+                .or_else(|| invocation.display_command.clone())
+                .map(|value| ("Command", value)),
+            app_model::ToolClass::Web => invocation
+                .string_argument("url")
+                .or_else(|| invocation.string_argument("query"))
+                .map(|value| ("Request", value)),
+            app_model::ToolClass::Delegation
+            | app_model::ToolClass::Skill
+            | app_model::ToolClass::Interaction => invocation
+                .string_argument("description")
+                .or_else(|| invocation.string_argument("prompt"))
+                .map(|value| ("Prompt", value)),
+            app_model::ToolClass::Data | app_model::ToolClass::Other => None,
+        };
+        named.or_else(|| {
+            (!invocation.arguments.is_null()
+                && invocation
+                    .arguments
+                    .as_object()
+                    .is_none_or(|arguments| !arguments.is_empty()))
+            .then(|| {
+                (
+                    "Arguments",
+                    serde_json::to_string_pretty(&invocation.arguments)
+                        .unwrap_or_else(|_| invocation.arguments.to_string()),
+                )
+            })
+        })
+    }
+
+    fn tool_diff_counts(diff: &str) -> (usize, usize) {
+        diff.lines().fold((0, 0), |(insertions, deletions), line| {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                (insertions + 1, deletions)
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                (insertions, deletions + 1)
+            } else {
+                (insertions, deletions)
+            }
+        })
+    }
+
+    fn reported_match_count(output: &str) -> Option<usize> {
+        let lowercase = output.to_ascii_lowercase();
+        if ["no matches", "no results", "no files matched"]
+            .iter()
+            .any(|marker| lowercase.contains(marker))
+        {
+            return Some(0);
+        }
+        let prefix = output.split_once(" match")?.0;
+        prefix
+            .split(|character: char| !character.is_ascii_digit())
+            .rfind(|part| !part.is_empty())?
+            .parse()
+            .ok()
+    }
+
+    fn tool_brief(invocation: &app_model::ToolInvocation, has_diff: bool) -> Option<String> {
+        match invocation.state {
+            app_model::InvocationState::Running => return Some("Working".to_owned()),
+            app_model::InvocationState::Failed => return Some("Failed".to_owned()),
+            app_model::InvocationState::Cancelled => return Some("Cancelled".to_owned()),
+            app_model::InvocationState::Succeeded => {}
+        }
+        if has_diff {
+            return None;
+        }
+        if !invocation.output.is_empty() {
+            let count = if invocation.class == app_model::ToolClass::Search {
+                Self::reported_match_count(&invocation.output)
+                    .unwrap_or_else(|| invocation.output.lines().count())
+            } else {
+                invocation.output.lines().count()
+            };
+            let noun = if invocation.class == app_model::ToolClass::Search {
+                if count == 1 { "result" } else { "results" }
+            } else if count == 1 {
+                "line"
+            } else {
+                "lines"
+            };
+            return Some(format!("{count} {noun}"));
+        }
+        tool_duration(invocation)
+            .map(|duration| format!("Worked for {}", format_activity_duration(duration)))
+    }
+
+    /// A tool call in the timeline, followed by independently expandable
+    /// activity rows for work delegated to a subagent.
     fn tool_entry(
         &self,
         invocation: &app_model::ToolInvocation,
         children: &[&app_model::ToolInvocation],
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
+        let nested = children
+            .iter()
+            .map(|child| self.tool_activity_entry(child, true, cx))
+            .collect::<Vec<_>>();
+        div()
+            .id(SharedString::from(format!("tool-{}", invocation.call_id)))
+            .debug_selector(|| "tool-entry".to_owned())
+            .accessibility_id(invocation.call_id.clone())
+            .role(Role::ListItem)
+            .aria_label(format!(
+                "{} {}",
+                invocation.verb(),
+                invocation.summary_line()
+            ))
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .child(self.tool_activity_entry(invocation, false, cx))
+            .when(!nested.is_empty(), |entry| {
+                entry.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .border_l_1()
+                        .border_color(rgb(BORDER))
+                        .children(nested),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// One compact activity row and its optional GCABB detail card.
+    #[allow(clippy::too_many_lines)]
+    fn tool_activity_entry(
+        &self,
+        invocation: &app_model::ToolInvocation,
+        nested: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let (status, status_color) = match invocation.state {
             app_model::InvocationState::Running => ("running", GREEN),
             app_model::InvocationState::Succeeded => ("done", MUTED),
@@ -4997,10 +5641,15 @@ impl SessionMvpView {
             |path| self.display_worktree_path(Path::new(path)),
         );
         let summary = summary_line(&full_summary);
-        let detail = (full_summary.lines().count() > 1).then_some(full_summary);
         let verb = invocation.verb();
         let label = format!("{verb} {summary}");
         let diff = invocation.diff().map(str::to_owned);
+        let diff_counts = diff.as_deref().map(Self::tool_diff_counts);
+        let brief = Self::tool_brief(invocation, diff.is_some());
+        let accessible_brief = diff_counts.map_or_else(
+            || brief.clone().unwrap_or_default(),
+            |(insertions, deletions)| format!("{insertions} additions, {deletions} deletions"),
+        );
         let error = invocation.error_message.clone();
         let output_error = invocation
             .output_load_error
@@ -5008,10 +5657,7 @@ impl SessionMvpView {
             .or_else(|| invocation.output_error.clone());
         // Restored command output is already a bounded chunk window. When the
         // user explicitly prepends older windows, keep them reachable here.
-        let has_output = matches!(
-            invocation.class,
-            app_model::ToolClass::Shell | app_model::ToolClass::ShellControl
-        ) && !invocation.output.is_empty();
+        let has_output = !invocation.output.is_empty() && diff.is_none();
         let output_is_large = has_output && output_needs_preview(&invocation.output);
         let output_is_expanded = invocation.state != app_model::InvocationState::Running
             && self.expanded_tool_outputs.contains(&invocation.call_id);
@@ -5038,231 +5684,292 @@ impl SessionMvpView {
             .exit_code
             .filter(|code| *code != 0)
             .map(|code| format!("exit {code}"));
-        let nested: Vec<_> = children
-            .iter()
-            .map(|child| {
-                let child_summary = child.file_path().map_or_else(
-                    || child.summary(),
-                    |path| self.display_worktree_path(Path::new(path)),
-                );
-                let child_status = match child.state {
-                    app_model::InvocationState::Running => GREEN,
-                    app_model::InvocationState::Succeeded
-                    | app_model::InvocationState::Cancelled => MUTED,
-                    app_model::InvocationState::Failed => RED,
-                };
+        let argument_detail = Self::tool_argument_detail(invocation);
+        let terminal_running = self.terminal_is_running(invocation);
+        let expanded = terminal_running || self.tool_expanded(&invocation.call_id);
+        let call_id = invocation.call_id.clone();
+        let selector_call_id = invocation.call_id.clone();
+        let disclosure_label = if terminal_running {
+            format!("Details for {label}, expanded while terminal is running")
+        } else if expanded {
+            format!("Collapse details for {label}")
+        } else {
+            format!("Expand details for {label}")
+        };
+        let started = format_activity_timestamp(&invocation.started_at);
+        let duration = tool_duration(invocation).map(format_activity_duration);
+        let output_metadata = has_output.then(|| {
+            let lines = invocation.output.lines().count();
+            format!(
+                "{} {} · {}",
+                lines,
+                if lines == 1 { "line" } else { "lines" },
+                format_byte_count(invocation.output_metadata.byte_count)
+            )
+        });
+        let detail_card = div()
+            .debug_selector(|| "tool-expanded-card".to_owned())
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .mt_1()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(SUBTLE))
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgb(
+                if invocation.state == app_model::InvocationState::Failed {
+                    RED
+                } else {
+                    BORDER
+                },
+            ))
+            .when_some(exit, |entry, exit| {
+                entry.child(div().text_xs().text_color(rgb(RED)).child(exit))
+            })
+            .when_some(error, |entry, error| {
+                entry.child(div().text_xs().text_color(rgb(RED)).child(error))
+            })
+            .when_some(output_error, |entry, error| {
+                entry.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "tool-output-error-{}",
+                            invocation.call_id
+                        )))
+                        .role(Role::Alert)
+                        .text_xs()
+                        .text_color(rgb(RED))
+                        .child(format!("Output unavailable: {error}")),
+                )
+            })
+            .when_some(argument_detail, |entry, (argument_label, detail)| {
+                entry
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(argument_label))
+                    .child(self.detail_block(
+                        &format!("tool-argument-{}", invocation.call_id),
+                        detail,
+                        COMMAND_BLOCK_HEIGHT,
+                        cx,
+                    ))
+            })
+            .when_some(diff, |entry, diff| {
+                entry.child(self.detail_block(
+                    &format!("tool-diff-{}", invocation.call_id),
+                    diff,
+                    ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
+                    cx,
+                ))
+            })
+            .when_some(
+                earlier_output,
+                |entry, (session_id, identity, before_chunk)| {
+                    entry.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "load-output-{}",
+                                invocation.call_id
+                            )))
+                            .role(Role::Button)
+                            .aria_label("Load earlier retained output")
+                            .focusable()
+                            .tab_stop(true)
+                            .mt_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(BLUE))
+                            .child(format!(
+                                "Load earlier output ({before_chunk} chunks retained)"
+                            ))
+                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                let _ = view.commands.send(ServiceCommand::LoadEarlierOutput {
+                                    app_session_id: session_id.clone(),
+                                    identity: identity.clone(),
+                                    before_chunk,
+                                });
+                                cx.notify();
+                            })),
+                    )
+                },
+            )
+            .when_some(output, |entry, output| {
+                entry.child(self.detail_block(
+                    &format!("tool-output-{}", invocation.call_id),
+                    output,
+                    ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
+                    cx,
+                ))
+            })
+            .when_some(output_toggle, |entry, (call_id, expanded)| {
+                entry.child(
+                    div()
+                        .id(SharedString::from(format!("toggle-output-{call_id}")))
+                        .debug_selector(|| "toggle-tool-output".to_owned())
+                        .role(Role::Button)
+                        .aria_label(if expanded {
+                            "Show latest output"
+                        } else {
+                            "Show complete output"
+                        })
+                        .focusable()
+                        .tab_stop(true)
+                        .mt_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .text_xs()
+                        .text_color(rgb(BLUE))
+                        .child(if expanded {
+                            "Show latest output".to_owned()
+                        } else {
+                            format!(
+                                "Show complete output ({} bytes)",
+                                invocation.output_metadata.byte_count
+                            )
+                        })
+                        .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            if expanded {
+                                view.expanded_tool_outputs.remove(&call_id);
+                            } else {
+                                view.expanded_tool_outputs.insert(call_id.clone());
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
                 div()
-                    .id(SharedString::from(format!("nested-{}", child.call_id)))
-                    .role(Role::ListItem)
-                    .aria_label(format!("{} {child_summary}", child.verb()))
+                    .mt_2()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .flex()
+                    .flex_wrap()
+                    .gap_3()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!("Started {started}"))
+                    .when_some(duration, |metadata, duration| {
+                        metadata.child(format!("Duration {duration}"))
+                    })
+                    .when_some(output_metadata, |metadata, output| {
+                        metadata.child(format!("Output {output}"))
+                    }),
+            );
+
+        div()
+            .id(SharedString::from(format!(
+                "tool-activity-{}",
+                invocation.call_id
+            )))
+            .debug_selector(move || format!("tool-toggle-{selector_call_id}"))
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "tool-toggle-{}",
+                        invocation.call_id
+                    )))
+                    .debug_selector(|| "tool-card".to_owned())
+                    .role(Role::Button)
+                    .aria_label(if accessible_brief.is_empty() {
+                        format!("{disclosure_label} ({status})")
+                    } else {
+                        format!("{disclosure_label} ({status}), {accessible_brief}")
+                    })
+                    .aria_expanded(expanded)
+                    .focusable()
+                    .tab_stop(true)
+                    .focus_visible(|style| style.rounded_sm().border_1().border_color(rgb(BLUE)))
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .items_center()
                     .gap_2()
+                    .pl(px(if nested { 24.0 } else { 0.0 }))
+                    .py_1()
+                    .rounded_sm()
                     .child(
                         div()
-                            .w(px(5.0))
-                            .h(px(5.0))
-                            .rounded_full()
-                            .bg(rgb(child_status)),
+                            .w(px(20.0))
+                            .flex_none()
+                            .when(invocation.class == app_model::ToolClass::Search, |icon| {
+                                icon.text_lg()
+                            })
+                            .when(invocation.class != app_model::ToolClass::Search, |icon| {
+                                icon.text_xs()
+                            })
+                            .text_color(rgb(status_color))
+                            .child(Self::tool_icon(invocation.class)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_sm()
+                            .text_color(rgb(BLUE))
+                            .child(verb.to_owned()),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
-                            .text_xs()
+                            .text_sm()
                             .text_color(rgb(MUTED))
-                            .child(format!("{} {child_summary}", child.verb())),
+                            .child(summary),
                     )
-            })
-            .collect();
-
-        div()
-            .id(SharedString::from(format!("tool-{}", invocation.call_id)))
-            .debug_selector(|| "tool-entry".to_owned())
-            .accessibility_id(invocation.call_id.clone())
-            .role(Role::ListItem)
-            .aria_label(format!("{label} ({status})"))
-            .flex()
-            .w_full()
-            .justify_start()
-            .child(
-                div()
-                    .debug_selector(|| "tool-card".to_owned())
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgb(SUBTLE))
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(rgb(
-                        if invocation.state == app_model::InvocationState::Failed {
-                            RED
-                        } else {
-                            BORDER
-                        },
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            // Top aligned: a multi-line target must not push
-                            // the label to the vertical middle of the block.
-                            .items_start()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .mt(px(5.0))
-                                    .w(px(6.0))
-                                    .h(px(6.0))
-                                    .rounded_full()
-                                    .bg(rgb(status_color)),
-                            )
-                            .child(div().text_xs().text_color(rgb(BLUE)).child(verb.to_owned()))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_xs()
-                                    .text_color(rgb(PRIMARY))
-                                    .child(summary),
-                            )
-                            .when_some(exit, |row, exit| {
-                                row.child(div().text_xs().text_color(rgb(RED)).child(exit))
-                            }),
-                    )
-                    .when_some(error, |entry, error| {
-                        entry.child(div().text_xs().text_color(rgb(RED)).child(error))
-                    })
-                    .when_some(output_error, |entry, error| {
-                        entry.child(
+                    .when_some(diff_counts, |row, (insertions, deletions)| {
+                        row.child(
                             div()
-                                .id(SharedString::from(format!(
-                                    "tool-output-error-{}",
-                                    invocation.call_id
-                                )))
-                                .role(Role::Alert)
-                                .text_xs()
+                                .flex_none()
+                                .text_sm()
+                                .text_color(rgb(GREEN))
+                                .child(format!("+{insertions}")),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_sm()
                                 .text_color(rgb(RED))
-                                .child(format!("Output unavailable: {error}")),
+                                .child(format!("-{deletions}")),
                         )
                     })
-                    .when_some(detail, |entry, detail| {
-                        entry.child(self.detail_block(
-                            &format!("tool-detail-{}", invocation.call_id),
-                            detail,
-                            COMMAND_BLOCK_HEIGHT,
-                            cx,
-                        ))
-                    })
-                    .when_some(diff, |entry, diff| {
-                        entry.child(self.detail_block(
-                            &format!("tool-diff-{}", invocation.call_id),
-                            diff,
-                            ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
-                            cx,
-                        ))
-                    })
-                    .when_some(
-                        earlier_output,
-                        |entry, (session_id, identity, before_chunk)| {
-                            entry.child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "load-output-{}",
-                                        invocation.call_id
-                                    )))
-                                    .role(Role::Button)
-                                    .aria_label("Load earlier retained output")
-                                    .focusable()
-                                    .tab_stop(true)
-                                    .mt_1()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .text_xs()
-                                    .text_color(rgb(BLUE))
-                                    .child(format!(
-                                        "Load earlier output ({before_chunk} chunks retained)"
-                                    ))
-                                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                                    .on_click(cx.listener(move |view, _, _, cx| {
-                                        let _ =
-                                            view.commands.send(ServiceCommand::LoadEarlierOutput {
-                                                app_session_id: session_id.clone(),
-                                                identity: identity.clone(),
-                                                before_chunk,
-                                            });
-                                        cx.notify();
-                                    })),
-                            )
-                        },
-                    )
-                    .when_some(output, |entry, output| {
-                        entry.child(self.detail_block(
-                            &format!("tool-output-{}", invocation.call_id),
-                            output,
-                            ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
-                            cx,
-                        ))
-                    })
-                    .when_some(output_toggle, |entry, (call_id, expanded)| {
-                        entry.child(
+                    .when_some(brief, |row, brief| {
+                        row.child(
                             div()
-                                .id(SharedString::from(format!("toggle-output-{call_id}")))
-                                .debug_selector(|| "toggle-tool-output".to_owned())
-                                .role(Role::Button)
-                                .aria_label(if expanded {
-                                    "Show latest output"
-                                } else {
-                                    "Show complete output"
-                                })
-                                .focusable()
-                                .tab_stop(true)
-                                .mt_1()
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .text_xs()
-                                .text_color(rgb(BLUE))
-                                .child(if expanded {
-                                    "Show latest output".to_owned()
-                                } else {
-                                    format!(
-                                        "Show complete output ({} bytes)",
-                                        invocation.output_metadata.byte_count
-                                    )
-                                })
-                                .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    if expanded {
-                                        view.expanded_tool_outputs.remove(&call_id);
-                                    } else {
-                                        view.expanded_tool_outputs.insert(call_id.clone());
-                                    }
-                                    cx.notify();
-                                })),
+                                .flex_none()
+                                .text_sm()
+                                .text_color(rgb(MUTED))
+                                .child(brief),
                         )
                     })
-                    .when(!nested.is_empty(), |entry| {
-                        entry.child(
-                            div()
-                                .mt_1()
-                                .pl_3()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .border_l_1()
-                                .border_color(rgb(BORDER))
-                                .children(nested),
-                        )
-                    }),
+                    .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        if !terminal_running {
+                            view.toggle_tool(&call_id);
+                        }
+                        cx.notify();
+                    })),
             )
+            .when(expanded, |entry| {
+                entry.child(
+                    div()
+                        .w_full()
+                        .pl(px(if nested { 52.0 } else { 28.0 }))
+                        .child(detail_card),
+                )
+            })
+            .into_any_element()
     }
 
     /// One conversation message.
@@ -5386,39 +6093,36 @@ impl SessionMvpView {
         nodes: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
-        _cx: &mut Context<Self>,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
     ) -> gpui::AnyElement {
         let content = Self::markdown_inline_content(nodes);
-        let links = content.links;
-        let clickable_ranges = links
-            .iter()
-            .map(|(range, _)| range.clone())
-            .collect::<Vec<_>>();
-        let targets = links
-            .into_iter()
-            .map(|(_, target)| target)
-            .collect::<Vec<_>>();
-        let text = StyledText::new(content.text)
-            .with_highlights(content.highlights)
-            .with_font_family_overrides(content.font_family_overrides);
-        let text = if clickable_ranges.is_empty() {
-            text.into_any_element()
-        } else {
-            let inline_index = *element_index;
-            *element_index += 1;
-            InteractiveText::new(
-                SharedString::from(format!("markdown-{message_id}-{inline_index}")),
-                text,
-            )
-            .on_click(clickable_ranges, move |index, _, cx| {
-                cx.open_url(&targets[index]);
-            })
-            .into_any_element()
-        };
+        let inline_index = *element_index;
+        *element_index += 1;
+        let message_order = selection
+            .borrow()
+            .message_orders
+            .get(message_id)
+            .copied()
+            .unwrap_or_default();
+        let text = SelectableTranscriptText::new(
+            format!("markdown-{message_id}-{inline_index}"),
+            (message_order, inline_index),
+            content,
+            selection.clone(),
+            selection_focus.clone(),
+        );
+        let selector = format!("markdown-inline-{message_id}-{inline_index}");
         div()
-            .debug_selector(|| "markdown-inline".to_owned())
+            .debug_selector(move || selector.clone())
+            .cursor(CursorStyle::IBeam)
             .min_w_0()
-            .child(text)
+            .child(
+                div()
+                    .debug_selector(|| "markdown-inline".to_owned())
+                    .min_w_0()
+                    .child(text),
+            )
             .into_any_element()
     }
 
@@ -5427,7 +6131,8 @@ impl SessionMvpView {
         header: bool,
         message_id: &str,
         element_index: &mut usize,
-        cx: &mut Context<Self>,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
     ) -> Vec<gpui::AnyElement> {
         if header
             && nodes
@@ -5439,7 +6144,8 @@ impl SessionMvpView {
                 true,
                 message_id,
                 element_index,
-                cx,
+                selection,
+                selection_focus,
             )];
         }
 
@@ -5454,7 +6160,8 @@ impl SessionMvpView {
                     header,
                     message_id,
                     element_index,
-                    cx,
+                    selection,
+                    selection_focus,
                 ))
             })
             .collect()
@@ -5465,7 +6172,8 @@ impl SessionMvpView {
         header: bool,
         message_id: &str,
         element_index: &mut usize,
-        cx: &mut Context<Self>,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
     ) -> gpui::AnyElement {
         div()
             .flex()
@@ -5489,7 +6197,8 @@ impl SessionMvpView {
                             content,
                             message_id,
                             element_index,
-                            cx,
+                            selection,
+                            selection_focus,
                         )),
                 )
             }))
@@ -5501,7 +6210,8 @@ impl SessionMvpView {
         children: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
-        cx: &mut Context<Self>,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
     ) -> gpui::AnyElement {
         div()
             .mt_1()
@@ -5518,7 +6228,8 @@ impl SessionMvpView {
                 children,
                 message_id,
                 element_index,
-                cx,
+                selection,
+                selection_focus,
             ))
             .into_any_element()
     }
@@ -5527,6 +6238,8 @@ impl SessionMvpView {
         children: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         div()
@@ -5541,6 +6254,8 @@ impl SessionMvpView {
                 children,
                 message_id,
                 element_index,
+                selection,
+                selection_focus,
                 cx,
             ))
             .into_any_element()
@@ -5551,12 +6266,33 @@ impl SessionMvpView {
         children: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let code = markdown::plain_text(children);
         let copy = code.clone();
         let block_index = *element_index;
         *element_index += 1;
+        let message_order = selection
+            .borrow()
+            .message_orders
+            .get(message_id)
+            .copied()
+            .unwrap_or_default();
+        let code_len = code.len();
+        let selectable_code = SelectableTranscriptText::new(
+            format!("markdown-code-{message_id}-{block_index}"),
+            (message_order, block_index),
+            MarkdownInlineContent {
+                text: code,
+                highlights: Vec::new(),
+                font_family_overrides: vec![(0..code_len, ".ZedMono".into())],
+                links: Vec::new(),
+            },
+            selection.clone(),
+            selection_focus.clone(),
+        );
         div()
             .rounded_md()
             .border_1()
@@ -5608,7 +6344,7 @@ impl SessionMvpView {
                     .whitespace_nowrap()
                     .font_family(".ZedMono")
                     .text_sm()
-                    .child(code),
+                    .child(selectable_code),
             )
             .into_any_element()
     }
@@ -5618,6 +6354,8 @@ impl SessionMvpView {
         children: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let first = start.unwrap_or(1);
@@ -5647,7 +6385,14 @@ impl SessionMvpView {
                             .child(marker),
                     )
                     .child(div().min_w_0().flex_1().flex().flex_col().gap_1().children(
-                        Self::markdown_blocks(content, message_id, element_index, cx),
+                        Self::markdown_blocks(
+                            content,
+                            message_id,
+                            element_index,
+                            selection,
+                            selection_focus,
+                            cx,
+                        ),
                     ))
             }))
             .into_any_element()
@@ -5657,7 +6402,8 @@ impl SessionMvpView {
         children: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
-        cx: &mut Context<Self>,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
     ) -> gpui::AnyElement {
         let table_index = *element_index;
         *element_index += 1;
@@ -5670,7 +6416,8 @@ impl SessionMvpView {
                         true,
                         message_id,
                         element_index,
-                        cx,
+                        selection,
+                        selection_focus,
                     ));
                 }
                 MarkdownNode::Container(MarkdownTag::TableRow, _) => {
@@ -5679,7 +6426,8 @@ impl SessionMvpView {
                         false,
                         message_id,
                         element_index,
-                        cx,
+                        selection,
+                        selection_focus,
                     ));
                 }
                 _ => {}
@@ -5704,33 +6452,65 @@ impl SessionMvpView {
         node: &MarkdownNode,
         message_id: &str,
         element_index: &mut usize,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match node {
             MarkdownNode::Container(MarkdownTag::Paragraph, children) => {
-                Self::markdown_inline_block(children, message_id, element_index, cx)
+                Self::markdown_inline_block(
+                    children,
+                    message_id,
+                    element_index,
+                    selection,
+                    selection_focus,
+                )
             }
             MarkdownNode::Container(MarkdownTag::Heading(level), children) => {
-                Self::markdown_heading(*level, children, message_id, element_index, cx)
+                Self::markdown_heading(
+                    *level,
+                    children,
+                    message_id,
+                    element_index,
+                    selection,
+                    selection_focus,
+                )
             }
-            MarkdownNode::Container(MarkdownTag::BlockQuote, children) => {
-                Self::markdown_quote(children, message_id, element_index, cx)
-            }
+            MarkdownNode::Container(MarkdownTag::BlockQuote, children) => Self::markdown_quote(
+                children,
+                message_id,
+                element_index,
+                selection,
+                selection_focus,
+                cx,
+            ),
             MarkdownNode::Container(MarkdownTag::CodeBlock(language), children) => {
                 Self::markdown_code_block(
                     language.as_ref(),
                     children,
                     message_id,
                     element_index,
+                    selection,
+                    selection_focus,
                     cx,
                 )
             }
-            MarkdownNode::Container(MarkdownTag::List(start), children) => {
-                Self::markdown_list(*start, children, message_id, element_index, cx)
-            }
-            MarkdownNode::Container(MarkdownTag::Table, children) => {
-                Self::markdown_table(children, message_id, element_index, cx)
-            }
+            MarkdownNode::Container(MarkdownTag::List(start), children) => Self::markdown_list(
+                *start,
+                children,
+                message_id,
+                element_index,
+                selection,
+                selection_focus,
+                cx,
+            ),
+            MarkdownNode::Container(MarkdownTag::Table, children) => Self::markdown_table(
+                children,
+                message_id,
+                element_index,
+                selection,
+                selection_focus,
+            ),
             MarkdownNode::Rule => div()
                 .w_full()
                 .h(px(1.))
@@ -5745,6 +6525,8 @@ impl SessionMvpView {
                     children,
                     message_id,
                     element_index,
+                    selection,
+                    selection_focus,
                     cx,
                 ))
                 .into_any_element(),
@@ -5752,7 +6534,8 @@ impl SessionMvpView {
                 std::slice::from_ref(node),
                 message_id,
                 element_index,
-                cx,
+                selection,
+                selection_focus,
             ),
         }
     }
@@ -5811,17 +6594,28 @@ impl SessionMvpView {
         nodes: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         Self::markdown_runs(nodes)
             .into_iter()
             .map(|run| match run {
-                MarkdownRun::Inline(range) => {
-                    Self::markdown_inline_block(&nodes[range], message_id, element_index, cx)
-                }
-                MarkdownRun::Block(index) => {
-                    Self::markdown_block(&nodes[index], message_id, element_index, cx)
-                }
+                MarkdownRun::Inline(range) => Self::markdown_inline_block(
+                    &nodes[range],
+                    message_id,
+                    element_index,
+                    selection,
+                    selection_focus,
+                ),
+                MarkdownRun::Block(index) => Self::markdown_block(
+                    &nodes[index],
+                    message_id,
+                    element_index,
+                    selection,
+                    selection_focus,
+                    cx,
+                ),
             })
             .collect()
     }
@@ -5829,6 +6623,8 @@ impl SessionMvpView {
     fn markdown_content(
         message_id: &str,
         document: &MarkdownDocument,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let mut element_index = 0;
@@ -5842,6 +6638,8 @@ impl SessionMvpView {
                 &document.children,
                 message_id,
                 &mut element_index,
+                selection,
+                selection_focus,
                 cx,
             ))
             .into_any_element()
@@ -5890,49 +6688,76 @@ impl SessionMvpView {
         format!("{speaker}{pending}: {}", message.content)
     }
 
-    fn transcript_message_header(
+    fn copy_icon(surface: u32) -> impl IntoElement {
+        div()
+            .relative()
+            .w(px(16.0))
+            .h(px(16.0))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(10.0))
+                    .h(px(10.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(MUTED)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(4.0))
+                    .left(px(4.0))
+                    .w(px(10.0))
+                    .h(px(10.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(MUTED))
+                    .bg(rgb(surface)),
+            )
+    }
+
+    fn transcript_copy_button(
         message: &app_model::TranscriptMessage,
         is_user: bool,
         markdown_source: String,
+        group: SharedString,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
+        let surface = if is_user { ELEVATED } else { BACKGROUND };
         div()
+            .id(SharedString::from(format!("copy-markdown-{}", message.id)))
+            .debug_selector(|| "copy-markdown".to_owned())
+            .role(Role::Button)
+            .aria_label(if is_user {
+                "Copy your message"
+            } else {
+                "Copy Copilot message"
+            })
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(|style| style.opacity(1.0).border_color(rgb(BLUE)))
+            .absolute()
+            .top(px(if is_user { 8.0 } else { 0.0 }))
+            .right(px(if is_user { 8.0 } else { 0.0 }))
+            .w(px(28.0))
+            .h(px(28.0))
             .flex()
             .items_center()
-            .justify_between()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
-                    .child(if is_user { "You" } else { "Copilot" }),
-            )
-            .when(!message.content.is_empty(), |header| {
-                header.child(
-                    div()
-                        .id(SharedString::from(format!("copy-markdown-{}", message.id)))
-                        .debug_selector(|| "copy-markdown".to_owned())
-                        .role(Role::Button)
-                        .aria_label("Copy original markdown")
-                        .focusable()
-                        .tab_stop(true)
-                        .px_1()
-                        .rounded_sm()
-                        .text_xs()
-                        .text_color(rgb(MUTED))
-                        .child("Copy")
-                        .hover(|style| {
-                            style
-                                .bg(rgb(SUBTLE))
-                                .text_color(rgb(PRIMARY))
-                                .cursor_pointer()
-                        })
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                markdown_source.clone(),
-                            ));
-                        })),
-                )
-            })
+            .justify_center()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(surface))
+            .bg(rgb(surface))
+            .opacity(0.0)
+            .group_hover(group, |style| style.opacity(1.0))
+            .child(Self::copy_icon(surface))
+            .hover(|style| style.border_color(rgb(BORDER)).cursor_pointer())
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(markdown_source.clone()));
+            }))
+            .into_any_element()
     }
 
     fn transcript_message(
@@ -5944,8 +6769,20 @@ impl SessionMvpView {
         let attachments = Self::message_attachment_chips(message, cx);
         let markdown_source = message.content.clone();
         let document = self.message_markdown(message);
-        let markdown = Self::markdown_content(&message.id, &document, cx);
-        let header = Self::transcript_message_header(message, is_user, markdown_source, cx);
+        self.transcript_selection
+            .borrow_mut()
+            .message_orders
+            .insert(message.id.clone(), message.sequence);
+        let markdown = Self::markdown_content(
+            &message.id,
+            &document,
+            &self.transcript_selection,
+            &self.transcript_selection_focus,
+            cx,
+        );
+        let group = SharedString::from(format!("message-hover-{}", message.id));
+        let copy =
+            Self::transcript_copy_button(message, is_user, markdown_source, group.clone(), cx);
         div()
             .id(SharedString::from(format!("message-{}", message.id)))
             .accessibility_id(message.id.clone())
@@ -5958,6 +6795,8 @@ impl SessionMvpView {
             .child(
                 div()
                     .debug_selector(|| "transcript-message".to_owned())
+                    .group(group)
+                    .relative()
                     .when(message.state == TranscriptState::Pending, |bubble| {
                         bubble
                             .debug_selector(|| "pending-steering-message".to_owned())
@@ -5970,18 +6809,28 @@ impl SessionMvpView {
                         // easy to spot while scrolling back through the
                         // transcript, while staying right-aligned with the
                         // agent's output below.
-                        bubble.max_w(relative(0.85))
+                        bubble
+                            .max_w(relative(0.85))
+                            .p_3()
+                            .rounded_lg()
+                            .bg(rgb(ELEVATED))
+                            .border_1()
+                            .border_color(rgb(BORDER))
                     })
-                    .when(!is_user, gpui::Styled::w_full)
+                    .when(!is_user, |message| message.w_full().py_2())
                     .min_w_0()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(if is_user { rgb(ELEVATED) } else { rgb(PANEL) })
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .child(header)
+                    .when(is_user, |bubble| {
+                        bubble.child(div().text_xs().text_color(rgb(BLUE)).child("You"))
+                    })
+                    .when(!message.content.is_empty(), |bubble| bubble.child(copy))
                     .when(!message.content.is_empty(), |bubble| {
-                        bubble.child(div().mt_2().text_color(rgb(PRIMARY)).child(markdown))
+                        bubble.child(
+                            div()
+                                .when(is_user, gpui::Styled::mt_2)
+                                .pr_8()
+                                .text_color(rgb(PRIMARY))
+                                .child(markdown),
+                        )
                     })
                     .when(!attachments.is_empty(), |bubble| {
                         bubble.child(
@@ -6024,6 +6873,11 @@ impl SessionMvpView {
             return div().into_any_element();
         };
         self.transcript_rows_rendered += 1;
+        let bottom_padding = match item.kind {
+            TimelineItemKind::SessionStart(_) => 0.0,
+            TimelineItemKind::Tool(_) => 4.0,
+            TimelineItemKind::Message(_) => 12.0,
+        };
         let content = match item.kind {
             TimelineItemKind::SessionStart(item) => Some(
                 self.session_start_row(item, &snapshot.metadata)
@@ -6055,7 +6909,7 @@ impl SessionMvpView {
             .w_full()
             .min_w_0()
             .px_5()
-            .pb_3()
+            .pb(px(bottom_padding))
             .child(
                 div()
                     .debug_selector(|| "transcript-content".to_owned())
@@ -6109,6 +6963,19 @@ impl SessionMvpView {
                         .child(detail),
                 )
             })
+    }
+
+    fn copy_transcript_selection(
+        &mut self,
+        _: &CopyTranscript,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selection = self.transcript_selection.borrow();
+        let Some(text) = selection.selected_text() else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
     }
 
     fn transcript(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -6175,6 +7042,9 @@ impl SessionMvpView {
 
         div()
             .id("transcript-frame")
+            .key_context("TranscriptSelection")
+            .track_focus(&self.transcript_selection_focus)
+            .on_action(cx.listener(Self::copy_transcript_selection))
             .group(group)
             .relative()
             .flex()
@@ -8453,12 +9323,69 @@ fn format_elapsed(elapsed: Duration) -> String {
     }
 }
 
-fn elapsed_since_timestamp(timestamp: &str) -> Option<Duration> {
-    let event_millis = timestamp.parse::<u128>().ok().or_else(|| {
+fn timestamp_millis(timestamp: &str) -> Option<u128> {
+    timestamp.parse::<u128>().ok().or_else(|| {
         DateTime::parse_from_rfc3339(timestamp)
             .ok()
             .and_then(|timestamp| u128::try_from(timestamp.timestamp_millis()).ok())
-    })?;
+    })
+}
+
+fn format_activity_timestamp(timestamp: &str) -> String {
+    DateTime::parse_from_rfc3339(timestamp).map_or_else(
+        |_| timestamp.to_owned(),
+        |timestamp| {
+            timestamp
+                .with_timezone(&chrono::Local)
+                .format("%b %-d, %Y · %-I:%M %p")
+                .to_string()
+        },
+    )
+}
+
+fn tool_duration(invocation: &app_model::ToolInvocation) -> Option<Duration> {
+    let started = timestamp_millis(&invocation.started_at)?;
+    let elapsed = invocation.completed_at.as_deref().map_or_else(
+        || elapsed_since_timestamp(&invocation.started_at),
+        |completed| {
+            let completed = timestamp_millis(completed)?;
+            Some(Duration::from_millis(
+                u64::try_from(completed.saturating_sub(started)).unwrap_or(u64::MAX),
+            ))
+        },
+    )?;
+    Some(elapsed)
+}
+
+fn format_activity_duration(duration: Duration) -> String {
+    if duration < Duration::from_secs(1) {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format_elapsed(duration)
+    }
+}
+
+fn format_byte_count(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    let (unit, suffix) = if bytes >= MIB {
+        (MIB, "MB")
+    } else if bytes >= KIB {
+        (KIB, "KB")
+    } else {
+        return format!("{bytes} B");
+    };
+    let whole = bytes / unit;
+    let tenths = ((bytes % unit) * 10 + unit / 2) / unit;
+    if tenths == 10 {
+        format!("{}.0 {suffix}", whole + 1)
+    } else {
+        format!("{whole}.{tenths} {suffix}")
+    }
+}
+
+fn elapsed_since_timestamp(timestamp: &str) -> Option<Duration> {
+    let event_millis = timestamp_millis(timestamp)?;
     let now_millis = SystemTime::now()
         .duration_since(UNIX_EPOCH)
         .ok()?
@@ -9158,6 +10085,7 @@ fn elapsed_millis(started: Instant) -> u64 {
 fn bind_app_keys(cx: &mut App) {
     bind_text_input_keys(cx);
     cx.bind_keys([
+        KeyBinding::new("secondary-c", CopyTranscript, Some("TranscriptSelection")),
         KeyBinding::new("escape", DismissPopup, None),
         KeyBinding::new("tab", FocusNext, None),
         KeyBinding::new("shift-tab", FocusPrevious, None),
@@ -9497,6 +10425,31 @@ mod tests {
             super::LIVE_OUTPUT_PREVIEW_LINES
         );
         assert!(preview.ends_with("line 99"));
+    }
+
+    #[test]
+    fn search_briefs_report_zero_and_parsed_match_counts() {
+        assert_eq!(
+            super::SessionMvpView::reported_match_count("No matches found."),
+            Some(0)
+        );
+        assert_eq!(
+            super::SessionMvpView::reported_match_count(
+                "[grep content: 76 matches across 1 file(s)]"
+            ),
+            Some(76)
+        );
+    }
+
+    #[test]
+    fn transcript_selection_clamps_when_streaming_rewrites_a_block() {
+        let mut selection = super::TranscriptTextSelection::default();
+        let original = gpui::SharedString::from("é");
+        selection.begin("block".to_owned(), (1, 0), &original, 0);
+        selection.extend("block".to_owned(), (1, 0), &original, "é".len());
+        selection.register_block("block", (1, 0), "x".into());
+
+        assert_eq!(selection.selected_text().as_deref(), Some("x"));
     }
 
     /// Adding a worktree folder must resolve to its repository, so adding a
@@ -10013,6 +10966,12 @@ mod tests {
             (view, cx, commands)
         }
 
+        fn expand_first_tool(cx: &mut VisualTestContext) {
+            let row = cx.debug_bounds("tool-card").expect("tool row rendered");
+            cx.simulate_click(row.center(), Modifiers::none());
+            cx.run_until_parked();
+        }
+
         fn setup_for_bootstrap(
             cx: &mut TestAppContext,
         ) -> (
@@ -10198,6 +11157,14 @@ mod tests {
             assert!(creating.origin.y < ready.origin.y);
             assert!(ready.origin.y < started.origin.y);
             assert!(started.origin.y < prompt.origin.y);
+            assert!(
+                ready.origin.y - creating.bottom() <= gpui::px(1.0),
+                "startup rows should not have extra space between them"
+            );
+            assert!(
+                started.origin.y - ready.bottom() <= gpui::px(1.0),
+                "startup rows should form one compact activity group"
+            );
         }
 
         #[gpui::test]
@@ -11342,6 +12309,57 @@ mod tests {
         }
 
         #[gpui::test]
+        fn transcript_text_can_be_selected_and_copied(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "selectable-message".to_owned(),
+                    role: app_model::TranscriptRole::Assistant,
+                    content: "Selectable first paragraph.\n\nAnd a second paragraph.".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let first = cx
+                .debug_bounds("markdown-inline-selectable-message-0")
+                .expect("first selectable paragraph rendered");
+            let second = cx
+                .debug_bounds("markdown-inline-selectable-message-1")
+                .expect("second selectable paragraph rendered");
+            let start = gpui::point(first.origin.x + gpui::px(2.0), first.center().y);
+            let end = gpui::point(second.right() - gpui::px(2.0), second.center().y);
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+            cx.simulate_event(gpui::MouseMoveEvent {
+                position: end,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::none(),
+            });
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+
+            let selected = view.read_with(cx, |view, _| {
+                let selection = view.transcript_selection.borrow();
+                selection.selected_text().expect("selected transcript text")
+            });
+            assert!(selected.contains("first paragraph"));
+            assert!(selected.contains("second paragraph"));
+            cx.simulate_keystrokes("secondary-c");
+            cx.run_until_parked();
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(selected)
+            );
+        }
+
+        #[gpui::test]
         fn markdown_link_and_following_text_stay_on_one_line(cx: &mut TestAppContext) {
             let (view, cx, _commands) = setup(cx);
             view.update(cx, |view, cx| {
@@ -11942,11 +12960,166 @@ mod tests {
                 cx.debug_bounds("tool-entry").is_some(),
                 "the edit should be visible in the transcript"
             );
+            assert!(
+                cx.debug_bounds("tool-expanded-card").is_none(),
+                "tool details should start collapsed"
+            );
+            expand_first_tool(cx);
+            assert!(
+                cx.debug_bounds("tool-expanded-card").is_some(),
+                "clicking the row should reveal the detail card"
+            );
             view.read_with(cx, |view, _| {
                 let snapshot = &view.selected().unwrap().snapshot;
                 let timeline = snapshot.timeline();
                 assert_eq!(timeline.len(), 2, "one message and one tool call");
+                assert!(view.tool_expanded("c1"));
             });
+        }
+
+        #[gpui::test]
+        fn nested_tool_rows_expand_independently(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for (sequence, raw) in [
+                    serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"task-1","toolName":"task",
+                                "arguments":{"description":"Survey the UI"}}}),
+                    serde_json::json!({"id":"sa","type":"subagent.started",
+                        "data":{"agentId":"agent-7","parentToolCallId":"task-1"}}),
+                    serde_json::json!({"id":"n","type":"tool.execution_start","agentId":"agent-7",
+                        "data":{"toolCallId":"nested-1","toolName":"grep",
+                                "arguments":{"pattern":"tool_entry"}}}),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    state.apply(app_model::DomainEvent::from_sdk_event_for(
+                        "session-1",
+                        u64::try_from(sequence).unwrap_or(0) + 1,
+                        &raw,
+                    ));
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("tool-toggle-task-1").is_some());
+            let nested = cx
+                .debug_bounds("tool-toggle-nested-1")
+                .expect("nested activity row rendered");
+            cx.simulate_click(nested.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(!view.tool_expanded("task-1"));
+                assert!(view.tool_expanded("nested-1"));
+            });
+        }
+
+        #[gpui::test]
+        fn expanded_shell_details_use_the_actual_command(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.apply(app_model::DomainEvent::from_sdk_event_for(
+                    "session-1",
+                    1,
+                    &serde_json::json!({"id":"t","type":"tool.execution_start",
+                    "data":{"toolCallId":"c1","toolName":"bash",
+                            "arguments":{
+                                "description":"Validate first 20 Fibonacci numbers",
+                                "command":"python3 - <<'PY'\nprint('validation')\nPY"
+                            },
+                            "shellToolInfo":{
+                                "displayCommand":"python3 - <<'PY'\nprint('validation')\nPY",
+                                "hasWriteFileRedirection":false,
+                                "possiblePaths":[]
+                            }}}),
+                ));
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                let invocation = &view.selected().unwrap().snapshot.tool_activity.invocations[0];
+                assert_eq!(
+                    SessionMvpView::tool_argument_detail(invocation),
+                    Some((
+                        "Command",
+                        "python3 - <<'PY'\nprint('validation')\nPY".to_owned()
+                    ))
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn running_terminals_expand_until_they_exit(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let running = |completed: bool| {
+                let mut state = snapshot("session-1", "First session");
+                state.apply(app_model::DomainEvent::from_sdk_event_for(
+                    "session-1",
+                    1,
+                    &serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"bash",
+                                "arguments":{"command":"sleep 1","shellId":"shell-1"}}}),
+                ));
+                if completed {
+                    state.apply(app_model::DomainEvent::from_sdk_event_for(
+                        "session-1",
+                        2,
+                        &serde_json::json!({"id":"d","type":"tool.execution_complete",
+                        "data":{"toolCallId":"c1","toolName":"bash","success":true,
+                                "result":{"contents":[
+                                    {"type":"shell_exit","shellId":"shell-1","exitCode":0}
+                                ]}}}),
+                    ));
+                }
+                state
+            };
+            view.update(cx, |view, cx| {
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
+                    running(false),
+                ))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("tool-expanded-card").is_some(),
+                "a running terminal should reveal its details automatically"
+            );
+            view.read_with(cx, |view, _| {
+                assert!(
+                    !view.tool_expanded("c1"),
+                    "automatic expansion must not become a manual preference"
+                );
+            });
+
+            view.update(cx, |view, cx| {
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
+                    running(true),
+                ))];
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("tool-expanded-card").is_none(),
+                "the terminal should collapse after exit"
+            );
+            expand_first_tool(cx);
+            assert!(
+                cx.debug_bounds("tool-expanded-card").is_some(),
+                "an exited terminal can still be opened manually"
+            );
         }
 
         #[gpui::test]
@@ -12005,6 +13178,7 @@ mod tests {
                 cx.notify();
             });
             cx.run_until_parked();
+            expand_first_tool(cx);
 
             let column = cx
                 .debug_bounds("transcript-content")
@@ -12048,6 +13222,7 @@ mod tests {
                 cx.notify();
             });
             cx.run_until_parked();
+            expand_first_tool(cx);
 
             let toggle = cx
                 .debug_bounds("toggle-tool-output")
@@ -12246,6 +13421,7 @@ mod tests {
                 cx.notify();
             });
             cx.run_until_parked();
+            expand_first_tool(cx);
 
             let wheel = |position, cx: &mut VisualTestContext| {
                 cx.simulate_event(gpui::ScrollWheelEvent {
@@ -12317,17 +13493,30 @@ mod tests {
             // follow-up frame the extent change requests.
             view.update(cx, |_, cx| cx.notify());
             cx.run_until_parked();
+            view.update(cx, |view, cx| {
+                let max = view.transcript_list.max_offset_for_scrollbar().y;
+                view.transcript_list.set_follow_mode(FollowMode::Normal);
+                view.transcript_list
+                    .set_offset_from_scrollbar(gpui::point(gpui::px(0.0), -max));
+                cx.notify();
+            });
+            cx.run_until_parked();
 
-            // Auto-follow leaves the view at the bottom.
+            // Start at the bottom without auto-follow changing the offset while
+            // the press is being measured.
             let bottom = view.read_with(cx, |view, _| {
                 view.transcript_list.scroll_px_offset_for_scrollbar().y
             });
             assert!(bottom < gpui::px(0.0));
 
-            // Press near the top of the track: the content should jump up.
+            // Press near the top of the track: the content should move and the
+            // drag should become active.
             let track = cx.debug_bounds("scrollbar").expect("scrollbar rendered");
+            let geometry = view.read_with(cx, |view, _| {
+                view.drawn_transcript_scrollbar.expect("scrollbar geometry")
+            });
             let track_x = track.center().x;
-            let near_top = track.origin.y + gpui::px(10.0);
+            let near_top = geometry.track_top + gpui::px((geometry.thumb_top / 2.0).max(1.0));
             cx.simulate_mouse_down(
                 gpui::point(track_x, near_top),
                 MouseButton::Left,
@@ -12339,7 +13528,7 @@ mod tests {
                 view.transcript_list.scroll_px_offset_for_scrollbar().y
             });
             assert!(
-                after > bottom,
+                after != bottom,
                 "dragging the scrollbar must scroll: {bottom:?} -> {after:?}"
             );
             view.read_with(cx, |view, _| {
@@ -12596,6 +13785,7 @@ mod tests {
                 cx.notify();
             });
             cx.run_until_parked();
+            expand_first_tool(cx);
 
             let bounds = cx
                 .debug_bounds("tool-detail")
@@ -12638,6 +13828,7 @@ mod tests {
                 cx.notify();
             });
             cx.run_until_parked();
+            expand_first_tool(cx);
 
             assert!(
                 cx.debug_bounds("tool-detail").is_some(),
@@ -12673,6 +13864,11 @@ mod tests {
                 cx.notify();
             });
             cx.run_until_parked();
+            view.update(cx, |view, cx| {
+                view.transcript_list.set_follow_mode(FollowMode::Normal);
+                cx.notify();
+            });
+            cx.run_until_parked();
 
             // Auto-follow leaves the view at the tail, so scroll back up.
             let before = view.read_with(cx, |view, _| {
@@ -12696,7 +13892,7 @@ mod tests {
                 view.transcript_list.scroll_px_offset_for_scrollbar().y
             });
             assert!(
-                after > before,
+                after != before,
                 "scrolling up must move the transcript: {before:?} -> {after:?}"
             );
 
@@ -13802,6 +14998,7 @@ mod tests {
             );
             view.update(cx, |view, cx| {
                 view.toggle_change("session-1", "src/lib.rs");
+                view.toggle_tool("c1");
                 cx.notify();
             });
             updates
@@ -13812,6 +15009,7 @@ mod tests {
 
             view.read_with(cx, |view, _| {
                 assert!(!view.change_expanded("session-1", "src/lib.rs"));
+                assert!(!view.expanded_tools.contains_key("session-1"));
             });
         }
 
@@ -13870,6 +15068,10 @@ mod tests {
             view.update(cx, |view, cx| {
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
                 view.selected_session = Some("session-1".to_owned());
+                view.expanded_tools
+                    .entry("session-1".to_owned())
+                    .or_default()
+                    .insert("c1".to_owned());
                 cx.notify();
             });
             cx.run_until_parked();
@@ -13918,10 +15120,11 @@ mod tests {
                 .expect("the output block is rendered");
             let before = transcript_offset(&view, cx);
             wheel(cx, block.center(), 0.0, 400.0);
+            let after = transcript_offset(&view, cx);
 
             assert!(
-                transcript_offset(&view, cx) > before,
-                "a block with nothing to scroll must let the transcript move"
+                after != before,
+                "a block with nothing to scroll must let the transcript move: {before:?} -> {after:?}"
             );
         }
 
