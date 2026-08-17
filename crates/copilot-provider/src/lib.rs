@@ -1037,16 +1037,24 @@ fn resolve_root(path: &Path) -> PathBuf {
     resolve_path(path).unwrap_or_else(|| path.to_owned())
 }
 
+/// The objects a permission field may live in, outermost first.
+///
+/// The CLI sends the request nested under `permissionRequest`, and the SDK
+/// copies the whole event into `extra`, so that is where the fields actually
+/// are. `extra` itself and a `request` child are searched too, because the
+/// shape varies by CLI version and tests construct the flat form.
+fn permission_containers(data: &PermissionRequestData) -> impl Iterator<Item = &Value> {
+    std::iter::once(&data.extra)
+        .chain(data.extra.get("permissionRequest"))
+        .chain(data.extra.get("request"))
+}
+
 fn permission_path(data: &PermissionRequestData, key: &str) -> Option<String> {
-    permission_string(data, &[key]).or_else(|| permission_string(data, &["request", key]))
+    permission_string(data, &[key])
 }
 
 fn permission_value<'a>(data: &'a PermissionRequestData, key: &str) -> Option<&'a Value> {
-    data.extra.get(key).or_else(|| {
-        data.extra
-            .get("request")
-            .and_then(|request| request.get(key))
-    })
+    permission_containers(data).find_map(|container| container.get(key))
 }
 
 fn permission_bool(data: &PermissionRequestData, key: &str) -> bool {
@@ -1146,13 +1154,11 @@ fn permission_for_domain(data: &PermissionRequestData) -> Option<PermissionDecis
 
 fn command_identifier(data: &PermissionRequestData) -> Option<String> {
     permission_string(data, &["commandIdentifier"])
-        .or_else(|| permission_string(data, &["request", "commandIdentifier"]))
         .or_else(|| permission_string(data, &["command_identifier"]))
 }
 
 fn permission_domain(data: &PermissionRequestData) -> Option<String> {
-    let url = permission_string(data, &["url"])
-        .or_else(|| permission_string(data, &["request", "url"]))?;
+    let url = permission_string(data, &["url"])?;
     let authority = url
         .split_once("://")
         .map_or(url.as_str(), |(_, value)| value)
@@ -1181,11 +1187,13 @@ fn host_without_port(authority: &str) -> Option<&str> {
 }
 
 fn permission_string(data: &PermissionRequestData, path: &[&str]) -> Option<String> {
-    let mut value = &data.extra;
-    for key in path {
-        value = value.get(*key)?;
-    }
-    value.as_str().map(str::to_owned)
+    permission_containers(data).find_map(|container| {
+        let mut value = container;
+        for key in path {
+            value = value.get(*key)?;
+        }
+        value.as_str().map(str::to_owned)
+    })
 }
 
 fn model_option(value: &Value) -> Option<ModelOption> {
@@ -1396,9 +1404,9 @@ mod tests {
 
     use super::{
         CopilotProvider, InteractionBroker, InteractionResponse, ProviderInteraction,
-        SessionRequest, message_options, model_option, permission_choices, permission_for_domain,
-        permission_for_location, permission_for_session, permission_stays_in_worktree,
-        resolve_root, sdk_context_windows,
+        SessionRequest, command_identifier, message_options, model_option, permission_choices,
+        permission_domain, permission_for_domain, permission_for_location, permission_for_session,
+        permission_stays_in_worktree, resolve_root, sdk_context_windows,
     };
 
     fn interaction_broker() -> Arc<InteractionBroker> {
@@ -1760,5 +1768,155 @@ mod tests {
         let option = model_option(&json!({"id": "byok/local", "name": "Local"})).unwrap();
         assert!(option.context_windows.is_empty());
         assert!(sdk_context_windows(None, None).is_empty());
+    }
+
+    // --- The payload shape the CLI actually sends ---------------------------
+
+    /// Builds request data the way the SDK does for a `permission.requested`
+    /// event: the fields live under `permissionRequest`, and `extra` holds the
+    /// whole event. Constructing the flat shape by hand instead is what let
+    /// worktree auto-approval regress unnoticed.
+    fn cli_shaped(permission_request: &Value) -> PermissionRequestData {
+        let event = json!({
+            "requestId": "permission-1",
+            "permissionRequest": permission_request,
+        });
+        let nested = event
+            .get("permissionRequest")
+            .cloned()
+            .expect("permissionRequest");
+        let mut data: PermissionRequestData =
+            serde_json::from_value(nested).expect("permission request data");
+        data.extra = event;
+        data
+    }
+
+    #[tokio::test]
+    async fn a_read_in_the_cli_payload_shape_is_approved_without_prompting() {
+        let worktree = tempfile::tempdir().expect("worktree");
+        let file = worktree.path().join("src/main.rs");
+        std::fs::create_dir_all(file.parent().expect("parent")).expect("create dir");
+        std::fs::write(&file, "fn main() {}").expect("write file");
+        let (broker, mut interactions) = worktree_broker(worktree.path());
+
+        let request = cli_shaped(&json!({
+            "kind": "read",
+            "intention": "read the entry point",
+            "path": file.to_string_lossy(),
+        }));
+        // Checked directly as well as through the broker, so a regression fails
+        // here rather than hanging on a prompt nobody answers.
+        assert!(permission_stays_in_worktree(
+            &request,
+            &resolve_root(worktree.path())
+        ));
+        let result = decide(&broker, request).await;
+
+        assert!(approved(&result));
+        assert!(interactions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_write_in_the_cli_payload_shape_is_approved_without_prompting() {
+        let worktree = tempfile::tempdir().expect("worktree");
+        let file = worktree.path().join("src/new.rs");
+        let (broker, mut interactions) = worktree_broker(worktree.path());
+
+        let request = cli_shaped(&json!({
+            "kind": "write",
+            "intention": "add a module",
+            "fileName": file.to_string_lossy(),
+            "diff": "+fn new() {}",
+            "canOfferSessionApproval": true,
+            "hasWriteFileRedirection": false,
+        }));
+        assert!(permission_stays_in_worktree(
+            &request,
+            &resolve_root(worktree.path())
+        ));
+        let result = decide(&broker, request).await;
+
+        assert!(approved(&result));
+        assert!(interactions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_shell_command_in_the_cli_payload_shape_is_approved_without_prompting() {
+        let worktree = tempfile::tempdir().expect("worktree");
+        let (broker, mut interactions) = worktree_broker(worktree.path());
+
+        let request = cli_shaped(&json!({
+            "kind": "shell",
+            "intention": "run the tests",
+            "fullCommandText": "cargo test",
+            "canOfferSessionApproval": true,
+            "hasWriteFileRedirection": false,
+            "commands": [],
+            "possiblePaths": [worktree.path().join("Cargo.toml").to_string_lossy()],
+            "possibleUrls": [],
+        }));
+        assert!(permission_stays_in_worktree(
+            &request,
+            &resolve_root(worktree.path())
+        ));
+        let result = decide(&broker, request).await;
+
+        assert!(approved(&result));
+        assert!(interactions.try_recv().is_err());
+    }
+
+    #[tokio::test]
+    async fn a_read_outside_the_worktree_still_prompts_in_the_cli_payload_shape() {
+        let worktree = tempfile::tempdir().expect("worktree");
+        let elsewhere = tempfile::tempdir().expect("elsewhere");
+        let file = elsewhere.path().join("secrets.txt");
+        std::fs::write(&file, "secret").expect("write file");
+        let (broker, mut interactions) = worktree_broker(worktree.path());
+
+        let task = tokio::spawn(async move {
+            decide(
+                &broker,
+                cli_shaped(&json!({
+                    "kind": "read",
+                    "intention": "read a file",
+                    "path": file.to_string_lossy(),
+                })),
+            )
+            .await
+        });
+
+        let interaction = interactions.recv().await.expect("permission prompt");
+        interaction
+            .response
+            .send(InteractionResponse::Reject { feedback: None })
+            .expect("send response");
+        let result = task.await.expect("decision");
+
+        assert!(!approved(&result));
+    }
+
+    #[test]
+    fn a_command_identifier_is_found_in_the_cli_payload_shape() {
+        let data = cli_shaped(&json!({
+            "kind": "shell",
+            "intention": "list files",
+            "fullCommandText": "ls",
+            "commandIdentifier": "ls",
+            "possiblePaths": [],
+            "possibleUrls": [],
+        }));
+
+        assert_eq!(command_identifier(&data).as_deref(), Some("ls"));
+    }
+
+    #[test]
+    fn a_domain_is_found_in_the_cli_payload_shape() {
+        let data = cli_shaped(&json!({
+            "kind": "url",
+            "intention": "fetch docs",
+            "url": "https://Example.COM:8443/docs?q=1",
+        }));
+
+        assert_eq!(permission_domain(&data).as_deref(), Some("example.com"));
     }
 }
