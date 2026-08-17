@@ -1,0 +1,26 @@
+[package]
+name = "session-orchestrator"
+edition.workspace = true
+license.workspace = true
+rust-version.workspace = true
+version.workspace = true
+
+[dependencies]
+app-model.workspace = true
+git-service.workspace = true
+session-manager.workspace = true
+thiserror.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+async-trait.workspace = true
+copilot-provider.workspace = true
+diagnostics.workspace = true
+serde_json.workspace = true
+storage.workspace = true
+tempfile.workspace = true
+test-harness = { path = "../test-harness" }
+
+[lints]
+workspace = true

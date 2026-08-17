@@ -46,6 +46,11 @@ pub enum SessionManagerError {
          Restore the directory or delete this session."
     )]
     WorkingDirectoryUnavailable(PathBuf),
+    #[error("session runtime failed: {error}; runtime cleanup failed: {cleanup_error}")]
+    RuntimeCleanup {
+        error: String,
+        cleanup_error: String,
+    },
 }
 
 pub type Result<T> = std::result::Result<T, SessionManagerError>;
@@ -553,8 +558,11 @@ impl SessionManager {
         let compatibility = match provider.start().await {
             Ok(compatibility) => compatibility,
             Err(error) => {
-                if isolated {
-                    let _ = provider.stop().await;
+                if isolated && let Err(cleanup_error) = provider.stop().await {
+                    return Err(SessionManagerError::RuntimeCleanup {
+                        error: error.to_string(),
+                        cleanup_error: cleanup_error.to_string(),
+                    });
                 }
                 return Err(error.into());
             }
@@ -627,7 +635,10 @@ impl SessionManager {
             }
             Err(error) => {
                 if isolated && let Err(cleanup_error) = provider.stop().await {
-                    tracing::warn!(%cleanup_error, %app_session_id, "failed to stop provider after session creation failed");
+                    return Err(SessionManagerError::RuntimeCleanup {
+                        error: error.to_string(),
+                        cleanup_error: cleanup_error.to_string(),
+                    });
                 }
                 Err(error)
             }

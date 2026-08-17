@@ -96,6 +96,29 @@ impl GitService {
             .to_owned())
     }
 
+    /// Canonical path of the main checkout backing this worktree.
+    ///
+    /// Falls back to the configured path when it is not a repository, so
+    /// callers can compare ownership without special-casing plain directories.
+    #[must_use]
+    pub fn repository_root(&self) -> PathBuf {
+        let root = self
+            .worktree
+            .canonicalize()
+            .unwrap_or_else(|_| self.worktree.clone());
+        self.run(&["worktree", "list", "--porcelain"])
+            .ok()
+            .and_then(|output| {
+                output
+                    .lines()
+                    .find_map(|line| line.strip_prefix("worktree ").map(str::to_owned))
+            })
+            .map_or(root, |path| {
+                let path = PathBuf::from(path);
+                path.canonicalize().unwrap_or(path)
+            })
+    }
+
     /// Resolve a logical local branch through its configured upstream.
     #[must_use]
     pub fn tracking_ref(&self, base_ref: &str) -> String {
@@ -149,6 +172,21 @@ impl GitService {
         let refspec = format!("{source}:{destination}");
         self.run(&["fetch", "--quiet", remote, &refspec])?;
         Ok(true)
+    }
+
+    /// Repository default branch, independent of the currently checked-out branch.
+    #[must_use]
+    pub fn default_branch(&self) -> Option<String> {
+        if let Ok(head) = self.run(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+            let head = head.trim();
+            return Some(
+                head.split_once('/')
+                    .map_or_else(|| head.to_owned(), |(_, branch)| branch.to_owned()),
+            );
+        }
+        ["main", "master"]
+            .into_iter()
+            .find_map(|candidate| self.branch_exists(candidate).then(|| candidate.to_owned()))
     }
 
     /// Merge base between `HEAD` and `base_ref`.

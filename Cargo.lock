@@ -2253,6 +2253,7 @@ dependencies = [
  "serde",
  "serde_json",
  "session-manager",
+ "session-orchestrator",
  "storage",
  "syntect",
  "tempfile",
@@ -5830,6 +5831,25 @@ dependencies = [
  "tokio",
  "tracing",
  "uuid",
+]
+
+[[package]]
+name = "session-orchestrator"
+version = "0.1.0-rc.9"
+dependencies = [
+ "app-model",
+ "async-trait",
+ "copilot-provider",
+ "diagnostics",
+ "git-service",
+ "serde_json",
+ "session-manager",
+ "storage",
+ "tempfile",
+ "test-harness",
+ "thiserror 2.0.20",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
