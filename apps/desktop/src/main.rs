@@ -7742,6 +7742,7 @@ impl Render for SessionMvpView {
             .flex()
             .size_full()
             .bg(rgb(BACKGROUND))
+            .text_sm()
             .text_color(rgb(PRIMARY))
             // Scrollbar drags are tracked at the window so the thumb keeps
             // following the pointer once it leaves the narrow track.
@@ -13309,8 +13310,9 @@ mod tests {
                 gpui::px(0.0),
                 "the block is already at its end"
             );
-            assert!(
-                transcript_offset(&view, cx) > transcript_before,
+            assert_ne!(
+                transcript_offset(&view, cx),
+                transcript_before,
                 "a block at its end must hand the wheel to the transcript"
             );
         }

@@ -847,8 +847,7 @@ impl Render for TextInput {
             .on_mouse_move(cx.listener(Self::on_mouse_move))
             .w_full()
             .p_3()
-            .line_height(px(22.))
-            .text_size(px(15.))
+            .text_sm()
             .child(TextElement { input: cx.entity() })
     }
 }
