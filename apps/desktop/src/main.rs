@@ -11,6 +11,7 @@ use app_model::{
     OutputStreamKind, ProjectMetadata, PromptAttachment, SessionKind, SessionLocation,
     SessionMetadata, SessionSnapshot, SessionStatus, TitleSource, TranscriptRole, TranscriptState,
 };
+use chrono::DateTime;
 use copilot_provider::{CopilotProvider, ProviderCompatibility};
 use diagnostics::{DiagnosticEvent, DiagnosticsSink, TracingDiagnostics, init_tracing};
 use git_service::GitService;
@@ -1432,6 +1433,10 @@ struct SessionMvpView {
     /// Background update worker, absent for developer builds that never update.
     update_service: Option<UpdateService>,
     settings_visibility: SettingsVisibility,
+    diagnostics_visibility: SettingsVisibility,
+    running_since: HashMap<String, Instant>,
+    last_event_seen: HashMap<String, (u64, Instant)>,
+    last_activity_repaint: Instant,
     _poll_task: gpui::Task<()>,
     _running_tick_task: gpui::Task<()>,
     _update_poll_task: gpui::Task<()>,
@@ -1517,7 +1522,10 @@ impl SessionMvpView {
                         let updated = view.apply_service_updates(cx);
                         let refreshed = view.refresh_snapshots();
                         let banner_changed = view.apply_update_events();
-                        if updated || refreshed || banner_changed {
+                        let timers_changed = view.sync_activity_timers();
+                        let repaint_timer = view.activity_timer_due();
+                        if updated || refreshed || banner_changed || timers_changed || repaint_timer
+                        {
                             cx.notify();
                         }
                     })
@@ -1635,6 +1643,10 @@ impl SessionMvpView {
             update_ui: UpdateUi::default(),
             update_service,
             settings_visibility: SettingsVisibility::Closed,
+            diagnostics_visibility: SettingsVisibility::Closed,
+            running_since: HashMap::new(),
+            last_event_seen: HashMap::new(),
+            last_activity_repaint: Instant::now(),
             _poll_task: poll_task,
             _running_tick_task: running_tick_task,
             _update_poll_task: update_poll_task,
@@ -2143,6 +2155,64 @@ impl SessionMvpView {
             }
         }
         changed
+    }
+
+    fn sync_activity_timers(&mut self) -> bool {
+        let now = Instant::now();
+        let mut changed = false;
+        let live: HashMap<_, _> = self
+            .sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id().to_owned(),
+                    (
+                        matches!(
+                            session.snapshot.status,
+                            SessionStatus::Running | SessionStatus::Starting
+                        ),
+                        session.snapshot.last_sequence,
+                    ),
+                )
+            })
+            .collect();
+
+        self.running_since.retain(|id, _| {
+            let keep = live.get(id).is_some_and(|(running, _)| *running);
+            changed |= !keep;
+            keep
+        });
+        self.last_event_seen.retain(|id, _| live.contains_key(id));
+
+        for (id, (running, sequence)) in live {
+            if running && !self.running_since.contains_key(&id) {
+                self.running_since.insert(id.clone(), now);
+                changed = true;
+            }
+            match self.last_event_seen.get_mut(&id) {
+                Some((seen_sequence, seen_at)) if *seen_sequence != sequence => {
+                    *seen_sequence = sequence;
+                    *seen_at = now;
+                    changed = true;
+                }
+                None => {
+                    self.last_event_seen.insert(id, (sequence, now));
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
+    fn activity_timer_due(&mut self) -> bool {
+        if self.running_since.is_empty()
+            || self.last_activity_repaint.elapsed() < Duration::from_secs(1)
+        {
+            return false;
+        }
+        self.last_activity_repaint = Instant::now();
+        true
     }
 
     fn selected(&self) -> Option<&SessionProjection> {
@@ -6417,6 +6487,292 @@ impl SessionMvpView {
             .into_any_element()
     }
 
+    fn running_activity(&self) -> Option<impl IntoElement> {
+        let session = self.selected()?;
+        if !matches!(
+            session.snapshot.status,
+            SessionStatus::Running | SessionStatus::Starting
+        ) {
+            return None;
+        }
+        let elapsed = self
+            .selected()
+            .and_then(|session| {
+                session
+                    .snapshot
+                    .diagnostics
+                    .turn_started_at
+                    .as_deref()
+                    .and_then(elapsed_since_timestamp)
+            })
+            .or_else(|| self.running_since.get(session.id()).map(Instant::elapsed))
+            .unwrap_or_default();
+        let diagnostics = &session.snapshot.diagnostics;
+        let label = diagnostics
+            .latest_intent
+            .as_ref()
+            .or(diagnostics.activity.as_ref())
+            .map_or("Agent is working", String::as_str);
+
+        Some(
+            div()
+                .id("running-activity")
+                .debug_selector(|| "running-activity".to_owned())
+                .role(Role::Status)
+                .aria_label(label)
+                .mx_auto()
+                .w_full()
+                .max_w(px(CONVERSATION_COLUMN_WIDTH))
+                .px_3()
+                .pb_2()
+                .flex()
+                .items_center()
+                .gap_2()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(GREEN)))
+                .child(
+                    div()
+                        .id("running-elapsed")
+                        .debug_selector(|| "running-elapsed".to_owned())
+                        .text_color(rgb(GREEN))
+                        .child(format_elapsed(elapsed)),
+                )
+                .child(
+                    div()
+                        .id("running-intent")
+                        .debug_selector(|| "running-intent".to_owned())
+                        .child(label.to_owned()),
+                ),
+        )
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn diagnostics_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.diagnostics_visibility != SettingsVisibility::Open {
+            return None;
+        }
+        let session = self.selected()?;
+        let snapshot = &session.snapshot;
+        let diagnostics = &snapshot.diagnostics;
+        let elapsed = self
+            .selected()
+            .and_then(|session| {
+                session
+                    .snapshot
+                    .diagnostics
+                    .turn_started_at
+                    .as_deref()
+                    .and_then(elapsed_since_timestamp)
+            })
+            .or_else(|| self.running_since.get(session.id()).map(Instant::elapsed))
+            .unwrap_or_default();
+        let silence = diagnostics
+            .last_event_at
+            .as_deref()
+            .and_then(elapsed_since_timestamp)
+            .or_else(|| {
+                self.last_event_seen
+                    .get(session.id())
+                    .map(|(_, seen_at)| seen_at.elapsed())
+            })
+            .unwrap_or_default();
+        let active_tools: Vec<_> = snapshot
+            .tool_activity
+            .invocations
+            .iter()
+            .filter(|invocation| invocation.state == app_model::InvocationState::Running)
+            .map(|invocation| {
+                diagnostic_field(
+                    invocation.tool_name.clone(),
+                    format!("{} · running", invocation.summary_line()),
+                )
+            })
+            .collect();
+        let event_counts: Vec<_> = diagnostics
+            .event_counts
+            .iter()
+            .map(|(event_type, count)| diagnostic_field(event_type.clone(), count.to_string()))
+            .collect();
+        let recent_events: Vec<_> = diagnostics
+            .recent_events
+            .iter()
+            .rev()
+            .map(|event| {
+                diagnostic_field(
+                    format!("#{} {}", event.sequence, event.event_type),
+                    event.summary.clone(),
+                )
+            })
+            .collect();
+        let usage = diagnostics.last_usage.as_ref().map(|usage| {
+            format!(
+                "{} · {} ms · {} input / {} output tokens · {} cached",
+                usage.model.as_deref().unwrap_or("unknown model"),
+                usage.duration_ms.unwrap_or_default(),
+                usage.input_tokens.unwrap_or_default(),
+                usage.output_tokens.unwrap_or_default(),
+                usage.cache_read_tokens.unwrap_or_default(),
+            )
+        });
+        let compaction = diagnostics.compaction.as_ref().map(|compaction| {
+            format!(
+                "{} / {} tokens · trigger {}",
+                compaction.current_tokens.unwrap_or_default(),
+                compaction.token_limit.unwrap_or_default(),
+                compaction.trigger.as_deref().unwrap_or("unknown"),
+            )
+        });
+
+        Some(
+            div()
+                .id("diagnostics-dialog")
+                .debug_selector(|| "diagnostics-dialog".to_owned())
+                .accessibility_id("diagnostics-dialog")
+                .role(Role::Dialog)
+                .aria_label("Agent diagnostics")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0000_00a8))
+                .child(
+                    div()
+                        .id("diagnostics-panel")
+                        .w(px(720.0))
+                        .max_h(px(720.0))
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .rounded_lg()
+                        .bg(rgb(PANEL))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .p_5()
+                                .border_b_1()
+                                .border_color(rgb(BORDER))
+                                .child(
+                                    div()
+                                        .id("diagnostics-heading")
+                                        .role(Role::Heading)
+                                        .aria_level(2)
+                                        .text_xl()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .child("Agent diagnostics"),
+                                )
+                                .child(
+                                    div()
+                                        .id("diagnostics-close")
+                                        .debug_selector(|| "diagnostics-close".to_owned())
+                                        .accessibility_id("diagnostics-close")
+                                        .role(Role::Button)
+                                        .aria_label("Close agent diagnostics")
+                                        .focusable()
+                                        .tab_stop(true)
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(ELEVATED))
+                                        .child("Close")
+                                        .hover(|style| style.opacity(0.85).cursor_pointer())
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            view.diagnostics_visibility =
+                                                SettingsVisibility::Closed;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("diagnostics-content")
+                                .p_5()
+                                .flex()
+                                .flex_1()
+                                .flex_col()
+                                .min_h_0()
+                                .gap_4()
+                                .overflow_y_scroll()
+                                .child(diagnostic_section(
+                                    "Current activity",
+                                    vec![
+                                        diagnostic_field(
+                                            "Status",
+                                            format!("{:?}", snapshot.status),
+                                        ),
+                                        diagnostic_field("Elapsed", format_elapsed(elapsed)),
+                                        diagnostic_field(
+                                            "Current activity",
+                                            diagnostics.activity.clone().unwrap_or_else(|| {
+                                                "No active SDK phase".to_owned()
+                                            }),
+                                        ),
+                                        diagnostic_field(
+                                            "Assistant intent",
+                                            diagnostics
+                                                .latest_intent
+                                                .clone()
+                                                .unwrap_or_else(|| "Not reported".to_owned()),
+                                        ),
+                                        diagnostic_field(
+                                            "Model / turn",
+                                            format!(
+                                                "{} / {}",
+                                                diagnostics.model.as_deref().unwrap_or("unknown"),
+                                                diagnostics.turn_id.as_deref().unwrap_or("unknown")
+                                            ),
+                                        ),
+                                        diagnostic_field(
+                                            "Last SDK event",
+                                            format!(
+                                                "{} · {} ago",
+                                                diagnostics
+                                                    .last_event_type
+                                                    .as_deref()
+                                                    .unwrap_or("none"),
+                                                format_elapsed(silence)
+                                            ),
+                                        ),
+                                        diagnostic_field(
+                                            "Response stream",
+                                            diagnostics.response_bytes.map_or_else(
+                                                || "No byte count reported".to_owned(),
+                                                |bytes| format!("{bytes} bytes received"),
+                                            ),
+                                        ),
+                                    ],
+                                ))
+                                .when_some(compaction, |content, value| {
+                                    content.child(diagnostic_section(
+                                        "Context compaction",
+                                        vec![diagnostic_field("In progress", value)],
+                                    ))
+                                })
+                                .when_some(usage, |content, value| {
+                                    content.child(diagnostic_section(
+                                        "Latest model call",
+                                        vec![diagnostic_field("Usage", value)],
+                                    ))
+                                })
+                                .when(!active_tools.is_empty(), |content| {
+                                    content.child(diagnostic_section("Active tools", active_tools))
+                                })
+                                .child(diagnostic_section("SDK event counts", event_counts))
+                                .child(diagnostic_section(
+                                    "Recent progress signals",
+                                    recent_events,
+                                )),
+                        ),
+                ),
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
     fn session_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let mode = title_case(&self.draft_mode);
@@ -6522,6 +6878,36 @@ impl SessionMvpView {
                     })
                     .children(context_control)
                     .child(div().flex_1())
+                    .child(
+                        div()
+                            .id("open-diagnostics")
+                            .debug_selector(|| "open-diagnostics".to_owned())
+                            .accessibility_id("open-diagnostics")
+                            .role(Role::Button)
+                            .aria_label("Open agent diagnostics")
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                            .w(px(32.0))
+                            .h(px(32.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(rgb(ELEVATED))
+                            .text_color(rgb(MUTED))
+                            .child("?")
+                            .hover(|style| {
+                                style
+                                    .bg(rgb(BORDER))
+                                    .text_color(rgb(PRIMARY))
+                                    .cursor_pointer()
+                            })
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.diagnostics_visibility = SettingsVisibility::Open;
+                                cx.notify();
+                            })),
+                    )
                     .child(
                         div()
                             .id(action_id)
@@ -7152,6 +7538,7 @@ impl Render for SessionMvpView {
                 view.dismiss_control_menu(cx);
                 view.dismiss_session_menu(cx);
                 view.dismiss_image_preview(cx);
+                view.diagnostics_visibility = SettingsVisibility::Closed;
                 view.settings_visibility = SettingsVisibility::Closed;
                 if view.renaming_session.is_some() {
                     view.cancel_rename(cx);
@@ -7305,6 +7692,10 @@ impl Render for SessionMvpView {
                                         .min_w_0()
                                         .min_h_0()
                                         .child(self.transcript(cx))
+                                        .when_some(
+                                            self.running_activity(),
+                                            gpui::ParentElement::child,
+                                        )
                                         .when_some(session_error, |column, error| {
                                             column.child(
                                                 div()
@@ -7407,11 +7798,89 @@ impl Render for SessionMvpView {
             .when_some(self.project_context_menu(cx), gpui::ParentElement::child)
             .when_some(self.rename_dialog(cx), gpui::ParentElement::child)
             .when_some(self.settings_dialog(cx), gpui::ParentElement::child)
+            .when_some(self.diagnostics_dialog(cx), gpui::ParentElement::child)
             .when_some(self.image_preview_overlay(cx), gpui::ParentElement::child)
             .when_some(self.interaction_dialog(cx), |root, dialog| {
                 root.child(dialog)
             })
     }
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    let hours = seconds / 3600;
+    let minutes = seconds / 60;
+    let minutes = minutes % 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else if minutes > 0 {
+        format!("{minutes}:{seconds:02}")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn elapsed_since_timestamp(timestamp: &str) -> Option<Duration> {
+    let event_millis = timestamp.parse::<u128>().ok().or_else(|| {
+        DateTime::parse_from_rfc3339(timestamp)
+            .ok()
+            .and_then(|timestamp| u128::try_from(timestamp.timestamp_millis()).ok())
+    })?;
+    let now_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    Some(Duration::from_millis(
+        u64::try_from(now_millis.saturating_sub(event_millis)).unwrap_or(u64::MAX),
+    ))
+}
+
+fn diagnostic_field(label: impl Into<String>, value: impl Into<String>) -> gpui::AnyElement {
+    div()
+        .flex()
+        .items_start()
+        .gap_3()
+        .child(
+            div()
+                .w(px(170.0))
+                .flex_none()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(label.into()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .text_color(rgb(PRIMARY))
+                .child(value.into()),
+        )
+        .into_any_element()
+}
+
+fn diagnostic_section(title: &str, rows: Vec<gpui::AnyElement>) -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::BOLD)
+                .child(title.to_owned()),
+        )
+        .when(rows.is_empty(), |section| {
+            section.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("No data reported"),
+            )
+        })
+        .children(rows)
+        .into_any_element()
 }
 
 /// Trailing slice of terminal output displayed until transcript virtualization.
@@ -9219,6 +9688,49 @@ mod tests {
                 }
                 _ => panic!("expected a Cancel command"),
             }
+        }
+
+        #[gpui::test]
+        fn running_session_shows_elapsed_activity_and_intent(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                let mut snapshot = (*view.sessions[0].snapshot).clone();
+                snapshot.status = SessionStatus::Running;
+                snapshot.diagnostics.latest_intent = Some("Reviewing repository state".to_owned());
+                snapshot.diagnostics.activity = Some("Waiting for model response".to_owned());
+                view.sessions[0].snapshot = Arc::new(snapshot);
+                view.sync_activity_timers();
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("running-activity").is_some());
+            assert!(cx.debug_bounds("running-elapsed").is_some());
+            assert!(cx.debug_bounds("running-intent").is_some());
+        }
+
+        #[gpui::test]
+        fn diagnostics_button_opens_and_closes_dialog(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let button = cx
+                .debug_bounds("open-diagnostics")
+                .expect("diagnostics button rendered");
+            cx.simulate_click(button.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("diagnostics-dialog").is_some());
+            let close = cx
+                .debug_bounds("diagnostics-close")
+                .expect("diagnostics close rendered");
+            cx.simulate_click(close.center(), Modifiers::none());
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("diagnostics-dialog").is_none());
         }
 
         #[gpui::test]

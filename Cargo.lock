@@ -2220,6 +2220,7 @@ name = "gcabb-desktop"
 version = "0.1.0-rc.9"
 dependencies = [
  "app-model",
+ "chrono",
  "copilot-provider",
  "diagnostics",
  "dirs 5.0.1",
