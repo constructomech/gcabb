@@ -64,6 +64,8 @@ pub enum SessionStatus {
     Failed,
     Cancelled,
     Disconnected,
+    /// Persisted history is available, but the session's working directory is not.
+    Unavailable,
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]

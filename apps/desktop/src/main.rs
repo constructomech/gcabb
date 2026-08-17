@@ -343,6 +343,10 @@ enum ServiceCommand {
     Resume {
         app_session_id: String,
     },
+    RelocateSession {
+        app_session_id: String,
+        working_directory: PathBuf,
+    },
     Respond {
         app_session_id: String,
         interaction_id: String,
@@ -476,12 +480,15 @@ impl AppService {
                     project_root.clone(),
                     diagnostics.clone(),
                 ));
-                let manager = Arc::new(SessionManager::new(provider, storage, diagnostics.clone()));
                 let session_roots = SessionRoots {
                     worktrees: Some(worktrees_root()),
                     attachments: attachments_directory(),
                     runtime_state: runtime_state_root(),
                 };
+                let manager = Arc::new(
+                    SessionManager::new(provider, storage, diagnostics.clone())
+                        .with_session_roots(session_roots.clone()),
+                );
                 // Projects are configured by the user, not inferred from the
                 // launch directory. Auto-registering the launch repository
                 // would silently re-add a project the user had removed.
@@ -857,6 +864,17 @@ async fn handle_service_command(
             created = Some(
                 manager
                     .resume_closed_session(&app_session_id)
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        ServiceCommand::RelocateSession {
+            app_session_id,
+            working_directory,
+        } => {
+            created = Some(
+                manager
+                    .relocate_session(&app_session_id, &working_directory)
                     .await
                     .map_err(|error| error.to_string())?,
             );
@@ -1796,18 +1814,20 @@ impl SessionMvpView {
 
         let banner = match &self.update_ui {
             UpdateUi::Available { .. } => banner
-                .child(action_button("Update", BLUE, cx, |view| {
+                .child(action_button("Update", BLUE, cx, |view, _| {
                     view.request_update(UpdateRequest::Install);
                 }))
-                .child(action_button("Later", ELEVATED, cx, |view| {
+                .child(action_button("Later", ELEVATED, cx, |view, _| {
                     view.request_update(UpdateRequest::Defer);
                 })),
             UpdateUi::ReadyToRestart { version } => {
                 banner.child(Self::restart_button(version.clone(), cx))
             }
-            UpdateUi::Failed(_) => banner.child(action_button("Dismiss", ELEVATED, cx, |view| {
-                view.update_ui = UpdateUi::Hidden;
-            })),
+            UpdateUi::Failed(_) => {
+                banner.child(action_button("Dismiss", ELEVATED, cx, |view, _| {
+                    view.update_ui = UpdateUi::Hidden;
+                }))
+            }
             _ => banner,
         };
 
@@ -2044,6 +2064,8 @@ impl SessionMvpView {
                 }
                 ServiceUpdate::SessionDeleted(id) => {
                     self.sessions.retain(|session| session.id() != id);
+                    self.restore_failures
+                        .retain(|failure| failure.app_session_id != id);
                     self.deleting_sessions.remove(&id);
                     if self.selected_session.as_deref() == Some(id.as_str()) {
                         self.switch_composer_draft(None, cx);
@@ -2121,13 +2143,18 @@ impl SessionMvpView {
 
     fn upsert_hydrated_session(&mut self, handle: SessionHandle, cx: &mut Context<Self>) {
         let id = handle.id().to_owned();
+        let unavailable = handle.snapshot().status == SessionStatus::Unavailable;
         if let Some(index) = self.sessions.iter().position(|session| session.id() == id) {
             self.sessions[index] = SessionProjection::new(handle);
         } else {
             self.sessions.insert(0, SessionProjection::new(handle));
         }
+        if unavailable && self.selected_session.as_deref() == Some(id.as_str()) {
+            self.switch_composer_draft(None, cx);
+            return;
+        }
         if self.startup_navigation == StartupNavigation::Untouched {
-            if self.selected_session.is_none() {
+            if self.selected_session.is_none() && !unavailable {
                 self.switch_composer_draft(Some(id), cx);
             }
             self.adopt_selected_session_location();
@@ -2590,6 +2617,43 @@ impl SessionMvpView {
             };
             let _ = view.update(cx, |view, cx| {
                 let _ = view.commands.send(ServiceCommand::AddProject { path });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Choose a replacement directory for a session whose original path vanished.
+    fn locate_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
+        self.action_error = None;
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Locate session working directory".into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let selection = match paths.await {
+                Ok(Ok(paths)) => paths.and_then(|paths| paths.into_iter().next()),
+                Ok(Err(error)) => {
+                    let message = format!("could not open the folder picker: {error}");
+                    let _ = view.update(cx, |view, cx| {
+                        view.action_error = Some(message);
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_) => None,
+            };
+            let Some(working_directory) = selection else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                let _ = view.commands.send(ServiceCommand::RelocateSession {
+                    app_session_id: app_session_id.clone(),
+                    working_directory,
+                });
                 cx.notify();
             });
         })
@@ -6890,8 +6954,74 @@ impl SessionMvpView {
         )
     }
 
+    fn unavailable_session_notice(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let session = self.selected().expect("selected session");
+        let app_session_id = session.id().to_owned();
+        let locate_id = app_session_id.clone();
+        let delete_id = app_session_id.clone();
+        let retry_id = app_session_id.clone();
+        let working_directory = PathBuf::from(&session.snapshot.metadata.project_path);
+        let can_recreate = working_directory.starts_with(worktrees_root())
+            && session.snapshot.changes.branch.is_some();
+
+        div()
+            .id("session-unavailable")
+            .debug_selector(|| "session-unavailable".to_owned())
+            .accessibility_id("session-unavailable")
+            .role(Role::Status)
+            .aria_label("Session working directory unavailable")
+            .mx_auto()
+            .mb_4()
+            .w_full()
+            .max_w(px(CONVERSATION_COLUMN_WIDTH))
+            .flex()
+            .items_center()
+            .gap_3()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child("Worktree unavailable")
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("Stored history is available read-only."),
+                    ),
+            )
+            .when(can_recreate, |notice| {
+                notice.child(action_button("Recreate", GREEN, cx, move |view, _| {
+                    view.action_error = None;
+                    let _ = view.commands.send(ServiceCommand::Resume {
+                        app_session_id: retry_id.clone(),
+                    });
+                }))
+            })
+            .child(action_button("Locate folder", BLUE, cx, move |view, cx| {
+                view.locate_session(locate_id.clone(), cx);
+            }))
+            .child(action_button("Delete session", RED, cx, move |view, cx| {
+                view.delete_session(delete_id.clone(), cx);
+            }))
+            .into_any_element()
+    }
+
     #[allow(clippy::too_many_lines)]
-    fn session_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn session_composer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self
+            .selected()
+            .is_some_and(|session| session.snapshot.status == SessionStatus::Unavailable)
+        {
+            return self.unavailable_session_notice(cx);
+        }
         let mode = title_case(&self.draft_mode);
         let effort = effort_label(&self.draft_effort);
         let model = self.draft_model_label();
@@ -7093,6 +7223,7 @@ impl SessionMvpView {
                         })
                     }),
             )
+            .into_any_element()
     }
 
     #[allow(clippy::too_many_lines)]
@@ -7674,7 +7805,7 @@ impl SessionMvpView {
                                         .child(div().text_xs().text_color(rgb(MUTED)).child(
                                             "Project rules can be changed in Copilot settings.",
                                         ))
-                                        .child(action_button("Deny", RED, cx, move |view| {
+                                        .child(action_button("Deny", RED, cx, move |view, _| {
                                             let _ = view.commands.send(ServiceCommand::Respond {
                                                 app_session_id: session_id.clone(),
                                                 interaction_id: reject.clone(),
@@ -7690,7 +7821,7 @@ impl SessionMvpView {
                                 "Cancel",
                                 RED,
                                 cx,
-                                move |view| {
+                                move |view, _| {
                                     let _ = view.commands.send(ServiceCommand::Respond {
                                         app_session_id: cancel_session.clone(),
                                         interaction_id: interaction_id.clone(),
@@ -7718,6 +7849,9 @@ impl Render for SessionMvpView {
         };
         let control_menu_left = self.open_control_menu.map_or(0, control_menu_offset);
         let session_selected = self.selected_session.is_some();
+        let session_unavailable = self
+            .selected()
+            .is_some_and(|session| session.snapshot.status == SessionStatus::Unavailable);
         let title = self.selected().map_or_else(
             || "New session".to_owned(),
             |session| session.snapshot.metadata.title.clone(),
@@ -7862,6 +7996,24 @@ impl Render for SessionMvpView {
                                         .flex()
                                         .items_center()
                                         .gap_3()
+                                        .when(session_unavailable, |status| {
+                                            status.child(
+                                                div()
+                                                    .id("worktree-unavailable-badge")
+                                                    .debug_selector(|| {
+                                                        "worktree-unavailable-badge".to_owned()
+                                                    })
+                                                    .role(Role::Status)
+                                                    .aria_label("Worktree unavailable")
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded_md()
+                                                    .text_xs()
+                                                    .text_color(rgb(AMBER))
+                                                    .bg(rgb(SUBTLE))
+                                                    .child("Worktree unavailable"),
+                                            )
+                                        })
                                         .child(
                                             div()
                                                 .id("panel-toggle")
@@ -8374,7 +8526,7 @@ fn action_button(
     label: &'static str,
     color: u32,
     cx: &mut Context<SessionMvpView>,
-    action: impl Fn(&mut SessionMvpView) + 'static,
+    action: impl Fn(&mut SessionMvpView, &mut Context<SessionMvpView>) + 'static,
 ) -> impl IntoElement {
     div()
         .id(label)
@@ -8393,7 +8545,7 @@ fn action_button(
         .child(label)
         .hover(|style| style.opacity(0.85).cursor_pointer())
         .on_click(cx.listener(move |view, _, _, cx| {
-            action(view);
+            action(view, cx);
             cx.notify();
         }))
 }
@@ -8403,7 +8555,10 @@ fn status_color(status: SessionStatus) -> gpui::Rgba {
         SessionStatus::Running | SessionStatus::Starting => rgb(GREEN),
         SessionStatus::Waiting => rgb(AMBER),
         SessionStatus::Failed | SessionStatus::Cancelled => rgb(RED),
-        SessionStatus::Idle | SessionStatus::Recovering | SessionStatus::Disconnected => rgb(MUTED),
+        SessionStatus::Idle
+        | SessionStatus::Recovering
+        | SessionStatus::Disconnected
+        | SessionStatus::Unavailable => rgb(MUTED),
     }
 }
 
@@ -9843,6 +9998,69 @@ mod tests {
             view.read_with(cx, |view, _| {
                 assert_eq!(view.selected_session.as_deref(), Some("session-1"));
             });
+        }
+
+        #[gpui::test]
+        fn unavailable_hydration_is_not_selected_automatically(cx: &mut TestAppContext) {
+            let (view, cx, _commands, updates) = setup_for_bootstrap(cx);
+            let mut unavailable = snapshot("session-1", "Archived session");
+            unavailable.status = SessionStatus::Unavailable;
+            updates
+                .send(ServiceUpdate::SessionHydrated(SessionHandle::for_test(
+                    unavailable,
+                )))
+                .unwrap();
+
+            view.update(cx, SessionMvpView::apply_service_updates);
+
+            view.read_with(cx, |view, _| {
+                assert!(view.selected_session.is_none());
+                assert_eq!(view.sessions[0].snapshot.status, SessionStatus::Unavailable);
+            });
+        }
+
+        #[gpui::test]
+        fn unavailable_session_is_read_only_and_offers_recovery(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut unavailable = snapshot("session-1", "Archived session");
+                unavailable.status = SessionStatus::Unavailable;
+                unavailable.metadata.project_path = super::super::worktrees_root()
+                    .join("project")
+                    .join("archived")
+                    .to_string_lossy()
+                    .into_owned();
+                unavailable.changes.branch = Some("gcabb/archived".to_owned());
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
+                    unavailable,
+                ))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("worktree-unavailable-badge").is_some());
+            assert!(cx.debug_bounds("session-unavailable").is_some());
+            assert!(cx.debug_bounds("composer-input").is_none());
+            assert!(cx.debug_bounds("Recreate").is_some());
+            assert!(cx.debug_bounds("Locate folder").is_some());
+            assert!(cx.debug_bounds("Delete session").is_some());
+
+            let recreate = cx.debug_bounds("Recreate").expect("recreate button");
+            cx.simulate_click(recreate.center(), Modifiers::none());
+            assert!(matches!(
+                commands.recv().expect("resume command"),
+                ServiceCommand::Resume { app_session_id } if app_session_id == "session-1"
+            ));
+
+            let delete = cx
+                .debug_bounds("Delete session")
+                .expect("delete session button");
+            cx.simulate_click(delete.center(), Modifiers::none());
+            assert!(matches!(
+                commands.recv().expect("delete command"),
+                ServiceCommand::DeleteSession { app_session_id } if app_session_id == "session-1"
+            ));
         }
 
         #[gpui::test]
