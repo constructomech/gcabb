@@ -7119,11 +7119,15 @@ impl SessionMvpView {
         let aria_label = detail
             .as_ref()
             .map_or_else(|| label.to_owned(), |detail| format!("{label}: {detail}"));
+        // Recorded as history: these are milestones from the session's actual
+        // creation, not a decoration re-rendered ahead of the transcript, so
+        // they carry the same timestamp as everything else that happened then.
+        let timestamp = format_activity_timestamp(&metadata.created_at);
         div()
             .id(SharedString::from(format!("session-start-{id}")))
             .debug_selector(move || format!("session-start-{id}"))
             .role(Role::Status)
-            .aria_label(aria_label)
+            .aria_label(format!("{aria_label} — {timestamp}"))
             .flex()
             .items_center()
             .gap_3()
@@ -7141,6 +7145,8 @@ impl SessionMvpView {
                         .child(detail),
                 )
             })
+            .child(div().flex_1())
+            .child(div().text_xs().text_color(rgb(MUTED)).child(timestamp))
     }
 
     fn copy_transcript_selection(
@@ -7154,6 +7160,27 @@ impl SessionMvpView {
             return;
         };
         cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+
+    fn resuming_session_placeholder() -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("resuming-session")
+            .debug_selector(|| "resuming-session".to_owned())
+            .role(Role::Status)
+            .aria_label("Resuming session")
+            .flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_color(rgb(MUTED))
+                    .child(progress_spinner("resuming-session-spinner".into()))
+                    .child("Resuming session…"),
+            )
     }
 
     fn transcript(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -7189,7 +7216,9 @@ impl SessionMvpView {
                         ),
                 );
         };
-        let _ = session;
+        if session.snapshot.status == SessionStatus::Recovering {
+            return Self::resuming_session_placeholder();
+        }
         self.transcript_rows_rendered = 0;
         let group = SharedString::from("scroll-transcript");
         let view = cx.entity();
@@ -11467,6 +11496,55 @@ mod tests {
                     SessionStatus::Recovering
                 );
             });
+        }
+
+        #[gpui::test]
+        fn recovering_session_shows_resuming_spinner_until_hydrated(cx: &mut TestAppContext) {
+            let (mut service, _commands, updates) = AppService::for_test_with_updates();
+            let metadata = snapshot("session-1", "First session").metadata;
+            service.bootstrap = Some(super::super::BootstrapState {
+                projects: Vec::new(),
+                sessions: vec![metadata],
+                selected_session: Some("session-1".to_owned()),
+            });
+            cx.update(super::super::bind_app_keys);
+            let (view, cx) = cx.add_window_view(|_, cx| {
+                SessionMvpView::new(
+                    service,
+                    std::path::PathBuf::from("/tmp/project"),
+                    "main".to_owned(),
+                    std::path::PathBuf::from("/tmp/chats"),
+                    None,
+                    crate::WorktreeConfiguration {
+                        data_dir: None,
+                        settings: crate::AppSettings::default(),
+                        default_root: std::path::PathBuf::from("/tmp/worktrees"),
+                    },
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("resuming-session").is_some(),
+                "resuming spinner should render while session is still hydrating"
+            );
+
+            updates
+                .send(ServiceUpdate::SessionAdded(SessionHandle::for_test(
+                    snapshot("session-1", "First session"),
+                )))
+                .unwrap();
+            view.update(cx, |view, cx| {
+                view.apply_service_updates(cx);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("resuming-session").is_none(),
+                "resuming spinner should disappear once the session is hydrated"
+            );
         }
 
         #[gpui::test]
