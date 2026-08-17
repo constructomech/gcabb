@@ -139,6 +139,8 @@ const SCROLL_TO_BOTTOM_STEP: Duration = Duration::from_millis(8);
 const TRANSCRIPT_TAIL_FADE: f32 = 112.0;
 const MARKDOWN_CACHE_CAPACITY: usize = 128;
 const DIFF_CACHE_CAPACITY: usize = 64;
+const DIFF_ADDED_BACKGROUND: u32 = 0x2386_3626;
+const DIFF_DELETED_BACKGROUND: u32 = 0xf851_6126;
 /// Maximum live shell output shaped on the UI thread for one tool row.
 const LIVE_OUTPUT_PREVIEW_BYTES: usize = 16 * 1_024;
 const LIVE_OUTPUT_PREVIEW_LINES: usize = 64;
@@ -181,8 +183,14 @@ struct MarkdownInlineContent {
 
 struct DiffDocument {
     source: SharedString,
-    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    lines: Vec<DiffLine>,
     muted: bool,
+}
+
+struct DiffLine {
+    source: SharedString,
+    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    background: Option<u32>,
 }
 
 #[derive(Default)]
@@ -191,11 +199,76 @@ struct DiffCache {
     order: VecDeque<String>,
 }
 
+fn diff_lines(
+    source: &str,
+    highlights: &[(std::ops::Range<usize>, HighlightStyle)],
+) -> Vec<DiffLine> {
+    let mut line_start = 0;
+    let mut highlight_index = 0;
+
+    source
+        .split_inclusive('\n')
+        .map(|line| {
+            let text = line.strip_suffix('\n').unwrap_or(line);
+            let line_end = line_start + text.len();
+            while highlight_index < highlights.len()
+                && highlights[highlight_index].0.end <= line_start
+            {
+                highlight_index += 1;
+            }
+
+            let mut line_highlights = Vec::new();
+            let mut index = highlight_index;
+            while index < highlights.len() && highlights[index].0.start < line_end {
+                let (range, style) = &highlights[index];
+                let start = range.start.max(line_start) - line_start;
+                let end = range.end.min(line_end) - line_start;
+                if start < end {
+                    line_highlights.push((start..end, *style));
+                }
+                index += 1;
+            }
+
+            let background = if text.starts_with('+') && !text.starts_with("+++ ") {
+                Some(DIFF_ADDED_BACKGROUND)
+            } else if text.starts_with('-') && !text.starts_with("--- ") {
+                Some(DIFF_DELETED_BACKGROUND)
+            } else {
+                None
+            };
+            line_start += line.len();
+            DiffLine {
+                source: text.to_owned().into(),
+                highlights: line_highlights,
+                background,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod diff_line_tests {
+    use super::*;
+
+    #[test]
+    fn change_backgrounds_belong_to_rows_not_text_runs() {
+        let lines = diff_lines("--- a/file\n+++ b/file\n-old\n+new\n context\n", &[]);
+
+        assert_eq!(lines[0].background, None);
+        assert_eq!(lines[1].background, None);
+        assert_eq!(lines[2].background, Some(DIFF_DELETED_BACKGROUND));
+        assert_eq!(lines[3].background, Some(DIFF_ADDED_BACKGROUND));
+        assert_eq!(lines[4].background, None);
+        assert!(lines.iter().all(|line| line.highlights.is_empty()));
+    }
+}
+
 impl MarkdownInlineContent {
     fn push(&mut self, text: &str, style: &MarkdownInlineStyle) {
         if text.is_empty() {
             return;
         }
+
         let range = self.text.len()..self.text.len() + text.len();
         self.text.push_str(text);
 
@@ -6718,9 +6791,10 @@ impl SessionMvpView {
                 Vec::new()
             })
         };
+        let lines = diff_lines(&body, &highlights);
         let document = Arc::new(DiffDocument {
             source: body.into(),
-            highlights,
+            lines,
             muted,
         });
 
@@ -6743,8 +6817,18 @@ impl SessionMvpView {
     fn change_diff(&self, session_id: &str, file: &ChangedFile) -> impl IntoElement {
         let path = file.path.clone();
         let document = self.change_diff_document(session_id, file);
-        let body =
-            StyledText::new(document.source.clone()).with_highlights(document.highlights.clone());
+        let body = div()
+            .flex()
+            .flex_col()
+            .min_w_full()
+            .children(document.lines.iter().map(|line| {
+                let text =
+                    StyledText::new(line.source.clone()).with_highlights(line.highlights.clone());
+                div()
+                    .min_w_full()
+                    .when_some(line.background, |row, color| row.bg(gpui::rgba(color)))
+                    .child(text)
+            }));
 
         div()
             .id(SharedString::from(format!("change-diff-{path}")))

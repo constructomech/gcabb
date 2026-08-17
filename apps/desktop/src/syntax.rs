@@ -1,7 +1,7 @@
 use std::path::Path;
 use std::sync::LazyLock;
 
-use gpui::{FontStyle, FontWeight, HighlightStyle, UnderlineStyle, px, rgb, rgba};
+use gpui::{FontStyle, FontWeight, HighlightStyle, UnderlineStyle, px, rgb};
 use syntect::easy::HighlightLines;
 use syntect::highlighting::{
     FontStyle as SyntectFontStyle, Style as SyntectStyle, Theme, ThemeSet,
@@ -12,9 +12,6 @@ const BLUE: u32 = 0x0058_a6ff;
 const GREEN: u32 = 0x003f_b950;
 const MUTED: u32 = 0x008b_949e;
 const RED: u32 = 0x00f8_5161;
-const ADDED_BACKGROUND: u32 = 0x2386_3626;
-const DELETED_BACKGROUND: u32 = 0xf851_6126;
-
 struct HighlightAssets {
     syntaxes: SyntaxSet,
     theme: Theme,
@@ -72,7 +69,6 @@ fn push_syntax_highlights(
     source: &str,
     source_offset: usize,
     syntaxes: &SyntaxSet,
-    background: Option<u32>,
     highlights: &mut Vec<(std::ops::Range<usize>, HighlightStyle)>,
 ) -> Result<(), String> {
     let spans = highlighter
@@ -82,9 +78,7 @@ fn push_syntax_highlights(
     for (style, text) in spans {
         let end = offset + text.len();
         if !text.is_empty() {
-            let mut style = gpui_style(style);
-            style.background_color = background.map(|color| rgba(color).into());
-            highlights.push((offset..end, style));
+            highlights.push((offset..end, gpui_style(style)));
         }
         offset = end;
     }
@@ -102,10 +96,9 @@ fn advance_highlighter(
         .map_err(|error| error.to_string())
 }
 
-fn line_highlight(color: u32, background: Option<u32>) -> HighlightStyle {
+fn line_highlight(color: u32) -> HighlightStyle {
     HighlightStyle {
         color: Some(rgb(color).into()),
-        background_color: background.map(|color| rgba(color).into()),
         ..HighlightStyle::default()
     }
 }
@@ -130,38 +123,30 @@ pub(crate) fn diff_highlights(
         if content.starts_with("@@") {
             old = HighlightLines::new(syntax, &assets.theme);
             new = HighlightLines::new(syntax, &assets.theme);
-            highlights.push((line_offset..line_end, line_highlight(BLUE, None)));
+            highlights.push((line_offset..line_end, line_highlight(BLUE)));
         } else if content.starts_with("diff ")
             || content.starts_with("index ")
             || content.starts_with("--- ")
             || content.starts_with("+++ ")
             || content.starts_with("\\ No newline")
         {
-            highlights.push((line_offset..line_end, line_highlight(MUTED, None)));
+            highlights.push((line_offset..line_end, line_highlight(MUTED)));
         } else if let Some(source) = line.strip_prefix('+') {
-            highlights.push((
-                line_offset..line_offset + 1,
-                line_highlight(GREEN, Some(ADDED_BACKGROUND)),
-            ));
+            highlights.push((line_offset..line_offset + 1, line_highlight(GREEN)));
             push_syntax_highlights(
                 &mut new,
                 source,
                 line_offset + 1,
                 &assets.syntaxes,
-                Some(ADDED_BACKGROUND),
                 &mut highlights,
             )?;
         } else if let Some(source) = line.strip_prefix('-') {
-            highlights.push((
-                line_offset..line_offset + 1,
-                line_highlight(RED, Some(DELETED_BACKGROUND)),
-            ));
+            highlights.push((line_offset..line_offset + 1, line_highlight(RED)));
             push_syntax_highlights(
                 &mut old,
                 source,
                 line_offset + 1,
                 &assets.syntaxes,
-                Some(DELETED_BACKGROUND),
                 &mut highlights,
             )?;
         } else {
@@ -173,7 +158,6 @@ pub(crate) fn diff_highlights(
                 source,
                 source_offset,
                 &assets.syntaxes,
-                None,
                 &mut highlights,
             )?;
             advance_highlighter(&mut new, source, &assets.syntaxes)?;
@@ -197,14 +181,10 @@ mod tests {
         let added_prefix = diff.find("+fn").unwrap();
         let deleted_prefix = diff.find("-fn").unwrap();
         assert!(highlights.iter().any(|(range, style)| {
-            range == &(added_prefix..added_prefix + 1)
-                && style.color.is_some()
-                && style.background_color.is_some()
+            range == &(added_prefix..added_prefix + 1) && style.color.is_some()
         }));
         assert!(highlights.iter().any(|(range, style)| {
-            range == &(deleted_prefix..deleted_prefix + 1)
-                && style.color.is_some()
-                && style.background_color.is_some()
+            range == &(deleted_prefix..deleted_prefix + 1) && style.color.is_some()
         }));
         assert!(
             highlights
