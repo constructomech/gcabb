@@ -12,7 +12,7 @@ use app_model::{
     SessionMetadata, SessionSnapshot, SessionStatus, TitleSource, TranscriptRole, TranscriptState,
 };
 use chrono::DateTime;
-use copilot_provider::{CopilotProvider, ProviderCompatibility};
+use copilot_provider::{CopilotProviderFactory, ProviderCompatibility};
 use diagnostics::{DiagnosticEvent, DiagnosticsSink, TracingDiagnostics, init_tracing};
 use git_service::GitService;
 use gpui::prelude::FluentBuilder;
@@ -476,17 +476,15 @@ impl AppService {
                     }
                 };
                 let runtime_ms = elapsed_millis(runtime_started);
-                let provider = Arc::new(CopilotProvider::new(
-                    project_root.clone(),
-                    diagnostics.clone(),
-                ));
+                let provider_factory =
+                    CopilotProviderFactory::new(project_root.clone(), diagnostics.clone());
                 let session_roots = SessionRoots {
                     worktrees: Some(worktrees_root()),
                     attachments: attachments_directory(),
                     runtime_state: runtime_state_root(),
                 };
                 let manager = Arc::new(
-                    SessionManager::new(provider, storage, diagnostics.clone())
+                    SessionManager::new(provider_factory, storage, diagnostics.clone())
                         .with_session_roots(session_roots.clone()),
                 );
                 // Projects are configured by the user, not inferred from the

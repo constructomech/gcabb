@@ -153,6 +153,95 @@ pub trait AgentProvider: Send + Sync {
     ) -> Result<String>;
 }
 
+/// Creates isolated provider runtimes for app sessions.
+///
+/// Each provider returned by [`create`](Self::create) is owned by one app
+/// session. Compatibility and title generation use short-lived providers so
+/// they cannot become an ambient client shared by active sessions.
+#[async_trait]
+pub trait AgentProviderFactory: Send + Sync {
+    async fn compatibility(&self) -> Result<ProviderCompatibility>;
+    fn create(&self, working_directory: &Path) -> Arc<dyn AgentProvider>;
+    fn isolates_session_runtimes(&self) -> bool {
+        true
+    }
+    async fn shutdown(&self) -> Result<()> {
+        Ok(())
+    }
+    async fn generate_title(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        working_directory: &Path,
+    ) -> Result<String>;
+}
+
+/// Adapter for tests and embedders that deliberately reuse one provider.
+///
+/// Production uses [`CopilotProviderFactory`]; this adapter preserves a small
+/// seam for deterministic providers that need to emit events into a known
+/// session.
+#[async_trait]
+impl<T> AgentProviderFactory for Arc<T>
+where
+    T: AgentProvider + 'static,
+{
+    async fn compatibility(&self) -> Result<ProviderCompatibility> {
+        self.start().await
+    }
+
+    fn create(&self, _working_directory: &Path) -> Arc<dyn AgentProvider> {
+        self.clone()
+    }
+
+    fn isolates_session_runtimes(&self) -> bool {
+        false
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        self.stop().await
+    }
+
+    async fn generate_title(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        working_directory: &Path,
+    ) -> Result<String> {
+        self.start().await?;
+        AgentProvider::generate_title(self.as_ref(), prompt, model, working_directory).await
+    }
+}
+
+#[async_trait]
+impl AgentProviderFactory for Arc<dyn AgentProvider> {
+    async fn compatibility(&self) -> Result<ProviderCompatibility> {
+        self.start().await
+    }
+
+    fn create(&self, _working_directory: &Path) -> Arc<dyn AgentProvider> {
+        self.clone()
+    }
+
+    fn isolates_session_runtimes(&self) -> bool {
+        false
+    }
+
+    async fn shutdown(&self) -> Result<()> {
+        self.stop().await
+    }
+
+    async fn generate_title(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        working_directory: &Path,
+    ) -> Result<String> {
+        self.start().await?;
+        AgentProvider::generate_title(self.as_ref(), prompt, model, working_directory).await
+    }
+}
+
 #[derive(Clone)]
 struct InteractionBroker {
     sender: mpsc::Sender<ProviderInteraction>,
@@ -368,6 +457,61 @@ pub struct CopilotProvider {
     client: Mutex<Option<Client>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     diagnostics: Arc<dyn DiagnosticsSink>,
+}
+
+#[derive(Clone)]
+pub struct CopilotProviderFactory {
+    probe_root: PathBuf,
+    diagnostics: Arc<dyn DiagnosticsSink>,
+}
+
+impl CopilotProviderFactory {
+    #[must_use]
+    pub fn new(probe_root: impl Into<PathBuf>, diagnostics: Arc<dyn DiagnosticsSink>) -> Self {
+        Self {
+            probe_root: probe_root.into(),
+            diagnostics,
+        }
+    }
+
+    fn provider(&self, root: &Path) -> Arc<CopilotProvider> {
+        Arc::new(CopilotProvider::new(root, self.diagnostics.clone()))
+    }
+}
+
+#[async_trait]
+impl AgentProviderFactory for CopilotProviderFactory {
+    async fn compatibility(&self) -> Result<ProviderCompatibility> {
+        let provider = self.provider(&self.probe_root);
+        let result = provider.start().await;
+        let stopped = provider.stop().await;
+        match (result, stopped) {
+            (Ok(compatibility), Ok(())) => Ok(compatibility),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
+
+    fn create(&self, working_directory: &Path) -> Arc<dyn AgentProvider> {
+        self.provider(working_directory)
+    }
+
+    async fn generate_title(
+        &self,
+        prompt: &str,
+        model: Option<&str>,
+        working_directory: &Path,
+    ) -> Result<String> {
+        let provider = self.provider(working_directory);
+        provider.start().await?;
+        let result =
+            AgentProvider::generate_title(provider.as_ref(), prompt, model, working_directory)
+                .await;
+        let stopped = provider.stop().await;
+        match (result, stopped) {
+            (Ok(title), Ok(())) => Ok(title),
+            (Err(error), _) | (Ok(_), Err(error)) => Err(error),
+        }
+    }
 }
 
 impl CopilotProvider {
@@ -1394,6 +1538,7 @@ mod tests {
     use std::path::Path;
     use std::sync::Arc;
 
+    use diagnostics::MemoryDiagnostics;
     use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
     use github_copilot_sdk::rpc::PermissionDecision;
     use github_copilot_sdk::{
@@ -1403,9 +1548,10 @@ mod tests {
     use tokio::sync::mpsc;
 
     use super::{
-        CopilotProvider, InteractionBroker, InteractionResponse, ProviderInteraction,
-        SessionRequest, command_identifier, message_options, model_option, permission_choices,
-        permission_domain, permission_for_domain, permission_for_location, permission_for_session,
+        AgentProviderFactory, CopilotProvider, CopilotProviderFactory, InteractionBroker,
+        InteractionResponse, ProviderInteraction, SessionRequest, command_identifier,
+        message_options, model_option, permission_choices, permission_domain,
+        permission_for_domain, permission_for_location, permission_for_session,
         permission_stays_in_worktree, resolve_root, sdk_context_windows,
     };
 
@@ -1416,6 +1562,17 @@ mod tests {
             auto_approve_root: None,
             permission_location: std::env::temp_dir().to_string_lossy().into_owned(),
         })
+    }
+
+    #[test]
+    fn production_factory_creates_distinct_session_providers() {
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let factory = CopilotProviderFactory::new(std::env::temp_dir(), diagnostics);
+
+        let first = factory.create(Path::new("/tmp/first"));
+        let second = factory.create(Path::new("/tmp/second"));
+
+        assert!(!Arc::ptr_eq(&first, &second));
     }
 
     #[test]

@@ -11,17 +11,25 @@ GPUI FoundationView
              |
 SessionManager
     one serialized SessionActor per live session
-       |                         |
-AgentProvider                Storage
-       |                  SQLite WAL
-CopilotProvider       metadata/events/snapshots
        |
-github-copilot-sdk
+       +-- SessionRuntime per live session
+       |      |
+       |   CopilotProvider
+       |      |
+       |   github-copilot-sdk Client + CLI process
+       |
+       +-- Storage
+              |
+           SQLite WAL
 ```
 
 The GPUI thread performs no SDK, database, Git, or filesystem work. A dedicated
-service thread owns the Tokio runtime, provider, manager, and actors. GPUI polls
-only service messages and Tokio watch snapshots on a 33 ms frame budget.
+service thread owns the Tokio runtime, provider factory, manager, and actors.
+Every app session owns a separate provider, SDK client, and CLI process, so
+closing or losing one runtime does not interrupt another. Compatibility and
+title generation use short-lived clients rather than an ambient client shared
+by active sessions. GPUI polls only service messages and Tokio watch snapshots
+on a 33 ms frame budget.
 
 ## State and recovery
 
@@ -66,6 +74,7 @@ The deterministic suite covers:
 - Database close/reopen, provider resume, history reconciliation, and duplicate
   suppression.
 - Independent resume-failure reporting.
+- Distinct provider runtimes and shutdown isolation between concurrent sessions.
 - Recursive diagnostic redaction.
 - Golden SDK event fixture validity.
 
