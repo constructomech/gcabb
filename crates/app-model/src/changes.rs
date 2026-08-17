@@ -1,7 +1,7 @@
 //! Changes view state: the session worktree compared against its base.
 //!
-//! Phase 3 keeps the base fixed to the session's recorded base commit. Phase 6
-//! adds ref discovery and selectable bases.
+//! The session stores a logical base branch while each refresh resolves its
+//! current upstream and merge-base commit.
 
 use serde::{Deserialize, Serialize};
 
@@ -87,6 +87,9 @@ pub struct ChangesView {
     pub base: Option<String>,
     /// Human-readable base description, e.g. a branch name.
     pub base_label: Option<String>,
+    /// Ref actually resolved, e.g. `origin/main` for logical base `main`.
+    #[serde(default)]
+    pub tracking_ref: Option<String>,
     pub head: Option<String>,
     pub branch: Option<String>,
     #[serde(default)]

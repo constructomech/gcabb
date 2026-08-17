@@ -23,8 +23,8 @@ use gpui::{
     HighlightStyle, InteractiveElement, IntoElement, KeyBinding, LayoutId, ListAlignment,
     ListState, MouseButton, ParentElement, PathPromptOptions, Render, Role, SharedString,
     StatefulInteractiveElement, StrikethroughStyle, Styled, StyledText, TextLayout,
-    TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowOptions, actions, div, list, px,
-    relative, rgb, size,
+    TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowOptions, actions, deferred, div,
+    list, px, relative, rgb, size,
 };
 use session_manager::{
     CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, SessionRoots,
@@ -914,6 +914,14 @@ enum ServiceCommand {
         app_session_id: String,
         tier: String,
     },
+    SetBaseRef {
+        app_session_id: String,
+        base_ref: String,
+    },
+    RefreshChanges {
+        app_session_id: String,
+        force: bool,
+    },
     Select {
         app_session_id: Option<String>,
     },
@@ -1495,6 +1503,26 @@ async fn handle_service_command(
             .set_context_tier(tier)
             .await
             .map_err(|error| error.to_string())?,
+        ServiceCommand::SetBaseRef {
+            app_session_id,
+            base_ref,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .set_base_ref(base_ref)
+            .await
+            .map_err(|error| error.to_string())?,
+        ServiceCommand::RefreshChanges {
+            app_session_id,
+            force,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .refresh_changes(force)
+            .await
+            .map_err(|error| error.to_string())?,
         ServiceCommand::RenameSession {
             app_session_id,
             title,
@@ -1578,6 +1606,9 @@ fn resolve_session_workspace(
         .map(str::to_owned)
         .or_else(|| default_branch(&repository))
         .unwrap_or_else(|| "HEAD".to_owned());
+    if let Err(error) = service.fetch_base_ref(&base) {
+        tracing::warn!(%error, base_ref = %base, "failed to refresh worktree base; using cached ref");
+    }
     let namespace = repository_worktree_namespace(worktrees_root, &repository)?;
     let branch = unique_worktree_branch(&service, title, &namespace);
     let path = worktree_path(&namespace, &branch)?;
@@ -2158,6 +2189,12 @@ struct SessionMvpView {
     /// Focus handles for changed-file rows, keyed by session and path so a row
     /// keeps its focus identity while change data refreshes.
     change_focus: RefCell<HashMap<String, FocusHandle>>,
+    /// Whether the Changes base selector is open.
+    base_menu_visibility: SettingsVisibility,
+    /// Branches discovered when the base selector was opened.
+    base_ref_options: Vec<String>,
+    /// Cached project default shown by the open Base menu.
+    base_default_ref: Option<String>,
     open_control_menu: Option<ControlMenu>,
     /// Session whose context menu is open, and where to draw it.
     session_menu: Option<SessionMenu>,
@@ -2384,6 +2421,9 @@ impl SessionMvpView {
             active_panel: SessionPanel::Changes,
             expanded_changes: HashMap::new(),
             change_focus: RefCell::new(HashMap::new()),
+            base_menu_visibility: SettingsVisibility::Closed,
+            base_ref_options: Vec::new(),
+            base_default_ref: None,
             open_control_menu: None,
             session_menu: None,
             project_menu: None,
@@ -3371,6 +3411,8 @@ impl SessionMvpView {
 
     fn select_session(&mut self, id: String, cx: &mut Context<Self>) {
         self.open_control_menu = None;
+        self.base_menu_visibility = SettingsVisibility::Closed;
+        self.base_default_ref = None;
         self.switch_composer_draft(Some(id), cx);
         self.startup_navigation = StartupNavigation::Changed;
         let _ = self.commands.send(ServiceCommand::Select {
@@ -3402,6 +3444,13 @@ impl SessionMvpView {
                 .reasoning_effort
                 .unwrap_or_else(|| "medium".to_owned());
             self.draft_context_tier = controls.context_tier;
+        }
+        if self.active_panel == SessionPanel::Changes
+            && self
+                .selected()
+                .is_some_and(|session| !session.snapshot.metadata.is_chat())
+        {
+            self.refresh_selected_changes(false, cx);
         }
         cx.notify();
     }
@@ -4179,7 +4228,77 @@ impl SessionMvpView {
     }
 
     fn toggle_control_menu(&mut self, menu: ControlMenu) {
+        self.base_menu_visibility = SettingsVisibility::Closed;
         self.open_control_menu = toggled_menu(self.open_control_menu, menu);
+    }
+
+    fn toggle_base_menu(&mut self, cx: &mut Context<Self>) {
+        if self.base_menu_visibility == SettingsVisibility::Open {
+            self.base_menu_visibility = SettingsVisibility::Closed;
+            cx.notify();
+            return;
+        }
+        let Some(snapshot) = self.selected().map(|session| session.snapshot.clone()) else {
+            return;
+        };
+        match GitService::new(&snapshot.metadata.project_path).base_refs() {
+            Ok(mut options) => {
+                if let Some(selected) = snapshot.metadata.base_ref.clone()
+                    && !options.contains(&selected)
+                {
+                    options.push(selected);
+                }
+                options.sort_by_key(|reference| (reference.contains('/'), reference.clone()));
+                self.base_ref_options = options;
+                self.base_default_ref = self.default_base_ref(&snapshot);
+                self.base_menu_visibility = SettingsVisibility::Open;
+                self.open_control_menu = None;
+                cx.notify();
+            }
+            Err(error) => {
+                self.action_error = Some(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    fn default_base_ref(&self, snapshot: &SessionSnapshot) -> Option<String> {
+        self.projects
+            .iter()
+            .find(|project| project.path == snapshot.metadata.project_key())
+            .and_then(|project| project.default_branch.clone())
+            .or_else(|| {
+                snapshot
+                    .metadata
+                    .repository_root
+                    .as_deref()
+                    .and_then(|root| default_branch(Path::new(root)))
+            })
+    }
+
+    fn set_changes_base(&mut self, base_ref: String, cx: &mut Context<Self>) {
+        let Some(session_id) = self.selected_session.clone() else {
+            return;
+        };
+        self.base_menu_visibility = SettingsVisibility::Closed;
+        self.action_error = None;
+        let _ = self.commands.send(ServiceCommand::SetBaseRef {
+            app_session_id: session_id,
+            base_ref,
+        });
+        cx.notify();
+    }
+
+    fn refresh_selected_changes(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Some(session_id) = self.selected_session.clone() else {
+            return;
+        };
+        self.action_error = None;
+        let _ = self.commands.send(ServiceCommand::RefreshChanges {
+            app_session_id: session_id,
+            force,
+        });
+        cx.notify();
     }
 
     fn dismiss_control_menu(&mut self, cx: &mut Context<Self>) {
@@ -7513,6 +7632,11 @@ impl SessionMvpView {
                 .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
                 .on_click(cx.listener(move |view, _, _, cx| {
                     view.active_panel = panel;
+                    if panel == SessionPanel::Changes {
+                        view.refresh_selected_changes(false, cx);
+                    } else {
+                        view.base_menu_visibility = SettingsVisibility::Closed;
+                    }
                     cx.notify();
                 }))
         });
@@ -7564,33 +7688,208 @@ impl SessionMvpView {
     }
 
     #[allow(clippy::too_many_lines)]
+    fn changes_base_controls(
+        &self,
+        snapshot: &SessionSnapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = snapshot.metadata.base_ref.as_deref().unwrap_or("HEAD");
+        let resolved = snapshot.changes.tracking_ref.as_deref().unwrap_or(selected);
+        let commit = snapshot
+            .changes
+            .base
+            .as_deref()
+            .map_or("unresolved", |commit| &commit[..commit.len().min(8)]);
+        let default = self.base_default_ref.clone();
+        let options = self
+            .base_ref_options
+            .iter()
+            .enumerate()
+            .map(|(index, reference)| {
+                let value = reference.clone();
+                let is_selected = reference == selected;
+                div()
+                    .id(("changes-base-option", index))
+                    .debug_selector({
+                        let selector = format!("changes-base-option-{index}");
+                        move || selector.clone()
+                    })
+                    .accessibility_id(format!("changes-base-option-{index}"))
+                    .role(Role::Button)
+                    .aria_label(reference.clone())
+                    .aria_selected(is_selected)
+                    .focusable()
+                    .tab_stop(true)
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .w_full()
+                    .min_w_0()
+                    .truncate()
+                    .when(is_selected, |row| row.bg(rgb(ELEVATED)))
+                    .child(reference.clone())
+                    .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.set_changes_base(value.clone(), cx);
+                    }))
+            });
+
+        div()
+            .id("changes-base-controls")
+            .relative()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .id("changes-base")
+                    .debug_selector(|| "changes-base".to_owned())
+                    .accessibility_id("changes-base")
+                    .role(Role::ComboBox)
+                    .aria_label("Change comparison base")
+                    .aria_value(selected)
+                    .aria_expanded(self.base_menu_visibility == SettingsVisibility::Open)
+                    .focusable()
+                    .tab_stop(true)
+                    .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child("Base")
+                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                    .on_click(cx.listener(|view, _, _, cx| view.toggle_base_menu(cx))),
+            )
+            .child(
+                div()
+                    .id("changes-refresh")
+                    .debug_selector(|| "changes-refresh".to_owned())
+                    .accessibility_id("changes-refresh")
+                    .role(Role::Button)
+                    .aria_label("Refresh changes and base branch")
+                    .focusable()
+                    .tab_stop(true)
+                    .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .child("\u{21bb}")
+                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.refresh_selected_changes(true, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!("{selected} \u{2192} {resolved} @ {commit}")),
+            )
+            .when(
+                self.base_menu_visibility == SettingsVisibility::Open,
+                |controls| {
+                    controls.child(
+                        deferred(
+                            div()
+                                .id("changes-base-menu")
+                                .accessibility_id("changes-base-menu")
+                                .role(Role::ListBox)
+                                .aria_label("Comparison base branches")
+                                .occlude()
+                                .absolute()
+                                .top(px(34.0))
+                                .left_0()
+                                .w(px(320.0))
+                                .max_h(px(360.0))
+                                .overflow_y_scroll()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .p_2()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .bg(rgb(PANEL))
+                                .shadow_lg()
+                                .when_some(default, |menu, default| {
+                                    let value = default.clone();
+                                    menu.child(
+                                        div()
+                                            .id("changes-base-reset")
+                                            .debug_selector(|| "changes-base-reset".to_owned())
+                                            .accessibility_id("changes-base-reset")
+                                            .role(Role::Button)
+                                            .aria_label(format!("Reset to default base {default}"))
+                                            .focusable()
+                                            .tab_stop(true)
+                                            .w_full()
+                                            .min_w_0()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .truncate()
+                                            .text_color(rgb(BLUE))
+                                            .child(format!("Reset to default ({default})"))
+                                            .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                                            .on_click(cx.listener(move |view, _, _, cx| {
+                                                view.set_changes_base(value.clone(), cx);
+                                            })),
+                                    )
+                                })
+                                .children(options),
+                        )
+                        .with_priority(1),
+                    )
+                },
+            )
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn changes_panel(
         &self,
         snapshot: &SessionSnapshot,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let changes = &snapshot.changes;
+        let controls = self.changes_base_controls(snapshot, cx).into_any_element();
         if let Some(error) = &changes.error {
             return div()
-                .id("changes-error")
-                .role(Role::Alert)
-                .aria_label(error.clone())
-                .text_sm()
-                .text_color(rgb(RED))
-                .child(error.clone())
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(controls)
+                .child(
+                    div()
+                        .id("changes-error")
+                        .role(Role::Alert)
+                        .aria_label(error.clone())
+                        .text_sm()
+                        .text_color(rgb(RED))
+                        .child(error.clone()),
+                )
                 .into_any_element();
         }
         if changes.is_empty() {
             return div()
-                .id("changes-empty")
-                .role(Role::Status)
-                .aria_label("No changes")
-                .text_sm()
-                .text_color(rgb(MUTED))
-                .child(format!(
-                    "No changes against {}.",
-                    changes.base_label.as_deref().unwrap_or("base")
-                ))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(controls)
+                .child(
+                    div()
+                        .id("changes-empty")
+                        .role(Role::Status)
+                        .aria_label("No changes")
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child(format!(
+                            "No changes against {}.",
+                            changes.base_label.as_deref().unwrap_or("base")
+                        )),
+                )
                 .into_any_element();
         }
 
@@ -7616,6 +7915,7 @@ impl SessionMvpView {
             .flex_1()
             .min_h_0()
             .gap_2()
+            .child(controls)
             .child(
                 div()
                     .id("changes-summary")
@@ -15062,6 +15362,7 @@ mod tests {
             state.changes = app_model::ChangesView {
                 base: Some("abc1234".to_owned()),
                 base_label: Some("main".to_owned()),
+                tracking_ref: Some("origin/main".to_owned()),
                 head: Some("def5678".to_owned()),
                 branch: Some("feature".to_owned()),
                 files,
@@ -15088,6 +15389,75 @@ mod tests {
             });
             cx.simulate_resize(gpui::size(gpui::px(1_400.0), gpui::px(800.0)));
             cx.run_until_parked();
+        }
+
+        #[gpui::test]
+        fn changes_refresh_button_requests_a_forced_base_refresh(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            open_changes(&view, cx, Vec::new());
+
+            let refresh = cx
+                .debug_bounds("changes-refresh")
+                .expect("changes refresh button");
+            cx.simulate_click(refresh.center(), Modifiers::none());
+
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(ServiceCommand::RefreshChanges {
+                    app_session_id,
+                    force: true,
+                }) if app_session_id == "session-1"
+            ));
+        }
+
+        #[gpui::test]
+        fn changes_base_menu_selects_a_persisted_comparison_branch(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            open_changes(&view, cx, Vec::new());
+            view.update(cx, |view, cx| {
+                view.base_ref_options = vec!["release/next".to_owned()];
+                view.base_menu_visibility = crate::SettingsVisibility::Open;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let option = cx
+                .debug_bounds("changes-base-option-0")
+                .expect("base branch option");
+            cx.simulate_click(option.center(), Modifiers::none());
+
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(ServiceCommand::SetBaseRef {
+                    app_session_id,
+                    base_ref,
+                }) if app_session_id == "session-1" && base_ref == "release/next"
+            ));
+        }
+
+        #[gpui::test]
+        fn changes_base_menu_can_reset_to_the_project_default(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            open_changes(&view, cx, Vec::new());
+            view.update(cx, |view, cx| {
+                view.base_default_ref = Some("main".to_owned());
+                view.base_menu_visibility = crate::SettingsVisibility::Open;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let reset = cx
+                .debug_bounds("changes-base-reset")
+                .expect("reset base option");
+            cx.simulate_click(reset.center(), Modifiers::none());
+
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(ServiceCommand::SetBaseRef {
+                    app_session_id,
+                    base_ref,
+                }) if app_session_id == "session-1" && base_ref == "main"
+            ));
         }
 
         fn changes_scroll(

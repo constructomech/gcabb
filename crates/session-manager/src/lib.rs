@@ -3,7 +3,7 @@
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
-use std::time::{Instant, SystemTime, UNIX_EPOCH};
+use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
     ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus, DomainEvent,
@@ -23,6 +23,7 @@ use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
 
 const SNAPSHOT_INTERVAL: u64 = 50;
+const BASE_REF_REFRESH_TTL: Duration = Duration::from_mins(5);
 
 #[derive(Debug, Error)]
 pub enum SessionManagerError {
@@ -30,8 +31,12 @@ pub enum SessionManagerError {
     Provider(#[from] ProviderError),
     #[error(transparent)]
     Storage(#[from] StorageError),
+    #[error(transparent)]
+    Git(#[from] git_service::GitError),
     #[error("session actor is no longer running")]
     ActorClosed,
+    #[error("background task failed: {0}")]
+    BackgroundTask(String),
     #[error("session not found: {0}")]
     SessionNotFound(String),
     #[error("session is already being restored: {0}")]
@@ -307,6 +312,25 @@ impl SessionHandle {
     pub async fn set_reasoning_effort(&self, effort: impl Into<String>) -> Result<()> {
         self.control(SessionControlCommand::ReasoningEffort(effort.into()))
             .await
+    }
+
+    pub async fn set_base_ref(&self, base_ref: impl Into<String>) -> Result<()> {
+        self.control(SessionControlCommand::BaseRef(base_ref.into()))
+            .await
+    }
+
+    pub async fn refresh_changes(&self, force: bool) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(SessionCommand::RefreshChanges {
+                force,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| SessionManagerError::ActorClosed)?;
+        response_rx
+            .await
+            .map_err(|_| SessionManagerError::ActorClosed)?
     }
 
     async fn command(&self, kind: SessionCommandKind) -> Result<()> {
@@ -585,7 +609,7 @@ impl SessionManager {
             // prompt, so a runtime that is missing file or shell tools is visible
             // as capability state rather than as an unexplained model failure.
             self.populate_capabilities(&provider, &mut state).await;
-            refresh_changes(&mut state);
+            refresh_changes_on_start(&mut state).await;
             Ok(self.spawn_actor(provider.clone(), isolated, state, provider_session))
         }
         .await;
@@ -1312,7 +1336,7 @@ impl SessionManager {
         self.populate_capabilities(&provider, &mut state).await;
         let capabilities_ms = elapsed_ms(capabilities_started);
         let changes_started = Instant::now();
-        refresh_changes(&mut state);
+        refresh_changes_on_start(&mut state).await;
         let changes_ms = elapsed_ms(changes_started);
         let persistence_started = Instant::now();
         self.storage.write_snapshot(&state)?;
@@ -1464,6 +1488,7 @@ impl SessionManager {
             provider_events: provider_session.events,
             provider_interactions: provider_session.interactions,
             pending_responses: HashMap::new(),
+            last_base_refresh: Instant::now(),
             commands: command_rx,
             snapshots: snapshot_tx,
         };
@@ -1558,6 +1583,10 @@ enum SessionCommand {
         max_chunks: u64,
         response: oneshot::Sender<Result<()>>,
     },
+    RefreshChanges {
+        force: bool,
+        response: oneshot::Sender<Result<()>>,
+    },
     Control {
         control: SessionControlCommand,
         response: oneshot::Sender<Result<()>>,
@@ -1582,6 +1611,7 @@ enum SessionControlCommand {
     Mode(String),
     ReasoningEffort(String),
     ContextTier(String),
+    BaseRef(String),
 }
 
 enum ReasoningEffortUpdate {
@@ -1599,6 +1629,7 @@ struct SessionActor {
     provider_events: mpsc::Receiver<ProviderEvent>,
     provider_interactions: mpsc::Receiver<ProviderInteraction>,
     pending_responses: HashMap<String, oneshot::Sender<InteractionResponse>>,
+    last_base_refresh: Instant,
     commands: mpsc::Receiver<SessionCommand>,
     snapshots: watch::Sender<Arc<SessionSnapshot>>,
 }
@@ -1676,6 +1707,10 @@ impl SessionActor {
                                 before_chunk,
                                 max_chunks,
                             );
+                            let _ = response.send(result);
+                        }
+                        Some(SessionCommand::RefreshChanges { force, response }) => {
+                            let result = self.refresh_changes(force).await;
                             let _ = response.send(result);
                         }
                         Some(SessionCommand::Control { control, response }) => {
@@ -1774,6 +1809,7 @@ impl SessionActor {
         if !needs_changes_refresh(&self.state, &event) {
             return;
         }
+
         let worktree = PathBuf::from(&self.state.metadata.project_path);
         let base_ref = base_ref_for(&self.state);
         let computed =
@@ -1785,6 +1821,31 @@ impl SessionActor {
             }
             Err(error) => self.record_actor_error("refresh_changes", &error.to_string()),
         }
+    }
+
+    async fn refresh_changes(&mut self, force: bool) -> Result<()> {
+        let worktree = PathBuf::from(&self.state.metadata.project_path);
+        let base_ref = base_ref_for(&self.state);
+        let fetched_ref = base_ref.clone();
+        let fetch = force || self.last_base_refresh.elapsed() >= BASE_REF_REFRESH_TTL;
+        let (fetch_error, computed) = tokio::task::spawn_blocking(move || {
+            let service = GitService::new(&worktree);
+            let fetch_error = fetch
+                .then(|| service.fetch_base_ref(&fetched_ref).err())
+                .flatten();
+            (fetch_error, compute_changes(&worktree, &fetched_ref))
+        })
+        .await
+        .map_err(|error| SessionManagerError::BackgroundTask(error.to_string()))?;
+        if fetch {
+            self.last_base_refresh = Instant::now();
+        }
+        if let Some(error) = fetch_error {
+            tracing::warn!(%error, %base_ref, "failed to refresh changes base; using cached ref");
+        }
+        apply_changes(&mut self.state, computed);
+        self.publish(false);
+        Ok(())
     }
 
     fn receive_interaction(&mut self, mut interaction: ProviderInteraction) {
@@ -1875,6 +1936,23 @@ impl SessionActor {
                     )
                     .await?;
                 self.state.controls.context_tier = Some(tier);
+            }
+            SessionControlCommand::BaseRef(base_ref) => {
+                let worktree = PathBuf::from(&self.state.metadata.project_path);
+                let selected = base_ref.clone();
+                let (fetch_error, changes) = tokio::task::spawn_blocking(move || {
+                    let service = GitService::new(&worktree);
+                    let fetch_error = service.fetch_base_ref(&selected).err();
+                    (fetch_error, compute_changes(&worktree, &selected))
+                })
+                .await
+                .map_err(|error| SessionManagerError::BackgroundTask(error.to_string()))?;
+                self.last_base_refresh = Instant::now();
+                if let Some(error) = fetch_error {
+                    tracing::warn!(%error, %base_ref, "failed to refresh selected base; using cached ref");
+                }
+                self.state.metadata.base_ref = Some(base_ref);
+                apply_changes(&mut self.state, changes);
             }
         }
         self.state.metadata.updated_at = timestamp();
@@ -2099,11 +2177,8 @@ fn base_ref_for(state: &SessionSnapshot) -> String {
         .unwrap_or_else(|| "HEAD".to_owned())
 }
 
-/// Recompute the session's changes view synchronously.
-///
-/// Used on session creation and restore, where blocking briefly is acceptable
-/// and the result must be present in the first published snapshot.
-fn refresh_changes(state: &mut SessionSnapshot) {
+/// Refresh the selected upstream and compute the first changes snapshot.
+async fn refresh_changes_on_start(state: &mut SessionSnapshot) {
     // Chats are not attached to a checkout, so there is nothing to diff.
     if state.metadata.is_chat() {
         state.changes = app_model::ChangesView::default();
@@ -2117,8 +2192,24 @@ fn refresh_changes(state: &mut SessionSnapshot) {
     }
     let worktree = PathBuf::from(&state.metadata.project_path);
     let base_ref = base_ref_for(state);
-    let changes = compute_changes(&worktree, &base_ref);
-    apply_changes(state, changes);
+    let computed = tokio::task::spawn_blocking(move || {
+        let service = GitService::new(&worktree);
+        let fetch_error = service.fetch_base_ref(&base_ref).err();
+        (fetch_error, compute_changes(&worktree, &base_ref))
+    })
+    .await;
+    match computed {
+        Ok((fetch_error, changes)) => {
+            if let Some(error) = fetch_error {
+                tracing::warn!(%error, "failed to refresh changes base; using cached ref");
+            }
+            apply_changes(state, changes);
+        }
+        Err(error) => {
+            tracing::error!(%error, "changes refresh task failed");
+            state.changes.error = Some(format!("changes refresh task failed: {error}"));
+        }
+    }
 }
 
 /// Whether an event indicates the worktree may have changed.
@@ -2905,6 +2996,47 @@ mod tests {
         let metadata = storage.list_sessions().unwrap();
         assert_eq!(metadata[0].model.as_deref(), Some("model-2"));
         assert_eq!(metadata[0].mode.as_deref(), Some("plan"));
+    }
+
+    #[tokio::test]
+    async fn changing_base_ref_recomputes_changes_and_persists_selection() {
+        let provider = Arc::new(FakeProvider::default());
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider, storage.clone(), diagnostics);
+        manager.start().await.unwrap();
+        let directory = tempdir().unwrap();
+        initialise_repository(directory.path());
+        git(directory.path(), &["branch", "feature"]);
+        let missing_remote = directory.path().join("missing-remote");
+        git(
+            directory.path(),
+            &["remote", "add", "origin", &missing_remote.to_string_lossy()],
+        );
+        git(
+            directory.path(),
+            &["update-ref", "refs/remotes/origin/feature", "feature"],
+        );
+        git(
+            directory.path(),
+            &["branch", "--set-upstream-to=origin/feature", "feature"],
+        );
+        let mut create = request(directory.path().to_owned());
+        create.repository_root = Some(directory.path().to_string_lossy().into_owned());
+        create.base_ref = Some("main".to_owned());
+        let handle = manager.create_session(create).await.unwrap();
+
+        handle.set_base_ref("feature").await.unwrap();
+
+        let snapshot = handle.snapshot();
+        assert_eq!(snapshot.metadata.base_ref.as_deref(), Some("feature"));
+        assert_eq!(snapshot.changes.base_label.as_deref(), Some("feature"));
+        assert_eq!(
+            snapshot.changes.tracking_ref.as_deref(),
+            Some("origin/feature")
+        );
+        let metadata = storage.list_sessions().unwrap();
+        assert_eq!(metadata[0].base_ref.as_deref(), Some("feature"));
     }
 
     /// Regression: earlier builds registered one project per worktree, so a

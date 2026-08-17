@@ -96,6 +96,61 @@ impl GitService {
             .to_owned())
     }
 
+    /// Resolve a logical local branch through its configured upstream.
+    #[must_use]
+    pub fn tracking_ref(&self, base_ref: &str) -> String {
+        let local_ref = format!("refs/heads/{base_ref}");
+        self.run(&[
+            "for-each-ref",
+            "--format=%(upstream:short)",
+            local_ref.as_str(),
+        ])
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| base_ref.to_owned())
+    }
+
+    /// Local and remote-tracking branches available as comparison bases.
+    pub fn base_refs(&self) -> Result<Vec<String>> {
+        let output = self.run(&[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ])?;
+        let mut refs = output
+            .lines()
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty() && !reference.ends_with("/HEAD"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        refs.sort_by_key(|reference| (reference.contains('/'), reference.clone()));
+        refs.dedup();
+        Ok(refs)
+    }
+
+    /// Fetch the remote-tracking ref backing a logical base branch.
+    ///
+    /// Returns `false` when the selected base is local-only.
+    pub fn fetch_base_ref(&self, base_ref: &str) -> Result<bool> {
+        let tracking_ref = self.tracking_ref(base_ref);
+        let remotes = self.run(&["remote"])?;
+        let Some((remote, branch)) = remotes.lines().find_map(|remote| {
+            tracking_ref
+                .strip_prefix(remote)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map(|branch| (remote, branch))
+        }) else {
+            return Ok(false);
+        };
+        let source = format!("refs/heads/{branch}");
+        let destination = format!("refs/remotes/{tracking_ref}");
+        let refspec = format!("{source}:{destination}");
+        self.run(&["fetch", "--quiet", remote, &refspec])?;
+        Ok(true)
+    }
+
     /// Merge base between `HEAD` and `base_ref`.
     ///
     /// Falls back to the ref itself when no merge base exists, so a detached
@@ -118,9 +173,8 @@ impl GitService {
         let path_string = path.to_string_lossy().into_owned();
         // Resolve the base first so a missing ref fails here with a clear
         // error rather than leaving a half-created worktree behind.
-        let base = self
-            .merge_base(base_ref)
-            .unwrap_or_else(|_| base_ref.to_owned());
+        let tracking_ref = self.tracking_ref(base_ref);
+        let base = self.merge_base(&tracking_ref).unwrap_or(tracking_ref);
         self.run(&["worktree", "add", "-b", branch, &path_string, &base])?;
         Ok(branch.to_owned())
     }
@@ -205,10 +259,12 @@ impl GitService {
             };
         }
 
-        match self.collect_changes(base_ref) {
+        let tracking_ref = self.tracking_ref(base_ref);
+        match self.collect_changes(&tracking_ref) {
             Ok((base, head, branch, files)) => ChangesView {
                 base: Some(base),
                 base_label: Some(base_ref.to_owned()),
+                tracking_ref: Some(tracking_ref),
                 head: Some(head),
                 branch: Some(branch),
                 files,
@@ -217,6 +273,7 @@ impl GitService {
             },
             Err(error) => ChangesView {
                 base_label: Some(base_ref.to_owned()),
+                tracking_ref: Some(tracking_ref),
                 generated_at: Some(generated_at),
                 error: Some(error.to_string()),
                 ..ChangesView::default()
@@ -549,6 +606,47 @@ mod tests {
                 .as_ref()
                 .is_some_and(|d| d.contains("+untracked"))
         );
+    }
+
+    #[test]
+    fn logical_base_uses_its_upstream_when_local_branch_is_stale() {
+        let dir = repo();
+        let path = dir.path();
+        let remote = tempfile::tempdir().expect("remote");
+        git(remote.path(), &["init", "--bare"]);
+        git(
+            path,
+            &["remote", "add", "origin", &remote.path().to_string_lossy()],
+        );
+        git(path, &["push", "-u", "origin", "main"]);
+        let stale_main = GitService::new(path).head_commit().unwrap();
+
+        fs::write(path.join("upstream.txt"), "upstream\n").expect("upstream file");
+        git(path, &["add", "upstream.txt"]);
+        git(path, &["commit", "-m", "upstream"]);
+        git(path, &["push", "origin", "main"]);
+        git(path, &["branch", "-f", "main-stale", &stale_main]);
+        git(path, &["checkout", "-b", "session"]);
+        fs::write(path.join("session.txt"), "session\n").expect("session file");
+        git(path, &["add", "session.txt"]);
+        git(path, &["commit", "-m", "session"]);
+        git(path, &["branch", "-f", "main", &stale_main]);
+
+        let service = GitService::new(path);
+        let view = service.changes("main", "now".to_owned());
+
+        assert_eq!(service.tracking_ref("main"), "origin/main");
+        assert_eq!(view.tracking_ref.as_deref(), Some("origin/main"));
+        assert_eq!(view.files.len(), 1, "files: {:?}", view.files);
+        assert!(view.file("session.txt").is_some());
+
+        let outside = tempfile::tempdir().expect("worktree root");
+        let worktree = outside.path().join("new-session");
+        service
+            .create_worktree(&worktree, "gcabb/new-session", "main")
+            .expect("worktree from tracked base");
+        assert!(worktree.join("upstream.txt").exists());
+        assert!(!worktree.join("session.txt").exists());
     }
 
     #[test]
