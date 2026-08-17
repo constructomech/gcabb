@@ -656,6 +656,20 @@ impl SessionManager {
     }
 
     pub async fn resume_closed_session(&self, app_session_id: &str) -> Result<SessionHandle> {
+        self.resume_closed_session_from_worktrees_root(
+            app_session_id,
+            self.roots.worktrees.as_deref(),
+        )
+        .await
+    }
+
+    /// Resume a session while allowing the caller to identify the managed root
+    /// that owns a missing worktree.
+    pub async fn resume_closed_session_from_worktrees_root(
+        &self,
+        app_session_id: &str,
+        worktrees_root: Option<&Path>,
+    ) -> Result<SessionHandle> {
         let existing = {
             let sessions = self.sessions.lock().await;
             sessions.get(app_session_id).cloned()
@@ -687,7 +701,9 @@ impl SessionManager {
             ));
         }
         let result = async {
-            let runtime = self.restore_session(metadata.clone()).await?;
+            let runtime = self
+                .restore_session_from_worktrees_root(metadata.clone(), worktrees_root)
+                .await?;
             self.install_restored_runtime(&metadata, runtime, |_| {})
                 .await?
                 .ok_or_else(|| SessionManagerError::SessionNotFound(app_session_id.to_owned()))
@@ -1161,6 +1177,15 @@ impl SessionManager {
     }
 
     async fn restore_session(&self, metadata: SessionMetadata) -> Result<SessionRuntime> {
+        self.restore_session_from_worktrees_root(metadata, self.roots.worktrees.as_deref())
+            .await
+    }
+
+    async fn restore_session_from_worktrees_root(
+        &self,
+        metadata: SessionMetadata,
+        worktrees_root: Option<&Path>,
+    ) -> Result<SessionRuntime> {
         let started = Instant::now();
         let recovery_started = Instant::now();
         let recovered = self.storage.recover_session(&metadata.id)?;
@@ -1172,7 +1197,12 @@ impl SessionManager {
         state.pending_interactions.clear();
         let working_directory = PathBuf::from(&metadata.project_path);
         if !working_directory.is_dir()
-            && !self.recreate_managed_worktree(&metadata, &state, &working_directory)
+            && !self.recreate_managed_worktree(
+                &metadata,
+                &state,
+                &working_directory,
+                worktrees_root,
+            )
         {
             return self.restore_unavailable(
                 &metadata,
@@ -1373,8 +1403,9 @@ impl SessionManager {
         metadata: &SessionMetadata,
         state: &SessionSnapshot,
         working_directory: &Path,
+        worktrees_root: Option<&Path>,
     ) -> bool {
-        let Some(worktrees_root) = self.roots.worktrees.as_deref() else {
+        let Some(worktrees_root) = worktrees_root else {
             return false;
         };
         if metadata.kind != SessionKind::Project

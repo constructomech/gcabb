@@ -347,6 +347,8 @@ enum ServiceCommand {
     },
     Resume {
         app_session_id: String,
+        /// Managed root used to recreate a missing worktree, when known.
+        worktrees_root: Option<PathBuf>,
     },
     RelocateSession {
         app_session_id: String,
@@ -867,10 +869,16 @@ async fn handle_service_command(
             .cancel()
             .await
             .map_err(|error| error.to_string())?,
-        ServiceCommand::Resume { app_session_id } => {
+        ServiceCommand::Resume {
+            app_session_id,
+            worktrees_root,
+        } => {
             created = Some(
                 manager
-                    .resume_closed_session(&app_session_id)
+                    .resume_closed_session_from_worktrees_root(
+                        &app_session_id,
+                        worktrees_root.as_deref(),
+                    )
                     .await
                     .map_err(|error| error.to_string())?,
             );
@@ -7198,8 +7206,14 @@ impl SessionMvpView {
         let delete_id = app_session_id.clone();
         let retry_id = app_session_id.clone();
         let working_directory = PathBuf::from(&session.snapshot.metadata.project_path);
-        let can_recreate = working_directory.starts_with(worktrees_root())
-            && session.snapshot.changes.branch.is_some();
+        let worktrees_root = self
+            .worktree_configuration
+            .settings
+            .owning_root_for_worktree(
+                &working_directory,
+                &self.worktree_configuration.default_root,
+            );
+        let can_recreate = worktrees_root.is_some() && session.snapshot.changes.branch.is_some();
 
         div()
             .id("session-unavailable")
@@ -7239,6 +7253,7 @@ impl SessionMvpView {
                     view.action_error = None;
                     let _ = view.commands.send(ServiceCommand::Resume {
                         app_session_id: retry_id.clone(),
+                        worktrees_root: worktrees_root.clone(),
                     });
                 }))
             })
@@ -7454,6 +7469,7 @@ impl SessionMvpView {
                                     .on_click(cx.listener(move |view, _, _, _| {
                                         let _ = view.commands.send(ServiceCommand::Resume {
                                             app_session_id: id.clone(),
+                                            worktrees_root: None,
                                         });
                                     })),
                             )
@@ -10306,9 +10322,11 @@ mod tests {
             view.update(cx, |view, cx| {
                 let mut unavailable = snapshot("session-1", "Archived session");
                 unavailable.status = SessionStatus::Unavailable;
-                unavailable.metadata.project_path = super::super::worktrees_root()
+                unavailable.metadata.project_path = view
+                    .worktree_configuration
+                    .default_root
                     .join("project")
-                    .join("archived")
+                    .join("gcabb-archived")
                     .to_string_lossy()
                     .into_owned();
                 unavailable.changes.branch = Some("gcabb/archived".to_owned());
@@ -10331,7 +10349,11 @@ mod tests {
             cx.simulate_click(recreate.center(), Modifiers::none());
             assert!(matches!(
                 commands.recv().expect("resume command"),
-                ServiceCommand::Resume { app_session_id } if app_session_id == "session-1"
+                ServiceCommand::Resume {
+                    app_session_id,
+                    worktrees_root: Some(worktrees_root),
+                } if app_session_id == "session-1"
+                    && worktrees_root == std::path::Path::new("/tmp/worktrees")
             ));
 
             let delete = cx
@@ -10340,7 +10362,8 @@ mod tests {
             cx.simulate_click(delete.center(), Modifiers::none());
             assert!(matches!(
                 commands.recv().expect("delete command"),
-                ServiceCommand::DeleteSession { app_session_id } if app_session_id == "session-1"
+                ServiceCommand::DeleteSession { app_session_id, .. }
+                    if app_session_id == "session-1"
             ));
         }
 
