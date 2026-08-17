@@ -13310,9 +13310,8 @@ mod tests {
                 gpui::px(0.0),
                 "the block is already at its end"
             );
-            assert_ne!(
-                transcript_offset(&view, cx),
-                transcript_before,
+            assert!(
+                transcript_offset(&view, cx) > transcript_before,
                 "a block at its end must hand the wheel to the transcript"
             );
         }
