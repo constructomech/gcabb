@@ -501,8 +501,8 @@ pub struct SessionMetadata {
     pub mode: Option<String>,
     /// Git ref the changes view compares against.
     ///
-    /// Recorded once at session creation so the comparison stays stable even
-    /// if the base branch moves on. Phase 6 makes this user-selectable.
+    /// This is the logical branch selected by the user. Change refreshes resolve
+    /// its current upstream and merge-base commit.
     #[serde(default)]
     pub base_ref: Option<String>,
     pub created_at: String,
