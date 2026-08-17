@@ -128,6 +128,17 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    fn read_only(state: SessionSnapshot) -> Self {
+        let id = state.metadata.id.clone();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_snapshot_tx, snapshots) = watch::channel(Arc::new(state));
+        Self {
+            id,
+            command_tx,
+            snapshots,
+        }
+    }
+
     /// Build a detached handle around a fixed snapshot, for UI tests.
     ///
     /// The command channel has no actor behind it, so lifecycle calls fail
@@ -136,14 +147,7 @@ impl SessionHandle {
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn for_test(snapshot: SessionSnapshot) -> Self {
-        let id = snapshot.metadata.id.clone();
-        let (command_tx, _command_rx) = mpsc::channel(1);
-        let (_snapshot_tx, snapshots) = watch::channel(Arc::new(snapshot));
-        Self {
-            id,
-            command_tx,
-            snapshots,
-        }
+        Self::read_only(snapshot)
     }
 
     #[must_use]
@@ -349,6 +353,7 @@ pub struct SessionManager {
     storage: Arc<Storage>,
     diagnostics: Arc<dyn DiagnosticsSink>,
     sessions: Mutex<HashMap<String, SessionHandle>>,
+    roots: SessionRoots,
 }
 
 impl SessionManager {
@@ -363,7 +368,14 @@ impl SessionManager {
             storage,
             diagnostics,
             sessions: Mutex::new(HashMap::new()),
+            roots: SessionRoots::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_session_roots(mut self, roots: SessionRoots) -> Self {
+        self.roots = roots;
+        self
     }
 
     pub async fn start(&self) -> Result<(ProviderCompatibility, RestoreReport)> {
@@ -557,7 +569,10 @@ impl SessionManager {
             sessions.get(app_session_id).cloned()
         };
         if let Some(handle) = existing {
-            if handle.snapshot().status != SessionStatus::Disconnected {
+            if !matches!(
+                handle.snapshot().status,
+                SessionStatus::Disconnected | SessionStatus::Unavailable
+            ) {
                 return Ok(handle);
             }
             self.sessions.lock().await.remove(app_session_id);
@@ -574,6 +589,54 @@ impl SessionManager {
             .await
             .insert(app_session_id.to_owned(), handle.clone());
         Ok(handle)
+    }
+
+    /// Point a read-only session at a replacement working directory and retry it.
+    pub async fn relocate_session(
+        &self,
+        app_session_id: &str,
+        working_directory: &Path,
+    ) -> Result<SessionHandle> {
+        if !working_directory.is_dir() {
+            return Err(SessionManagerError::WorkingDirectoryUnavailable(
+                working_directory.to_owned(),
+            ));
+        }
+        let mut metadata = self
+            .storage
+            .list_sessions()?
+            .into_iter()
+            .find(|metadata| metadata.id == app_session_id)
+            .ok_or_else(|| SessionManagerError::SessionNotFound(app_session_id.to_owned()))?;
+        let previous_path = metadata.project_path.clone();
+        metadata.project_path = working_directory
+            .canonicalize()
+            .unwrap_or_else(|_| working_directory.to_owned())
+            .to_string_lossy()
+            .into_owned();
+        self.storage.upsert_session(&metadata)?;
+        match self.restore_session(metadata).await {
+            Ok(handle) => {
+                self.sessions
+                    .lock()
+                    .await
+                    .insert(app_session_id.to_owned(), handle.clone());
+                Ok(handle)
+            }
+            Err(error) => {
+                let mut metadata = self
+                    .storage
+                    .list_sessions()?
+                    .into_iter()
+                    .find(|metadata| metadata.id == app_session_id)
+                    .ok_or_else(|| {
+                        SessionManagerError::SessionNotFound(app_session_id.to_owned())
+                    })?;
+                metadata.project_path = previous_path;
+                self.storage.upsert_session(&metadata)?;
+                Err(error)
+            }
+        }
     }
 
     pub fn register_project(&self, project: &ProjectMetadata) -> Result<()> {
@@ -899,6 +962,7 @@ impl SessionManager {
         state.tool_catalog = catalog;
     }
 
+    #[allow(clippy::too_many_lines)]
     async fn restore_session(&self, metadata: SessionMetadata) -> Result<SessionHandle> {
         let started = Instant::now();
         let recovery_started = Instant::now();
@@ -906,13 +970,21 @@ impl SessionManager {
         let recovery_ms = elapsed_ms(recovery_started);
         let replayed_events = recovered.replayed_events;
         let mut state = recovered.state;
+        state.metadata = metadata.clone();
         state.status = SessionStatus::Recovering;
         state.pending_interactions.clear();
         let working_directory = PathBuf::from(&metadata.project_path);
-        if !working_directory.is_dir() {
-            return Err(SessionManagerError::WorkingDirectoryUnavailable(
-                working_directory,
-            ));
+        if !working_directory.is_dir()
+            && !self.recreate_managed_worktree(&metadata, &state, &working_directory)
+        {
+            return self.restore_unavailable(
+                &metadata,
+                state,
+                &working_directory,
+                started,
+                recovery_ms,
+                replayed_events,
+            );
         }
         let resume_started = Instant::now();
         let provider_session = self
@@ -974,14 +1046,10 @@ impl SessionManager {
         self.storage.write_snapshot(&state)?;
         let persistence_ms = elapsed_ms(persistence_started);
         let handle = self.spawn_actor(state, provider_session);
-        self.diagnostics.record(DiagnosticEvent {
-            timestamp: timestamp(),
-            category: "session_manager".to_owned(),
-            operation: "restore_session".to_owned(),
-            elapsed_ms: Some(elapsed_ms(started)),
-            session_id: Some(metadata.id),
-            success: true,
-            details: json!({
+        self.record_restore_success(
+            metadata.id,
+            started,
+            json!({
                 "storageRecoveryMs": recovery_ms,
                 "replayedEvents": replayed_events,
                 "providerResumeMs": resume_ms,
@@ -993,8 +1061,106 @@ impl SessionManager {
                 "changesMs": changes_ms,
                 "persistenceMs": persistence_ms
             }),
-        });
+        );
         Ok(handle)
+    }
+
+    fn record_restore_success(&self, session_id: String, started: Instant, details: Value) {
+        self.diagnostics.record(DiagnosticEvent {
+            timestamp: timestamp(),
+            category: "session_manager".to_owned(),
+            operation: "restore_session".to_owned(),
+            elapsed_ms: Some(elapsed_ms(started)),
+            session_id: Some(session_id),
+            success: true,
+            details,
+        });
+    }
+
+    fn restore_unavailable(
+        &self,
+        metadata: &SessionMetadata,
+        mut state: SessionSnapshot,
+        working_directory: &Path,
+        started: Instant,
+        recovery_ms: u64,
+        replayed_events: usize,
+    ) -> Result<SessionHandle> {
+        state.reconcile_after_restart(&timestamp());
+        state.status = SessionStatus::Unavailable;
+        state.capabilities.set(app_model::Capability {
+            id: CapabilityId::Changes,
+            status: CapabilityStatus::Unavailable,
+            detail: "The session working directory is unavailable.".to_owned(),
+            evidence: vec![working_directory.display().to_string()],
+        });
+        self.storage.write_snapshot(&state)?;
+        if self.selected_session()?.as_deref() == Some(metadata.id.as_str()) {
+            self.set_selected_session(None)?;
+        }
+        self.diagnostics.record(DiagnosticEvent {
+            timestamp: timestamp(),
+            category: "session_manager".to_owned(),
+            operation: "restore_session".to_owned(),
+            elapsed_ms: Some(elapsed_ms(started)),
+            session_id: Some(metadata.id.clone()),
+            success: true,
+            details: json!({
+                "storageRecoveryMs": recovery_ms,
+                "replayedEvents": replayed_events,
+                "readOnly": true,
+                "reason": "working_directory_unavailable",
+                "workingDirectory": working_directory
+            }),
+        });
+        Ok(SessionHandle::read_only(state))
+    }
+
+    /// Recreate only worktrees beneath GCABB's own managed root.
+    fn recreate_managed_worktree(
+        &self,
+        metadata: &SessionMetadata,
+        state: &SessionSnapshot,
+        working_directory: &Path,
+    ) -> bool {
+        let Some(worktrees_root) = self.roots.worktrees.as_deref() else {
+            return false;
+        };
+        if metadata.kind != SessionKind::Project
+            || !working_directory.starts_with(worktrees_root)
+            || working_directory == worktrees_root
+            || working_directory
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return false;
+        }
+        let Some(repository) = metadata.repository_root.as_deref().map(Path::new) else {
+            return false;
+        };
+        let Some(branch) = state.changes.branch.as_deref() else {
+            return false;
+        };
+        let git = GitService::new(repository);
+        if !git.is_worktree() || !git.branch_exists(branch) {
+            return false;
+        }
+        let result = git.recreate_worktree(working_directory, branch);
+        self.diagnostics.record(DiagnosticEvent {
+            timestamp: timestamp(),
+            category: "session_manager".to_owned(),
+            operation: "recreate_worktree".to_owned(),
+            elapsed_ms: None,
+            session_id: Some(metadata.id.clone()),
+            success: result.is_ok(),
+            details: json!({
+                "workingDirectory": working_directory,
+                "repository": repository,
+                "branch": branch,
+                "error": result.as_ref().err().map(ToString::to_string)
+            }),
+        });
+        result.is_ok()
     }
 
     fn spawn_actor(
@@ -1672,10 +1838,35 @@ fn is_gcabb_worktree(
 #[cfg(test)]
 mod tests {
     use diagnostics::MemoryDiagnostics;
+    use std::process::Command;
     use tempfile::tempdir;
     use test_harness::{FakeProvider, golden_events};
 
     use super::*;
+
+    fn git(directory: &Path, arguments: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .output()
+            .expect("git command runs");
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn initialise_repository(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        git(path, &["init", "--initial-branch=main"]);
+        git(path, &["config", "user.email", "test@example.com"]);
+        git(path, &["config", "user.name", "Test"]);
+        std::fs::write(path.join("base.txt"), "base\n").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-m", "base"]);
+    }
 
     #[test]
     fn only_gcabb_worktrees_auto_approve_tools() {
@@ -1966,15 +2157,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_working_directory_is_reported_before_resume() {
+    async fn missing_working_directory_restores_read_only_without_resuming() {
         let directory = tempdir().unwrap();
         let missing = directory.path().join("deleted-worktree");
         let provider = Arc::new(FakeProvider::default());
+        provider.start().await.unwrap();
+        let seeded = provider
+            .create_session(SessionRequest {
+                working_directory: directory.path().to_owned(),
+                model: None,
+                mode: None,
+                reasoning_effort: None,
+                context_tier: None,
+                auto_approve_tools: false,
+            })
+            .await
+            .unwrap();
+        provider.disconnect(&seeded.sdk_session_id).await.unwrap();
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let diagnostics = Arc::new(MemoryDiagnostics::default());
         let metadata = SessionMetadata {
             id: "stale-session".to_owned(),
-            sdk_session_id: "stale-sdk-session".to_owned(),
+            sdk_session_id: seeded.sdk_session_id,
             project_path: missing.to_string_lossy().into_owned(),
             repository_root: None,
             title: "Deleted worktree".to_owned(),
@@ -1987,15 +2191,120 @@ mod tests {
             updated_at: "1".to_owned(),
         };
         storage.upsert_session(&metadata).unwrap();
+        let mut snapshot = SessionSnapshot::new(metadata.clone());
+        snapshot.transcript.push(app_model::TranscriptMessage {
+            id: "message-1".to_owned(),
+            role: app_model::TranscriptRole::Assistant,
+            content: "Persisted history".to_owned(),
+            state: app_model::TranscriptState::Complete,
+            timestamp: "1".to_owned(),
+            sequence: 1,
+            attachments: Vec::new(),
+        });
+        storage.write_snapshot(&snapshot).unwrap();
+        storage.set_selected_session(Some(&metadata.id)).unwrap();
         let manager = SessionManager::new(provider.clone(), storage, diagnostics);
 
         let (_, report) = manager.start().await.unwrap();
 
-        assert!(report.restored.is_empty());
-        assert_eq!(report.failed.len(), 1);
-        assert!(report.failed[0].error.contains("working directory"));
-        assert!(report.failed[0].error.contains("delete this session"));
+        assert!(
+            report.failed.is_empty(),
+            "restore failed: {:?}",
+            report
+                .failed
+                .iter()
+                .map(|failure| failure.error.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(report.restored.len(), 1);
+        let restored = report.restored[0].snapshot();
+        assert_eq!(restored.status, SessionStatus::Unavailable);
+        assert_eq!(restored.transcript[0].content, "Persisted history");
+        assert_eq!(manager.selected_session().unwrap(), None);
         assert_eq!(provider.active_sessions().await, 0);
+
+        let replacement = tempdir().unwrap();
+        let relocated = manager
+            .relocate_session("stale-session", replacement.path())
+            .await
+            .unwrap();
+        assert_eq!(relocated.snapshot().status, SessionStatus::Idle);
+        assert_eq!(
+            relocated.snapshot().metadata.project_path,
+            replacement.path().canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(provider.active_sessions().await, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_managed_worktree_is_recreated_before_resume() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let worktrees = directory.path().join("worktrees");
+        let worktree = worktrees.join("repository").join("session");
+        initialise_repository(&repository);
+        let git = GitService::new(&repository);
+        git.create_worktree(&worktree, "gcabb/recover", "main")
+            .unwrap();
+        let provider = Arc::new(FakeProvider::default());
+        provider.start().await.unwrap();
+        let seeded = provider
+            .create_session(SessionRequest {
+                working_directory: worktree.clone(),
+                model: None,
+                mode: None,
+                reasoning_effort: None,
+                context_tier: None,
+                auto_approve_tools: true,
+            })
+            .await
+            .unwrap();
+        provider.disconnect(&seeded.sdk_session_id).await.unwrap();
+
+        let metadata = SessionMetadata {
+            id: "recoverable-session".to_owned(),
+            sdk_session_id: seeded.sdk_session_id,
+            project_path: worktree.to_string_lossy().into_owned(),
+            repository_root: Some(repository.to_string_lossy().into_owned()),
+            title: "Recover worktree".to_owned(),
+            title_source: TitleSource::Manual,
+            kind: SessionKind::Project,
+            model: None,
+            mode: None,
+            base_ref: Some("main".to_owned()),
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+        };
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        storage.upsert_session(&metadata).unwrap();
+        let mut snapshot = SessionSnapshot::new(metadata);
+        snapshot.changes.branch = Some("gcabb/recover".to_owned());
+        storage.write_snapshot(&snapshot).unwrap();
+        git.remove_worktree(&worktree).unwrap();
+        assert!(!worktree.exists());
+
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider.clone(), storage, diagnostics)
+            .with_session_roots(SessionRoots {
+                worktrees: Some(worktrees),
+                ..SessionRoots::default()
+            });
+
+        let (_, report) = manager.start().await.unwrap();
+
+        assert!(
+            report.failed.is_empty(),
+            "managed restore failed: {:?}",
+            report
+                .failed
+                .iter()
+                .map(|failure| failure.error.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(report.restored.len(), 1);
+        assert_eq!(report.restored[0].snapshot().status, SessionStatus::Idle);
+        assert!(worktree.join("base.txt").exists());
+        assert_eq!(provider.active_sessions().await, 1);
     }
 
     #[tokio::test]
