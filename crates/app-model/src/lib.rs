@@ -17,8 +17,8 @@ pub use tools::{
 };
 
 pub const DOMAIN_EVENT_VERSION: u16 = 1;
-/// Version 7 adds bounded SDK activity diagnostics for progress reporting.
-pub const SNAPSHOT_VERSION: u16 = 7;
+/// Version 8 retains permission requests and their outcomes in the timeline.
+pub const SNAPSHOT_VERSION: u16 = 8;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -220,6 +220,14 @@ pub struct InteractionRequest {
     pub choices: Vec<String>,
     pub allow_freeform: bool,
     pub details: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct InteractionRecord {
+    pub request: InteractionRequest,
+    /// Event sequence after which the interaction was requested.
+    pub sequence: u64,
+    pub response: Option<InteractionResponse>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -636,6 +644,8 @@ pub struct SessionSnapshot {
     #[serde(default)]
     pub pending_interactions: Vec<InteractionRequest>,
     #[serde(default)]
+    pub interaction_history: Vec<InteractionRecord>,
+    #[serde(default)]
     pub controls: SessionControls,
     /// Tools the runtime advertises for this session, proven via `tools.list`.
     #[serde(default)]
@@ -672,6 +682,7 @@ impl SessionSnapshot {
             last_sequence: 0,
             transcript: Vec::new(),
             pending_interactions: Vec::new(),
+            interaction_history: Vec::new(),
             controls,
             tool_catalog: ToolCatalog::default(),
             tool_activity: ToolActivity::default(),
@@ -694,7 +705,7 @@ impl SessionSnapshot {
 
     /// Reconcile state that cannot still be active after reconnecting a runtime.
     pub fn reconcile_after_restart(&mut self, timestamp: &str) {
-        self.pending_interactions.clear();
+        self.cancel_pending_interactions();
         mark_streaming_interrupted(&mut self.transcript);
         tools::mark_running_invocations_cancelled(&mut self.tool_activity, timestamp);
         tools::mark_running_terminals_cancelled(&mut self.tool_activity, timestamp);
@@ -755,7 +766,7 @@ impl SessionSnapshot {
         ApplyOutcome::Applied
     }
 
-    /// Messages and root-agent tool calls in the order they happened.
+    /// Messages, root-agent tool calls, and permission requests in causal order.
     ///
     /// Subagent calls are excluded here and reached through
     /// [`ToolActivity::children_of`], so delegated work appears beneath the
@@ -771,6 +782,12 @@ impl SessionSnapshot {
                     .root_invocations()
                     .into_iter()
                     .map(TimelineEntry::Tool),
+            )
+            .chain(
+                self.interaction_history
+                    .iter()
+                    .filter(|record| record.request.kind == InteractionKind::Permission)
+                    .map(TimelineEntry::Interaction),
             )
             .collect();
         // Sequence is monotonic per session, so this is a stable total order.
@@ -789,6 +806,13 @@ impl SessionSnapshot {
             .iter()
             .any(|pending| pending.id == request.id)
         {
+            if request.kind == InteractionKind::Permission {
+                self.interaction_history.push(InteractionRecord {
+                    request: request.clone(),
+                    sequence: self.last_sequence,
+                    response: None,
+                });
+            }
             self.pending_interactions.push(request);
             self.status = SessionStatus::Waiting;
         }
@@ -1013,17 +1037,45 @@ impl SessionSnapshot {
         }
         self.pending_interactions.len() != original_len
     }
+
+    pub fn record_interaction_response(
+        &mut self,
+        interaction_id: &str,
+        response: InteractionResponse,
+    ) {
+        if let Some(record) = self
+            .interaction_history
+            .iter_mut()
+            .find(|record| record.request.id == interaction_id && record.response.is_none())
+        {
+            record.response = Some(response);
+        }
+    }
+
+    pub fn cancel_pending_interactions(&mut self) {
+        for record in &mut self.interaction_history {
+            if record.response.is_none()
+                && self
+                    .pending_interactions
+                    .iter()
+                    .any(|request| request.id == record.request.id)
+            {
+                record.response = Some(InteractionResponse::Cancel);
+            }
+        }
+        self.pending_interactions.clear();
+    }
 }
 
 /// One item in the session timeline.
 ///
 /// The transcript alone shows only what the agent *said*; the timeline
-/// interleaves what it *did*, which is the difference between watching a
-/// session and watching a black box.
+/// interleaves what it *did* and asked permission to do.
 #[derive(Clone, Copy, Debug)]
 pub enum TimelineEntry<'a> {
     Message(&'a TranscriptMessage),
     Tool(&'a ToolInvocation),
+    Interaction(&'a InteractionRecord),
 }
 
 impl TimelineEntry<'_> {
@@ -1032,6 +1084,7 @@ impl TimelineEntry<'_> {
         match self {
             Self::Message(message) => message.sequence,
             Self::Tool(invocation) => invocation.sequence,
+            Self::Interaction(record) => record.sequence,
         }
     }
 }
@@ -1646,9 +1699,30 @@ mod tests {
         state.add_interaction(request.clone());
         state.add_interaction(request);
         assert_eq!(state.pending_interactions.len(), 1);
+        assert_eq!(state.interaction_history.len(), 1);
         assert_eq!(state.status, SessionStatus::Waiting);
+        state.record_interaction_response("permission-1", InteractionResponse::ApproveForSession);
         assert!(state.remove_interaction("permission-1"));
         assert!(state.pending_interactions.is_empty());
+        assert_eq!(
+            state.interaction_history[0].response,
+            Some(InteractionResponse::ApproveForSession)
+        );
+
+        let repeated = state.interaction_history[0].request.clone();
+        state.add_interaction(repeated);
+        state.record_interaction_response(
+            "permission-1",
+            InteractionResponse::Reject { feedback: None },
+        );
+        assert_eq!(
+            state.interaction_history[0].response,
+            Some(InteractionResponse::ApproveForSession)
+        );
+        assert_eq!(
+            state.interaction_history[1].response,
+            Some(InteractionResponse::Reject { feedback: None })
+        );
     }
 
     #[test]
@@ -2236,6 +2310,7 @@ mod tests {
             .map(|entry| match entry {
                 TimelineEntry::Message(_) => "message",
                 TimelineEntry::Tool(_) => "tool",
+                TimelineEntry::Interaction(_) => "interaction",
             })
             .collect();
         assert_eq!(shape, ["message", "tool", "tool", "message"]);

@@ -1194,7 +1194,6 @@ impl SessionManager {
         let mut state = recovered.state;
         state.metadata = metadata.clone();
         state.status = SessionStatus::Recovering;
-        state.pending_interactions.clear();
         let working_directory = PathBuf::from(&metadata.project_path);
         if !working_directory.is_dir()
             && !self.recreate_managed_worktree(
@@ -1806,8 +1805,10 @@ impl SessionActor {
             .remove(interaction_id)
             .ok_or_else(|| SessionManagerError::SessionNotFound(interaction_id.to_owned()))?;
         response
-            .send(answer)
+            .send(answer.clone())
             .map_err(|_| SessionManagerError::ActorClosed)?;
+        self.state
+            .record_interaction_response(interaction_id, answer);
         self.state.remove_interaction(interaction_id);
         self.publish(true);
         Ok(())
@@ -1927,7 +1928,7 @@ impl SessionActor {
         for (_, response) in self.pending_responses.drain() {
             let _ = response.send(InteractionResponse::Cancel);
         }
-        self.state.pending_interactions.clear();
+        self.state.cancel_pending_interactions();
     }
 
     fn publish(&self, persist: bool) {
