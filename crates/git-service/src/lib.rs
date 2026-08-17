@@ -27,6 +27,8 @@ pub enum GitError {
     Command { command: String, stderr: String },
     #[error("path is not inside a git worktree: {0}")]
     NotAWorktree(PathBuf),
+    #[error("worktree path already exists: {0}")]
+    WorktreePathExists(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, GitError>;
@@ -121,6 +123,25 @@ impl GitService {
             .unwrap_or_else(|_| base_ref.to_owned());
         self.run(&["worktree", "add", "-b", branch, &path_string, &base])?;
         Ok(branch.to_owned())
+    }
+
+    /// Recreate a missing linked worktree from an existing local branch.
+    ///
+    /// This never creates a branch or overwrites a path. It is intended for
+    /// recovering an app-managed worktree whose directory was removed while its
+    /// branch and session history remained.
+    pub fn recreate_worktree(&self, path: &Path, branch: &str) -> Result<()> {
+        if path.exists() {
+            return Err(GitError::WorktreePathExists(path.to_owned()));
+        }
+        self.run(&["rev-parse", "--verify", &format!("refs/heads/{branch}")])?;
+        self.run(&["worktree", "prune"])?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let path_string = path.to_string_lossy().into_owned();
+        self.run(&["worktree", "add", &path_string, branch])?;
+        Ok(())
     }
 
     /// Whether `branch` already exists in this repository.
@@ -564,6 +585,31 @@ mod tests {
         let session = GitService::new(&worktree);
         assert_eq!(session.current_branch().unwrap(), "session/one");
         assert_eq!(GitService::new(path).current_branch().unwrap(), "main");
+    }
+
+    #[test]
+    fn recreates_a_missing_worktree_from_its_existing_branch() {
+        let dir = repo();
+        let outside = tempfile::tempdir().expect("tempdir");
+        let worktree = outside.path().join("session-worktree");
+        let service = GitService::new(dir.path());
+        service
+            .create_worktree(&worktree, "session/recover", "main")
+            .expect("worktree created");
+        service
+            .remove_worktree(&worktree)
+            .expect("worktree removed");
+
+        assert!(!worktree.exists());
+        assert!(service.branch_exists("session/recover"));
+        service
+            .recreate_worktree(&worktree, "session/recover")
+            .expect("worktree recreated");
+
+        assert_eq!(
+            GitService::new(&worktree).current_branch().unwrap(),
+            "session/recover"
+        );
     }
 
     #[test]

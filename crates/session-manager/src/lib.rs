@@ -1,6 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Instant, SystemTime, UNIX_EPOCH};
@@ -11,8 +11,8 @@ use app_model::{
     SessionMetadata, SessionSnapshot, SessionStatus, TitleSource, ToolCatalog,
 };
 use copilot_provider::{
-    AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderInteraction,
-    ProviderSession, SessionRequest,
+    AgentProvider, AgentProviderFactory, ProviderCompatibility, ProviderError, ProviderEvent,
+    ProviderInteraction, ProviderSession, SessionRequest,
 };
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
 use git_service::GitService;
@@ -34,6 +34,8 @@ pub enum SessionManagerError {
     ActorClosed,
     #[error("session not found: {0}")]
     SessionNotFound(String),
+    #[error("session is already being restored: {0}")]
+    SessionRestoreInProgress(String),
     #[error(
         "saved session working directory does not exist or cannot be accessed: {0}. \
          Restore the directory or delete this session."
@@ -128,6 +130,17 @@ pub struct SessionHandle {
 }
 
 impl SessionHandle {
+    fn read_only(state: SessionSnapshot) -> Self {
+        let id = state.metadata.id.clone();
+        let (command_tx, _command_rx) = mpsc::channel(1);
+        let (_snapshot_tx, snapshots) = watch::channel(Arc::new(state));
+        Self {
+            id,
+            command_tx,
+            snapshots,
+        }
+    }
+
     /// Build a detached handle around a fixed snapshot, for UI tests.
     ///
     /// The command channel has no actor behind it, so lifecycle calls fail
@@ -136,14 +149,7 @@ impl SessionHandle {
     #[cfg(feature = "test-support")]
     #[must_use]
     pub fn for_test(snapshot: SessionSnapshot) -> Self {
-        let id = snapshot.metadata.id.clone();
-        let (command_tx, _command_rx) = mpsc::channel(1);
-        let (_snapshot_tx, snapshots) = watch::channel(Arc::new(snapshot));
-        Self {
-            id,
-            command_tx,
-            snapshots,
-        }
+        Self::read_only(snapshot)
     }
 
     #[must_use]
@@ -344,26 +350,54 @@ pub struct RestoreFailure {
     pub error: String,
 }
 
+#[derive(Clone)]
+struct SessionRuntime {
+    handle: SessionHandle,
+    provider: Option<Arc<dyn AgentProvider>>,
+    isolated: bool,
+}
+
+struct RestoreTiming {
+    started: Instant,
+    recovery_ms: u64,
+    replayed_events: usize,
+}
+
 pub struct SessionManager {
-    provider: Arc<dyn AgentProvider>,
+    provider_factory: Arc<dyn AgentProviderFactory>,
     storage: Arc<Storage>,
     diagnostics: Arc<dyn DiagnosticsSink>,
-    sessions: Mutex<HashMap<String, SessionHandle>>,
+    lifecycle: Mutex<()>,
+    restoring: Mutex<HashSet<String>>,
+    sessions: Mutex<HashMap<String, SessionRuntime>>,
+    roots: SessionRoots,
 }
 
 impl SessionManager {
     #[must_use]
-    pub fn new(
-        provider: Arc<dyn AgentProvider>,
+    pub fn new<F>(
+        provider_factory: F,
         storage: Arc<Storage>,
         diagnostics: Arc<dyn DiagnosticsSink>,
-    ) -> Self {
+    ) -> Self
+    where
+        F: AgentProviderFactory + 'static,
+    {
         Self {
-            provider,
+            provider_factory: Arc::new(provider_factory),
             storage,
             diagnostics,
+            lifecycle: Mutex::new(()),
+            restoring: Mutex::new(HashSet::new()),
             sessions: Mutex::new(HashMap::new()),
+            roots: SessionRoots::default(),
         }
+    }
+
+    #[must_use]
+    pub fn with_session_roots(mut self, roots: SessionRoots) -> Self {
+        self.roots = roots;
+        self
     }
 
     pub async fn start(&self) -> Result<(ProviderCompatibility, RestoreReport)> {
@@ -381,7 +415,7 @@ impl SessionManager {
     ) -> Result<(ProviderCompatibility, RestoreReport)> {
         let started = Instant::now();
         let provider_started = Instant::now();
-        let compatibility = self.provider.start().await?;
+        let compatibility = self.provider_factory.compatibility().await?;
         let provider_ms = elapsed_ms(provider_started);
         let restore_started = Instant::now();
         let report = self
@@ -415,7 +449,7 @@ impl SessionManager {
         preferred_session: Option<&str>,
         mut on_restored: impl FnMut(SessionHandle),
     ) -> Result<(ProviderCompatibility, RestoreReport, Vec<SessionMetadata>)> {
-        let compatibility = self.provider.start().await?;
+        let compatibility = self.provider_factory.compatibility().await?;
         let mut sessions = self.storage.list_sessions()?;
         let preferred = preferred_session.and_then(|id| {
             sessions
@@ -444,87 +478,136 @@ impl SessionManager {
     }
 
     pub async fn stop(&self) -> Result<()> {
-        let handles = self
+        let runtimes = self
             .sessions
             .lock()
             .await
             .values()
             .cloned()
             .collect::<Vec<_>>();
-        for handle in handles {
-            let _ = handle.disconnect().await;
+        let mut stop_error = None;
+        for runtime in runtimes {
+            let disconnect_result = if matches!(
+                runtime.handle.snapshot().status,
+                SessionStatus::Disconnected | SessionStatus::Unavailable
+            ) {
+                Ok(())
+            } else {
+                runtime.handle.disconnect().await
+            };
+            if let Err(error) = disconnect_result
+                && stop_error.is_none()
+            {
+                stop_error = Some(ProviderError::Sdk(error.to_string()));
+            }
+            if let Some(provider) = runtime.provider
+                && runtime.isolated
+                && let Err(error) = provider.stop().await
+                && stop_error.is_none()
+            {
+                stop_error = Some(error);
+            }
         }
         self.sessions.lock().await.clear();
-        self.provider.stop().await?;
-        Ok(())
+        if let Err(error) = self.provider_factory.shutdown().await
+            && stop_error.is_none()
+        {
+            stop_error = Some(error);
+        }
+        stop_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionHandle> {
+        let app_session_id = Uuid::new_v4().to_string();
         let auto_approve_tools = is_gcabb_worktree(
             request.kind,
             &request.project_path,
             request.repository_root.as_deref(),
         );
-        let provider_session = self
-            .provider
-            .create_session(SessionRequest {
-                working_directory: request.project_path.clone(),
-                model: request.model.clone(),
-                mode: request.mode.clone(),
-                reasoning_effort: request.reasoning_effort.clone(),
-                context_tier: request.context_tier.clone(),
-                auto_approve_tools,
-            })
-            .await?;
-        let controls = match self
-            .provider
-            .controls(&provider_session.sdk_session_id)
-            .await
-        {
-            Ok(controls) => controls,
+        let provider = self.provider_factory.create(&request.project_path);
+        let isolated = self.provider_factory.isolates_session_runtimes();
+        let compatibility = match provider.start().await {
+            Ok(compatibility) => compatibility,
             Err(error) => {
-                let _ = self
-                    .provider
-                    .disconnect(&provider_session.sdk_session_id)
-                    .await;
+                if isolated {
+                    let _ = provider.stop().await;
+                }
                 return Err(error.into());
             }
         };
-        let now = timestamp();
-        let metadata = SessionMetadata {
-            id: Uuid::new_v4().to_string(),
-            sdk_session_id: provider_session.sdk_session_id.clone(),
-            project_path: request.project_path.to_string_lossy().into_owned(),
-            repository_root: request.repository_root,
-            title: request.title,
-            title_source: request.title_source,
-            kind: request.kind,
-            model: request.model,
-            mode: request.mode,
-            base_ref: request.base_ref,
-            created_at: now.clone(),
-            updated_at: now,
-        };
-        self.storage.upsert_session(&metadata)?;
-        let mut state = SessionSnapshot::new(metadata);
-        state.controls = controls;
-        if request.reasoning_effort.is_some() {
-            state.controls.reasoning_effort = request.reasoning_effort;
+        self.record_runtime_start(&app_session_id, &compatibility);
+        let result: Result<SessionHandle> = async {
+            let provider_session = provider
+                .create_session(SessionRequest {
+                    working_directory: request.project_path.clone(),
+                    model: request.model.clone(),
+                    mode: request.mode.clone(),
+                    reasoning_effort: request.reasoning_effort.clone(),
+                    context_tier: request.context_tier.clone(),
+                    auto_approve_tools,
+                })
+                .await?;
+            let controls = match provider.controls(&provider_session.sdk_session_id).await {
+                Ok(controls) => controls,
+                Err(error) => {
+                    let _ = provider.disconnect(&provider_session.sdk_session_id).await;
+                    return Err(error.into());
+                }
+            };
+            let now = timestamp();
+            let metadata = SessionMetadata {
+                id: app_session_id.clone(),
+                sdk_session_id: provider_session.sdk_session_id.clone(),
+                project_path: request.project_path.to_string_lossy().into_owned(),
+                repository_root: request.repository_root,
+                title: request.title,
+                title_source: request.title_source,
+                kind: request.kind,
+                model: request.model,
+                mode: request.mode,
+                base_ref: request.base_ref,
+                created_at: now.clone(),
+                updated_at: now,
+            };
+            if let Err(error) = self.storage.upsert_session(&metadata) {
+                let _ = provider.disconnect(&provider_session.sdk_session_id).await;
+                return Err(error.into());
+            }
+            let mut state = SessionSnapshot::new(metadata);
+            state.controls = controls;
+            if request.reasoning_effort.is_some() {
+                state.controls.reasoning_effort = request.reasoning_effort;
+            }
+            if request.context_tier.is_some() {
+                state.controls.context_tier = request.context_tier;
+            }
+            // Prove inherited tool capabilities through the SDK before the first
+            // prompt, so a runtime that is missing file or shell tools is visible
+            // as capability state rather than as an unexplained model failure.
+            self.populate_capabilities(&provider, &mut state).await;
+            refresh_changes(&mut state);
+            Ok(self.spawn_actor(provider.clone(), isolated, state, provider_session))
         }
-        if request.context_tier.is_some() {
-            state.controls.context_tier = request.context_tier;
+        .await;
+        match result {
+            Ok(handle) => {
+                self.sessions.lock().await.insert(
+                    handle.id.clone(),
+                    SessionRuntime {
+                        handle: handle.clone(),
+                        provider: Some(provider),
+                        isolated,
+                    },
+                );
+                Ok(handle)
+            }
+            Err(error) => {
+                if isolated && let Err(cleanup_error) = provider.stop().await {
+                    tracing::warn!(%cleanup_error, %app_session_id, "failed to stop provider after session creation failed");
+                }
+                Err(error)
+            }
         }
-        // Prove inherited tool capabilities through the SDK before the first
-        // prompt, so a runtime that is missing file or shell tools is visible
-        // as capability state rather than as an unexplained model failure.
-        self.populate_capabilities(&mut state).await;
-        refresh_changes(&mut state);
-        let handle = self.spawn_actor(state, provider_session);
-        self.sessions
-            .lock()
-            .await
-            .insert(handle.id.clone(), handle.clone());
-        Ok(handle)
     }
 
     pub async fn session(&self, app_session_id: &str) -> Result<SessionHandle> {
@@ -532,23 +615,44 @@ impl SessionManager {
             .lock()
             .await
             .get(app_session_id)
-            .cloned()
+            .map(|runtime| runtime.handle.clone())
             .ok_or_else(|| SessionManagerError::SessionNotFound(app_session_id.to_owned()))
     }
 
     pub async fn sessions(&self) -> Vec<SessionHandle> {
-        self.sessions.lock().await.values().cloned().collect()
+        self.sessions
+            .lock()
+            .await
+            .values()
+            .map(|runtime| runtime.handle.clone())
+            .collect()
     }
 
     pub async fn close_session(&self, app_session_id: &str) -> Result<()> {
-        let handle = self.session(app_session_id).await?;
-        if handle.snapshot().status == SessionStatus::Disconnected {
-            self.sessions.lock().await.remove(app_session_id);
-            return Ok(());
-        }
-        handle.disconnect().await?;
+        let runtime = self
+            .sessions
+            .lock()
+            .await
+            .get(app_session_id)
+            .cloned()
+            .ok_or_else(|| SessionManagerError::SessionNotFound(app_session_id.to_owned()))?;
+        let disconnect_result = if matches!(
+            runtime.handle.snapshot().status,
+            SessionStatus::Disconnected | SessionStatus::Unavailable
+        ) {
+            Ok(())
+        } else {
+            runtime.handle.disconnect().await
+        };
+        let stop_result = if let Some(provider) = runtime.provider
+            && runtime.isolated
+        {
+            provider.stop().await.map_err(Into::into)
+        } else {
+            Ok(())
+        };
         self.sessions.lock().await.remove(app_session_id);
-        Ok(())
+        disconnect_result.and(stop_result)
     }
 
     pub async fn resume_closed_session(&self, app_session_id: &str) -> Result<SessionHandle> {
@@ -556,11 +660,20 @@ impl SessionManager {
             let sessions = self.sessions.lock().await;
             sessions.get(app_session_id).cloned()
         };
-        if let Some(handle) = existing {
-            if handle.snapshot().status != SessionStatus::Disconnected {
-                return Ok(handle);
+        if let Some(runtime) = existing {
+            if !matches!(
+                runtime.handle.snapshot().status,
+                SessionStatus::Disconnected | SessionStatus::Unavailable
+            ) {
+                return Ok(runtime.handle);
             }
             self.sessions.lock().await.remove(app_session_id);
+            if let Some(provider) = runtime.provider
+                && runtime.isolated
+                && let Err(error) = provider.stop().await
+            {
+                tracing::warn!(%error, %app_session_id, "failed to finish stopping disconnected provider before resume");
+            }
         }
         let metadata = self
             .storage
@@ -568,12 +681,88 @@ impl SessionManager {
             .into_iter()
             .find(|metadata| metadata.id == app_session_id)
             .ok_or_else(|| SessionManagerError::SessionNotFound(app_session_id.to_owned()))?;
-        let handle = self.restore_session(metadata).await?;
-        self.sessions
-            .lock()
-            .await
-            .insert(app_session_id.to_owned(), handle.clone());
-        Ok(handle)
+        if !self.begin_restore(&metadata.id).await {
+            return Err(SessionManagerError::SessionRestoreInProgress(
+                app_session_id.to_owned(),
+            ));
+        }
+        let result = async {
+            let runtime = self.restore_session(metadata.clone()).await?;
+            self.install_restored_runtime(&metadata, runtime, |_| {})
+                .await?
+                .ok_or_else(|| SessionManagerError::SessionNotFound(app_session_id.to_owned()))
+        }
+        .await;
+        self.finish_restore(&metadata.id).await;
+        result
+    }
+
+    /// Point a read-only session at a replacement working directory and retry it.
+    pub async fn relocate_session(
+        &self,
+        app_session_id: &str,
+        working_directory: &Path,
+    ) -> Result<SessionHandle> {
+        if !working_directory.is_dir() {
+            return Err(SessionManagerError::WorkingDirectoryUnavailable(
+                working_directory.to_owned(),
+            ));
+        }
+        if !self.begin_restore(app_session_id).await {
+            return Err(SessionManagerError::SessionRestoreInProgress(
+                app_session_id.to_owned(),
+            ));
+        }
+        let result = self
+            .relocate_session_inner(app_session_id, working_directory)
+            .await;
+        self.finish_restore(app_session_id).await;
+        result
+    }
+
+    async fn relocate_session_inner(
+        &self,
+        app_session_id: &str,
+        working_directory: &Path,
+    ) -> Result<SessionHandle> {
+        let mut metadata = self
+            .storage
+            .list_sessions()?
+            .into_iter()
+            .find(|metadata| metadata.id == app_session_id)
+            .ok_or_else(|| SessionManagerError::SessionNotFound(app_session_id.to_owned()))?;
+        let previous_path = metadata.project_path.clone();
+        metadata.project_path = working_directory
+            .canonicalize()
+            .unwrap_or_else(|_| working_directory.to_owned())
+            .to_string_lossy()
+            .into_owned();
+        self.storage.upsert_session(&metadata)?;
+        let previous_runtime = self.sessions.lock().await.remove(app_session_id);
+        let result = match self.restore_session(metadata.clone()).await {
+            Ok(runtime) => match self
+                .install_restored_runtime(&metadata, runtime, |_| {})
+                .await
+            {
+                Ok(Some(handle)) => Ok(handle),
+                Ok(None) => Err(SessionManagerError::SessionNotFound(
+                    app_session_id.to_owned(),
+                )),
+                Err(error) => Err(error),
+            },
+            Err(error) => Err(error),
+        };
+        if result.is_err() {
+            if let Some(runtime) = previous_runtime {
+                self.sessions
+                    .lock()
+                    .await
+                    .insert(app_session_id.to_owned(), runtime);
+            }
+            metadata.project_path = previous_path;
+            self.storage.upsert_session(&metadata)?;
+        }
+        result
     }
 
     pub fn register_project(&self, project: &ProjectMetadata) -> Result<()> {
@@ -644,7 +833,7 @@ impl SessionManager {
         working_directory: &Path,
     ) -> Result<Option<String>> {
         let generated = self
-            .provider
+            .provider_factory
             .generate_title(prompt, model, working_directory)
             .await?;
         Ok(normalize_generated_title(&generated))
@@ -662,6 +851,7 @@ impl SessionManager {
         app_session_id: &str,
         roots: &SessionRoots,
     ) -> Result<SessionDeletion> {
+        let _lifecycle = self.lifecycle.lock().await;
         let metadata = self
             .storage
             .list_sessions()?
@@ -677,9 +867,14 @@ impl SessionManager {
             .map(|recovered| attachment_paths(&recovered.state))
             .unwrap_or_default();
 
-        if let Ok(handle) = self.session(app_session_id).await {
-            let _ = handle.disconnect().await;
-            self.sessions.lock().await.remove(app_session_id);
+        let runtime = self.sessions.lock().await.remove(app_session_id);
+        if let Some(runtime) = runtime {
+            let _ = runtime.handle.disconnect().await;
+            if let Some(provider) = runtime.provider
+                && runtime.isolated
+            {
+                let _ = provider.stop().await;
+            }
         }
         if self.selected_session()?.as_deref() == Some(app_session_id) {
             self.set_selected_session(None)?;
@@ -844,26 +1039,88 @@ impl SessionManager {
         let mut report = RestoreReport::default();
         for metadata in sessions {
             let started = Instant::now();
-            match self.restore_session(metadata.clone()).await {
-                Ok(handle) => {
-                    self.sessions
-                        .lock()
-                        .await
-                        .insert(handle.id.clone(), handle.clone());
-                    on_restored(handle.clone());
-                    report.restored.push(handle);
-                }
+            if !self.begin_restore(&metadata.id).await {
+                continue;
+            }
+            let result = self.restore_session(metadata.clone()).await;
+            match result {
+                Ok(runtime) => match self
+                    .install_restored_runtime(&metadata, runtime, |handle| {
+                        on_restored(handle.clone());
+                    })
+                    .await
+                {
+                    Ok(Some(handle)) => {
+                        report.restored.push(handle);
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        self.record_restore_failure(&metadata, &error, elapsed_ms(started));
+                        report.failed.push(RestoreFailure {
+                            app_session_id: metadata.id.clone(),
+                            sdk_session_id: metadata.sdk_session_id,
+                            error: error.to_string(),
+                        });
+                    }
+                },
                 Err(error) => {
                     self.record_restore_failure(&metadata, &error, elapsed_ms(started));
                     report.failed.push(RestoreFailure {
-                        app_session_id: metadata.id,
+                        app_session_id: metadata.id.clone(),
                         sdk_session_id: metadata.sdk_session_id,
                         error: error.to_string(),
                     });
                 }
             }
+            self.finish_restore(&metadata.id).await;
         }
         report
+    }
+
+    async fn begin_restore(&self, app_session_id: &str) -> bool {
+        self.restoring
+            .lock()
+            .await
+            .insert(app_session_id.to_owned())
+    }
+
+    async fn finish_restore(&self, app_session_id: &str) {
+        self.restoring.lock().await.remove(app_session_id);
+    }
+
+    async fn install_restored_runtime(
+        &self,
+        metadata: &SessionMetadata,
+        runtime: SessionRuntime,
+        on_installed: impl FnOnce(&SessionHandle),
+    ) -> Result<Option<SessionHandle>> {
+        let (installed, keeps_runtime): (Result<Option<SessionHandle>>, bool) = {
+            let _lifecycle = self.lifecycle.lock().await;
+            match self.storage.session_exists(&metadata.id) {
+                Ok(true) => {
+                    let mut sessions = self.sessions.lock().await;
+                    if let Some(existing) = sessions.get(&metadata.id) {
+                        (Ok(Some(existing.handle.clone())), false)
+                    } else {
+                        let handle = runtime.handle.clone();
+                        sessions.insert(handle.id.clone(), runtime.clone());
+                        on_installed(&handle);
+                        (Ok(Some(handle)), true)
+                    }
+                }
+                Ok(false) => (Ok(None), false),
+                Err(error) => (Err(error.into()), false),
+            }
+        };
+        if !keeps_runtime {
+            let _ = runtime.handle.disconnect().await;
+            if let Some(provider) = runtime.provider
+                && runtime.isolated
+            {
+                let _ = provider.stop().await;
+            }
+        }
+        installed
     }
 
     /// Discover tools for the session's model and derive capability status.
@@ -871,13 +1128,17 @@ impl SessionManager {
     /// Discovery failure is recorded rather than fatal: the session still
     /// runs, but capabilities report `Unknown` with the underlying error so
     /// the UI can explain why the loop may not work.
-    async fn populate_capabilities(&self, state: &mut SessionSnapshot) {
+    async fn populate_capabilities(
+        &self,
+        provider: &Arc<dyn AgentProvider>,
+        state: &mut SessionSnapshot,
+    ) {
         let model = state
             .controls
             .model
             .clone()
             .or_else(|| state.metadata.model.clone());
-        let catalog = match self.provider.discover_tools(model.as_deref()).await {
+        let catalog = match provider.discover_tools(model.as_deref()).await {
             Ok(catalog) => catalog,
             Err(error) => {
                 self.diagnostics.record(DiagnosticEvent {
@@ -899,24 +1160,79 @@ impl SessionManager {
         state.tool_catalog = catalog;
     }
 
-    async fn restore_session(&self, metadata: SessionMetadata) -> Result<SessionHandle> {
+    async fn restore_session(&self, metadata: SessionMetadata) -> Result<SessionRuntime> {
         let started = Instant::now();
         let recovery_started = Instant::now();
         let recovered = self.storage.recover_session(&metadata.id)?;
         let recovery_ms = elapsed_ms(recovery_started);
         let replayed_events = recovered.replayed_events;
         let mut state = recovered.state;
+        state.metadata = metadata.clone();
         state.status = SessionStatus::Recovering;
         state.pending_interactions.clear();
         let working_directory = PathBuf::from(&metadata.project_path);
-        if !working_directory.is_dir() {
-            return Err(SessionManagerError::WorkingDirectoryUnavailable(
-                working_directory,
-            ));
+        if !working_directory.is_dir()
+            && !self.recreate_managed_worktree(&metadata, &state, &working_directory)
+        {
+            return self.restore_unavailable(
+                &metadata,
+                state,
+                &working_directory,
+                started,
+                recovery_ms,
+                replayed_events,
+            );
         }
+        let provider = self.provider_factory.create(&working_directory);
+        let isolated = self.provider_factory.isolates_session_runtimes();
+        let compatibility = match provider.start().await {
+            Ok(compatibility) => compatibility,
+            Err(error) => {
+                if isolated {
+                    let _ = provider.stop().await;
+                }
+                return Err(error.into());
+            }
+        };
+        self.record_runtime_start(&metadata.id, &compatibility);
+        let timing = RestoreTiming {
+            started,
+            recovery_ms,
+            replayed_events,
+        };
+        let result = self
+            .restore_with_provider(
+                &metadata,
+                working_directory,
+                state,
+                provider.clone(),
+                isolated,
+                timing,
+            )
+            .await;
+        if result.is_err() {
+            let _ = provider.disconnect(&metadata.sdk_session_id).await;
+        }
+        if result.is_err()
+            && isolated
+            && let Err(cleanup_error) = provider.stop().await
+        {
+            tracing::warn!(%cleanup_error, app_session_id = %metadata.id, "failed to stop provider after session restore failed");
+        }
+        result
+    }
+
+    async fn restore_with_provider(
+        &self,
+        metadata: &SessionMetadata,
+        working_directory: PathBuf,
+        mut state: SessionSnapshot,
+        provider: Arc<dyn AgentProvider>,
+        isolated: bool,
+        timing: RestoreTiming,
+    ) -> Result<SessionRuntime> {
         let resume_started = Instant::now();
-        let provider_session = self
-            .provider
+        let provider_session = provider
             .resume_session(
                 &metadata.sdk_session_id,
                 SessionRequest {
@@ -935,13 +1251,12 @@ impl SessionManager {
             .await?;
         let resume_ms = elapsed_ms(resume_started);
         let history_started = Instant::now();
-        let history = match self.provider.history(&metadata.sdk_session_id).await {
+        let history = match provider.history(&metadata.sdk_session_id).await {
             Ok(history) => history,
             Err(error) => {
-                if let Err(cleanup_error) = self.provider.disconnect(&metadata.sdk_session_id).await
-                {
+                if let Err(cleanup_error) = provider.disconnect(&metadata.sdk_session_id).await {
                     self.record_restore_cleanup_failure(
-                        &metadata,
+                        metadata,
                         &error.to_string(),
                         &cleanup_error.to_string(),
                     );
@@ -955,17 +1270,17 @@ impl SessionManager {
         reconcile_history(&self.storage, &mut state, history)?;
         let reconcile_ms = elapsed_ms(reconcile_started);
         let controls_started = Instant::now();
-        state.controls = match self.provider.controls(&metadata.sdk_session_id).await {
+        state.controls = match provider.controls(&metadata.sdk_session_id).await {
             Ok(controls) => controls,
             Err(error) => {
-                let _ = self.provider.disconnect(&metadata.sdk_session_id).await;
+                let _ = provider.disconnect(&metadata.sdk_session_id).await;
                 return Err(error.into());
             }
         };
         let controls_ms = elapsed_ms(controls_started);
         state.reconcile_after_restart(&timestamp());
         let capabilities_started = Instant::now();
-        self.populate_capabilities(&mut state).await;
+        self.populate_capabilities(&provider, &mut state).await;
         let capabilities_ms = elapsed_ms(capabilities_started);
         let changes_started = Instant::now();
         refresh_changes(&mut state);
@@ -973,17 +1288,13 @@ impl SessionManager {
         let persistence_started = Instant::now();
         self.storage.write_snapshot(&state)?;
         let persistence_ms = elapsed_ms(persistence_started);
-        let handle = self.spawn_actor(state, provider_session);
-        self.diagnostics.record(DiagnosticEvent {
-            timestamp: timestamp(),
-            category: "session_manager".to_owned(),
-            operation: "restore_session".to_owned(),
-            elapsed_ms: Some(elapsed_ms(started)),
-            session_id: Some(metadata.id),
-            success: true,
-            details: json!({
-                "storageRecoveryMs": recovery_ms,
-                "replayedEvents": replayed_events,
+        let handle = self.spawn_actor(provider.clone(), isolated, state, provider_session);
+        self.record_restore_success(
+            metadata.id.clone(),
+            timing.started,
+            json!({
+                "storageRecoveryMs": timing.recovery_ms,
+                "replayedEvents": timing.replayed_events,
                 "providerResumeMs": resume_ms,
                 "historyMs": history_ms,
                 "historyEvents": history_events,
@@ -993,12 +1304,120 @@ impl SessionManager {
                 "changesMs": changes_ms,
                 "persistenceMs": persistence_ms
             }),
+        );
+        Ok(SessionRuntime {
+            handle,
+            provider: Some(provider),
+            isolated,
+        })
+    }
+
+    fn record_restore_success(&self, session_id: String, started: Instant, details: Value) {
+        self.diagnostics.record(DiagnosticEvent {
+            timestamp: timestamp(),
+            category: "session_manager".to_owned(),
+            operation: "restore_session".to_owned(),
+            elapsed_ms: Some(elapsed_ms(started)),
+            session_id: Some(session_id),
+            success: true,
+            details,
         });
-        Ok(handle)
+    }
+
+    fn restore_unavailable(
+        &self,
+        metadata: &SessionMetadata,
+        mut state: SessionSnapshot,
+        working_directory: &Path,
+        started: Instant,
+        recovery_ms: u64,
+        replayed_events: usize,
+    ) -> Result<SessionRuntime> {
+        state.reconcile_after_restart(&timestamp());
+        state.status = SessionStatus::Unavailable;
+        state.capabilities.set(app_model::Capability {
+            id: CapabilityId::Changes,
+            status: CapabilityStatus::Unavailable,
+            detail: "The session working directory is unavailable.".to_owned(),
+            evidence: vec![working_directory.display().to_string()],
+        });
+        self.storage.write_snapshot(&state)?;
+        if self.selected_session()?.as_deref() == Some(metadata.id.as_str()) {
+            self.set_selected_session(None)?;
+        }
+        self.diagnostics.record(DiagnosticEvent {
+            timestamp: timestamp(),
+            category: "session_manager".to_owned(),
+            operation: "restore_session".to_owned(),
+            elapsed_ms: Some(elapsed_ms(started)),
+            session_id: Some(metadata.id.clone()),
+            success: true,
+            details: json!({
+                "storageRecoveryMs": recovery_ms,
+                "replayedEvents": replayed_events,
+                "readOnly": true,
+                "reason": "working_directory_unavailable",
+                "workingDirectory": working_directory
+            }),
+        });
+        Ok(SessionRuntime {
+            handle: SessionHandle::read_only(state),
+            provider: None,
+            isolated: false,
+        })
+    }
+
+    /// Recreate only worktrees beneath GCABB's own managed root.
+    fn recreate_managed_worktree(
+        &self,
+        metadata: &SessionMetadata,
+        state: &SessionSnapshot,
+        working_directory: &Path,
+    ) -> bool {
+        let Some(worktrees_root) = self.roots.worktrees.as_deref() else {
+            return false;
+        };
+        if metadata.kind != SessionKind::Project
+            || !working_directory.starts_with(worktrees_root)
+            || working_directory == worktrees_root
+            || working_directory
+                .components()
+                .any(|component| component == std::path::Component::ParentDir)
+        {
+            return false;
+        }
+        let Some(repository) = metadata.repository_root.as_deref().map(Path::new) else {
+            return false;
+        };
+        let Some(branch) = state.changes.branch.as_deref() else {
+            return false;
+        };
+        let git = GitService::new(repository);
+        if !git.is_worktree() || !git.branch_exists(branch) {
+            return false;
+        }
+        let result = git.recreate_worktree(working_directory, branch);
+        self.diagnostics.record(DiagnosticEvent {
+            timestamp: timestamp(),
+            category: "session_manager".to_owned(),
+            operation: "recreate_worktree".to_owned(),
+            elapsed_ms: None,
+            session_id: Some(metadata.id.clone()),
+            success: result.is_ok(),
+            details: json!({
+                "workingDirectory": working_directory,
+                "repository": repository,
+                "branch": branch,
+                "error": result.as_ref().err().map(ToString::to_string)
+            }),
+        });
+        result.is_ok()
     }
 
     fn spawn_actor(
         &self,
+        provider: Arc<dyn AgentProvider>,
+        isolated: bool,
         state: SessionSnapshot,
         provider_session: ProviderSession,
     ) -> SessionHandle {
@@ -1006,7 +1425,8 @@ impl SessionManager {
         let (command_tx, command_rx) = mpsc::channel(32);
         let (snapshot_tx, snapshot_rx) = watch::channel(Arc::new(state.clone()));
         let actor = SessionActor {
-            provider: self.provider.clone(),
+            provider,
+            isolated,
             storage: self.storage.clone(),
             diagnostics: self.diagnostics.clone(),
             state,
@@ -1023,6 +1443,25 @@ impl SessionManager {
             command_tx,
             snapshots: snapshot_rx,
         }
+    }
+
+    fn record_runtime_start(&self, app_session_id: &str, compatibility: &ProviderCompatibility) {
+        self.diagnostics.record(DiagnosticEvent {
+            timestamp: timestamp(),
+            category: "session_manager".to_owned(),
+            operation: "runtime_start".to_owned(),
+            elapsed_ms: compatibility
+                .startup
+                .as_ref()
+                .map(|startup| startup.total_ms),
+            session_id: Some(app_session_id.to_owned()),
+            success: true,
+            details: json!({
+                "processId": compatibility.process_id,
+                "sdkProtocolVersion": compatibility.sdk_protocol_version,
+                "negotiatedProtocolVersion": compatibility.negotiated_protocol_version
+            }),
+        });
     }
 
     fn record_restore_failure(
@@ -1122,6 +1561,7 @@ enum ReasoningEffortUpdate {
 
 struct SessionActor {
     provider: Arc<dyn AgentProvider>,
+    isolated: bool,
     storage: Arc<Storage>,
     diagnostics: Arc<dyn DiagnosticsSink>,
     state: SessionSnapshot,
@@ -1413,11 +1853,26 @@ impl SessionActor {
 
     async fn disconnect(&mut self) -> Result<()> {
         self.cancel_pending_interactions();
-        self.storage.write_snapshot(&self.state)?;
-        self.provider.disconnect(&self.sdk_session_id).await?;
+        let persistence_result = self
+            .storage
+            .write_snapshot(&self.state)
+            .map_err(SessionManagerError::from);
+        let disconnect_result = self
+            .provider
+            .disconnect(&self.sdk_session_id)
+            .await
+            .map_err(SessionManagerError::from);
+        let stop_result = if self.isolated {
+            self.provider
+                .stop()
+                .await
+                .map_err(SessionManagerError::from)
+        } else {
+            Ok(())
+        };
         self.state.status = SessionStatus::Disconnected;
         self.publish(false);
-        Ok(())
+        persistence_result.and(disconnect_result).and(stop_result)
     }
 
     async fn handle_provider_closed(&mut self) {
@@ -1428,6 +1883,11 @@ impl SessionActor {
         self.record_actor_error("provider_stream_closed", message);
         if let Err(error) = self.provider.disconnect(&self.sdk_session_id).await {
             self.record_actor_error("provider_stream_cleanup", &error.to_string());
+        }
+        if self.isolated
+            && let Err(error) = self.provider.stop().await
+        {
+            self.record_actor_error("provider_runtime_cleanup", &error.to_string());
         }
         self.publish(true);
     }
@@ -1672,10 +2132,35 @@ fn is_gcabb_worktree(
 #[cfg(test)]
 mod tests {
     use diagnostics::MemoryDiagnostics;
+    use std::process::Command;
     use tempfile::tempdir;
-    use test_harness::{FakeProvider, golden_events};
+    use test_harness::{FakeProvider, FakeProviderFactory, golden_events};
 
     use super::*;
+
+    fn git(directory: &Path, arguments: &[&str]) {
+        let output = Command::new("git")
+            .arg("-C")
+            .arg(directory)
+            .args(arguments)
+            .output()
+            .expect("git command runs");
+        assert!(
+            output.status.success(),
+            "git {arguments:?} failed: {}",
+            String::from_utf8_lossy(&output.stderr)
+        );
+    }
+
+    fn initialise_repository(path: &Path) {
+        std::fs::create_dir_all(path).unwrap();
+        git(path, &["init", "--initial-branch=main"]);
+        git(path, &["config", "user.email", "test@example.com"]);
+        git(path, &["config", "user.name", "Test"]);
+        std::fs::write(path.join("base.txt"), "base\n").unwrap();
+        git(path, &["add", "."]);
+        git(path, &["commit", "-m", "base"]);
+    }
 
     #[test]
     fn only_gcabb_worktrees_auto_approve_tools() {
@@ -1713,6 +2198,135 @@ mod tests {
             context_tier: None,
             base_ref: None,
         }
+    }
+
+    #[tokio::test]
+    async fn sessions_own_independent_provider_runtimes() {
+        let factory = FakeProviderFactory::default();
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(factory.clone(), storage, diagnostics.clone());
+        manager.start().await.unwrap();
+        let directory = tempdir().unwrap();
+
+        let first = manager
+            .create_session(request(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let second = manager
+            .create_session(request(directory.path().to_owned()))
+            .await
+            .unwrap();
+
+        let providers = factory.providers();
+        assert_eq!(providers.len(), 2);
+        assert_eq!(providers[0].process_id(), Some(1));
+        assert_eq!(providers[1].process_id(), Some(2));
+        assert!(providers.iter().all(|provider| provider.is_started()));
+        assert_eq!(providers[0].active_sessions().await, 1);
+        assert_eq!(providers[1].active_sessions().await, 1);
+
+        manager.close_session(first.id()).await.unwrap();
+
+        assert!(!providers[0].is_started());
+        assert!(providers[1].is_started());
+        assert_eq!(
+            second.send("still running").await.unwrap(),
+            "message-fake-session-2001"
+        );
+        let runtime_processes = diagnostics
+            .events()
+            .into_iter()
+            .filter(|event| event.operation == "runtime_start")
+            .filter_map(|event| event.details["processId"].as_u64())
+            .collect::<Vec<_>>();
+        assert_eq!(runtime_processes, vec![1, 2]);
+
+        manager.stop().await.unwrap();
+        assert!(!providers[1].is_started());
+    }
+
+    #[tokio::test]
+    async fn shared_provider_adapter_keeps_siblings_running_until_manager_stop() {
+        let provider: Arc<dyn AgentProvider> = Arc::new(FakeProvider::default());
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider.clone(), storage, diagnostics);
+        manager.start().await.unwrap();
+        let directory = tempdir().unwrap();
+        let first = manager
+            .create_session(request(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let second = manager
+            .create_session(request(directory.path().to_owned()))
+            .await
+            .unwrap();
+
+        manager.close_session(first.id()).await.unwrap();
+
+        assert_eq!(
+            second.send("still shared").await.unwrap(),
+            "message-fake-session-2"
+        );
+        manager.stop().await.unwrap();
+    }
+
+    #[tokio::test]
+    async fn deleted_session_cannot_be_reinserted_after_restore_finishes() {
+        let hydrated = std::sync::atomic::AtomicBool::new(false);
+        let factory = FakeProviderFactory::default();
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(factory.clone(), storage.clone(), diagnostics);
+        manager.start().await.unwrap();
+        let directory = tempdir().unwrap();
+        let handle = manager
+            .create_session(request(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let metadata = handle.snapshot().metadata.clone();
+        let runtime = manager.sessions.lock().await.remove(handle.id()).unwrap();
+        storage.delete_session(handle.id()).unwrap();
+
+        let installed = manager
+            .install_restored_runtime(&metadata, runtime, |_| {
+                hydrated.store(true, std::sync::atomic::Ordering::SeqCst);
+            })
+            .await
+            .unwrap();
+
+        assert!(installed.is_none());
+        assert!(!hydrated.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(manager.sessions.lock().await.is_empty());
+        assert!(!factory.providers()[0].is_started());
+    }
+
+    #[tokio::test]
+    async fn failed_snapshot_cleanup_still_disconnects_shared_provider_session() {
+        let provider = Arc::new(FakeProvider::default());
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider.clone(), storage.clone(), diagnostics);
+        manager.start().await.unwrap();
+        let directory = tempdir().unwrap();
+        let handle = manager
+            .create_session(request(directory.path().to_owned()))
+            .await
+            .unwrap();
+        let metadata = handle.snapshot().metadata.clone();
+        let runtime = manager.sessions.lock().await.remove(handle.id()).unwrap();
+        storage.delete_session(handle.id()).unwrap();
+
+        let installed = manager
+            .install_restored_runtime(&metadata, runtime, |_| {})
+            .await
+            .unwrap();
+
+        assert!(installed.is_none());
+        assert_eq!(provider.active_sessions().await, 0);
+        assert!(provider.is_started());
+        manager.stop().await.unwrap();
     }
 
     #[tokio::test]
@@ -1966,15 +2580,28 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn missing_working_directory_is_reported_before_resume() {
+    async fn missing_working_directory_restores_read_only_without_resuming() {
         let directory = tempdir().unwrap();
         let missing = directory.path().join("deleted-worktree");
         let provider = Arc::new(FakeProvider::default());
+        provider.start().await.unwrap();
+        let seeded = provider
+            .create_session(SessionRequest {
+                working_directory: directory.path().to_owned(),
+                model: None,
+                mode: None,
+                reasoning_effort: None,
+                context_tier: None,
+                auto_approve_tools: false,
+            })
+            .await
+            .unwrap();
+        provider.disconnect(&seeded.sdk_session_id).await.unwrap();
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let diagnostics = Arc::new(MemoryDiagnostics::default());
         let metadata = SessionMetadata {
             id: "stale-session".to_owned(),
-            sdk_session_id: "stale-sdk-session".to_owned(),
+            sdk_session_id: seeded.sdk_session_id,
             project_path: missing.to_string_lossy().into_owned(),
             repository_root: None,
             title: "Deleted worktree".to_owned(),
@@ -1987,15 +2614,120 @@ mod tests {
             updated_at: "1".to_owned(),
         };
         storage.upsert_session(&metadata).unwrap();
+        let mut snapshot = SessionSnapshot::new(metadata.clone());
+        snapshot.transcript.push(app_model::TranscriptMessage {
+            id: "message-1".to_owned(),
+            role: app_model::TranscriptRole::Assistant,
+            content: "Persisted history".to_owned(),
+            state: app_model::TranscriptState::Complete,
+            timestamp: "1".to_owned(),
+            sequence: 1,
+            attachments: Vec::new(),
+        });
+        storage.write_snapshot(&snapshot).unwrap();
+        storage.set_selected_session(Some(&metadata.id)).unwrap();
         let manager = SessionManager::new(provider.clone(), storage, diagnostics);
 
         let (_, report) = manager.start().await.unwrap();
 
-        assert!(report.restored.is_empty());
-        assert_eq!(report.failed.len(), 1);
-        assert!(report.failed[0].error.contains("working directory"));
-        assert!(report.failed[0].error.contains("delete this session"));
+        assert!(
+            report.failed.is_empty(),
+            "restore failed: {:?}",
+            report
+                .failed
+                .iter()
+                .map(|failure| failure.error.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(report.restored.len(), 1);
+        let restored = report.restored[0].snapshot();
+        assert_eq!(restored.status, SessionStatus::Unavailable);
+        assert_eq!(restored.transcript[0].content, "Persisted history");
+        assert_eq!(manager.selected_session().unwrap(), None);
         assert_eq!(provider.active_sessions().await, 0);
+
+        let replacement = tempdir().unwrap();
+        let relocated = manager
+            .relocate_session("stale-session", replacement.path())
+            .await
+            .unwrap();
+        assert_eq!(relocated.snapshot().status, SessionStatus::Idle);
+        assert_eq!(
+            relocated.snapshot().metadata.project_path,
+            replacement.path().canonicalize().unwrap().to_string_lossy()
+        );
+        assert_eq!(provider.active_sessions().await, 1);
+    }
+
+    #[tokio::test]
+    async fn missing_managed_worktree_is_recreated_before_resume() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let worktrees = directory.path().join("worktrees");
+        let worktree = worktrees.join("repository").join("session");
+        initialise_repository(&repository);
+        let git = GitService::new(&repository);
+        git.create_worktree(&worktree, "gcabb/recover", "main")
+            .unwrap();
+        let provider = Arc::new(FakeProvider::default());
+        provider.start().await.unwrap();
+        let seeded = provider
+            .create_session(SessionRequest {
+                working_directory: worktree.clone(),
+                model: None,
+                mode: None,
+                reasoning_effort: None,
+                context_tier: None,
+                auto_approve_tools: true,
+            })
+            .await
+            .unwrap();
+        provider.disconnect(&seeded.sdk_session_id).await.unwrap();
+
+        let metadata = SessionMetadata {
+            id: "recoverable-session".to_owned(),
+            sdk_session_id: seeded.sdk_session_id,
+            project_path: worktree.to_string_lossy().into_owned(),
+            repository_root: Some(repository.to_string_lossy().into_owned()),
+            title: "Recover worktree".to_owned(),
+            title_source: TitleSource::Manual,
+            kind: SessionKind::Project,
+            model: None,
+            mode: None,
+            base_ref: Some("main".to_owned()),
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+        };
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        storage.upsert_session(&metadata).unwrap();
+        let mut snapshot = SessionSnapshot::new(metadata);
+        snapshot.changes.branch = Some("gcabb/recover".to_owned());
+        storage.write_snapshot(&snapshot).unwrap();
+        git.remove_worktree(&worktree).unwrap();
+        assert!(!worktree.exists());
+
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider.clone(), storage, diagnostics)
+            .with_session_roots(SessionRoots {
+                worktrees: Some(worktrees),
+                ..SessionRoots::default()
+            });
+
+        let (_, report) = manager.start().await.unwrap();
+
+        assert!(
+            report.failed.is_empty(),
+            "managed restore failed: {:?}",
+            report
+                .failed
+                .iter()
+                .map(|failure| failure.error.as_str())
+                .collect::<Vec<_>>()
+        );
+        assert_eq!(report.restored.len(), 1);
+        assert_eq!(report.restored[0].snapshot().status, SessionStatus::Idle);
+        assert!(worktree.join("base.txt").exists());
+        assert_eq!(provider.active_sessions().await, 1);
     }
 
     #[tokio::test]
@@ -2026,15 +2758,16 @@ mod tests {
 
     #[tokio::test]
     async fn unexpected_provider_close_is_visible_in_snapshot_and_diagnostics() {
-        let provider = Arc::new(FakeProvider::default());
+        let factory = FakeProviderFactory::default();
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let diagnostics = Arc::new(MemoryDiagnostics::default());
-        let manager = SessionManager::new(provider.clone(), storage, diagnostics.clone());
+        let manager = SessionManager::new(factory.clone(), storage, diagnostics.clone());
         manager.start().await.unwrap();
         let handle = manager
             .create_session(request(std::env::temp_dir()))
             .await
             .unwrap();
+        let provider = factory.providers()[0].clone();
         let sdk_session_id = handle.snapshot().metadata.sdk_session_id.clone();
         let mut snapshots = handle.subscribe();
 
@@ -2048,11 +2781,8 @@ mod tests {
             snapshots.borrow().last_error.as_deref(),
             Some("provider event stream closed unexpectedly")
         );
+        assert!(!provider.is_started());
         assert!(!diagnostics.events().is_empty());
-
-        let resumed = manager.resume_closed_session(handle.id()).await.unwrap();
-        assert_eq!(resumed.id(), handle.id());
-        assert_eq!(provider.active_sessions().await, 1);
     }
 
     #[tokio::test]

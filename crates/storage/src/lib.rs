@@ -124,6 +124,16 @@ impl Storage {
         Ok(())
     }
 
+    pub fn session_exists(&self, app_session_id: &str) -> Result<bool> {
+        self.connection()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM app_sessions WHERE id = ?1)",
+                [app_session_id],
+                |row| row.get(0),
+            )
+            .map_err(Into::into)
+    }
+
     pub fn upsert_project(&self, project: &ProjectMetadata) -> Result<()> {
         self.connection()?.execute(
             "INSERT INTO projects (id, path, name, default_branch, last_opened_at)
