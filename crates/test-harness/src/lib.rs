@@ -1,7 +1,9 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::collections::HashMap;
+use std::path::Path;
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use app_model::{
     InteractionRequest, InteractionResponse, PromptAttachment, SessionControls, ToolCatalog,
@@ -9,8 +11,8 @@ use app_model::{
 };
 use async_trait::async_trait;
 use copilot_provider::{
-    AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderInteraction,
-    ProviderSession, Result, SDK_CRATE_VERSION, SessionRequest,
+    AgentProvider, AgentProviderFactory, ProviderCompatibility, ProviderError, ProviderEvent,
+    ProviderInteraction, ProviderSession, Result, SDK_CRATE_VERSION, SessionRequest,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -116,6 +118,7 @@ pub fn large_session_events(config: LargeSessionConfig) -> Vec<Value> {
 #[derive(Default)]
 pub struct FakeProvider {
     started: AtomicBool,
+    process_id: AtomicU64,
     next_session: AtomicU64,
     script: Mutex<Vec<Value>>,
     history: Mutex<HashMap<String, Vec<Value>>>,
@@ -132,6 +135,14 @@ pub struct FakeProvider {
 }
 
 impl FakeProvider {
+    fn with_process_id(process_id: u64) -> Self {
+        Self {
+            process_id: AtomicU64::new(process_id),
+            next_session: AtomicU64::new(process_id.saturating_mul(1_000)),
+            ..Self::default()
+        }
+    }
+
     #[must_use]
     pub fn with_script(script: Vec<Value>) -> Self {
         Self {
@@ -194,6 +205,18 @@ impl FakeProvider {
 
     pub async fn active_sessions(&self) -> usize {
         self.live.lock().await.len()
+    }
+
+    #[must_use]
+    pub fn is_started(&self) -> bool {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub fn process_id(&self) -> Option<u32> {
+        u32::try_from(self.process_id.load(Ordering::SeqCst))
+            .ok()
+            .filter(|process_id| *process_id != 0)
     }
 
     pub async fn request_interaction(
@@ -263,7 +286,7 @@ impl AgentProvider for FakeProvider {
             sdk_crate_version: SDK_CRATE_VERSION.to_owned(),
             sdk_protocol_version: 3,
             negotiated_protocol_version: 3,
-            process_id: None,
+            process_id: self.process_id(),
             startup: None,
             available_modes: Vec::new(),
             available_models: Vec::new(),
@@ -413,6 +436,63 @@ impl AgentProvider for FakeProvider {
             .take(4)
             .collect::<Vec<_>>()
             .join(" "))
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct FakeProviderFactory {
+    state: Arc<FakeProviderFactoryState>,
+}
+
+#[derive(Default)]
+struct FakeProviderFactoryState {
+    next_provider: AtomicU64,
+    providers: StdMutex<Vec<Arc<FakeProvider>>>,
+}
+
+impl FakeProviderFactory {
+    #[must_use]
+    pub fn providers(&self) -> Vec<Arc<FakeProvider>> {
+        self.state
+            .providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+}
+
+#[async_trait]
+impl AgentProviderFactory for FakeProviderFactory {
+    async fn compatibility(&self) -> Result<ProviderCompatibility> {
+        Ok(ProviderCompatibility {
+            sdk_crate_version: SDK_CRATE_VERSION.to_owned(),
+            sdk_protocol_version: 3,
+            negotiated_protocol_version: 3,
+            process_id: None,
+            startup: None,
+            available_modes: Vec::new(),
+            available_models: Vec::new(),
+        })
+    }
+
+    fn create(&self, _working_directory: &Path) -> Arc<dyn AgentProvider> {
+        let process_id = self.state.next_provider.fetch_add(1, Ordering::SeqCst) + 1;
+        let provider = Arc::new(FakeProvider::with_process_id(process_id));
+        self.state
+            .providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(provider.clone());
+        provider
+    }
+
+    async fn generate_title(
+        &self,
+        _prompt: &str,
+        _model: Option<&str>,
+        _working_directory: &Path,
+    ) -> Result<String> {
+        Ok("Generated session title".to_owned())
     }
 }
 
