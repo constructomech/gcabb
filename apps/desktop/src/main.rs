@@ -8,9 +8,10 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    ChangeStatus, ChangedFile, ContextWindowOption, InteractionKind, InteractionResponse,
-    OutputStreamKind, ProjectMetadata, PromptAttachment, SessionKind, SessionLocation,
-    SessionMetadata, SessionSnapshot, SessionStatus, TranscriptRole, TranscriptState,
+    AgentTodoStatus, ChangeStatus, ChangedFile, ContextWindowOption, InteractionKind,
+    InteractionResponse, OutputStreamKind, ProjectMetadata, PromptAttachment, SessionKind,
+    SessionLocation, SessionMetadata, SessionSnapshot, SessionStatus, TranscriptRole,
+    TranscriptState,
 };
 use chrono::DateTime;
 use copilot_provider::{CopilotProviderFactory, ProviderCompatibility};
@@ -923,6 +924,21 @@ enum ServiceCommand {
         app_session_id: String,
         force: bool,
     },
+    /// Advance one of the agent's todos to the next status.
+    SetTodoStatus {
+        app_session_id: String,
+        todo_id: String,
+        status: AgentTodoStatus,
+    },
+    /// Add a todo of the developer's own to the agent's list.
+    AddTodo {
+        app_session_id: String,
+        title: String,
+    },
+    RemoveTodo {
+        app_session_id: String,
+        todo_id: String,
+    },
     Select {
         app_session_id: Option<String>,
     },
@@ -1345,6 +1361,45 @@ async fn handle_service_command(
             .await
             .map_err(|error| error.to_string())?
             .cancel()
+            .await
+            .map_err(|error| error.to_string())?,
+        ServiceCommand::SetTodoStatus {
+            app_session_id,
+            todo_id,
+            status,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .set_todo_status(todo_id, status)
+            .await
+            .map_err(|error| error.to_string())?,
+        ServiceCommand::AddTodo {
+            app_session_id,
+            title,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .upsert_todo(app_model::AgentTodo {
+                // Host-authored ids are prefixed so they read as the
+                // developer's rather than looking like the agent's own.
+                id: format!("gcabb-{}", uuid::Uuid::new_v4()),
+                title,
+                description: None,
+                status: AgentTodoStatus::Pending,
+                depends_on: Vec::new(),
+            })
+            .await
+            .map_err(|error| error.to_string())?,
+        ServiceCommand::RemoveTodo {
+            app_session_id,
+            todo_id,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .remove_todo(todo_id)
             .await
             .map_err(|error| error.to_string())?,
         ServiceCommand::Resume {
@@ -1813,13 +1868,14 @@ impl SessionPanel {
 
     /// Panels worth offering for a session.
     ///
-    /// The agent's task list is only meaningful once the agent has made one,
-    /// so its tab stays hidden rather than offering an empty panel.
+    /// The plan is offered whenever the agent has one, and also whenever the
+    /// developer can write one: an empty writable plan is where they add the
+    /// first entry, so hiding it would hide the feature.
     fn available(snapshot: &SessionSnapshot) -> Vec<Self> {
         Self::ALL
             .into_iter()
             .filter(|panel| match panel {
-                Self::Plan => !snapshot.agent_plan.is_empty(),
+                Self::Plan => !snapshot.agent_plan.is_empty() || snapshot.agent_plan.writable,
                 _ => true,
             })
             .collect()
@@ -1960,6 +2016,8 @@ struct SessionMvpView {
     /// Incomplete prompts keyed by the session they belong to.
     session_drafts: HashMap<String, String>,
     interaction_input: Entity<TextInput>,
+    /// Title for a todo the developer is adding to the agent's list.
+    todo_input: Entity<TextInput>,
     draft_mode: String,
     draft_model: Option<String>,
     draft_effort: String,
@@ -2074,6 +2132,11 @@ impl SessionMvpView {
             view.submit_interaction(event.text.clone());
             view.interaction_input.update(cx, TextInput::clear);
             cx.notify();
+        })
+        .detach();
+        let todo_input = cx.new(|cx| TextInput::new(cx, "todo-input", "Add a task..."));
+        cx.subscribe(&todo_input, |view, _, event: &InputSubmitted, cx| {
+            view.submit_todo(&event.text, cx);
         })
         .detach();
         let rename_input = cx.new(|cx| TextInput::new(cx, "rename-input", "Session name"));
@@ -2200,6 +2263,7 @@ impl SessionMvpView {
             home_draft: String::new(),
             session_drafts: HashMap::new(),
             interaction_input,
+            todo_input,
             draft_mode: "interactive".to_owned(),
             draft_model: None,
             draft_effort: "medium".to_owned(),
@@ -3192,6 +3256,48 @@ impl SessionMvpView {
             .into_iter()
             .map(|reference| (reference.clone(), reference, String::new()))
             .collect()
+    }
+
+    /// Advance one of the agent's todos to the next status.
+    fn set_todo_status(
+        &mut self,
+        session_id: &str,
+        todo_id: &str,
+        status: AgentTodoStatus,
+        cx: &mut Context<Self>,
+    ) {
+        let _ = self.commands.send(ServiceCommand::SetTodoStatus {
+            app_session_id: session_id.to_owned(),
+            todo_id: todo_id.to_owned(),
+            status,
+        });
+        cx.notify();
+    }
+
+    fn remove_todo(&mut self, session_id: &str, todo_id: &str, cx: &mut Context<Self>) {
+        let _ = self.commands.send(ServiceCommand::RemoveTodo {
+            app_session_id: session_id.to_owned(),
+            todo_id: todo_id.to_owned(),
+        });
+        cx.notify();
+    }
+
+    /// Add a todo of the developer's own to the agent's list.
+    fn submit_todo(&mut self, title: &str, cx: &mut Context<Self>) {
+        let title = title.trim();
+        // An empty title would create a row with nothing to read.
+        if title.is_empty() {
+            return;
+        }
+        let Some(session) = self.selected() else {
+            return;
+        };
+        let _ = self.commands.send(ServiceCommand::AddTodo {
+            app_session_id: session.snapshot.metadata.id.clone(),
+            title: title.to_owned(),
+        });
+        self.todo_input.update(cx, TextInput::clear);
+        cx.notify();
     }
 
     fn submit_interaction(&mut self, value: String) {
@@ -7515,7 +7621,7 @@ impl SessionMvpView {
             SessionPanel::Changes => self.changes_panel(&snapshot, cx).into_any_element(),
             SessionPanel::Terminals => Self::terminals_panel(&snapshot).into_any_element(),
             SessionPanel::Capabilities => Self::capabilities_panel(&snapshot).into_any_element(),
-            SessionPanel::Plan => Self::plan_panel(&snapshot).into_any_element(),
+            SessionPanel::Plan => self.plan_panel(&snapshot, cx).into_any_element(),
         };
 
         Some(
@@ -8220,75 +8326,126 @@ impl SessionMvpView {
             .into_any_element()
     }
 
+    /// One row of the agent's task list.
+    ///
+    /// The status is a button when the plan is writable. Clicking it writes
+    /// straight to the database the agent reads from, so the change is live
+    /// rather than a local annotation.
+    fn plan_row(
+        session_id: &str,
+        todo: &app_model::AgentTodo,
+        unfinished: &[String],
+        writable: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let status_color = match todo.status {
+            app_model::AgentTodoStatus::Done => GREEN,
+            app_model::AgentTodoStatus::InProgress => BLUE,
+            app_model::AgentTodoStatus::Blocked => RED,
+            app_model::AgentTodoStatus::Pending => MUTED,
+        };
+        // A todo waiting on unfinished work is called out, since otherwise it
+        // reads as simply pending with no explanation for the wait.
+        let waiting = todo.is_blocked_by(unfinished);
+        let dependencies = todo.depends_on.join(", ");
+        let next_status = todo.status.next();
+        let (session, todo_id) = (session_id.to_owned(), todo.id.clone());
+        let (remove_session, remove_id) = (session_id.to_owned(), todo.id.clone());
+
+        div()
+            .id(SharedString::from(format!("agent-todo-{}", todo.id)))
+            .role(Role::ListItem)
+            .aria_label(format!("{}: {}", todo.title, todo.status.label()))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_md()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(
+                if todo.status == app_model::AgentTodoStatus::InProgress {
+                    BLUE
+                } else {
+                    BORDER
+                },
+            ))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(rgb(PRIMARY))
+                            .child(todo.title.clone()),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("agent-todo-status-{}", todo.id)))
+                            .text_xs()
+                            .text_color(rgb(status_color))
+                            .child(todo.status.label())
+                            .when(writable, |status| {
+                                status
+                                    .aria_label(format!("Mark as {}", next_status.label()))
+                                    .px_1()
+                                    .rounded_md()
+                                    .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.set_todo_status(&session, &todo_id, next_status, cx);
+                                    }))
+                            }),
+                    )
+                    .when(writable, |row| {
+                        row.child(
+                            div()
+                                .id(SharedString::from(format!("agent-todo-remove-{}", todo.id)))
+                                .aria_label("Remove task")
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .px_1()
+                                .rounded_md()
+                                .child("x")
+                                .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                                .on_click(cx.listener(move |view, _, _, cx| {
+                                    view.remove_todo(&remove_session, &remove_id, cx);
+                                })),
+                        )
+                    }),
+            )
+            .when_some(todo.description.clone(), |row, description| {
+                row.child(div().text_xs().text_color(rgb(MUTED)).child(description))
+            })
+            .when(waiting, |row| {
+                row.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(AMBER))
+                        .child(format!("Waiting on {dependencies}")),
+                )
+            })
+            .into_any_element()
+    }
+
     /// The agent's own task list.
     ///
-    /// Read-only: the runtime owns these rows and offers no way to write them,
-    /// so this reports progress rather than inviting edits.
-    fn plan_panel(snapshot: &SessionSnapshot) -> impl IntoElement {
+    /// Editable when GCABB hosts the session filesystem, because then the app
+    /// and the agent are reading and writing the same database.
+    fn plan_panel(&self, snapshot: &SessionSnapshot, cx: &mut Context<Self>) -> impl IntoElement {
         let plan = &snapshot.agent_plan;
+        let session_id = snapshot.metadata.id.clone();
         let unfinished = plan.unfinished_ids();
         let completed = plan.completed();
         let total = plan.total();
-
-        let rows = plan.todos.iter().map(|todo| {
-            let (status_label, status_color) = match todo.status {
-                app_model::AgentTodoStatus::Done => (todo.status.label(), GREEN),
-                app_model::AgentTodoStatus::InProgress => (todo.status.label(), BLUE),
-                app_model::AgentTodoStatus::Blocked => (todo.status.label(), RED),
-                app_model::AgentTodoStatus::Pending => (todo.status.label(), MUTED),
-            };
-            // A todo waiting on unfinished work is called out, since otherwise
-            // it reads as simply pending with no explanation for the wait.
-            let waiting = todo.is_blocked_by(&unfinished);
-            div()
-                .id(SharedString::from(format!("agent-todo-{}", todo.id)))
-                .role(Role::ListItem)
-                .aria_label(format!("{}: {status_label}", todo.title))
-                .flex()
-                .flex_col()
-                .gap_1()
-                .p_2()
-                .rounded_md()
-                .bg(rgb(PANEL))
-                .border_1()
-                .border_color(rgb(
-                    if todo.status == app_model::AgentTodoStatus::InProgress {
-                        BLUE
-                    } else {
-                        BORDER
-                    },
-                ))
-                .child(
-                    div()
-                        .flex()
-                        .justify_between()
-                        .gap_2()
-                        .child(
-                            div()
-                                .flex_1()
-                                .text_xs()
-                                .text_color(rgb(PRIMARY))
-                                .child(todo.title.clone()),
-                        )
-                        .child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(status_color))
-                                .child(status_label),
-                        ),
-                )
-                .when_some(todo.description.clone(), |row, description| {
-                    row.child(div().text_xs().text_color(rgb(MUTED)).child(description))
-                })
-                .when(waiting, |row| {
-                    row.child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(AMBER))
-                            .child(format!("Waiting on {}", todo.depends_on.join(", "))),
-                    )
-                })
-        });
+        let writable = plan.writable;
+        let mut rows = Vec::with_capacity(plan.todos.len());
+        for todo in &plan.todos {
+            rows.push(Self::plan_row(&session_id, todo, &unfinished, writable, cx));
+        }
 
         div()
             .flex()
@@ -8308,12 +8465,7 @@ impl SessionMvpView {
                             .child(format!("{completed} of {total} done")),
                     )
                     .when_some(plan.current().cloned(), |header, current| {
-                        header.child(
-                            div()
-                                .text_xs()
-                                .text_color(rgb(BLUE))
-                                .child(current.title.clone()),
-                        )
+                        header.child(div().text_xs().text_color(rgb(BLUE)).child(current.title))
                     }),
             )
             .child(
@@ -8326,6 +8478,33 @@ impl SessionMvpView {
                     .gap_2()
                     .children(rows),
             )
+            .when(writable, |panel| {
+                panel
+                    .child(
+                        div()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .rounded_md()
+                            .child(self.todo_input.clone()),
+                    )
+                    // The agent holds its plan in context, not only in the
+                    // database, so an edit is seen when it next reads the list
+                    // rather than immediately.
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("Changes reach the agent when it next reads its task list."),
+                    )
+            })
+            .when(!writable && plan.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("The agent has not planned any tasks yet."),
+                )
+            })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -11005,14 +11184,25 @@ mod tests {
     }
 
     #[test]
-    fn the_plan_tab_is_offered_only_once_the_agent_has_a_plan() {
+    fn the_plan_tab_is_offered_once_the_agent_has_a_plan() {
         let without = snapshot_with_plan(app_model::AgentPlan::default());
         assert!(!super::SessionPanel::available(&without).contains(&super::SessionPanel::Plan));
 
         let with = snapshot_with_plan(app_model::AgentPlan {
             todos: vec![agent_todo("a", app_model::AgentTodoStatus::Pending)],
+            writable: false,
         });
         assert!(super::SessionPanel::available(&with).contains(&super::SessionPanel::Plan));
+    }
+
+    #[test]
+    fn an_empty_writable_plan_still_offers_its_tab() {
+        // Hiding the tab would hide the only place to add the first task.
+        let writable = snapshot_with_plan(app_model::AgentPlan {
+            todos: Vec::new(),
+            writable: true,
+        });
+        assert!(super::SessionPanel::available(&writable).contains(&super::SessionPanel::Plan));
     }
 
     #[test]
@@ -11033,6 +11223,7 @@ mod tests {
                 agent_todo("b", app_model::AgentTodoStatus::InProgress),
                 agent_todo("c", app_model::AgentTodoStatus::Pending),
             ],
+            writable: false,
         });
         assert_eq!(snapshot.agent_plan.completed(), 1);
         assert_eq!(snapshot.agent_plan.total(), 3);

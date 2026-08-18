@@ -6,8 +6,9 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use app_model::{
-    AgentPlan, InteractionRequest, InteractionResponse, PromptAttachment, QueueDelivery,
-    SessionControls, ToolCatalog, ToolClass, ToolDescriptor, ToolSource,
+    AgentPlan, AgentTodo, AgentTodoStatus, InteractionRequest, InteractionResponse,
+    PromptAttachment, QueueDelivery, SessionControls, ToolCatalog, ToolClass, ToolDescriptor,
+    ToolSource,
 };
 use async_trait::async_trait;
 use copilot_provider::{
@@ -497,6 +498,45 @@ impl AgentProvider for FakeProvider {
 
     async fn agent_plan(&self, _sdk_session_id: &str) -> Result<AgentPlan> {
         Ok(self.agent_plan.lock().await.clone())
+    }
+
+    async fn set_agent_todo_status(
+        &self,
+        _sdk_session_id: &str,
+        todo_id: &str,
+        status: &str,
+    ) -> Result<bool> {
+        let mut plan = self.agent_plan.lock().await;
+        if !plan.writable {
+            return Err(ProviderError::AgentPlanNotWritable);
+        }
+        let Some(todo) = plan.todos.iter_mut().find(|todo| todo.id == todo_id) else {
+            return Ok(false);
+        };
+        todo.status = AgentTodoStatus::from_runtime(status);
+        Ok(true)
+    }
+
+    async fn upsert_agent_todo(&self, _sdk_session_id: &str, todo: &AgentTodo) -> Result<()> {
+        let mut plan = self.agent_plan.lock().await;
+        if !plan.writable {
+            return Err(ProviderError::AgentPlanNotWritable);
+        }
+        match plan.todos.iter_mut().find(|row| row.id == todo.id) {
+            Some(existing) => *existing = todo.clone(),
+            None => plan.todos.push(todo.clone()),
+        }
+        Ok(())
+    }
+
+    async fn remove_agent_todo(&self, _sdk_session_id: &str, todo_id: &str) -> Result<bool> {
+        let mut plan = self.agent_plan.lock().await;
+        if !plan.writable {
+            return Err(ProviderError::AgentPlanNotWritable);
+        }
+        let before = plan.todos.len();
+        plan.todos.retain(|todo| todo.id != todo_id);
+        Ok(plan.todos.len() != before)
     }
 
     async fn cancel(&self, sdk_session_id: &str) -> Result<()> {

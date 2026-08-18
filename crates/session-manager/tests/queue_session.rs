@@ -359,6 +359,7 @@ async fn the_agent_plan_refreshes_when_the_runtime_signals_a_change() {
                     depends_on: vec!["a".to_owned()],
                 },
             ],
+            writable: false,
         })
         .await;
     // The event carries no payload, so the list has to be re-read rather than
@@ -410,4 +411,93 @@ async fn steering_items_reach_the_agent_as_a_turn() {
         harness.provider.sent_prompts().await,
         vec!["interrupt".to_owned()]
     );
+}
+
+#[tokio::test]
+async fn the_agents_task_list_can_be_edited_when_it_is_writable() {
+    let (harness, session) = harness().await;
+    harness
+        .provider
+        .set_agent_plan(AgentPlan {
+            todos: vec![AgentTodo {
+                id: "a".to_owned(),
+                title: "Agent task".to_owned(),
+                description: None,
+                status: AgentTodoStatus::Pending,
+                depends_on: Vec::new(),
+            }],
+            writable: true,
+        })
+        .await;
+
+    session
+        .set_todo_status("a", AgentTodoStatus::Done)
+        .await
+        .expect("status change");
+
+    let snapshot = await_snapshot(&session, |snapshot| {
+        snapshot
+            .agent_plan
+            .todos
+            .iter()
+            .any(|todo| todo.status == AgentTodoStatus::Done)
+    })
+    .await;
+    assert!(snapshot.agent_plan.writable);
+}
+
+#[tokio::test]
+async fn host_authored_tasks_join_the_agents_list() {
+    let (harness, session) = harness().await;
+    harness
+        .provider
+        .set_agent_plan(AgentPlan {
+            todos: Vec::new(),
+            writable: true,
+        })
+        .await;
+
+    session
+        .upsert_todo(AgentTodo {
+            id: "gcabb-1".to_owned(),
+            title: "Host priority".to_owned(),
+            description: None,
+            status: AgentTodoStatus::Pending,
+            depends_on: Vec::new(),
+        })
+        .await
+        .expect("upsert");
+
+    let snapshot = await_snapshot(&session, |snapshot| !snapshot.agent_plan.is_empty()).await;
+    assert_eq!(snapshot.agent_plan.todos[0].title, "Host priority");
+
+    session.remove_todo("gcabb-1").await.expect("remove");
+    let cleared = await_snapshot(&session, |snapshot| snapshot.agent_plan.is_empty()).await;
+    assert!(cleared.agent_plan.todos.is_empty());
+}
+
+#[tokio::test]
+async fn editing_a_task_list_that_is_not_writable_fails_rather_than_pretending() {
+    let (harness, session) = harness().await;
+    harness
+        .provider
+        .set_agent_plan(AgentPlan {
+            todos: vec![AgentTodo {
+                id: "a".to_owned(),
+                title: "Agent task".to_owned(),
+                description: None,
+                status: AgentTodoStatus::Pending,
+                depends_on: Vec::new(),
+            }],
+            writable: false,
+        })
+        .await;
+
+    // Without a hosted filesystem the runtime owns these rows outright, and a
+    // silent no-op would look like the edit had been accepted.
+    let error = session
+        .set_todo_status("a", AgentTodoStatus::Done)
+        .await
+        .expect_err("edit is refused");
+    assert!(error.to_string().contains("hosts the session filesystem"));
 }

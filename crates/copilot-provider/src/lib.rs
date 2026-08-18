@@ -1228,7 +1228,7 @@ impl AgentProvider for CopilotProvider {
             "description".to_owned(),
             todo.description.clone().map_or(Value::Null, Value::from),
         );
-        params.insert("status".to_owned(), Value::from(agent_status(todo.status)));
+        params.insert("status".to_owned(), Value::from(todo.status.as_runtime()));
         database
             .write(
                 "INSERT INTO todos (id, title, description, status)
@@ -1391,21 +1391,17 @@ const AGENT_TODO_SCHEMA: &str = "
     );
 ";
 
-/// The status strings the runtime's schema constrains todos to.
-const fn agent_status(status: AgentTodoStatus) -> &'static str {
-    match status {
-        AgentTodoStatus::Pending => "pending",
-        AgentTodoStatus::InProgress => "in_progress",
-        AgentTodoStatus::Done => "done",
-        AgentTodoStatus::Blocked => "blocked",
-    }
-}
-
 /// Read the agent's task list straight from the hosted database.
 async fn hosted_agent_plan(filesystem: &HostSessionFs) -> Result<AgentPlan> {
+    // A hosted session is writable even before it has a database or any
+    // rows: an empty list is where the developer adds the first entry.
+    let empty = AgentPlan {
+        todos: Vec::new(),
+        writable: true,
+    };
     let database = filesystem.database();
     if !database.exists().await {
-        return Ok(AgentPlan::default());
+        return Ok(empty);
     }
     // A session that has never planned has no tables, which is an empty list
     // rather than a failure.
@@ -1416,7 +1412,7 @@ async fn hosted_agent_plan(filesystem: &HostSessionFs) -> Result<AgentPlan> {
         )
         .await
     else {
-        return Ok(AgentPlan::default());
+        return Ok(empty);
     };
     let dependencies = database
         .read("SELECT todo_id, depends_on FROM todo_deps", None)
@@ -1459,7 +1455,10 @@ async fn hosted_agent_plan(filesystem: &HostSessionFs) -> Result<AgentPlan> {
             })
         })
         .collect();
-    Ok(AgentPlan { todos })
+    Ok(AgentPlan {
+        todos,
+        writable: true,
+    })
 }
 
 /// Translate the runtime's todo rows into the app's plan model.
@@ -1496,7 +1495,11 @@ fn agent_plan(read: github_copilot_sdk::rpc::PlanReadSqlTodosWithDependenciesRes
             })
         })
         .collect();
-    AgentPlan { todos }
+    AgentPlan {
+        todos,
+        // Read through the runtime's RPC, which offers no way to write back.
+        writable: false,
+    }
 }
 
 fn tool_descriptor(tool: github_copilot_sdk::rpc::Tool) -> ToolDescriptor {

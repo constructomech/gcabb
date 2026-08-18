@@ -6,10 +6,10 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus, DomainEvent,
-    InteractionResponse, OutputStreamKind, ProjectMetadata, PromptAttachment, QueueDelivery,
-    QueueItem, QueueItemState, SessionKind, SessionMetadata, SessionSnapshot, SessionStatus,
-    TitleSource, ToolCatalog,
+    AgentTodo, AgentTodoStatus, ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus,
+    DomainEvent, InteractionResponse, OutputStreamKind, ProjectMetadata, PromptAttachment,
+    QueueDelivery, QueueItem, QueueItemState, SessionKind, SessionMetadata, SessionSnapshot,
+    SessionStatus, TitleSource, ToolCatalog,
 };
 use copilot_provider::{
     AgentProvider, AgentProviderFactory, ProviderCompatibility, ProviderError, ProviderEvent,
@@ -443,6 +443,46 @@ impl SessionHandle {
     /// Drop every pending item from the queue.
     pub async fn clear_queue(&self) -> Result<()> {
         self.queue(QueueCommand::Clear).await.map(|_| ())
+    }
+
+    async fn plan(&self, command: PlanCommand) -> Result<()> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(SessionCommand::Plan {
+                command,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| SessionManagerError::ActorClosed)?;
+        response_rx
+            .await
+            .map_err(|_| SessionManagerError::ActorClosed)?
+    }
+
+    /// Change the status of one of the agent's todos.
+    pub async fn set_todo_status(
+        &self,
+        todo_id: impl Into<String>,
+        status: AgentTodoStatus,
+    ) -> Result<()> {
+        self.plan(PlanCommand::SetStatus {
+            todo_id: todo_id.into(),
+            status,
+        })
+        .await
+    }
+
+    /// Add or replace one of the agent's todos.
+    pub async fn upsert_todo(&self, todo: AgentTodo) -> Result<()> {
+        self.plan(PlanCommand::Upsert { todo }).await
+    }
+
+    /// Remove one of the agent's todos.
+    pub async fn remove_todo(&self, todo_id: impl Into<String>) -> Result<()> {
+        self.plan(PlanCommand::Remove {
+            todo_id: todo_id.into(),
+        })
+        .await
     }
 }
 
@@ -1685,6 +1725,28 @@ enum SessionCommand {
         command: QueueCommand,
         response: oneshot::Sender<Result<Option<String>>>,
     },
+    Plan {
+        command: PlanCommand,
+        response: oneshot::Sender<Result<()>>,
+    },
+}
+
+/// Edits to the agent's own task list.
+///
+/// These reach the same database the agent writes through, so a change lands
+/// immediately. The agent only observes it when it next reads the list, and
+/// whatever it writes afterwards wins.
+pub enum PlanCommand {
+    SetStatus {
+        todo_id: String,
+        status: AgentTodoStatus,
+    },
+    Upsert {
+        todo: AgentTodo,
+    },
+    Remove {
+        todo_id: String,
+    },
 }
 
 /// Edits to the durable queue.
@@ -1758,6 +1820,7 @@ struct SessionActor {
 impl SessionActor {
     async fn run(mut self) {
         self.load_queue();
+        self.refresh_agent_plan().await;
         self.publish(false);
         loop {
             tokio::select! {
@@ -1779,79 +1842,88 @@ impl SessionActor {
                     self.receive_interaction(interaction);
                 }
                 command = self.commands.recv() => {
-                    match command {
-                        Some(SessionCommand::Send {
-                            prompt,
-                            attachments,
-                            response,
-                        }) => {
-                            let result = self.provider
-                                .send(&self.sdk_session_id, &prompt, &attachments)
-                                .await
-                                .map_err(SessionManagerError::from);
-                            let _ = response.send(result);
-                        }
-                        Some(SessionCommand::Lifecycle {
-                            kind: SessionCommandKind::Cancel,
-                            response,
-                        }) => {
-                            let result = self.provider
-                                .cancel(&self.sdk_session_id)
-                                .await
-                                .map_err(SessionManagerError::from);
-                            let _ = response.send(result);
-                        }
-                        Some(SessionCommand::Lifecycle {
-                            kind: SessionCommandKind::Disconnect,
-                            response,
-                        }) => {
-                            let result = self.disconnect().await;
-                            let _ = response.send(result);
-                            break;
-                        }
-                        Some(SessionCommand::Respond {
-                            interaction_id,
-                            answer,
-                            response,
-                        }) => {
-                            let result = self.respond(&interaction_id, answer);
-                            let _ = response.send(result);
-                        }
-                        Some(SessionCommand::LoadOutput {
-                            kind,
-                            identity,
-                            before_chunk,
-                            max_chunks,
-                            response,
-                        }) => {
-                            let result = self.load_output(
-                                kind,
-                                &identity,
-                                before_chunk,
-                                max_chunks,
-                            );
-                            let _ = response.send(result);
-                        }
-                        Some(SessionCommand::RefreshChanges { force, response }) => {
-                            let result = self.refresh_changes(force).await;
-                            let _ = response.send(result);
-                        }
-                        Some(SessionCommand::Control { control, response }) => {
-                            let result = self.apply_control(control).await;
-                            let _ = response.send(result);
-                        }
-                        Some(SessionCommand::Queue { command, response }) => {
-                            let result = self.apply_queue(command).await;
-                            let _ = response.send(result);
-                        }
-                        None => {
-                            let _ = self.disconnect().await;
-                            break;
-                        }
+                    if self.dispatch_command(command).await {
+                        break;
                     }
                 }
             }
         }
+    }
+
+    /// Handle one command, reporting whether the session should stop.
+    async fn dispatch_command(&mut self, command: Option<SessionCommand>) -> bool {
+        match command {
+            Some(SessionCommand::Send {
+                prompt,
+                attachments,
+                response,
+            }) => {
+                let result = self
+                    .provider
+                    .send(&self.sdk_session_id, &prompt, &attachments)
+                    .await
+                    .map_err(SessionManagerError::from);
+                let _ = response.send(result);
+            }
+            Some(SessionCommand::Lifecycle {
+                kind: SessionCommandKind::Cancel,
+                response,
+            }) => {
+                let result = self
+                    .provider
+                    .cancel(&self.sdk_session_id)
+                    .await
+                    .map_err(SessionManagerError::from);
+                let _ = response.send(result);
+            }
+            Some(SessionCommand::Lifecycle {
+                kind: SessionCommandKind::Disconnect,
+                response,
+            }) => {
+                let result = self.disconnect().await;
+                let _ = response.send(result);
+                return true;
+            }
+            Some(SessionCommand::Respond {
+                interaction_id,
+                answer,
+                response,
+            }) => {
+                let result = self.respond(&interaction_id, answer);
+                let _ = response.send(result);
+            }
+            Some(SessionCommand::LoadOutput {
+                kind,
+                identity,
+                before_chunk,
+                max_chunks,
+                response,
+            }) => {
+                let result = self.load_output(kind, &identity, before_chunk, max_chunks);
+                let _ = response.send(result);
+            }
+            Some(SessionCommand::RefreshChanges { force, response }) => {
+                let result = self.refresh_changes(force).await;
+                let _ = response.send(result);
+            }
+            Some(SessionCommand::Control { control, response }) => {
+                let result = self.apply_control(control).await;
+                let _ = response.send(result);
+            }
+            Some(SessionCommand::Queue { command, response }) => {
+                let result = self.apply_queue(command).await;
+                let _ = response.send(result);
+            }
+            Some(SessionCommand::Plan { command, response }) => {
+                let result = self.apply_plan(command).await;
+                let _ = response.send(result);
+            }
+            None => {
+                let _ = self.disconnect().await;
+                return true;
+            }
+        }
+        false
     }
 
     async fn apply_raw(&mut self, raw: &Value) {
@@ -2288,6 +2360,32 @@ impl SessionActor {
             "session.todos_changed" => self.refresh_agent_plan().await,
             _ => {}
         }
+    }
+
+    /// Apply an edit to the agent's task list, then re-read it.
+    ///
+    /// The list is re-read rather than patched in place because the agent may
+    /// have written to it in the meantime, and what it wrote is what counts.
+    async fn apply_plan(&mut self, command: PlanCommand) -> Result<()> {
+        match command {
+            PlanCommand::SetStatus { todo_id, status } => {
+                self.provider
+                    .set_agent_todo_status(&self.sdk_session_id, &todo_id, status.as_runtime())
+                    .await?;
+            }
+            PlanCommand::Upsert { todo } => {
+                self.provider
+                    .upsert_agent_todo(&self.sdk_session_id, &todo)
+                    .await?;
+            }
+            PlanCommand::Remove { todo_id } => {
+                self.provider
+                    .remove_agent_todo(&self.sdk_session_id, &todo_id)
+                    .await?;
+            }
+        }
+        self.refresh_agent_plan().await;
+        Ok(())
     }
 
     /// Re-read the agent's own task list from the runtime.

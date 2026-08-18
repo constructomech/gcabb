@@ -48,6 +48,31 @@ impl AgentTodoStatus {
     pub const fn is_finished(self) -> bool {
         matches!(self, Self::Done)
     }
+
+    /// The status a click advances to.
+    ///
+    /// Blocked is not in the cycle: the agent sets it to record that
+    /// something is in its way, and a developer clicking through statuses is
+    /// not saying that.
+    #[must_use]
+    pub const fn next(self) -> Self {
+        match self {
+            Self::Pending => Self::InProgress,
+            Self::InProgress => Self::Done,
+            Self::Done | Self::Blocked => Self::Pending,
+        }
+    }
+
+    /// The value the runtime's schema stores.
+    #[must_use]
+    pub const fn as_runtime(self) -> &'static str {
+        match self {
+            Self::Pending => "pending",
+            Self::InProgress => "in_progress",
+            Self::Done => "done",
+            Self::Blocked => "blocked",
+        }
+    }
 }
 
 /// One row of the agent's todo list.
@@ -77,10 +102,20 @@ impl AgentTodo {
 pub struct AgentPlan {
     #[serde(default)]
     pub todos: Vec<AgentTodo>,
+    /// Whether the app can change these rows.
+    ///
+    /// True only when GCABB hosts the session filesystem and therefore owns
+    /// the database the agent writes through. The panel uses this to decide
+    /// whether to offer editing at all, rather than offering it and failing.
+    #[serde(default)]
+    pub writable: bool,
 }
 
 impl AgentPlan {
     /// Whether there is anything worth showing.
+    ///
+    /// A writable plan is worth showing even when empty, since that is where
+    /// the developer adds the first entry.
     #[must_use]
     pub fn is_empty(&self) -> bool {
         self.todos.is_empty()
@@ -158,6 +193,7 @@ mod tests {
                 todo("b", AgentTodoStatus::InProgress),
                 todo("c", AgentTodoStatus::Blocked),
             ],
+            writable: false,
         };
         assert_eq!(plan.total(), 3);
         assert_eq!(plan.completed(), 1);
@@ -179,5 +215,41 @@ mod tests {
         assert!(plan.is_empty());
         assert_eq!(plan.completed(), 0);
         assert!(plan.current().is_none());
+    }
+
+    #[test]
+    fn clicking_through_statuses_never_lands_on_blocked() {
+        let mut status = AgentTodoStatus::Pending;
+        let mut seen = Vec::new();
+        for _ in 0..6 {
+            status = status.next();
+            seen.push(status);
+        }
+        assert!(!seen.contains(&AgentTodoStatus::Blocked));
+        assert_eq!(
+            &seen[..3],
+            &[
+                AgentTodoStatus::InProgress,
+                AgentTodoStatus::Done,
+                AgentTodoStatus::Pending
+            ]
+        );
+    }
+
+    #[test]
+    fn a_blocked_todo_can_be_moved_back_into_the_cycle() {
+        assert_eq!(AgentTodoStatus::Blocked.next(), AgentTodoStatus::Pending);
+    }
+
+    #[test]
+    fn runtime_status_strings_round_trip() {
+        for status in [
+            AgentTodoStatus::Pending,
+            AgentTodoStatus::InProgress,
+            AgentTodoStatus::Done,
+            AgentTodoStatus::Blocked,
+        ] {
+            assert_eq!(AgentTodoStatus::from_runtime(status.as_runtime()), status);
+        }
     }
 }
