@@ -7122,7 +7122,7 @@ impl SessionMvpView {
         // Recorded as history: these are milestones from the session's actual
         // creation, not a decoration re-rendered ahead of the transcript, so
         // they carry the same timestamp as everything else that happened then.
-        let timestamp = format_activity_timestamp(&metadata.created_at);
+        let timestamp = format_session_created_at(&metadata.created_at);
         div()
             .id(SharedString::from(format!("session-start-{id}")))
             .debug_selector(move || format!("session-start-{id}"))
@@ -9799,6 +9799,26 @@ fn format_activity_timestamp(timestamp: &str) -> String {
                 .to_string()
         },
     )
+}
+
+/// `metadata.created_at`/`updated_at` are always epoch-millis strings (see
+/// `session-manager`'s `timestamp()`), unlike SDK-sourced event timestamps
+/// which are RFC3339. Format directly rather than routing through the
+/// RFC3339-only `format_activity_timestamp`.
+fn format_session_created_at(created_at: &str) -> String {
+    created_at
+        .parse::<i64>()
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map_or_else(
+            || created_at.to_owned(),
+            |timestamp| {
+                timestamp
+                    .with_timezone(&chrono::Local)
+                    .format("%b %-d, %Y · %-I:%M %p")
+                    .to_string()
+            },
+        )
 }
 
 fn tool_duration(invocation: &app_model::ToolInvocation) -> Option<Duration> {
