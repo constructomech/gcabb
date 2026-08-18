@@ -122,6 +122,9 @@ type ScrollWheelGuard = Box<dyn Fn(&gpui::ScrollWheelEvent, &mut Window, &mut Ap
 const CHANGES_SCROLL_ID: &str = "changes-scroll";
 /// Scroll region of the composer's mode, model, and effort menus.
 const CONTROL_MENU_SCROLL_ID: &str = "control-menu-scroll";
+/// Scroll region for a permission request's requested-action detail, which
+/// can run to many pages of JSON for tool calls with large payloads.
+const PERMISSION_DETAIL_SCROLL_ID: &str = "permission-detail-scroll";
 /// Extra content laid out above and below the viewport to avoid blank flashes
 /// during fast trackpad and scrollbar movement.
 const TRANSCRIPT_OVERDRAW: f32 = 720.0;
@@ -6952,6 +6955,7 @@ impl SessionMvpView {
 
     #[allow(clippy::too_many_lines)]
     fn permission_entry(
+        &self,
         interaction_index: usize,
         record: &app_model::InteractionRecord,
         snapshot: &SessionSnapshot,
@@ -7061,9 +7065,28 @@ impl SessionMvpView {
                     .child(request.message.clone()),
             )
             .when_some(details, |card, details| {
+                let scroll_id = format!("permission-detail-{}-{}", interaction_index, request.id);
+                let handle = self
+                    .detail_scrolls
+                    .borrow_mut()
+                    .entry(scroll_id.clone())
+                    .or_default()
+                    .clone();
                 card.child(
                     div()
+                        .id(SharedString::from(scroll_id.clone()))
+                        .debug_selector({
+                            let scroll_id = scroll_id.clone();
+                            move || scroll_id.clone()
+                        })
+                        .accessibility_id(scroll_id.clone())
+                        .role(Role::Document)
+                        .aria_label("Requested action detail")
                         .mt_3()
+                        .max_h(px(320.0))
+                        .track_scroll(&handle)
+                        .overflow_y_scroll()
+                        .on_scroll_wheel(self.claim_scroll_when_moved(&scroll_id, &handle, cx))
                         .p_3()
                         .rounded_md()
                         .bg(rgb(SUBTLE))
@@ -7120,7 +7143,7 @@ impl SessionMvpView {
                 .interaction_history
                 .get(interaction_index)
                 .map(|record| {
-                    Self::permission_entry(interaction_index, record, &snapshot, cx)
+                    self.permission_entry(interaction_index, record, &snapshot, cx)
                         .into_any_element()
                 }),
         };
@@ -9323,6 +9346,12 @@ impl SessionMvpView {
                                 .child(interaction.title),
                         )
                         .when(interaction.kind == InteractionKind::Permission, |dialog| {
+                            let handle = self
+                                .detail_scrolls
+                                .borrow_mut()
+                                .entry(PERMISSION_DETAIL_SCROLL_ID.to_owned())
+                                .or_default()
+                                .clone();
                             dialog.child(
                                 div()
                                     .flex()
@@ -9336,6 +9365,19 @@ impl SessionMvpView {
                                     )
                                     .child(
                                         div()
+                                            .id("permission-detail")
+                                            .debug_selector(|| "permission-detail".to_owned())
+                                            .accessibility_id("permission-detail")
+                                            .role(Role::Document)
+                                            .aria_label("Requested action detail")
+                                            .max_h(px(320.0))
+                                            .track_scroll(&handle)
+                                            .overflow_y_scroll()
+                                            .on_scroll_wheel(self.claim_scroll_when_moved(
+                                                PERMISSION_DETAIL_SCROLL_ID,
+                                                &handle,
+                                                cx,
+                                            ))
                                             .p_3()
                                             .rounded_md()
                                             .border_1()
@@ -12100,6 +12142,53 @@ mod tests {
 
             assert!(cx.debug_bounds("permission-entry").is_some());
             assert!(cx.debug_bounds("permission-scope-1").is_none());
+        }
+
+        /// Regression: a permission's requested-action detail could run to
+        /// many pages of JSON for large tool-call payloads, pushing both the
+        /// scope choices and the top of the request off screen. The detail
+        /// now sits in its own scrollable panel capped to a fixed height.
+        #[gpui::test]
+        fn permission_detail_is_capped_and_scrollable(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                let mut request = interaction(
+                    InteractionKind::Permission,
+                    "Permission required",
+                    "Read a very large file",
+                    &["Allow once", "Allow for this session", "Deny"],
+                    false,
+                );
+                // A payload large enough that, unbounded, it would run to
+                // many pages on screen.
+                let large_paths: Vec<String> = (0..500)
+                    .map(|index| format!("/tmp/file-{index}.rs"))
+                    .collect();
+                request.details = serde_json::json!({ "paths": large_paths });
+                Arc::make_mut(&mut view.sessions[0].snapshot).add_interaction(request);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let entry = cx
+                .debug_bounds("permission-entry")
+                .expect("permission entry rendered");
+            let detail = cx
+                .debug_bounds("permission-detail-0-interaction-1")
+                .expect("requested-action detail rendered");
+            assert!(
+                f32::from(detail.size.height) <= 320.0,
+                "the detail panel should be capped to a rational height instead \
+                 of growing with the payload, got {:?}",
+                detail.size.height
+            );
+            assert!(
+                f32::from(entry.size.height) < 2000.0,
+                "the whole permission card should stay compact even for a huge \
+                 payload, got {:?}",
+                entry.size.height
+            );
         }
 
         #[gpui::test]
