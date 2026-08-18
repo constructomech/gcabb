@@ -8373,6 +8373,8 @@ impl SessionMvpView {
             )
         });
 
+        let (provider_status, provider_color) = self.provider_status();
+
         Some(
             div()
                 .id("diagnostics-dialog")
@@ -8448,6 +8450,18 @@ impl SessionMvpView {
                                 .min_h_0()
                                 .gap_4()
                                 .overflow_y_scroll()
+                                .child(diagnostic_section(
+                                    "Connection",
+                                    vec![
+                                        div()
+                                            .id("provider-status")
+                                            .role(Role::Status)
+                                            .aria_label(provider_status.clone())
+                                            .text_color(rgb(provider_color))
+                                            .child(provider_status)
+                                            .into_any_element(),
+                                    ],
+                                ))
                                 .child(diagnostic_section(
                                     "Current activity",
                                     vec![
@@ -9087,7 +9101,6 @@ impl SessionMvpView {
 
     #[allow(clippy::too_many_lines)]
     fn home(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let (provider_status, provider_color) = self.provider_status();
         let launch = self.session_launch.clone();
         let launching = launch.is_some();
 
@@ -9102,18 +9115,6 @@ impl SessionMvpView {
             .when(!compact, gpui::Styled::overflow_hidden)
             .px(if compact { px(24.0) } else { px(40.0) })
             .pb_6()
-            .child(
-                div()
-                    .id("provider-status")
-                    .role(Role::Status)
-                    .aria_label(provider_status.clone())
-                    .absolute()
-                    .top(px(20.0))
-                    .right(px(24.0))
-                    .text_xs()
-                    .text_color(rgb(provider_color))
-                    .child(provider_status),
-            )
             .child(
                 div()
                     .flex()
@@ -9415,7 +9416,6 @@ impl Render for SessionMvpView {
     #[allow(clippy::too_many_lines)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_transcript();
-        let (provider_status, provider_color) = self.provider_status();
         let compact = compact_layout(f32::from(window.viewport_size().width));
         let show_sidebar = self.sidebar_open;
         let content_left = if show_sidebar {
@@ -9615,15 +9615,6 @@ impl Render for SessionMvpView {
                                                     view.panel_open = !view.panel_open;
                                                     cx.notify();
                                                 })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("provider-status")
-                                                .role(Role::Status)
-                                                .aria_label(provider_status.clone())
-                                                .text_xs()
-                                                .text_color(rgb(provider_color))
-                                                .child(provider_status),
                                         ),
                                 ),
                         )
