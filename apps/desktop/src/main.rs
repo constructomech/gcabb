@@ -125,6 +125,17 @@ const CONTROL_MENU_SCROLL_ID: &str = "control-menu-scroll";
 /// Scroll region for a permission request's requested-action detail, which
 /// can run to many pages of JSON for tool calls with large payloads.
 const PERMISSION_DETAIL_SCROLL_ID: &str = "permission-detail-scroll";
+/// Fraction of the window's viewport height allotted to a permission's
+/// requested-action detail panel, so it scales with the window rather than
+/// using a fixed pixel cap that under- or over-shoots on very short or very
+/// tall windows.
+const PERMISSION_DETAIL_HEIGHT_FRACTION: f32 = 0.35;
+/// Smallest a permission detail panel is allowed to shrink to, so it still
+/// shows a few lines even in a very short window.
+const PERMISSION_DETAIL_MIN_HEIGHT: f32 = 180.0;
+/// Largest a permission detail panel is allowed to grow to, so a single
+/// panel doesn't dominate a very tall window.
+const PERMISSION_DETAIL_MAX_HEIGHT: f32 = 480.0;
 /// Extra content laid out above and below the viewport to avoid blank flashes
 /// during fast trackpad and scrollbar movement.
 const TRANSCRIPT_OVERDRAW: f32 = 720.0;
@@ -1891,6 +1902,11 @@ struct SessionMvpView {
     diff_cache: RefCell<DiffCache>,
     /// Number of transcript rows instantiated during the latest render pass.
     transcript_rows_rendered: usize,
+    /// Latest window viewport height, refreshed every render, so height-capped
+    /// panels (like a permission's requested-action detail) can scale with the
+    /// window instead of using a fixed pixel cap that under- or over-shoots on
+    /// very short or very tall windows.
+    viewport_height: gpui::Pixels,
     /// Last snapshot revision whose mutable rows were invalidated.
     transcript_snapshot_sequence: u64,
     transcript_snapshot_ptr: usize,
@@ -2147,6 +2163,7 @@ impl SessionMvpView {
             markdown_cache_order: VecDeque::new(),
             diff_cache: RefCell::new(DiffCache::default()),
             transcript_rows_rendered: 0,
+            viewport_height: px(860.0),
             transcript_snapshot_sequence: 0,
             transcript_snapshot_ptr: 0,
             detail_scrolls: RefCell::new(HashMap::new()),
@@ -5384,6 +5401,16 @@ impl SessionMvpView {
             )
     }
 
+    /// Height cap for a permission's requested-action detail panel: a
+    /// fraction of the window's viewport height, clamped so it never shrinks
+    /// to a sliver in a short window or swallows a tall one.
+    fn permission_detail_max_height(&self) -> gpui::Pixels {
+        px(
+            (f32::from(self.viewport_height) * PERMISSION_DETAIL_HEIGHT_FRACTION)
+                .clamp(PERMISSION_DETAIL_MIN_HEIGHT, PERMISSION_DETAIL_MAX_HEIGHT),
+        )
+    }
+
     /// Hand the wheel to a scroll region only while the region can use it.
     ///
     /// GPUI applies a wheel event to every scrollable container under the
@@ -7083,7 +7110,7 @@ impl SessionMvpView {
                         .role(Role::Document)
                         .aria_label("Requested action detail")
                         .mt_3()
-                        .max_h(px(320.0))
+                        .max_h(self.permission_detail_max_height())
                         .track_scroll(&handle)
                         .overflow_y_scroll()
                         .on_scroll_wheel(self.claim_scroll_when_moved(&scroll_id, &handle, cx))
@@ -9370,7 +9397,7 @@ impl SessionMvpView {
                                             .accessibility_id("permission-detail")
                                             .role(Role::Document)
                                             .aria_label("Requested action detail")
-                                            .max_h(px(320.0))
+                                            .max_h(self.permission_detail_max_height())
                                             .track_scroll(&handle)
                                             .overflow_y_scroll()
                                             .on_scroll_wheel(self.claim_scroll_when_moved(
@@ -9534,6 +9561,7 @@ impl Render for SessionMvpView {
     #[allow(clippy::too_many_lines)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_transcript();
+        self.viewport_height = window.viewport_size().height;
         let compact = compact_layout(f32::from(window.viewport_size().width));
         let show_sidebar = self.sidebar_open;
         let content_left = if show_sidebar {
@@ -11340,8 +11368,8 @@ mod tests {
         use std::sync::Arc;
 
         use crate::{
-            AppService, SCROLL_TO_BOTTOM_DURATION, ServiceCommand, ServiceUpdate,
-            SessionLaunchProgress, SessionMvpView, SessionProjection, UpdateUi,
+            AppService, PERMISSION_DETAIL_MAX_HEIGHT, SCROLL_TO_BOTTOM_DURATION, ServiceCommand,
+            ServiceUpdate, SessionLaunchProgress, SessionMvpView, SessionProjection, UpdateUi,
         };
 
         fn snapshot(id: &str, title: &str) -> SessionSnapshot {
@@ -12178,7 +12206,7 @@ mod tests {
                 .debug_bounds("permission-detail-0-interaction-1")
                 .expect("requested-action detail rendered");
             assert!(
-                f32::from(detail.size.height) <= 320.0,
+                f32::from(detail.size.height) <= PERMISSION_DETAIL_MAX_HEIGHT,
                 "the detail panel should be capped to a rational height instead \
                  of growing with the payload, got {:?}",
                 detail.size.height
