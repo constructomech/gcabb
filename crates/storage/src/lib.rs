@@ -6,13 +6,17 @@ use std::sync::{Mutex, MutexGuard};
 
 use app_model::{
     DomainEvent, OutputMetadata, OutputStreamKind, OutputStreamUpdate, ProjectMetadata,
-    SessionKind, SessionMetadata, SessionSnapshot, TitleSource, ToolActivity, rebuild,
+    QueueDelivery, QueueItem, QueueItemState, QueueView, SessionKind, SessionMetadata,
+    SessionSnapshot, TitleSource, ToolActivity, rebuild,
 };
 use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 9;
+const SCHEMA_VERSION: i64 = 10;
+/// Gap left between queue positions so an item can be moved between two
+/// neighbours without renumbering the rest of the queue.
+const QUEUE_POSITION_STRIDE: i64 = 1024;
 /// Initial restored output window. Older chunks stay in `SQLite` and can be
 /// prepended through `read_output` without inflating every restored snapshot.
 pub const RESTORED_OUTPUT_CHUNKS: u64 = 64;
@@ -685,6 +689,150 @@ impl Storage {
         Ok(())
     }
 
+    /// Read the durable queue for a session, ordered by position.
+    pub fn queue_view(&self, session_id: &str) -> Result<QueueView> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT id, session_id, position, prompt, display_prompt, state, delivery,
+                    agent_mode, runtime_id, created_at, updated_at, error
+             FROM queue_items WHERE session_id = ?1 ORDER BY position, created_at, id",
+        )?;
+        let items = statement
+            .query_map(params![session_id], |row| {
+                Ok(QueueItem {
+                    id: row.get(0)?,
+                    session_id: row.get(1)?,
+                    position: row.get(2)?,
+                    prompt: row.get(3)?,
+                    display_prompt: row.get(4)?,
+                    state: queue_state_from_str(&row.get::<_, String>(5)?),
+                    delivery: queue_delivery_from_str(&row.get::<_, String>(6)?),
+                    agent_mode: row.get(7)?,
+                    runtime_id: row.get(8)?,
+                    created_at: row.get(9)?,
+                    updated_at: row.get(10)?,
+                    error: row.get(11)?,
+                })
+            })?
+            .collect::<rusqlite::Result<Vec<_>>>()?;
+        let paused = connection
+            .query_row(
+                "SELECT paused FROM queue_state WHERE session_id = ?1",
+                params![session_id],
+                |row| row.get::<_, i64>(0),
+            )
+            .optional()?
+            .unwrap_or(0)
+            != 0;
+        Ok(QueueView {
+            items,
+            paused,
+            // Runtime-reported state is not durable; the session actor fills
+            // it in from the live runtime after loading.
+            runtime_steering: Vec::new(),
+            error: None,
+        })
+    }
+
+    /// Insert or update a queue item.
+    pub fn upsert_queue_item(&self, item: &QueueItem) -> Result<()> {
+        self.connection()?.execute(
+            "INSERT INTO queue_items (
+                id, session_id, position, prompt, display_prompt, state, delivery,
+                agent_mode, runtime_id, created_at, updated_at, error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+             ON CONFLICT(id) DO UPDATE SET
+                position = excluded.position,
+                prompt = excluded.prompt,
+                display_prompt = excluded.display_prompt,
+                state = excluded.state,
+                delivery = excluded.delivery,
+                agent_mode = excluded.agent_mode,
+                runtime_id = excluded.runtime_id,
+                updated_at = excluded.updated_at,
+                error = excluded.error",
+            params![
+                item.id,
+                item.session_id,
+                item.position,
+                item.prompt,
+                item.display_prompt,
+                queue_state_to_str(item.state),
+                queue_delivery_to_str(item.delivery),
+                item.agent_mode,
+                item.runtime_id,
+                item.created_at,
+                item.updated_at,
+                item.error,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Remove a queue item outright. Returns whether a row was deleted.
+    pub fn delete_queue_item(&self, id: &str) -> Result<bool> {
+        let removed = self
+            .connection()?
+            .execute("DELETE FROM queue_items WHERE id = ?1", params![id])?;
+        Ok(removed > 0)
+    }
+
+    /// The position to use when appending to a session's queue.
+    ///
+    /// Positions advance in strides so an item can later be moved between two
+    /// neighbours without rewriting every following row.
+    pub fn next_queue_position(&self, session_id: &str) -> Result<i64> {
+        let highest: Option<i64> = self.connection()?.query_row(
+            "SELECT max(position) FROM queue_items WHERE session_id = ?1",
+            params![session_id],
+            |row| row.get(0),
+        )?;
+        Ok(highest.map_or(QUEUE_POSITION_STRIDE, |position| {
+            position.saturating_add(QUEUE_POSITION_STRIDE)
+        }))
+    }
+
+    /// Rewrite every position for a session so the given order holds, spaced
+    /// by the position stride. Ids not belonging to the session are ignored.
+    pub fn reorder_queue(&self, session_id: &str, ordered_ids: &[String]) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        for (index, id) in ordered_ids.iter().enumerate() {
+            let position = i64::try_from(index + 1)
+                .unwrap_or(i64::MAX / QUEUE_POSITION_STRIDE)
+                .saturating_mul(QUEUE_POSITION_STRIDE);
+            transaction.execute(
+                "UPDATE queue_items SET position = ?1 WHERE id = ?2 AND session_id = ?3",
+                params![position, id, session_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(())
+    }
+
+    /// Record whether draining is paused for a session.
+    pub fn set_queue_paused(&self, session_id: &str, paused: bool) -> Result<()> {
+        self.connection()?.execute(
+            "INSERT INTO queue_state (session_id, paused) VALUES (?1, ?2)
+             ON CONFLICT(session_id) DO UPDATE SET paused = excluded.paused",
+            params![session_id, i64::from(paused)],
+        )?;
+        Ok(())
+    }
+
+    /// Clear the runtime identifiers recorded for a session's queue items.
+    ///
+    /// The runtime mints its own ids and reissues them per session, so they
+    /// are meaningless once a session ends and must not be carried forward
+    /// into the next one.
+    pub fn clear_queue_runtime_ids(&self, session_id: &str) -> Result<()> {
+        self.connection()?.execute(
+            "UPDATE queue_items SET runtime_id = NULL WHERE session_id = ?1",
+            params![session_id],
+        )?;
+        Ok(())
+    }
+
     #[allow(
         clippy::too_many_lines,
         reason = "schema creation and backfill must remain in one migration transaction"
@@ -776,6 +924,26 @@ impl Storage {
                 branch TEXT,
                 head_commit TEXT,
                 patch TEXT
+             );
+             CREATE TABLE IF NOT EXISTS queue_items (
+                id TEXT PRIMARY KEY,
+                session_id TEXT NOT NULL REFERENCES app_sessions(id) ON DELETE CASCADE,
+                position INTEGER NOT NULL,
+                prompt TEXT NOT NULL,
+                display_prompt TEXT,
+                state TEXT NOT NULL,
+                delivery TEXT NOT NULL,
+                agent_mode TEXT,
+                runtime_id TEXT,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                error TEXT
+             );
+             CREATE INDEX IF NOT EXISTS queue_items_session_position
+                ON queue_items(session_id, position);
+             CREATE TABLE IF NOT EXISTS queue_state (
+                session_id TEXT PRIMARY KEY REFERENCES app_sessions(id) ON DELETE CASCADE,
+                paused INTEGER NOT NULL DEFAULT 0
              );",
         )?;
         // Databases created before schema version 3 predate the changes view
@@ -930,6 +1098,44 @@ impl Storage {
 /// Whether a rusqlite error reports a duplicate column name.
 fn is_duplicate_column(error: &rusqlite::Error) -> bool {
     error.to_string().contains("duplicate column name")
+}
+
+const fn queue_state_to_str(state: QueueItemState) -> &'static str {
+    match state {
+        QueueItemState::Pending => "pending",
+        QueueItemState::Dispatched => "dispatched",
+        QueueItemState::Completed => "completed",
+        QueueItemState::Failed => "failed",
+        QueueItemState::Cancelled => "cancelled",
+    }
+}
+
+/// Unknown values decode as `Pending` so a database written by a newer build
+/// leaves items editable rather than stranding them in an unreachable state.
+fn queue_state_from_str(value: &str) -> QueueItemState {
+    match value {
+        "dispatched" => QueueItemState::Dispatched,
+        "completed" => QueueItemState::Completed,
+        "failed" => QueueItemState::Failed,
+        "cancelled" => QueueItemState::Cancelled,
+        _ => QueueItemState::Pending,
+    }
+}
+
+const fn queue_delivery_to_str(delivery: QueueDelivery) -> &'static str {
+    match delivery {
+        QueueDelivery::WhenIdle => "when_idle",
+        QueueDelivery::Steer => "steer",
+    }
+}
+
+/// Unknown values decode as `WhenIdle`, the conservative choice: an unreadable
+/// delivery mode must not cause an item to interrupt a running turn.
+fn queue_delivery_from_str(value: &str) -> QueueDelivery {
+    match value {
+        "steer" => QueueDelivery::Steer,
+        _ => QueueDelivery::WhenIdle,
+    }
 }
 
 /// Add a column to an existing table unless it is already present.
@@ -1742,6 +1948,169 @@ mod tests {
         assert_eq!(sessions[0].id, "legacy");
         assert!(sessions[0].base_ref.is_none());
         assert_eq!(sessions[0].title_source, TitleSource::Manual);
+
+        // The queue tables arrived in version 9 and must exist after an
+        // upgrade, not only on a freshly created database.
+        assert!(storage.queue_view("legacy").unwrap().is_empty());
+    }
+
+    fn queue_item(id: &str, position: i64) -> QueueItem {
+        QueueItem {
+            id: id.to_owned(),
+            session_id: "app-session".to_owned(),
+            position,
+            prompt: format!("prompt {id}"),
+            display_prompt: None,
+            state: QueueItemState::Pending,
+            delivery: QueueDelivery::WhenIdle,
+            agent_mode: None,
+            runtime_id: None,
+            created_at: "1".to_owned(),
+            updated_at: "2".to_owned(),
+            error: None,
+        }
+    }
+
+    fn queue_storage() -> Storage {
+        let storage = Storage::open_in_memory().unwrap();
+        storage.upsert_session(&metadata()).unwrap();
+        storage
+    }
+
+    #[test]
+    fn queue_items_round_trip_in_position_order() {
+        let storage = queue_storage();
+        storage.upsert_queue_item(&queue_item("b", 2048)).unwrap();
+        storage.upsert_queue_item(&queue_item("a", 1024)).unwrap();
+
+        let view = storage.queue_view("app-session").unwrap();
+        let ids: Vec<_> = view.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["a", "b"]);
+        assert_eq!(view.pending_count(), 2);
+        assert!(!view.paused);
+    }
+
+    #[test]
+    fn upserting_an_existing_item_updates_it_in_place() {
+        let storage = queue_storage();
+        storage.upsert_queue_item(&queue_item("a", 1024)).unwrap();
+
+        let mut edited = queue_item("a", 1024);
+        edited.prompt = "edited prompt".to_owned();
+        edited.state = QueueItemState::Dispatched;
+        edited.runtime_id = Some("7".to_owned());
+        storage.upsert_queue_item(&edited).unwrap();
+
+        let view = storage.queue_view("app-session").unwrap();
+        assert_eq!(view.items.len(), 1);
+        assert_eq!(view.items[0].prompt, "edited prompt");
+        assert_eq!(view.items[0].state, QueueItemState::Dispatched);
+        assert_eq!(view.items[0].runtime_id.as_deref(), Some("7"));
+        assert_eq!(view.pending_count(), 0);
+    }
+
+    #[test]
+    fn next_position_leaves_room_between_neighbours() {
+        let storage = queue_storage();
+        assert_eq!(storage.next_queue_position("app-session").unwrap(), 1024);
+
+        storage.upsert_queue_item(&queue_item("a", 1024)).unwrap();
+        let next = storage.next_queue_position("app-session").unwrap();
+        assert_eq!(next, 2048);
+        // The stride has to admit a position strictly between the two.
+        assert!(next - 1024 > 1);
+    }
+
+    #[test]
+    fn reordering_rewrites_positions_to_match_the_given_order() {
+        let storage = queue_storage();
+        for (index, id) in ["a", "b", "c"].iter().enumerate() {
+            let position = (i64::try_from(index).unwrap() + 1) * 1024;
+            storage
+                .upsert_queue_item(&queue_item(id, position))
+                .unwrap();
+        }
+
+        storage
+            .reorder_queue(
+                "app-session",
+                &["c".to_owned(), "a".to_owned(), "b".to_owned()],
+            )
+            .unwrap();
+
+        let view = storage.queue_view("app-session").unwrap();
+        let ids: Vec<_> = view.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["c", "a", "b"]);
+        assert_eq!(view.next_pending().map(|item| item.id.as_str()), Some("c"));
+    }
+
+    #[test]
+    fn deleting_removes_only_the_named_item() {
+        let storage = queue_storage();
+        storage.upsert_queue_item(&queue_item("a", 1024)).unwrap();
+        storage.upsert_queue_item(&queue_item("b", 2048)).unwrap();
+
+        assert!(storage.delete_queue_item("a").unwrap());
+        assert!(!storage.delete_queue_item("a").unwrap());
+
+        let view = storage.queue_view("app-session").unwrap();
+        let ids: Vec<_> = view.items.iter().map(|item| item.id.as_str()).collect();
+        assert_eq!(ids, vec!["b"]);
+    }
+
+    #[test]
+    fn paused_flag_persists_per_session() {
+        let storage = queue_storage();
+        storage.set_queue_paused("app-session", true).unwrap();
+        assert!(storage.queue_view("app-session").unwrap().paused);
+
+        storage.set_queue_paused("app-session", false).unwrap();
+        assert!(!storage.queue_view("app-session").unwrap().paused);
+    }
+
+    #[test]
+    fn runtime_ids_can_be_cleared_without_touching_the_queue() {
+        let storage = queue_storage();
+        let mut item = queue_item("a", 1024);
+        item.runtime_id = Some("0".to_owned());
+        storage.upsert_queue_item(&item).unwrap();
+
+        storage.clear_queue_runtime_ids("app-session").unwrap();
+
+        let view = storage.queue_view("app-session").unwrap();
+        assert_eq!(view.items.len(), 1);
+        assert!(view.items[0].runtime_id.is_none());
+        assert_eq!(view.items[0].state, QueueItemState::Pending);
+    }
+
+    #[test]
+    fn queue_items_are_removed_with_their_session() {
+        let storage = queue_storage();
+        storage.upsert_queue_item(&queue_item("a", 1024)).unwrap();
+        storage.set_queue_paused("app-session", true).unwrap();
+
+        storage.delete_session("app-session").unwrap();
+
+        assert!(storage.queue_view("app-session").unwrap().is_empty());
+        assert!(!storage.queue_view("app-session").unwrap().paused);
+    }
+
+    #[test]
+    fn queue_survives_reopening_the_database() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gcabb.db");
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage.upsert_session(&metadata()).unwrap();
+            storage.upsert_queue_item(&queue_item("a", 1024)).unwrap();
+            storage.set_queue_paused("app-session", true).unwrap();
+        }
+
+        let storage = Storage::open(&path).unwrap();
+        let view = storage.queue_view("app-session").unwrap();
+        assert_eq!(view.items.len(), 1);
+        assert_eq!(view.items[0].prompt, "prompt a");
+        assert!(view.paused);
     }
 
     #[test]

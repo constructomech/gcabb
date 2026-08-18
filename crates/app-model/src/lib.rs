@@ -6,10 +6,12 @@ use serde_json::Value;
 
 pub mod capability;
 pub mod changes;
+pub mod queue;
 pub mod tools;
 
 pub use capability::{Capability, CapabilityId, CapabilityReport, CapabilityStatus};
 pub use changes::{ChangeStage, ChangeStatus, ChangedFile, ChangesView, DiffStats};
+pub use queue::{QueueDelivery, QueueItem, QueueItemState, QueueView};
 pub use tools::{
     InvocationState, OutputMetadata, OutputStreamKind, OutputStreamUpdate, TerminalSession,
     TerminalState, ToolActivity, ToolCatalog, ToolClass, ToolDescriptor, ToolInvocation,
@@ -659,6 +661,14 @@ pub struct SessionSnapshot {
     /// Worktree changes against the session's recorded base.
     #[serde(default)]
     pub changes: ChangesView,
+    /// Prompts the developer has queued for this session.
+    ///
+    /// Skipped when serializing: the queue is durable state owned by the
+    /// `queue_items` table, not a projection of the event log. Persisting a
+    /// second copy inside snapshots would let the two disagree after a
+    /// restart, so the session actor reloads it from storage instead.
+    #[serde(skip)]
+    pub queue: QueueView,
     /// Latest SDK lifecycle and progress signals for user-facing diagnostics.
     #[serde(default)]
     pub diagnostics: AgentDiagnostics,
@@ -688,6 +698,7 @@ impl SessionSnapshot {
             tool_activity: ToolActivity::default(),
             capabilities: CapabilityReport::default(),
             changes: ChangesView::default(),
+            queue: QueueView::default(),
             diagnostics: AgentDiagnostics::default(),
             last_error: None,
             seen_event_ids: HashSet::new(),
