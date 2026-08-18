@@ -5648,6 +5648,7 @@ dependencies = [
  "async-trait",
  "clap",
  "github-copilot-sdk",
+ "rusqlite",
  "serde",
  "serde_json",
  "tokio",

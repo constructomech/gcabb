@@ -15,8 +15,8 @@ use github_copilot_sdk::handler::{
 };
 use github_copilot_sdk::hooks::{HookEvent, HookOutput, SessionHooks};
 use github_copilot_sdk::rpc::{
-    QueueDuplicateAtRequest, QueueInsertAtRequest, QueueInsertMessage, QueueMoveItemRequest,
-    QueueRemoveAtRequest, QueueSetDrainPausedRequest, QueueUpdateTextRequest,
+    PlanUpdateRequest, QueueDuplicateAtRequest, QueueInsertAtRequest, QueueInsertMessage,
+    QueueMoveItemRequest, QueueRemoveAtRequest, QueueSetDrainPausedRequest, QueueUpdateTextRequest,
 };
 use github_copilot_sdk::session::Session;
 use github_copilot_sdk::tool::ToolHandler;
@@ -65,6 +65,11 @@ struct Args {
     /// steering works on the stable `session.send` surface. Consumes quota.
     #[arg(long)]
     steering_probe: bool,
+    /// Write a plan file and todo rows for the session, then read them back
+    /// through the runtime to see whether host-authored priorities are visible
+    /// to the agent.
+    #[arg(long)]
+    plan_inject_probe: bool,
 }
 
 #[derive(Clone)]
@@ -836,6 +841,145 @@ async fn exercise_steering(
     )
 }
 
+/// Tests whether GCABB can seed the agent's own planning surfaces.
+///
+/// Two routes are tried: the supported `session.plan.update` RPC, which writes
+/// the session plan file, and a direct write into the runtime's session
+/// database, which is unsupported and only measured here to establish whether
+/// it is visible at all.
+async fn exercise_plan_injection(session: &Session, recorder: &Recorder) -> Result<()> {
+    recorder.write("plan_inject.start", Value::Null)?;
+    let plan_path = exercise_plan_file_injection(session, recorder).await?;
+    exercise_todo_table_injection(session, recorder, plan_path.as_deref()).await?;
+    recorder.write("plan_inject.complete", Value::Null)
+}
+
+/// Write the session plan file through the supported RPC and read it back.
+async fn exercise_plan_file_injection(
+    session: &Session,
+    recorder: &Recorder,
+) -> Result<Option<String>> {
+    let started = Instant::now();
+    let before = record_rpc_value(
+        recorder,
+        "rpc.session.plan.read.before",
+        started,
+        session.rpc().plan().read().await,
+    )?;
+
+    // Route 1: the supported plan file.
+    let content = "# Host priorities\n\n- [ ] Injected by GCABB\n- [ ] Second priority\n";
+    let started = Instant::now();
+    record_rpc(
+        recorder,
+        "rpc.session.plan.update",
+        started,
+        session
+            .rpc()
+            .plan()
+            .update(PlanUpdateRequest {
+                content: content.to_owned(),
+            })
+            .await,
+    )?;
+    let started = Instant::now();
+    let after = record_rpc_value(
+        recorder,
+        "rpc.session.plan.read.after",
+        started,
+        session.rpc().plan().read().await,
+    )?;
+    recorder.write(
+        "plan_inject.plan_file",
+        json!({
+            "existedBefore": before.as_ref().is_some_and(|read| read.exists),
+            "existsAfter": after.as_ref().is_some_and(|read| read.exists),
+            "roundTripped": after
+                .as_ref()
+                .and_then(|read| read.content.as_deref())
+                .is_some_and(|stored| stored == content),
+            "path": after.as_ref().and_then(|read| read.path.clone()),
+        }),
+    )?;
+    Ok(after.and_then(|read| read.path))
+}
+
+/// Write rows straight into the runtime's todo table and read them back.
+async fn exercise_todo_table_injection(
+    session: &Session,
+    recorder: &Recorder,
+    plan_path: Option<&str>,
+) -> Result<()> {
+    let started = Instant::now();
+    let todos_before = record_rpc_value(
+        recorder,
+        "rpc.session.plan.read_sql_todos.before",
+        started,
+        session
+            .rpc()
+            .plan()
+            .read_sql_todos_with_dependencies()
+            .await,
+    )?;
+    let database = plan_path
+        .and_then(|path| Path::new(path).parent())
+        .map(|directory| directory.join("session.db"));
+    let wrote = match database.as_deref() {
+        Some(path) if path.exists() => match write_todo_rows(path) {
+            Ok(()) => true,
+            Err(error) => {
+                recorder.write(
+                    "plan_inject.sql_write.error",
+                    json!({"error": error.to_string()}),
+                )?;
+                false
+            }
+        },
+        _ => {
+            recorder.write(
+                "plan_inject.sql_write.skipped",
+                json!({"reason": "no session database on disk yet"}),
+            )?;
+            false
+        }
+    };
+
+    let started = Instant::now();
+    let todos_after = record_rpc_value(
+        recorder,
+        "rpc.session.plan.read_sql_todos.after",
+        started,
+        session
+            .rpc()
+            .plan()
+            .read_sql_todos_with_dependencies()
+            .await,
+    )?;
+    recorder.write(
+        "plan_inject.sql_todos",
+        json!({
+            "wroteDirectly": wrote,
+            "database": database,
+            "rowsBefore": todos_before.as_ref().map(|read| read.rows.len()),
+            "rowsAfter": todos_after.as_ref().map(|read| read.rows.len()),
+            "titlesAfter": todos_after
+                .as_ref()
+                .map(|read| read.rows.iter().filter_map(|row| row.title.clone()).collect::<Vec<_>>()),
+        }),
+    )
+}
+
+/// Insert todo rows straight into the runtime's session database.
+fn write_todo_rows(path: &Path) -> Result<()> {
+    let connection = rusqlite::Connection::open(path)?;
+    connection.execute(
+        "INSERT OR REPLACE INTO todos (id, title, description, status)
+         VALUES ('gcabb-priority', 'Injected priority', 'Written by the host', 'pending')",
+        [],
+    )?;
+    Ok(())
+}
+
 #[async_trait]
 impl ElicitationHandler for ProbeCallbacks {
     async fn handle(
@@ -1194,6 +1338,13 @@ async fn main() -> Result<()> {
             timeout,
         )
         .await?;
+    }
+
+    // Runs after any prompt: the runtime only creates the session database
+    // once the agent has done something, so an earlier write has nothing to
+    // write into.
+    if args.plan_inject_probe {
+        exercise_plan_injection(&session, &recorder).await?;
     }
 
     // Runs last: the CLI only persists a session once it has taken a turn, so
