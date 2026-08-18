@@ -1026,8 +1026,14 @@ impl AppService {
                     }
                 };
                 let runtime_ms = elapsed_millis(runtime_started);
-                let provider_factory =
-                    CopilotProviderFactory::new(project_root.clone(), diagnostics.clone());
+                let provider_factory = {
+                    let factory =
+                        CopilotProviderFactory::new(project_root.clone(), diagnostics.clone());
+                    match hosted_session_state_root() {
+                        Some(root) => factory.hosting_session_state(root),
+                        None => factory,
+                    }
+                };
                 let session_roots = SessionRoots {
                     worktrees: None,
                     attachments: attachments_directory(),
@@ -1517,6 +1523,17 @@ fn register_directory_as_project(manager: &SessionManager, path: &Path) -> Resul
 fn runtime_state_root() -> Option<PathBuf> {
     let path = dirs::home_dir()?.join(".copilot").join("session-state");
     path.is_dir().then_some(path)
+}
+
+/// Directory GCABB serves session state from when it hosts the filesystem.
+///
+/// Deliberately the same location the runtime uses on its own, so hosting
+/// changes who performs the writes without moving anything on disk. A session
+/// created before hosting was enabled still resumes from its own directory.
+fn hosted_session_state_root() -> Option<PathBuf> {
+    let path = dirs::home_dir()?.join(".copilot").join("session-state");
+    std::fs::create_dir_all(&path).ok()?;
+    Some(path)
 }
 
 fn default_worktrees_root() -> PathBuf {

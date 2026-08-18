@@ -996,7 +996,7 @@ fn write_todo_rows(path: &Path) -> Result<()> {
 async fn run_hosted_fs_probe(args: &Args, cwd: &Path, recorder: &Recorder) -> Result<()> {
     let state_root = cwd.join("session-state");
     create_dir_all(&state_root)?;
-    let provider = Arc::new(HostSessionFs::new(state_root.join("session.db")));
+    let provider = Arc::new(HostSessionFs::new(&state_root, &state_root));
     let database = provider.database();
 
     let mut client_options = ClientOptions::default();

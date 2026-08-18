@@ -28,6 +28,9 @@ use github_copilot_sdk::rpc::{
     PermissionDecisionApproveForSessionApprovalWrite, ToolsListRequest,
 };
 use github_copilot_sdk::session::Session;
+use github_copilot_sdk::session_fs::{
+    SessionFsCapabilities, SessionFsConfig, SessionFsConventions,
+};
 use github_copilot_sdk::{
     Client, ClientMode, ClientOptions, DeliveryMode, ElicitationRequest, ElicitationResult,
     ExitPlanModeData, MessageOptions, PermissionRequestData, PermissionRequestKind, RequestId,
@@ -35,12 +38,29 @@ use github_copilot_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use session_fs::HostSessionFs;
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot};
 use uuid::Uuid;
 
 pub const SDK_CRATE_VERSION: &str = "1.0.9";
 pub const MINIMUM_PROTOCOL_VERSION: u32 = 3;
+
+/// Logical path the runtime is told its session state lives at.
+///
+/// One path serves every session on the client: each session registers its
+/// own filesystem, and that provider maps this path onto a directory of its
+/// own, so two sessions never share real files.
+const HOSTED_SESSION_STATE_PATH: &str = "/gcabb-session-state";
+
+/// Path conventions of the platform GCABB is running on.
+const fn session_fs_conventions() -> SessionFsConventions {
+    if cfg!(windows) {
+        SessionFsConventions::Windows
+    } else {
+        SessionFsConventions::Posix
+    }
+}
 
 pub mod queue;
 
@@ -59,6 +79,8 @@ pub enum ProviderError {
     IncompatibleProtocol { actual: u32, minimum: u32 },
     #[error("Copilot SDK operation failed: {0}")]
     Sdk(String),
+    #[error("the agent's task list is only writable when GCABB hosts the session filesystem")]
+    AgentPlanNotWritable,
     #[error("provider event serialization failed: {0}")]
     Serialization(#[from] serde_json::Error),
 }
@@ -192,9 +214,32 @@ pub trait AgentProvider: Send + Sync {
 
     /// The agent's own task list, as recorded in the runtime's session database.
     ///
-    /// Read-only: the runtime exposes no way to write these rows.
+    /// Read-only unless GCABB hosts the session filesystem.
     async fn agent_plan(&self, _sdk_session_id: &str) -> Result<AgentPlan> {
         Ok(AgentPlan::default())
+    }
+
+    /// Change the status of one of the agent's todos.
+    ///
+    /// Returns whether a row was found. Fails when the session's database is
+    /// not hosted by GCABB, since the runtime offers no write RPC.
+    async fn set_agent_todo_status(
+        &self,
+        _sdk_session_id: &str,
+        _todo_id: &str,
+        _status: &str,
+    ) -> Result<bool> {
+        Err(ProviderError::AgentPlanNotWritable)
+    }
+
+    /// Add or replace one of the agent's todos.
+    async fn upsert_agent_todo(&self, _sdk_session_id: &str, _todo: &AgentTodo) -> Result<()> {
+        Err(ProviderError::AgentPlanNotWritable)
+    }
+
+    /// Remove one of the agent's todos, with any dependency edges naming it.
+    async fn remove_agent_todo(&self, _sdk_session_id: &str, _todo_id: &str) -> Result<bool> {
+        Err(ProviderError::AgentPlanNotWritable)
     }
 }
 
@@ -499,17 +544,22 @@ impl AutoModeSwitchHandler for InteractionBroker {
 
 pub struct CopilotProvider {
     root: PathBuf,
+    /// Directory GCABB keeps hosted session state under, when hosting is on.
+    session_state_root: Option<PathBuf>,
     client: Mutex<Option<Client>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     /// Transport chosen per session, cached after the first probe so the
     /// choice cannot change midway through a session's lifetime.
     queue_transports: Mutex<HashMap<String, Arc<dyn QueueTransport>>>,
+    /// Hosted filesystems, one per session, keyed by SDK session id.
+    session_filesystems: Mutex<HashMap<String, Arc<HostSessionFs>>>,
     diagnostics: Arc<dyn DiagnosticsSink>,
 }
 
 #[derive(Clone)]
 pub struct CopilotProviderFactory {
     probe_root: PathBuf,
+    session_state_root: Option<PathBuf>,
     diagnostics: Arc<dyn DiagnosticsSink>,
 }
 
@@ -518,12 +568,25 @@ impl CopilotProviderFactory {
     pub fn new(probe_root: impl Into<PathBuf>, diagnostics: Arc<dyn DiagnosticsSink>) -> Self {
         Self {
             probe_root: probe_root.into(),
+            session_state_root: None,
             diagnostics,
         }
     }
 
+    /// Host the session filesystem for every session this factory creates,
+    /// keeping their state under `root`.
+    #[must_use]
+    pub fn hosting_session_state(mut self, root: impl Into<PathBuf>) -> Self {
+        self.session_state_root = Some(root.into());
+        self
+    }
+
     fn provider(&self, root: &Path) -> Arc<CopilotProvider> {
-        Arc::new(CopilotProvider::new(root, self.diagnostics.clone()))
+        let provider = CopilotProvider::new(root, self.diagnostics.clone());
+        Arc::new(match self.session_state_root.clone() {
+            Some(state_root) => provider.hosting_session_state(state_root),
+            None => provider,
+        })
     }
 }
 
@@ -567,11 +630,50 @@ impl CopilotProvider {
     pub fn new(root: impl Into<PathBuf>, diagnostics: Arc<dyn DiagnosticsSink>) -> Self {
         Self {
             root: root.into(),
+            session_state_root: None,
             client: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             queue_transports: Mutex::new(HashMap::new()),
+            session_filesystems: Mutex::new(HashMap::new()),
             diagnostics,
         }
+    }
+
+    /// Host the session filesystem, keeping session state under `root`.
+    ///
+    /// Hosting is what makes the agent's task list shared rather than the
+    /// runtime's alone: its SQL arrives as calls GCABB serves, so the app can
+    /// read and change the same rows.
+    #[must_use]
+    pub fn hosting_session_state(mut self, root: impl Into<PathBuf>) -> Self {
+        self.session_state_root = Some(root.into());
+        self
+    }
+
+    /// The hosted filesystem for a session, when hosting is enabled.
+    pub async fn session_filesystem(&self, sdk_session_id: &str) -> Option<Arc<HostSessionFs>> {
+        self.session_filesystems
+            .lock()
+            .await
+            .get(sdk_session_id)
+            .cloned()
+    }
+
+    /// Build and record the hosted filesystem for one session.
+    ///
+    /// The directory is named after the session so a resume reopens the state
+    /// the session already has, rather than starting empty.
+    async fn host_filesystem(&self, sdk_session_id: &str) -> Option<Arc<HostSessionFs>> {
+        let root = self.session_state_root.as_ref()?;
+        let filesystem = Arc::new(HostSessionFs::new(
+            HOSTED_SESSION_STATE_PATH,
+            root.join(sdk_session_id),
+        ));
+        self.session_filesystems
+            .lock()
+            .await
+            .insert(sdk_session_id.to_owned(), filesystem.clone());
+        Some(filesystem)
     }
 
     /// Resolve the queue transport for a session, probing the runtime once.
@@ -742,6 +844,18 @@ impl AgentProvider for CopilotProvider {
         // depends on, and that regression would surface as an unexplained
         // model failure rather than a configuration error.
         options.mode = ClientMode::CopilotCli;
+        // Hosting the session filesystem is what lets the app share the
+        // agent's task list rather than only read it.
+        if self.session_state_root.is_some() {
+            options.session_fs = Some(
+                SessionFsConfig::new(
+                    self.root.to_string_lossy(),
+                    HOSTED_SESSION_STATE_PATH,
+                    session_fs_conventions(),
+                )
+                .with_capabilities(SessionFsCapabilities::new().with_sqlite(true)),
+            );
+        }
         let client = Client::start(options).await.map_err(|error| {
             self.record(
                 "start",
@@ -794,10 +908,22 @@ impl AgentProvider for CopilotProvider {
         let started = Instant::now();
         let (interaction_tx, interactions) = mpsc::channel(16);
         let broker = Arc::new(InteractionBroker::new(interaction_tx, &request));
+        let mut config = Self::session_config(&request, broker);
+        // The session id is minted here rather than by the runtime so the
+        // hosted state directory can be named before the session exists, and
+        // so a later resume finds the same directory.
+        if self.session_state_root.is_some() {
+            let sdk_session_id = Uuid::new_v4().to_string();
+            let filesystem = self.host_filesystem(&sdk_session_id).await;
+            config = config.with_session_id(sdk_session_id);
+            if let Some(filesystem) = filesystem {
+                config = config.with_session_fs_provider(filesystem);
+            }
+        }
         let session = self
             .client()
             .await?
-            .create_session(Self::session_config(&request, broker))
+            .create_session(config)
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))?;
         if let Err(error) = session.rpc().skills().ensure_loaded().await {
@@ -827,10 +953,14 @@ impl AgentProvider for CopilotProvider {
         let started = Instant::now();
         let (interaction_tx, interactions) = mpsc::channel(16);
         let broker = Arc::new(InteractionBroker::new(interaction_tx, &request));
+        let mut config = Self::resume_config(sdk_session_id, &request, broker);
+        if let Some(filesystem) = self.host_filesystem(sdk_session_id).await {
+            config = config.with_session_fs_provider(filesystem);
+        }
         let session = self
             .client()
             .await?
-            .resume_session(Self::resume_config(sdk_session_id, &request, broker))
+            .resume_session(config)
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))?;
         // The SDK's automatic resume reload is best-effort and only logs errors.
@@ -1040,6 +1170,11 @@ impl AgentProvider for CopilotProvider {
     }
 
     async fn agent_plan(&self, sdk_session_id: &str) -> Result<AgentPlan> {
+        // Prefer the hosted database: it is the same store the agent writes
+        // through, so it cannot lag the runtime's own view.
+        if let Some(filesystem) = self.session_filesystem(sdk_session_id).await {
+            return hosted_agent_plan(&filesystem).await;
+        }
         let session = self.session(sdk_session_id).await?;
         let read = session
             .rpc()
@@ -1048,6 +1183,89 @@ impl AgentProvider for CopilotProvider {
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))?;
         Ok(agent_plan(read))
+    }
+
+    async fn set_agent_todo_status(
+        &self,
+        sdk_session_id: &str,
+        todo_id: &str,
+        status: &str,
+    ) -> Result<bool> {
+        let filesystem = self
+            .session_filesystem(sdk_session_id)
+            .await
+            .ok_or(ProviderError::AgentPlanNotWritable)?;
+        let mut params = HashMap::new();
+        params.insert("id".to_owned(), Value::from(todo_id.to_owned()));
+        params.insert("status".to_owned(), Value::from(status.to_owned()));
+        let result = filesystem
+            .database()
+            .write(
+                "UPDATE todos SET status = :status, updated_at = datetime('now') WHERE id = :id",
+                Some(&params),
+            )
+            .await
+            .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        Ok(result.rows_affected > 0)
+    }
+
+    async fn upsert_agent_todo(&self, sdk_session_id: &str, todo: &AgentTodo) -> Result<()> {
+        let filesystem = self
+            .session_filesystem(sdk_session_id)
+            .await
+            .ok_or(ProviderError::AgentPlanNotWritable)?;
+        let database = filesystem.database();
+        // The agent creates these tables the first time it plans anything, so
+        // a host-authored todo may be the first row the session ever has.
+        database
+            .exec(AGENT_TODO_SCHEMA)
+            .await
+            .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        let mut params = HashMap::new();
+        params.insert("id".to_owned(), Value::from(todo.id.clone()));
+        params.insert("title".to_owned(), Value::from(todo.title.clone()));
+        params.insert(
+            "description".to_owned(),
+            todo.description.clone().map_or(Value::Null, Value::from),
+        );
+        params.insert("status".to_owned(), Value::from(agent_status(todo.status)));
+        database
+            .write(
+                "INSERT INTO todos (id, title, description, status)
+                 VALUES (:id, :title, :description, :status)
+                 ON CONFLICT(id) DO UPDATE SET
+                    title = excluded.title,
+                    description = excluded.description,
+                    status = excluded.status,
+                    updated_at = datetime('now')",
+                Some(&params),
+            )
+            .await
+            .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        Ok(())
+    }
+
+    async fn remove_agent_todo(&self, sdk_session_id: &str, todo_id: &str) -> Result<bool> {
+        let filesystem = self
+            .session_filesystem(sdk_session_id)
+            .await
+            .ok_or(ProviderError::AgentPlanNotWritable)?;
+        let mut params = HashMap::new();
+        params.insert("id".to_owned(), Value::from(todo_id.to_owned()));
+        let database = filesystem.database();
+        // Dependency rows reference the todo, so they go first.
+        database
+            .write(
+                "DELETE FROM todo_deps WHERE todo_id = :id OR depends_on = :id",
+                Some(&params),
+            )
+            .await
+            .ok();
+        let result = database
+            .write("DELETE FROM todos WHERE id = :id", Some(&params))
+            .await
+            .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        Ok(result.rows_affected > 0)
     }
 
     async fn discover_tools(&self, model: Option<&str>) -> Result<ToolCatalog> {
@@ -1151,6 +1369,99 @@ impl AgentProvider for CopilotProvider {
 ///
 /// MCP tools are identified by a `server/tool` namespaced name, which is the
 /// only signal the wire type carries about tool origin.
+/// Schema for the agent's task list, matching what the runtime creates.
+///
+/// GCABB may write a todo before the agent has planned anything, in which
+/// case the tables do not exist yet.
+const AGENT_TODO_SCHEMA: &str = "
+    CREATE TABLE IF NOT EXISTS todos (
+        id TEXT PRIMARY KEY,
+        title TEXT NOT NULL,
+        description TEXT,
+        status TEXT DEFAULT 'pending' CHECK(status IN ('pending', 'in_progress', 'done', 'blocked')),
+        created_at TEXT DEFAULT (datetime('now')),
+        updated_at TEXT DEFAULT (datetime('now'))
+    );
+    CREATE TABLE IF NOT EXISTS todo_deps (
+        todo_id TEXT NOT NULL,
+        depends_on TEXT NOT NULL,
+        PRIMARY KEY (todo_id, depends_on),
+        FOREIGN KEY (todo_id) REFERENCES todos(id),
+        FOREIGN KEY (depends_on) REFERENCES todos(id)
+    );
+";
+
+/// The status strings the runtime's schema constrains todos to.
+const fn agent_status(status: AgentTodoStatus) -> &'static str {
+    match status {
+        AgentTodoStatus::Pending => "pending",
+        AgentTodoStatus::InProgress => "in_progress",
+        AgentTodoStatus::Done => "done",
+        AgentTodoStatus::Blocked => "blocked",
+    }
+}
+
+/// Read the agent's task list straight from the hosted database.
+async fn hosted_agent_plan(filesystem: &HostSessionFs) -> Result<AgentPlan> {
+    let database = filesystem.database();
+    if !database.exists().await {
+        return Ok(AgentPlan::default());
+    }
+    // A session that has never planned has no tables, which is an empty list
+    // rather than a failure.
+    let Ok(rows) = database
+        .read(
+            "SELECT id, title, description, status FROM todos ORDER BY created_at, id",
+            None,
+        )
+        .await
+    else {
+        return Ok(AgentPlan::default());
+    };
+    let dependencies = database
+        .read("SELECT todo_id, depends_on FROM todo_deps", None)
+        .await
+        .map(|read| read.rows)
+        .unwrap_or_default();
+
+    let todos = rows
+        .rows
+        .into_iter()
+        .filter_map(|row| {
+            let id = row.get("id").and_then(Value::as_str)?.to_owned();
+            let title = row
+                .get("title")
+                .and_then(Value::as_str)
+                .filter(|title| !title.trim().is_empty())
+                .map_or_else(|| id.clone(), str::to_owned);
+            let depends_on = dependencies
+                .iter()
+                .filter(|edge| edge.get("todo_id").and_then(Value::as_str) == Some(id.as_str()))
+                .filter_map(|edge| {
+                    edge.get("depends_on")
+                        .and_then(Value::as_str)
+                        .map(str::to_owned)
+                })
+                .collect();
+            Some(AgentTodo {
+                id,
+                title,
+                description: row
+                    .get("description")
+                    .and_then(Value::as_str)
+                    .filter(|text| !text.trim().is_empty())
+                    .map(str::to_owned),
+                status: row
+                    .get("status")
+                    .and_then(Value::as_str)
+                    .map_or(AgentTodoStatus::Pending, AgentTodoStatus::from_runtime),
+                depends_on,
+            })
+        })
+        .collect();
+    Ok(AgentPlan { todos })
+}
+
 /// Translate the runtime's todo rows into the app's plan model.
 ///
 /// Every column the runtime reports is optional because the schema is

@@ -4,15 +4,15 @@
 //! registered, so these cover the operations it performs rather than only the
 //! happy path of each method.
 
-use std::path::Path;
-
 use github_copilot_sdk::session_fs::{DirEntryKind, FsErrorKind, SessionFsProvider};
 use session_fs::HostSessionFs;
 use tempfile::{TempDir, tempdir};
 
+/// A provider whose logical and real roots are the same, so these tests
+/// exercise the operations rather than the path mapping.
 fn provider() -> (HostSessionFs, TempDir) {
     let directory = tempdir().expect("tempdir");
-    let provider = HostSessionFs::new(directory.path().join("session.db"));
+    let provider = HostSessionFs::new(directory.path(), directory.path());
     (provider, directory)
 }
 
@@ -213,10 +213,93 @@ async fn the_sqlite_capability_is_offered() {
 }
 
 #[tokio::test]
-async fn the_database_lives_where_the_provider_was_told() {
+async fn the_database_lives_inside_the_session_root() {
     let directory = tempdir().expect("tempdir");
-    let expected = directory.path().join("state").join("session.db");
-    let provider = HostSessionFs::new(&expected);
+    let real = directory.path().join("session-a");
+    let provider = HostSessionFs::new("/session-state", &real);
 
-    assert_eq!(provider.database().path(), Path::new(&expected));
+    assert_eq!(provider.database().path(), real.join("session.db"));
+}
+
+#[tokio::test]
+async fn the_shared_state_path_is_served_from_a_per_session_directory() {
+    let directory = tempdir().expect("tempdir");
+    // The runtime is configured with one session-state path for the whole
+    // client, so two sessions ask for the very same path.
+    let first = HostSessionFs::new("/session-state", directory.path().join("first"));
+    let second = HostSessionFs::new("/session-state", directory.path().join("second"));
+
+    first
+        .write_file("/session-state/events.jsonl", "first", None)
+        .await
+        .expect("write first");
+    second
+        .write_file("/session-state/events.jsonl", "second", None)
+        .await
+        .expect("write second");
+
+    // Neither session may see the other's state through that shared path.
+    assert_eq!(
+        first
+            .read_file("/session-state/events.jsonl")
+            .await
+            .expect("read first"),
+        "first"
+    );
+    assert_eq!(
+        second
+            .read_file("/session-state/events.jsonl")
+            .await
+            .expect("read second"),
+        "second"
+    );
+}
+
+#[tokio::test]
+async fn project_paths_are_passed_through_untouched() {
+    let directory = tempdir().expect("tempdir");
+    let project = directory.path().join("project");
+    std::fs::create_dir_all(&project).expect("create project");
+    let source = project.join("main.rs");
+    std::fs::write(&source, "fn main() {}").expect("seed");
+
+    let provider = HostSessionFs::new("/session-state", directory.path().join("state"));
+
+    // The agent reads and edits the repository through this same provider, so
+    // rewriting these would send its edits somewhere else entirely.
+    let read = provider
+        .read_file(&source.to_string_lossy())
+        .await
+        .expect("read project file");
+    assert_eq!(read, "fn main() {}");
+
+    provider
+        .write_file(&source.to_string_lossy(), "edited", None)
+        .await
+        .expect("write project file");
+    assert_eq!(
+        std::fs::read_to_string(&source).expect("read back"),
+        "edited"
+    );
+}
+
+#[tokio::test]
+async fn renaming_out_of_session_state_resolves_both_ends() {
+    let directory = tempdir().expect("tempdir");
+    let state = directory.path().join("state");
+    let provider = HostSessionFs::new("/session-state", &state);
+    provider
+        .write_file("/session-state/from.txt", "body", None)
+        .await
+        .expect("write");
+
+    provider
+        .rename("/session-state/from.txt", "/session-state/nested/to.txt")
+        .await
+        .expect("rename");
+
+    assert_eq!(
+        std::fs::read_to_string(state.join("nested/to.txt")).expect("read"),
+        "body"
+    );
 }

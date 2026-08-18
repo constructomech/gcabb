@@ -116,6 +116,15 @@ impl SqliteStore {
         self.query(SessionFsSqliteQueryType::Run, query, params)
             .await
     }
+
+    /// Apply a batch that may contain several statements, such as a schema.
+    ///
+    /// [`Self::write`] prepares a single statement and rejects anything after
+    /// it, which is the wrong shape for schema bootstraps.
+    pub async fn exec(&self, query: &str) -> Result<SessionFsSqliteQueryResult, FsError> {
+        self.query(SessionFsSqliteQueryType::Exec, query, None)
+            .await
+    }
 }
 
 /// A busy or locked database is worth retrying; anything else is not.
@@ -455,6 +464,22 @@ mod tests {
             .await
             .expect("read");
         assert_eq!(read.rows[0]["title"], Value::from("Bound title"));
+    }
+
+    #[tokio::test]
+    async fn a_multi_statement_schema_needs_exec_rather_than_write() {
+        let directory = tempdir().expect("tempdir");
+        let store = store(directory.path());
+
+        // `write` prepares one statement, so a schema handed to it is
+        // rejected rather than silently half-applied.
+        assert!(store.write(RUNTIME_TODO_SCHEMA, None).await.is_err());
+
+        store.exec(RUNTIME_TODO_SCHEMA).await.expect("exec applies");
+        store
+            .read("SELECT todo_id FROM todo_deps", None)
+            .await
+            .expect("todo_deps exists");
     }
 
     #[tokio::test]

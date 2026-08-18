@@ -33,19 +33,30 @@ mod sqlite;
 pub use sqlite::SqliteStore;
 
 /// A session filesystem rooted at a directory GCABB owns.
+///
+/// The runtime is configured with one session-state path for the whole
+/// client, but each session registers its own provider. Serving that shared
+/// logical path from a per-session directory is what keeps two sessions from
+/// writing over each other. Paths outside it — the project files the agent
+/// reads and edits — are passed through untouched.
 pub struct HostSessionFs {
+    logical_root: PathBuf,
+    real_root: PathBuf,
     database: Arc<SqliteStore>,
 }
 
 impl HostSessionFs {
-    /// Serve a session whose `SQLite` database lives at `database_path`.
+    /// Serve `logical_root` from `real_root`.
     ///
-    /// The database is opened lazily so a session that never touches SQL does
-    /// not create a file for it.
+    /// The session's `SQLite` database lives inside `real_root`, and is opened
+    /// lazily so a session that never runs SQL does not create a file for it.
     #[must_use]
-    pub fn new(database_path: impl Into<PathBuf>) -> Self {
+    pub fn new(logical_root: impl Into<PathBuf>, real_root: impl Into<PathBuf>) -> Self {
+        let real_root = real_root.into();
         Self {
-            database: Arc::new(SqliteStore::new(database_path)),
+            logical_root: logical_root.into(),
+            database: Arc::new(SqliteStore::new(real_root.join("session.db"))),
+            real_root,
         }
     }
 
@@ -54,6 +65,25 @@ impl HostSessionFs {
     #[must_use]
     pub fn database(&self) -> Arc<SqliteStore> {
         self.database.clone()
+    }
+
+    /// The directory this session's state is actually written to.
+    #[must_use]
+    pub fn real_root(&self) -> &Path {
+        &self.real_root
+    }
+
+    /// Map a path the runtime asked for onto the path GCABB serves.
+    ///
+    /// Anything outside the session-state root is a project path and must be
+    /// left alone: the agent reads and edits the repository through this same
+    /// provider, and rewriting those would send its edits somewhere else.
+    fn resolve(&self, path: &str) -> PathBuf {
+        let requested = Path::new(path);
+        requested.strip_prefix(&self.logical_root).map_or_else(
+            |_| requested.to_path_buf(),
+            |relative| self.real_root.join(relative),
+        )
     }
 }
 
@@ -75,7 +105,7 @@ async fn ensure_parent(path: &Path) -> Result<(), FsError> {
 #[async_trait]
 impl SessionFsProvider for HostSessionFs {
     async fn read_file(&self, path: &str) -> Result<String, FsError> {
-        Ok(tokio::fs::read_to_string(path).await?)
+        Ok(tokio::fs::read_to_string(self.resolve(path)).await?)
     }
 
     async fn write_file(
@@ -84,8 +114,8 @@ impl SessionFsProvider for HostSessionFs {
         content: &str,
         _mode: Option<i64>,
     ) -> Result<(), FsError> {
-        let path = Path::new(path);
-        ensure_parent(path).await?;
+        let path = self.resolve(path);
+        ensure_parent(&path).await?;
         Ok(tokio::fs::write(path, content).await?)
     }
 
@@ -96,8 +126,8 @@ impl SessionFsProvider for HostSessionFs {
         _mode: Option<i64>,
     ) -> Result<(), FsError> {
         use tokio::io::AsyncWriteExt as _;
-        let path = Path::new(path);
-        ensure_parent(path).await?;
+        let path = self.resolve(path);
+        ensure_parent(&path).await?;
         let mut file = tokio::fs::OpenOptions::new()
             .create(true)
             .append(true)
@@ -109,11 +139,11 @@ impl SessionFsProvider for HostSessionFs {
 
     async fn exists(&self, path: &str) -> Result<bool, FsError> {
         // A missing path is a false answer, not a failure.
-        Ok(tokio::fs::metadata(path).await.is_ok())
+        Ok(tokio::fs::metadata(self.resolve(path)).await.is_ok())
     }
 
     async fn stat(&self, path: &str) -> Result<FileInfo, FsError> {
-        let metadata = tokio::fs::metadata(path).await?;
+        let metadata = tokio::fs::metadata(self.resolve(path)).await?;
         Ok(FileInfo::new(
             metadata.is_file(),
             metadata.is_dir(),
@@ -124,6 +154,7 @@ impl SessionFsProvider for HostSessionFs {
     }
 
     async fn mkdir(&self, path: &str, recursive: bool, _mode: Option<i64>) -> Result<(), FsError> {
+        let path = self.resolve(path);
         if recursive {
             tokio::fs::create_dir_all(path).await?;
         } else {
@@ -142,7 +173,7 @@ impl SessionFsProvider for HostSessionFs {
     }
 
     async fn readdir_with_types(&self, path: &str) -> Result<Vec<DirEntry>, FsError> {
-        let mut entries = tokio::fs::read_dir(path).await?;
+        let mut entries = tokio::fs::read_dir(self.resolve(path)).await?;
         let mut listed = Vec::new();
         while let Some(entry) = entries.next_entry().await? {
             let kind = if entry.file_type().await?.is_dir() {
@@ -159,19 +190,19 @@ impl SessionFsProvider for HostSessionFs {
     }
 
     async fn rm(&self, path: &str, recursive: bool, force: bool) -> Result<(), FsError> {
-        let target = Path::new(path);
-        let metadata = match tokio::fs::symlink_metadata(target).await {
+        let target = self.resolve(path);
+        let metadata = match tokio::fs::symlink_metadata(&target).await {
             Ok(metadata) => metadata,
             // `force` exists so removing something already gone is a success.
             Err(error) if force && error.kind() == std::io::ErrorKind::NotFound => return Ok(()),
             Err(error) => return Err(error.into()),
         };
         let result = if metadata.is_dir() && recursive {
-            tokio::fs::remove_dir_all(target).await
+            tokio::fs::remove_dir_all(&target).await
         } else if metadata.is_dir() {
-            tokio::fs::remove_dir(target).await
+            tokio::fs::remove_dir(&target).await
         } else {
-            tokio::fs::remove_file(target).await
+            tokio::fs::remove_file(&target).await
         };
         match result {
             Ok(()) => Ok(()),
@@ -181,9 +212,9 @@ impl SessionFsProvider for HostSessionFs {
     }
 
     async fn rename(&self, src: &str, dest: &str) -> Result<(), FsError> {
-        let destination = Path::new(dest);
-        ensure_parent(destination).await?;
-        Ok(tokio::fs::rename(src, destination).await?)
+        let destination = self.resolve(dest);
+        ensure_parent(&destination).await?;
+        Ok(tokio::fs::rename(self.resolve(src), destination).await?)
     }
 
     fn sqlite(&self) -> Option<&dyn SessionFsSqliteProvider> {
