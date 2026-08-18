@@ -6,11 +6,13 @@ use serde_json::Value;
 
 pub mod capability;
 pub mod changes;
+pub mod plan;
 pub mod queue;
 pub mod tools;
 
 pub use capability::{Capability, CapabilityId, CapabilityReport, CapabilityStatus};
 pub use changes::{ChangeStage, ChangeStatus, ChangedFile, ChangesView, DiffStats};
+pub use plan::{AgentPlan, AgentTodo, AgentTodoStatus};
 pub use queue::{QueueDelivery, QueueItem, QueueItemState, QueueView};
 pub use tools::{
     InvocationState, OutputMetadata, OutputStreamKind, OutputStreamUpdate, TerminalSession,
@@ -669,6 +671,13 @@ pub struct SessionSnapshot {
     /// restart, so the session actor reloads it from storage instead.
     #[serde(skip)]
     pub queue: QueueView,
+    /// The agent's own task list, as reported by the runtime.
+    ///
+    /// Skipped when serializing: the runtime owns these rows and is re-read
+    /// whenever it signals a change, so a persisted copy would only ever be
+    /// a stale duplicate.
+    #[serde(skip)]
+    pub agent_plan: AgentPlan,
     /// Latest SDK lifecycle and progress signals for user-facing diagnostics.
     #[serde(default)]
     pub diagnostics: AgentDiagnostics,
@@ -699,6 +708,7 @@ impl SessionSnapshot {
             capabilities: CapabilityReport::default(),
             changes: ChangesView::default(),
             queue: QueueView::default(),
+            agent_plan: AgentPlan::default(),
             diagnostics: AgentDiagnostics::default(),
             last_error: None,
             seen_event_ids: HashSet::new(),

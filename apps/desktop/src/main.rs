@@ -1783,16 +1783,37 @@ enum SessionPanel {
     Changes,
     Terminals,
     Capabilities,
+    Plan,
 }
 
 impl SessionPanel {
-    const ALL: [Self; 3] = [Self::Changes, Self::Terminals, Self::Capabilities];
+    const ALL: [Self; 4] = [
+        Self::Changes,
+        Self::Terminals,
+        Self::Capabilities,
+        Self::Plan,
+    ];
+
+    /// Panels worth offering for a session.
+    ///
+    /// The agent's task list is only meaningful once the agent has made one,
+    /// so its tab stays hidden rather than offering an empty panel.
+    fn available(snapshot: &SessionSnapshot) -> Vec<Self> {
+        Self::ALL
+            .into_iter()
+            .filter(|panel| match panel {
+                Self::Plan => !snapshot.agent_plan.is_empty(),
+                _ => true,
+            })
+            .collect()
+    }
 
     const fn label(self) -> &'static str {
         match self {
             Self::Changes => "Changes",
             Self::Terminals => "Terminals",
             Self::Capabilities => "Capabilities",
+            Self::Plan => "Plan",
         }
     }
 
@@ -1801,6 +1822,7 @@ impl SessionPanel {
             Self::Changes => "panel-changes",
             Self::Terminals => "panel-terminals",
             Self::Capabilities => "panel-capabilities",
+            Self::Plan => "panel-plan",
         }
     }
 }
@@ -7430,41 +7452,53 @@ impl SessionMvpView {
     fn side_panel(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let session = self.selected()?;
         let snapshot = session.snapshot.clone();
-        let active = self.active_panel;
-        let tabs = SessionPanel::ALL.map(|panel| {
-            let selected = panel == active;
-            div()
-                .id(panel.id())
-                .accessibility_id(panel.id())
-                .role(Role::Tab)
-                .aria_label(panel.label())
-                .aria_selected(selected)
-                .focusable()
-                .tab_stop(true)
-                .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
-                .px_3()
-                .py_1()
-                .text_xs()
-                .rounded_md()
-                .text_color(if selected { rgb(PRIMARY) } else { rgb(MUTED) })
-                .when(selected, |tab| tab.bg(rgb(ELEVATED)))
-                .child(panel.label())
-                .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
-                .on_click(cx.listener(move |view, _, _, cx| {
-                    view.active_panel = panel;
-                    if panel == SessionPanel::Changes {
-                        view.refresh_selected_changes(false, cx);
-                    } else {
-                        view.base_menu_visibility = SettingsVisibility::Closed;
-                    }
-                    cx.notify();
-                }))
-        });
+        let panels = SessionPanel::available(&snapshot);
+        // The plan tab disappears when the agent's list is cleared, which
+        // would otherwise leave the panel showing a section that is no longer
+        // offered.
+        let active = if panels.contains(&self.active_panel) {
+            self.active_panel
+        } else {
+            SessionPanel::Changes
+        };
+        let tabs: Vec<_> = panels
+            .into_iter()
+            .map(|panel| {
+                let selected = panel == active;
+                div()
+                    .id(panel.id())
+                    .accessibility_id(panel.id())
+                    .role(Role::Tab)
+                    .aria_label(panel.label())
+                    .aria_selected(selected)
+                    .focusable()
+                    .tab_stop(true)
+                    .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                    .px_3()
+                    .py_1()
+                    .text_xs()
+                    .rounded_md()
+                    .text_color(if selected { rgb(PRIMARY) } else { rgb(MUTED) })
+                    .when(selected, |tab| tab.bg(rgb(ELEVATED)))
+                    .child(panel.label())
+                    .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.active_panel = panel;
+                        if panel == SessionPanel::Changes {
+                            view.refresh_selected_changes(false, cx);
+                        } else {
+                            view.base_menu_visibility = SettingsVisibility::Closed;
+                        }
+                        cx.notify();
+                    }))
+            })
+            .collect();
 
         let body = match active {
             SessionPanel::Changes => self.changes_panel(&snapshot, cx).into_any_element(),
             SessionPanel::Terminals => Self::terminals_panel(&snapshot).into_any_element(),
             SessionPanel::Capabilities => Self::capabilities_panel(&snapshot).into_any_element(),
+            SessionPanel::Plan => Self::plan_panel(&snapshot).into_any_element(),
         };
 
         Some(
@@ -8167,6 +8201,114 @@ impl SessionMvpView {
             .overflow_hidden()
             .children(cards)
             .into_any_element()
+    }
+
+    /// The agent's own task list.
+    ///
+    /// Read-only: the runtime owns these rows and offers no way to write them,
+    /// so this reports progress rather than inviting edits.
+    fn plan_panel(snapshot: &SessionSnapshot) -> impl IntoElement {
+        let plan = &snapshot.agent_plan;
+        let unfinished = plan.unfinished_ids();
+        let completed = plan.completed();
+        let total = plan.total();
+
+        let rows = plan.todos.iter().map(|todo| {
+            let (status_label, status_color) = match todo.status {
+                app_model::AgentTodoStatus::Done => (todo.status.label(), GREEN),
+                app_model::AgentTodoStatus::InProgress => (todo.status.label(), BLUE),
+                app_model::AgentTodoStatus::Blocked => (todo.status.label(), RED),
+                app_model::AgentTodoStatus::Pending => (todo.status.label(), MUTED),
+            };
+            // A todo waiting on unfinished work is called out, since otherwise
+            // it reads as simply pending with no explanation for the wait.
+            let waiting = todo.is_blocked_by(&unfinished);
+            div()
+                .id(SharedString::from(format!("agent-todo-{}", todo.id)))
+                .role(Role::ListItem)
+                .aria_label(format!("{}: {status_label}", todo.title))
+                .flex()
+                .flex_col()
+                .gap_1()
+                .p_2()
+                .rounded_md()
+                .bg(rgb(PANEL))
+                .border_1()
+                .border_color(rgb(
+                    if todo.status == app_model::AgentTodoStatus::InProgress {
+                        BLUE
+                    } else {
+                        BORDER
+                    },
+                ))
+                .child(
+                    div()
+                        .flex()
+                        .justify_between()
+                        .gap_2()
+                        .child(
+                            div()
+                                .flex_1()
+                                .text_xs()
+                                .text_color(rgb(PRIMARY))
+                                .child(todo.title.clone()),
+                        )
+                        .child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(status_color))
+                                .child(status_label),
+                        ),
+                )
+                .when_some(todo.description.clone(), |row, description| {
+                    row.child(div().text_xs().text_color(rgb(MUTED)).child(description))
+                })
+                .when(waiting, |row| {
+                    row.child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(AMBER))
+                            .child(format!("Waiting on {}", todo.depends_on.join(", "))),
+                    )
+                })
+        });
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap_2()
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{completed} of {total} done")),
+                    )
+                    .when_some(plan.current().cloned(), |header, current| {
+                        header.child(
+                            div()
+                                .text_xs()
+                                .text_color(rgb(BLUE))
+                                .child(current.title.clone()),
+                        )
+                    }),
+            )
+            .child(
+                div()
+                    .id("agent-todo-list")
+                    .role(Role::List)
+                    .aria_label("Agent plan")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(rows),
+            )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -10814,6 +10956,74 @@ mod tests {
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+
+    /// A snapshot carrying only what the panel logic reads.
+    fn snapshot_with_plan(plan: app_model::AgentPlan) -> app_model::SessionSnapshot {
+        let mut snapshot = app_model::SessionSnapshot::new(app_model::SessionMetadata {
+            id: "session".to_owned(),
+            sdk_session_id: "sdk-session".to_owned(),
+            project_path: "/tmp/project".to_owned(),
+            repository_root: None,
+            title: "Session".to_owned(),
+            title_source: app_model::TitleSource::Manual,
+            kind: app_model::SessionKind::Project,
+            model: None,
+            mode: None,
+            base_ref: None,
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+        });
+        snapshot.agent_plan = plan;
+        snapshot
+    }
+
+    fn agent_todo(id: &str, status: app_model::AgentTodoStatus) -> app_model::AgentTodo {
+        app_model::AgentTodo {
+            id: id.to_owned(),
+            title: format!("Task {id}"),
+            description: None,
+            status,
+            depends_on: Vec::new(),
+        }
+    }
+
+    #[test]
+    fn the_plan_tab_is_offered_only_once_the_agent_has_a_plan() {
+        let without = snapshot_with_plan(app_model::AgentPlan::default());
+        assert!(!super::SessionPanel::available(&without).contains(&super::SessionPanel::Plan));
+
+        let with = snapshot_with_plan(app_model::AgentPlan {
+            todos: vec![agent_todo("a", app_model::AgentTodoStatus::Pending)],
+        });
+        assert!(super::SessionPanel::available(&with).contains(&super::SessionPanel::Plan));
+    }
+
+    #[test]
+    fn hiding_the_plan_tab_never_hides_the_other_panels() {
+        let snapshot = snapshot_with_plan(app_model::AgentPlan::default());
+        let panels = super::SessionPanel::available(&snapshot);
+        assert!(panels.contains(&super::SessionPanel::Changes));
+        assert!(panels.contains(&super::SessionPanel::Terminals));
+        assert!(panels.contains(&super::SessionPanel::Capabilities));
+        assert_eq!(panels.len(), 3);
+    }
+
+    #[test]
+    fn plan_progress_reports_finished_work_and_the_current_task() {
+        let snapshot = snapshot_with_plan(app_model::AgentPlan {
+            todos: vec![
+                agent_todo("a", app_model::AgentTodoStatus::Done),
+                agent_todo("b", app_model::AgentTodoStatus::InProgress),
+                agent_todo("c", app_model::AgentTodoStatus::Pending),
+            ],
+        });
+        assert_eq!(snapshot.agent_plan.completed(), 1);
+        assert_eq!(snapshot.agent_plan.total(), 3);
+        assert_eq!(
+            snapshot.agent_plan.current().map(|todo| todo.id.as_str()),
+            Some("b")
+        );
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let output = Command::new("git")

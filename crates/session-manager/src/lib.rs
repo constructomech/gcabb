@@ -2283,7 +2283,23 @@ impl SessionActor {
                 }
             }
             "session.idle" => self.drain_queue().await,
+            // Signal-only: the agent wrote to its todos table, so the list has
+            // to be re-read rather than derived from the event.
+            "session.todos_changed" => self.refresh_agent_plan().await,
             _ => {}
+        }
+    }
+
+    /// Re-read the agent's own task list from the runtime.
+    async fn refresh_agent_plan(&mut self) {
+        match self.provider.agent_plan(&self.sdk_session_id).await {
+            Ok(plan) => {
+                if plan != self.state.agent_plan {
+                    self.state.agent_plan = plan;
+                    self.publish(false);
+                }
+            }
+            Err(error) => tracing::debug!(%error, "agent plan refresh failed"),
         }
     }
 

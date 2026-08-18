@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    ContextWindowOption, InteractionKind, InteractionRequest, InteractionResponse, ModelOption,
-    PromptAttachment, SessionControls, ToolCatalog, ToolClass, ToolDescriptor, ToolSource,
+    AgentPlan, AgentTodo, AgentTodoStatus, ContextWindowOption, InteractionKind,
+    InteractionRequest, InteractionResponse, ModelOption, PromptAttachment, SessionControls,
+    ToolCatalog, ToolClass, ToolDescriptor, ToolSource,
 };
 use async_trait::async_trait;
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
@@ -187,6 +188,13 @@ pub trait AgentProvider: Send + Sync {
     /// Suspend or resume the runtime's own draining.
     async fn set_queue_paused(&self, _sdk_session_id: &str, _paused: bool) -> Result<()> {
         Ok(())
+    }
+
+    /// The agent's own task list, as recorded in the runtime's session database.
+    ///
+    /// Read-only: the runtime exposes no way to write these rows.
+    async fn agent_plan(&self, _sdk_session_id: &str) -> Result<AgentPlan> {
+        Ok(AgentPlan::default())
     }
 }
 
@@ -1031,6 +1039,17 @@ impl AgentProvider for CopilotProvider {
             .await
     }
 
+    async fn agent_plan(&self, sdk_session_id: &str) -> Result<AgentPlan> {
+        let session = self.session(sdk_session_id).await?;
+        let read = session
+            .rpc()
+            .plan()
+            .read_sql_todos_with_dependencies()
+            .await
+            .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        Ok(agent_plan(read))
+    }
+
     async fn discover_tools(&self, model: Option<&str>) -> Result<ToolCatalog> {
         let started = Instant::now();
         let request = ToolsListRequest {
@@ -1132,6 +1151,43 @@ impl AgentProvider for CopilotProvider {
 ///
 /// MCP tools are identified by a `server/tool` namespaced name, which is the
 /// only signal the wire type carries about tool origin.
+/// Translate the runtime's todo rows into the app's plan model.
+///
+/// Every column the runtime reports is optional because the schema is
+/// best-effort, so rows without an id are dropped: a todo that cannot be
+/// addressed cannot be tied to its dependencies. A row with an id but no
+/// title keeps the id as its label rather than rendering as blank.
+fn agent_plan(read: github_copilot_sdk::rpc::PlanReadSqlTodosWithDependenciesResult) -> AgentPlan {
+    let todos = read
+        .rows
+        .into_iter()
+        .filter_map(|row| {
+            let id = row.id?;
+            let title = row
+                .title
+                .filter(|title| !title.trim().is_empty())
+                .unwrap_or_else(|| id.clone());
+            let depends_on = read
+                .dependencies
+                .iter()
+                .filter(|dependency| dependency.todo_id == id)
+                .map(|dependency| dependency.depends_on.clone())
+                .collect();
+            Some(AgentTodo {
+                id,
+                title,
+                description: row.description.filter(|text| !text.trim().is_empty()),
+                status: row
+                    .status
+                    .as_deref()
+                    .map_or(AgentTodoStatus::Pending, AgentTodoStatus::from_runtime),
+                depends_on,
+            })
+        })
+        .collect();
+    AgentPlan { todos }
+}
+
 fn tool_descriptor(tool: github_copilot_sdk::rpc::Tool) -> ToolDescriptor {
     let source = tool
         .namespaced_name

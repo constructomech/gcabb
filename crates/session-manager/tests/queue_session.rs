@@ -7,7 +7,10 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use app_model::{QueueDelivery, QueueItemState, SessionKind, SessionSnapshot, TitleSource};
+use app_model::{
+    AgentPlan, AgentTodo, AgentTodoStatus, QueueDelivery, QueueItemState, SessionKind,
+    SessionSnapshot, TitleSource,
+};
 use diagnostics::MemoryDiagnostics;
 use session_manager::{CreateSessionRequest, SessionHandle, SessionManager};
 use storage::Storage;
@@ -329,6 +332,59 @@ async fn clearing_removes_pending_items_only() {
             .items
             .iter()
             .all(|item| item.state != QueueItemState::Pending)
+    );
+}
+
+#[tokio::test]
+async fn the_agent_plan_refreshes_when_the_runtime_signals_a_change() {
+    let (harness, session) = harness().await;
+    assert!(session.snapshot().agent_plan.is_empty());
+
+    harness
+        .provider
+        .set_agent_plan(AgentPlan {
+            todos: vec![
+                AgentTodo {
+                    id: "a".to_owned(),
+                    title: "First".to_owned(),
+                    description: None,
+                    status: AgentTodoStatus::Done,
+                    depends_on: Vec::new(),
+                },
+                AgentTodo {
+                    id: "b".to_owned(),
+                    title: "Second".to_owned(),
+                    description: None,
+                    status: AgentTodoStatus::InProgress,
+                    depends_on: vec!["a".to_owned()],
+                },
+            ],
+        })
+        .await;
+    // The event carries no payload, so the list has to be re-read rather than
+    // reconstructed from it.
+    harness
+        .provider
+        .emit(
+            &session_sdk_id(&session),
+            serde_json::json!({
+                "id": "todos-1",
+                "type": "session.todos_changed",
+                "data": {}
+            }),
+        )
+        .await
+        .expect("emit");
+
+    let snapshot = await_snapshot(&session, |snapshot| !snapshot.agent_plan.is_empty()).await;
+    assert_eq!(snapshot.agent_plan.total(), 2);
+    assert_eq!(snapshot.agent_plan.completed(), 1);
+    assert_eq!(
+        snapshot
+            .agent_plan
+            .current()
+            .map(|todo| todo.title.as_str()),
+        Some("Second")
     );
 }
 

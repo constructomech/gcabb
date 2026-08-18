@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use app_model::{
-    InteractionRequest, InteractionResponse, PromptAttachment, QueueDelivery, SessionControls,
-    ToolCatalog, ToolClass, ToolDescriptor, ToolSource,
+    AgentPlan, InteractionRequest, InteractionResponse, PromptAttachment, QueueDelivery,
+    SessionControls, ToolCatalog, ToolClass, ToolDescriptor, ToolSource,
 };
 use async_trait::async_trait;
 use copilot_provider::{
@@ -148,6 +148,7 @@ pub struct FakeProvider {
     /// send-on-idle fallback.
     without_runtime_queue: AtomicBool,
     fail_queue_delivery: AtomicBool,
+    agent_plan: Mutex<AgentPlan>,
 }
 
 impl FakeProvider {
@@ -228,6 +229,11 @@ impl FakeProvider {
             .get(sdk_session_id)
             .copied()
             .unwrap_or(false)
+    }
+
+    /// Set the agent task list the fake runtime reports.
+    pub async fn set_agent_plan(&self, plan: AgentPlan) {
+        *self.agent_plan.lock().await = plan;
     }
 
     async fn tool_names(&self) -> Vec<String> {
@@ -487,6 +493,10 @@ impl AgentProvider for FakeProvider {
             .await
             .insert(sdk_session_id.to_owned(), paused);
         Ok(())
+    }
+
+    async fn agent_plan(&self, _sdk_session_id: &str) -> Result<AgentPlan> {
+        Ok(self.agent_plan.lock().await.clone())
     }
 
     async fn cancel(&self, sdk_session_id: &str) -> Result<()> {
