@@ -1763,6 +1763,15 @@ const ADD_PROJECT_OPTION: &str = "\u{0}add-project";
 /// Sentinel option value that switches the composer to a standalone chat.
 const CHAT_OPTION: &str = "\u{0}chat";
 
+/// Menu label for revealing a folder in the platform's file manager.
+const REVEAL_IN_FILE_MANAGER_LABEL: &str = if cfg!(target_os = "macos") {
+    "Show in Finder"
+} else if cfg!(target_os = "windows") {
+    "Show in File Explorer"
+} else {
+    "Show in File Manager"
+};
+
 /// An open session context menu, anchored at the click position.
 struct SessionMenu {
     id: String,
@@ -3443,6 +3452,36 @@ impl SessionMvpView {
         cx.notify();
     }
 
+    /// Open a session's working directory in the platform file manager.
+    ///
+    /// The session's `project_path` is its own worktree, and that is the folder
+    /// to show. Revealing selects the folder inside its *parent*, which lands
+    /// the user in the worktrees root instead, so open the directory itself.
+    fn reveal_session_in_file_manager(&mut self, app_session_id: &str, cx: &mut Context<Self>) {
+        self.session_menu = None;
+        self.action_error = None;
+        let Some(path) = self
+            .sessions
+            .iter()
+            .find(|session| session.id() == app_session_id)
+            .map(|session| PathBuf::from(&session.snapshot.metadata.project_path))
+        else {
+            cx.notify();
+            return;
+        };
+        // A worktree can be deleted outside the app; opening a path that no
+        // longer exists silently does nothing on some platforms.
+        if path.is_dir() {
+            cx.open_with_system(&path);
+        } else {
+            self.action_error = Some(format!(
+                "could not show {}: the folder no longer exists",
+                path.display()
+            ));
+        }
+        cx.notify();
+    }
+
     fn delete_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
         self.session_menu = None;
         self.action_error = None;
@@ -3471,6 +3510,7 @@ impl SessionMvpView {
         let menu = self.session_menu.as_ref()?;
         let rename_id = menu.id.clone();
         let rename_title = menu.title.clone();
+        let reveal_id = menu.id.clone();
         let delete_id = menu.id.clone();
         let label = menu.title.clone();
         Some(
@@ -3513,6 +3553,30 @@ impl SessionMvpView {
                         .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
                         .on_click(cx.listener(move |view, _, window, cx| {
                             view.begin_rename(rename_id.clone(), rename_title.clone(), window, cx);
+                        })),
+                )
+                .child(
+                    div()
+                        .id("session-menu-reveal")
+                        .debug_selector(|| "session-menu-reveal".to_owned())
+                        .accessibility_id("session-menu-reveal")
+                        .role(Role::MenuItem)
+                        .aria_label(format!("{REVEAL_IN_FILE_MANAGER_LABEL} session folder"))
+                        .focusable()
+                        .tab_stop(true)
+                        .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .px_3()
+                        .py_2()
+                        .rounded_md()
+                        .text_sm()
+                        .text_color(rgb(PRIMARY))
+                        .child(REVEAL_IN_FILE_MANAGER_LABEL)
+                        .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            view.reveal_session_in_file_manager(&reveal_id, cx);
                         })),
                 )
                 .child(
@@ -12211,6 +12275,40 @@ mod tests {
             view.read_with(cx, |view, _| {
                 assert_eq!(view.renaming_session.as_deref(), Some("session-1"));
                 assert!(view.session_menu.is_none(), "menu closes after choosing");
+            });
+        }
+
+        /// The reveal item is offered for every session, and a working
+        /// directory that vanished is reported instead of silently ignored.
+        #[gpui::test]
+        fn clicking_show_in_file_manager_reports_a_missing_folder(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut snapshot = (*view.sessions[0].snapshot).clone();
+                snapshot.metadata.project_path = "/gcabb-does-not-exist/session-1".to_owned();
+                view.sessions[0].set_snapshot(Arc::new(snapshot));
+                cx.notify();
+            });
+            let row = cx
+                .debug_bounds("session-row")
+                .expect("session row rendered");
+            cx.simulate_mouse_down(row.center(), MouseButton::Right, Modifiers::none());
+            cx.simulate_mouse_up(row.center(), MouseButton::Right, Modifiers::none());
+            cx.run_until_parked();
+
+            let item = cx
+                .debug_bounds("session-menu-reveal")
+                .expect("reveal item rendered");
+            cx.simulate_click(item.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(view.session_menu.is_none(), "menu closes after choosing");
+                let error = view.action_error.as_deref().expect("an error is shown");
+                assert!(
+                    error.contains("/gcabb-does-not-exist/session-1"),
+                    "error names the missing folder: {error}"
+                );
             });
         }
 
