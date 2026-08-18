@@ -1756,6 +1756,7 @@ enum StartupNavigation {
 enum ControlMenu {
     Project,
     Location,
+    Base,
     Mode,
     Model,
     Effort,
@@ -1929,6 +1930,10 @@ struct SessionMvpView {
     draft_model: Option<String>,
     draft_effort: String,
     draft_context_tier: Option<String>,
+    /// Base branch chosen for the next new session's worktree, overriding
+    /// the project's default branch. Resets whenever the project changes so
+    /// a stale override from a different repository cannot leak in.
+    draft_base_ref: Option<String>,
     sidebar_open: bool,
     panel_open: bool,
     active_panel: SessionPanel,
@@ -2165,6 +2170,7 @@ impl SessionMvpView {
             draft_model: None,
             draft_effort: "medium".to_owned(),
             draft_context_tier: None,
+            draft_base_ref: None,
             sidebar_open: true,
             panel_open: false,
             active_panel: SessionPanel::Changes,
@@ -3088,9 +3094,10 @@ impl SessionMvpView {
     /// Branch shown beside the location pill.
     ///
     /// A new worktree does not exist yet, so it names the base branch it will
-    /// be created from. Running in the local repository names the branch that
-    /// repository currently has checked out. Neither is the branch of the
-    /// directory GCABB happened to be launched from.
+    /// be created from — the user's chosen override when one is set,
+    /// otherwise the project default. Running in the local repository names
+    /// the branch that repository currently has checked out. Neither is the
+    /// branch of the directory GCABB happened to be launched from.
     fn composer_branch_label(&self) -> String {
         let default_branch = self
             .projects
@@ -3098,7 +3105,10 @@ impl SessionMvpView {
             .find(|project| Path::new(&project.path) == self.selected_project)
             .and_then(|project| project.default_branch.clone());
         match self.draft_location {
-            SessionLocation::NewWorktree => default_branch
+            SessionLocation::NewWorktree => self
+                .draft_base_ref
+                .clone()
+                .or(default_branch)
                 .or_else(|| self.project_branch.clone())
                 .unwrap_or_else(|| "HEAD".to_owned()),
             SessionLocation::LocalRepository => self
@@ -3113,6 +3123,7 @@ impl SessionMvpView {
     fn new_chat(&mut self, cx: &mut Context<Self>) {
         self.open_control_menu = None;
         self.composing_chat = true;
+        self.draft_base_ref = None;
         self.switch_composer_draft(None, cx);
         self.startup_navigation = StartupNavigation::Changed;
         self.action_error = None;
@@ -3124,16 +3135,32 @@ impl SessionMvpView {
 
     /// Base ref new sessions in the selected project compare against.
     ///
-    /// The repository's default branch is the natural base for a session
-    /// worktree; sessions record it once so later movement on that branch does
-    /// not silently change what the changes view reports. Falls back to
-    /// resolving it directly when the project has none recorded.
+    /// The user's chosen override takes priority; otherwise the repository's
+    /// default branch is the natural base for a session worktree. Sessions
+    /// record it once so later movement on that branch does not silently
+    /// change what the changes view reports. Falls back to resolving it
+    /// directly when the project has none recorded.
     fn selected_project_base_ref(&self) -> Option<String> {
-        self.projects
-            .iter()
-            .find(|project| Path::new(&project.path) == self.selected_project)
-            .and_then(|project| project.default_branch.clone())
-            .or_else(|| default_branch(&self.selected_project))
+        self.draft_base_ref.clone().or_else(|| {
+            self.projects
+                .iter()
+                .find(|project| Path::new(&project.path) == self.selected_project)
+                .and_then(|project| project.default_branch.clone())
+                .or_else(|| default_branch(&self.selected_project))
+        })
+    }
+
+    /// Branches available for the new-session base-branch picker.
+    ///
+    /// Reuses the same discovery as the existing-session Changes base
+    /// selector so both pickers agree on what counts as a base.
+    fn base_ref_menu_options(&self) -> Vec<(String, String, String)> {
+        GitService::new(&self.selected_project)
+            .base_refs()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|reference| (reference.clone(), reference, String::new()))
+            .collect()
     }
 
     fn submit_interaction(&mut self, value: String) {
@@ -3212,6 +3239,7 @@ impl SessionMvpView {
         // from the menu, and restoring a session all clear the flag here.
         self.composing_chat = false;
         self.selected_project = PathBuf::from(path);
+        self.draft_base_ref = None;
         self.project_branch = git_output(Path::new(path), &["branch", "--show-current"]);
         // New sessions run in the project directory the user chose.
         self.workspace_root = PathBuf::from(path);
@@ -4072,6 +4100,9 @@ impl SessionMvpView {
             ControlMenu::Location => {
                 self.draft_location = SessionLocation::from_str_or_default(&value);
             }
+            ControlMenu::Base => {
+                self.draft_base_ref = Some(value);
+            }
             ControlMenu::Mode => {
                 value.clone_into(&mut self.draft_mode);
                 if let Some(id) = self.selected_session.clone() {
@@ -4395,6 +4426,15 @@ impl SessionMvpView {
                 })
                 .collect(),
             ),
+            ControlMenu::Base => {
+                let options = self.base_ref_menu_options();
+                let selected = self
+                    .draft_base_ref
+                    .clone()
+                    .or_else(|| self.selected_project_base_ref())
+                    .unwrap_or_default();
+                ("Base branch", selected, options)
+            }
             ControlMenu::Mode => ("Mode", self.draft_mode.clone(), self.mode_options()),
             ControlMenu::Model => {
                 let options = self.model_options();
@@ -8991,7 +9031,41 @@ impl SessionMvpView {
                                         cx.notify();
                                     })),
                             )
-                            .child(format!("⌁ {branch}"))
+                            .when(
+                                self.draft_location == SessionLocation::NewWorktree,
+                                |strip| {
+                                    strip.child(
+                                        div()
+                                            .id("base-branch-pill")
+                                            .debug_selector(|| "base-branch-pill".to_owned())
+                                            .accessibility_id("base-branch-pill")
+                                            .role(Role::ComboBox)
+                                            .aria_label("Base branch")
+                                            .aria_value(branch.clone())
+                                            .aria_expanded(
+                                                self.open_control_menu == Some(ControlMenu::Base),
+                                            )
+                                            .focusable()
+                                            .tab_stop(true)
+                                            .focus_visible(|style| {
+                                                style.border_1().border_color(rgb(BLUE))
+                                            })
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .child(format!("⌁ {branch}"))
+                                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.toggle_control_menu(ControlMenu::Base);
+                                                cx.notify();
+                                            })),
+                                    )
+                                },
+                            )
+                            .when(
+                                self.draft_location != SessionLocation::NewWorktree,
+                                |strip| strip.child(format!("⌁ {branch}")),
+                            )
                     })
                     .child(div().flex_1())
                     .child(
@@ -10031,6 +10105,7 @@ fn control_pill(
     let label = match menu {
         ControlMenu::Project => "Project",
         ControlMenu::Location => "Where to run this session",
+        ControlMenu::Base => "Base branch",
         ControlMenu::Mode => "Mode",
         ControlMenu::Model => "Model",
         ControlMenu::Effort => "Reasoning effort",
@@ -10077,6 +10152,7 @@ fn control_menu_id(menu: ControlMenu) -> &'static str {
     match menu {
         ControlMenu::Project => "project",
         ControlMenu::Location => "location",
+        ControlMenu::Base => "base",
         ControlMenu::Mode => "mode",
         ControlMenu::Model => "model",
         ControlMenu::Effort => "effort",
@@ -10109,10 +10185,11 @@ fn compact_layout(width: f32) -> bool {
 
 fn control_menu_offset(menu: ControlMenu) -> u16 {
     match menu {
-        // The project and location pills sit in the checkout strip below the
-        // composer, left to right.
+        // The project, location, and base pills sit in the checkout strip
+        // below the composer, left to right.
         ControlMenu::Project => 0,
         ControlMenu::Location => 96,
+        ControlMenu::Base => 176,
         ControlMenu::Mode => 40,
         ControlMenu::Model => 128,
         ControlMenu::Effort => 216,
@@ -11081,6 +11158,7 @@ mod tests {
         assert_eq!(control_menu_offset(ControlMenu::Mode), 40);
         assert_eq!(control_menu_offset(ControlMenu::Model), 128);
         assert_eq!(control_menu_offset(ControlMenu::Effort), 216);
+        assert_eq!(control_menu_offset(ControlMenu::Base), 176);
     }
 
     #[test]
@@ -11088,6 +11166,7 @@ mod tests {
         assert_eq!(control_menu_id(ControlMenu::Mode), "mode");
         assert_eq!(control_menu_id(ControlMenu::Model), "model");
         assert_eq!(control_menu_id(ControlMenu::Effort), "effort");
+        assert_eq!(control_menu_id(ControlMenu::Base), "base");
     }
 
     #[test]
@@ -14772,6 +14851,81 @@ mod tests {
             view.read_with(cx, |view, _| {
                 assert_eq!(view.composer_branch_label(), "feature");
                 assert_ne!(view.composer_branch_label(), view.branch);
+            });
+        }
+
+        /// Choosing a base branch overrides the project default for the new
+        /// worktree, both in the composer label and the submitted request.
+        #[gpui::test]
+        fn base_branch_pill_overrides_the_project_default(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.projects = vec![app_model::ProjectMetadata {
+                    id: "/tmp/project".to_owned(),
+                    path: "/tmp/project".to_owned(),
+                    name: "project".to_owned(),
+                    default_branch: Some("main".to_owned()),
+                    last_opened_at: "1".to_owned(),
+                }];
+                view.selected_project = std::path::PathBuf::from("/tmp/project");
+                view.selected_session = None;
+                view.composing_chat = false;
+                cx.notify();
+            });
+
+            // Nothing chosen yet, so the project default shows through.
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.composer_branch_label(), "main");
+            });
+
+            view.update(cx, |view, cx| {
+                view.choose_control(
+                    super::super::ControlMenu::Base,
+                    "release/next".to_owned(),
+                    cx,
+                );
+            });
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.draft_base_ref.as_deref(), Some("release/next"));
+                assert_eq!(view.composer_branch_label(), "release/next");
+            });
+
+            view.update(cx, |view, _cx| {
+                view.submit_prompt("hello".to_owned());
+            });
+
+            match commands.try_recv().expect("a command was sent") {
+                ServiceCommand::Submit { base_ref, .. } => {
+                    assert_eq!(base_ref.as_deref(), Some("release/next"));
+                }
+                _ => panic!("expected a Submit command"),
+            }
+        }
+
+        /// Switching to a different project clears a chosen base override so
+        /// a stale branch from another repository cannot leak in.
+        #[gpui::test]
+        fn selecting_a_project_clears_the_base_branch_override(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.projects = vec![app_model::ProjectMetadata {
+                    id: "/tmp/project".to_owned(),
+                    path: "/tmp/project".to_owned(),
+                    name: "project".to_owned(),
+                    default_branch: Some("main".to_owned()),
+                    last_opened_at: "1".to_owned(),
+                }];
+                view.selected_project = std::path::PathBuf::from("/tmp/project");
+                view.draft_base_ref = Some("release/next".to_owned());
+                cx.notify();
+            });
+
+            view.update(cx, |view, cx| {
+                view.select_project("/tmp/project", cx);
+            });
+
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.draft_base_ref, None);
             });
         }
 
