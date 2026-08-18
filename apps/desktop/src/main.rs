@@ -827,7 +827,6 @@ enum ServiceUpdate {
         failures: Vec<RestoreFailure>,
     },
     SessionHydrated(SessionHandle),
-    RestorationFinished(Vec<RestoreFailure>),
     SessionAdded(SessionHandle),
     SessionsDiscovered(Vec<SessionHandle>),
     /// A session was deleted and must be dropped from the UI.
@@ -1062,7 +1061,6 @@ impl AppService {
                 let adoption_ms = elapsed_millis(adoption_started);
 
                 let manager_started = Instant::now();
-                let mut restoration_task = None;
                 match runtime.block_on(manager.start_preferred_session(
                     preferred_session.as_deref(),
                     |handle| {
@@ -1096,23 +1094,15 @@ impl AppService {
                                 "remainingSessions": remaining.len()
                             }),
                         });
+                        // Other stored sessions are left as metadata-only
+                        // placeholders; they are only actively reconnected
+                        // when the user selects them (see ServiceCommand::Select).
+                        let _ = remaining;
                         let _ = update_tx.send(ServiceUpdate::Ready {
                             compatibility,
                             projects,
                             failures: report.failed,
                         });
-                        let background_manager = manager.clone();
-                        let background_updates = update_tx.clone();
-                        restoration_task = Some(runtime.spawn(async move {
-                            let report = background_manager
-                                .restore_remaining_sessions(remaining, |handle| {
-                                    let _ = background_updates
-                                        .send(ServiceUpdate::SessionHydrated(handle));
-                                })
-                                .await;
-                            let _ = background_updates
-                                .send(ServiceUpdate::RestorationFinished(report.failed));
-                        }));
                     }
                     Err(error) => {
                         let _ = update_tx.send(ServiceUpdate::Failed(format!(
@@ -1123,9 +1113,6 @@ impl AppService {
 
                 while let Ok(command) = command_rx.recv() {
                     if matches!(command, ServiceCommand::Stop) {
-                        if let Some(task) = restoration_task.take() {
-                            let _ = runtime.block_on(task);
-                        }
                         let _ = runtime.block_on(manager.stop());
                         break;
                     }
@@ -1732,6 +1719,14 @@ impl SessionProjection {
 
     fn id(&self) -> &str {
         &self.snapshot.metadata.id
+    }
+
+    /// True when this session is still a metadata-only placeholder that has
+    /// never been actively resumed with the provider (or was disconnected).
+    /// These are the sessions the startup path intentionally leaves alone;
+    /// they must be reconnected on demand when the user selects them.
+    fn needs_resume(&self) -> bool {
+        self.receiver.is_none() || self.snapshot.status == SessionStatus::Disconnected
     }
 
     #[cfg(test)]
@@ -2672,9 +2667,6 @@ impl SessionMvpView {
                 ServiceUpdate::SessionHydrated(handle) => {
                     self.upsert_hydrated_session(handle, cx);
                 }
-                ServiceUpdate::RestorationFinished(failures) => {
-                    self.apply_restore_failures(failures);
-                }
                 ServiceUpdate::SessionAdded(handle) => {
                     let id = handle.id().to_owned();
                     self.session_launch = None;
@@ -3162,11 +3154,21 @@ impl SessionMvpView {
         self.open_control_menu = None;
         self.base_menu_visibility = SettingsVisibility::Closed;
         self.base_default_ref = None;
-        self.switch_composer_draft(Some(id), cx);
+        self.switch_composer_draft(Some(id.clone()), cx);
         self.startup_navigation = StartupNavigation::Changed;
         let _ = self.commands.send(ServiceCommand::Select {
             app_session_id: self.selected_session.clone(),
         });
+        // A session that hasn't been actively hydrated yet (startup only
+        // resumes the previously-selected session) needs to be reconnected
+        // now that the user has chosen it.
+        if self.selected().is_some_and(SessionProjection::needs_resume) {
+            let worktrees_root = Some(self.current_worktrees_root());
+            let _ = self.commands.send(ServiceCommand::Resume {
+                app_session_id: id,
+                worktrees_root,
+            });
+        }
         if let Some(controls) = self
             .selected()
             .map(|session| session.snapshot.controls.clone())
