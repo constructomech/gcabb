@@ -6,13 +6,14 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use app_model::{
-    InteractionRequest, InteractionResponse, PromptAttachment, SessionControls, ToolCatalog,
-    ToolClass, ToolDescriptor, ToolSource,
+    InteractionRequest, InteractionResponse, PromptAttachment, QueueDelivery, SessionControls,
+    ToolCatalog, ToolClass, ToolDescriptor, ToolSource,
 };
 use async_trait::async_trait;
 use copilot_provider::{
-    AgentProvider, AgentProviderFactory, ProviderCompatibility, ProviderError, ProviderEvent,
-    ProviderInteraction, ProviderSession, Result, SDK_CRATE_VERSION, SessionRequest,
+    AgentProvider, AgentProviderFactory, DeliveryReceipt, ProviderCompatibility, ProviderError,
+    ProviderEvent, ProviderInteraction, ProviderSession, QueueDeliveryRequest, QueueTransportKind,
+    Result, RuntimeQueue, RuntimeQueueItem, SDK_CRATE_VERSION, SessionRequest,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -139,6 +140,14 @@ pub struct FakeProvider {
     omit_tools: Mutex<Vec<String>>,
     sent_attachments: Mutex<Vec<Vec<PromptAttachment>>>,
     sent_prompts: Mutex<Vec<String>>,
+    /// Items the fake runtime is holding, keyed by session.
+    runtime_queue: Mutex<HashMap<String, Vec<RuntimeQueueItem>>>,
+    queue_paused: Mutex<HashMap<String, bool>>,
+    next_runtime_id: AtomicU64,
+    /// When set, the fake reports no runtime queue so callers exercise the
+    /// send-on-idle fallback.
+    without_runtime_queue: AtomicBool,
+    fail_queue_delivery: AtomicBool,
 }
 
 impl FakeProvider {
@@ -199,6 +208,26 @@ impl FakeProvider {
     /// Prompts carried by each send, in order.
     pub async fn sent_prompts(&self) -> Vec<String> {
         self.sent_prompts.lock().await.clone()
+    }
+
+    /// Report no runtime queue, forcing the send-on-idle transport.
+    pub fn without_runtime_queue(&self, without: bool) {
+        self.without_runtime_queue.store(without, Ordering::SeqCst);
+    }
+
+    /// Fail every queue delivery.
+    pub fn fail_queue_delivery(&self, fail: bool) {
+        self.fail_queue_delivery.store(fail, Ordering::SeqCst);
+    }
+
+    /// Whether the fake runtime has been told to pause draining.
+    pub async fn queue_paused(&self, sdk_session_id: &str) -> bool {
+        self.queue_paused
+            .lock()
+            .await
+            .get(sdk_session_id)
+            .copied()
+            .unwrap_or(false)
     }
 
     async fn tool_names(&self) -> Vec<String> {
@@ -373,6 +402,91 @@ impl AgentProvider for FakeProvider {
             self.emit(sdk_session_id, event).await?;
         }
         Ok(format!("message-{sdk_session_id}"))
+    }
+
+    async fn queue_transport(&self, _sdk_session_id: &str) -> Result<QueueTransportKind> {
+        Ok(if self.without_runtime_queue.load(Ordering::SeqCst) {
+            QueueTransportKind::SendOnIdle
+        } else {
+            QueueTransportKind::Native
+        })
+    }
+
+    async fn runtime_queue(&self, sdk_session_id: &str) -> Result<RuntimeQueue> {
+        if self.without_runtime_queue.load(Ordering::SeqCst) {
+            return Ok(RuntimeQueue::default());
+        }
+        Ok(RuntimeQueue {
+            items: self
+                .runtime_queue
+                .lock()
+                .await
+                .get(sdk_session_id)
+                .cloned()
+                .unwrap_or_default(),
+            steering: Vec::new(),
+        })
+    }
+
+    async fn deliver_queued(
+        &self,
+        sdk_session_id: &str,
+        request: &QueueDeliveryRequest,
+    ) -> Result<DeliveryReceipt> {
+        if self.fail_queue_delivery.load(Ordering::SeqCst) {
+            return Err(ProviderError::Sdk("configured queue failure".to_owned()));
+        }
+        // Steering and the fallback transport both reach the agent as a turn
+        // rather than entering the runtime queue.
+        if request.delivery == QueueDelivery::Steer
+            || self.without_runtime_queue.load(Ordering::SeqCst)
+        {
+            let message_id = self.send(sdk_session_id, &request.prompt, &[]).await?;
+            return Ok(DeliveryReceipt {
+                runtime_id: None,
+                message_id: Some(message_id),
+            });
+        }
+        let runtime_id = self
+            .next_runtime_id
+            .fetch_add(1, Ordering::SeqCst)
+            .to_string();
+        self.runtime_queue
+            .lock()
+            .await
+            .entry(sdk_session_id.to_owned())
+            .or_default()
+            .push(RuntimeQueueItem {
+                runtime_id: runtime_id.clone(),
+                display_text: request
+                    .display_prompt
+                    .clone()
+                    .unwrap_or_else(|| request.prompt.clone()),
+                is_command: false,
+                agent_mode: request.agent_mode.clone(),
+            });
+        Ok(DeliveryReceipt {
+            runtime_id: Some(runtime_id),
+            message_id: None,
+        })
+    }
+
+    async fn withdraw_queued(&self, sdk_session_id: &str, runtime_id: &str) -> Result<bool> {
+        let mut queues = self.runtime_queue.lock().await;
+        let Some(items) = queues.get_mut(sdk_session_id) else {
+            return Ok(false);
+        };
+        let before = items.len();
+        items.retain(|item| item.runtime_id != runtime_id);
+        Ok(items.len() != before)
+    }
+
+    async fn set_queue_paused(&self, sdk_session_id: &str, paused: bool) -> Result<()> {
+        self.queue_paused
+            .lock()
+            .await
+            .insert(sdk_session_id.to_owned(), paused);
+        Ok(())
     }
 
     async fn cancel(&self, sdk_session_id: &str) -> Result<()> {
