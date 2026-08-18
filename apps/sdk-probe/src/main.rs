@@ -19,6 +19,9 @@ use github_copilot_sdk::rpc::{
     QueueMoveItemRequest, QueueRemoveAtRequest, QueueSetDrainPausedRequest, QueueUpdateTextRequest,
 };
 use github_copilot_sdk::session::Session;
+use github_copilot_sdk::session_fs::{
+    SessionFsCapabilities, SessionFsConfig, SessionFsConventions,
+};
 use github_copilot_sdk::tool::ToolHandler;
 use github_copilot_sdk::{
     Client, ClientOptions, DeliveryMode, ElicitationRequest, ElicitationResult, MessageOptions,
@@ -26,6 +29,7 @@ use github_copilot_sdk::{
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
+use session_fs::HostSessionFs;
 use tokio::io::{AsyncBufReadExt, BufReader};
 use tokio::sync::mpsc;
 use tracing::{info, warn};
@@ -70,6 +74,10 @@ struct Args {
     /// to the agent.
     #[arg(long)]
     plan_inject_probe: bool,
+    /// Host the session filesystem so GCABB owns the session database, and
+    /// check that the agent's SQL reaches it. Consumes quota.
+    #[arg(long)]
+    host_fs_probe: bool,
 }
 
 #[derive(Clone)]
@@ -980,6 +988,110 @@ fn write_todo_rows(path: &Path) -> Result<()> {
     Ok(())
 }
 
+/// Runs a session whose filesystem GCABB hosts, and checks that the agent's
+/// own SQL arrives at the host-owned database.
+///
+/// This is the question the whole approach rests on: if the agent's `sql`
+/// tool does not route here, the host cannot own the task list.
+async fn run_hosted_fs_probe(args: &Args, cwd: &Path, recorder: &Recorder) -> Result<()> {
+    let state_root = cwd.join("session-state");
+    create_dir_all(&state_root)?;
+    let provider = Arc::new(HostSessionFs::new(state_root.join("session.db")));
+    let database = provider.database();
+
+    let mut client_options = ClientOptions::default();
+    client_options.working_directory = cwd.to_owned();
+    client_options.session_fs = Some(
+        SessionFsConfig::new(
+            cwd.to_string_lossy(),
+            state_root.to_string_lossy(),
+            SessionFsConventions::Posix,
+        )
+        .with_capabilities(SessionFsCapabilities::new().with_sqlite(true)),
+    );
+    let client = Client::start(client_options)
+        .await
+        .context("failed to start the CLI with a hosted session filesystem")?;
+    recorder.write(
+        "host_fs.client_started",
+        json!({"stateRoot": state_root, "database": database.path()}),
+    )?;
+
+    let session = client
+        .create_session(
+            SessionConfig::default()
+                .with_working_directory(cwd)
+                .with_permission_handler(Arc::new(github_copilot_sdk::handler::ApproveAllHandler))
+                .with_session_fs_provider(provider.clone()),
+        )
+        .await
+        .context("failed to create a session on the hosted filesystem")?;
+    recorder.write("host_fs.session_ready", json!({"sessionId": session.id()}))?;
+
+    let prompt = "Use the sql tool to run exactly this query, then reply done: \
+                  INSERT INTO todos (id, title, status) \
+                  VALUES ('agent-row', 'Agent authored', 'pending')";
+    run_prompt(
+        &session,
+        recorder,
+        prompt,
+        None,
+        Duration::from_secs(args.timeout_seconds),
+    )
+    .await?;
+
+    // Did the agent's SQL reach the host-owned database?
+    let agent_rows = database
+        .read("SELECT id, title, status FROM todos", None)
+        .await
+        .map(|read| read.rows)
+        .unwrap_or_default();
+    recorder.write(
+        "host_fs.agent_rows",
+        json!({
+            "databaseExists": database.exists().await,
+            "rows": agent_rows,
+        }),
+    )?;
+
+    // Can the host edit what the agent wrote?
+    let host_edit = database
+        .write(
+            "UPDATE todos SET status = 'done' WHERE id = 'agent-row'",
+            None,
+        )
+        .await;
+    let after = database
+        .read("SELECT id, status FROM todos", None)
+        .await
+        .map(|read| read.rows)
+        .unwrap_or_default();
+    recorder.write(
+        "host_fs.host_edit",
+        json!({
+            "updated": host_edit.map_or(-1, |result| result.rows_affected),
+            "rows": after,
+        }),
+    )?;
+
+    // And does the runtime agree, reading back through its own RPC?
+    let started = Instant::now();
+    record_rpc(
+        recorder,
+        "rpc.session.plan.read_sql_todos.hosted",
+        started,
+        session
+            .rpc()
+            .plan()
+            .read_sql_todos_with_dependencies()
+            .await,
+    )?;
+
+    session.disconnect().await?;
+    client.stop().await?;
+    recorder.write("host_fs.complete", Value::Null)
+}
+
 #[async_trait]
 impl ElicitationHandler for ProbeCallbacks {
     async fn handle(
@@ -1306,6 +1418,15 @@ async fn main() -> Result<()> {
             "cwd": cwd,
         }),
     )?;
+
+    // The hosted-filesystem probe needs its own client, because the provider
+    // is registered when the client starts rather than per session.
+    if args.host_fs_probe {
+        run_hosted_fs_probe(&args, &cwd, &recorder).await?;
+        recorder.write("probe.complete", Value::Null)?;
+        info!(output = %args.output.display(), "Phase 0 SDK probe complete");
+        return Ok(());
+    }
 
     let client = start_client(&cwd, &recorder).await?;
     let mut session = open_session(&client, &args, &cwd, &recorder).await?;

@@ -5651,6 +5651,7 @@ dependencies = [
  "rusqlite",
  "serde",
  "serde_json",
+ "session-fs",
  "tokio",
  "tracing",
  "tracing-subscriber",
@@ -5814,6 +5815,20 @@ dependencies = [
  "itoa",
  "ryu",
  "serde",
+]
+
+[[package]]
+name = "session-fs"
+version = "0.1.0-rc.11"
+dependencies = [
+ "async-trait",
+ "chrono",
+ "github-copilot-sdk",
+ "rusqlite",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]
