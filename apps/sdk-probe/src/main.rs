@@ -14,11 +14,15 @@ use github_copilot_sdk::handler::{
     ExitPlanModeResult, UserInputHandler, UserInputResponse,
 };
 use github_copilot_sdk::hooks::{HookEvent, HookOutput, SessionHooks};
+use github_copilot_sdk::rpc::{
+    QueueDuplicateAtRequest, QueueInsertAtRequest, QueueInsertMessage, QueueMoveItemRequest,
+    QueueRemoveAtRequest, QueueSetDrainPausedRequest, QueueUpdateTextRequest,
+};
 use github_copilot_sdk::session::Session;
 use github_copilot_sdk::tool::ToolHandler;
 use github_copilot_sdk::{
-    Client, ClientOptions, ElicitationRequest, ElicitationResult, RequestId, ResumeSessionConfig,
-    SessionConfig, SessionId, Tool, ToolInvocation, ToolResult,
+    Client, ClientOptions, DeliveryMode, ElicitationRequest, ElicitationResult, MessageOptions,
+    RequestId, ResumeSessionConfig, SessionConfig, SessionId, Tool, ToolInvocation, ToolResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -27,8 +31,9 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(about = "Record Copilot SDK events for the GCABB Phase 0 feasibility matrix")]
+#[allow(clippy::struct_excessive_bools, reason = "CLI flags map to bools")]
 struct Args {
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
@@ -46,6 +51,20 @@ struct Args {
     approve_permissions: bool,
     #[arg(long)]
     fleet_prompt: Option<String>,
+    /// Exercise the mutating `session.queue.*` RPCs before any prompt is sent.
+    #[arg(long)]
+    queue_probe: bool,
+    /// Unpause a queue holding real prompts to observe drain-on-idle.
+    /// Sends those prompts to the model and therefore consumes quota.
+    #[arg(long)]
+    queue_drain_probe: bool,
+    /// Queue items, disconnect, and resume to check whether the queue persists.
+    #[arg(long)]
+    queue_resume_probe: bool,
+    /// Interrupt a running turn with an immediate-delivery send to verify
+    /// steering works on the stable `session.send` surface. Consumes quota.
+    #[arg(long)]
+    steering_probe: bool,
 }
 
 #[derive(Clone)]
@@ -209,15 +228,30 @@ fn record_rpc<T: Serialize>(
     started: Instant,
     result: github_copilot_sdk::Result<T>,
 ) -> Result<()> {
+    record_rpc_value(recorder, name, started, result).map(|_| ())
+}
+
+fn record_rpc_value<T: Serialize>(
+    recorder: &Recorder,
+    name: &str,
+    started: Instant,
+    result: github_copilot_sdk::Result<T>,
+) -> Result<Option<T>> {
     match result {
-        Ok(value) => recorder.write(
-            name,
-            json!({"elapsedMs": started.elapsed().as_millis(), "result": value}),
-        ),
-        Err(error) => recorder.write(
-            &format!("{name}.error"),
-            json!({"elapsedMs": started.elapsed().as_millis(), "error": error.to_string()}),
-        ),
+        Ok(value) => {
+            recorder.write(
+                name,
+                json!({"elapsedMs": started.elapsed().as_millis(), "result": &value}),
+            )?;
+            Ok(Some(value))
+        }
+        Err(error) => {
+            recorder.write(
+                &format!("{name}.error"),
+                json!({"elapsedMs": started.elapsed().as_millis(), "error": error.to_string()}),
+            )?;
+            Ok(None)
+        }
     }
 }
 
@@ -276,6 +310,529 @@ async fn exercise_read_only_rpcs(session: &Session, recorder: &Recorder) -> Resu
         "rpc.session.tasks.list",
         started,
         session.rpc().tasks().list().await,
+    )
+}
+
+/// Records the current queue contents as a compact, order-preserving list so
+/// consecutive snapshots in the JSONL output can be diffed by eye.
+async fn record_pending_items(session: &Session, recorder: &Recorder, step: &str) -> Result<()> {
+    let started = Instant::now();
+    let pending = record_rpc_value(
+        recorder,
+        "rpc.session.queue.pending_items",
+        started,
+        session.rpc().queue().pending_items().await,
+    )?;
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+    let order: Vec<Value> = pending
+        .items
+        .iter()
+        .map(|item| {
+            json!({
+                "id": item.id,
+                "kind": item.kind,
+                "agentMode": item.agent_mode,
+                "displayText": item.display_text,
+            })
+        })
+        .collect();
+    recorder.write(
+        "queue.order",
+        json!({
+            "step": step,
+            "items": order,
+            "steeringMessages": pending.steering_messages,
+        }),
+    )
+}
+
+async fn insert_queue_item(
+    session: &Session,
+    recorder: &Recorder,
+    prompt: &str,
+    position: i64,
+) -> Result<Option<String>> {
+    let started = Instant::now();
+    let result = record_rpc_value(
+        recorder,
+        "rpc.session.queue.insert_at",
+        started,
+        session
+            .rpc()
+            .queue()
+            .insert_at(QueueInsertAtRequest {
+                message: QueueInsertMessage {
+                    prompt: prompt.to_owned(),
+                    ..QueueInsertMessage::default()
+                },
+                position,
+            })
+            .await,
+    )?;
+    Ok(result.map(|inserted| inserted.id))
+}
+
+/// Edits one queued item in place and round-trips duplicate/remove on another,
+/// recording the queue order after each mutation.
+async fn reorder_and_edit_queue(
+    session: &Session,
+    recorder: &Recorder,
+    duplicate_target: Option<&str>,
+    edit_target: Option<&str>,
+) -> Result<()> {
+    if let Some(id) = edit_target {
+        let started = Instant::now();
+        record_rpc(
+            recorder,
+            "rpc.session.queue.update_text",
+            started,
+            session
+                .rpc()
+                .queue()
+                .update_text(QueueUpdateTextRequest {
+                    id: id.to_owned(),
+                    prompt: "gcabb queue probe: second (edited)".to_owned(),
+                    display_prompt: Some("gcabb queue probe: second (edited)".to_owned()),
+                })
+                .await,
+        )?;
+        record_pending_items(session, recorder, "after-update-text").await?;
+    }
+
+    let Some(id) = duplicate_target else {
+        return Ok(());
+    };
+    let started = Instant::now();
+    let duplicated = record_rpc_value(
+        recorder,
+        "rpc.session.queue.duplicate_at",
+        started,
+        session
+            .rpc()
+            .queue()
+            .duplicate_at(QueueDuplicateAtRequest { id: id.to_owned() })
+            .await,
+    )?;
+    record_pending_items(session, recorder, "after-duplicate").await?;
+
+    if let Some(duplicated) = duplicated {
+        let started = Instant::now();
+        record_rpc(
+            recorder,
+            "rpc.session.queue.remove_at",
+            started,
+            session
+                .rpc()
+                .queue()
+                .remove_at(QueueRemoveAtRequest { id: duplicated.id })
+                .await,
+        )?;
+        record_pending_items(session, recorder, "after-remove").await?;
+    }
+    Ok(())
+}
+
+/// Exercises the mutating `session.queue.*` surface against a live CLI.
+///
+/// The queue is paused for the whole probe and cleared before it is unpaused,
+/// so no probe-authored prompt is ever handed to the model.
+async fn exercise_queue_rpcs(session: &Session, recorder: &Recorder) -> Result<()> {
+    let mut subscription = session.subscribe();
+
+    recorder.write("queue.probe.start", Value::Null)?;
+    record_pending_items(session, recorder, "baseline").await?;
+
+    let started = Instant::now();
+    let paused = record_rpc_value(
+        recorder,
+        "rpc.session.queue.set_drain_paused.pause",
+        started,
+        session
+            .rpc()
+            .queue()
+            .set_drain_paused(QueueSetDrainPausedRequest { paused: true })
+            .await,
+    )?;
+    if paused.is_none() {
+        recorder.write(
+            "queue.probe.aborted",
+            json!({"reason": "could not pause queue drain; refusing to enqueue prompts"}),
+        )?;
+        return Ok(());
+    }
+
+    let first = insert_queue_item(session, recorder, "gcabb queue probe: first", 0).await?;
+    let second = insert_queue_item(session, recorder, "gcabb queue probe: second", 1).await?;
+    let third = insert_queue_item(session, recorder, "gcabb queue probe: third", 2).await?;
+    record_pending_items(session, recorder, "after-inserts").await?;
+
+    reorder_and_edit_queue(session, recorder, first.as_deref(), second.as_deref()).await?;
+    if let Some(id) = third.as_deref() {
+        let started = Instant::now();
+        record_rpc(
+            recorder,
+            "rpc.session.queue.move_item",
+            started,
+            session
+                .rpc()
+                .queue()
+                .move_item(QueueMoveItemRequest {
+                    id: id.to_owned(),
+                    to_position: 0,
+                })
+                .await,
+        )?;
+        record_pending_items(session, recorder, "after-move").await?;
+    }
+
+    let started = Instant::now();
+    record_rpc(
+        recorder,
+        "rpc.session.queue.remove_most_recent",
+        started,
+        session.rpc().queue().remove_most_recent().await,
+    )?;
+    record_pending_items(session, recorder, "after-remove-most-recent").await?;
+
+    let started = Instant::now();
+    record_rpc(
+        recorder,
+        "rpc.session.queue.clear",
+        started,
+        session.rpc().queue().clear().await,
+    )?;
+    record_pending_items(session, recorder, "after-clear").await?;
+
+    let started = Instant::now();
+    record_rpc(
+        recorder,
+        "rpc.session.queue.set_drain_paused.resume",
+        started,
+        session
+            .rpc()
+            .queue()
+            .set_drain_paused(QueueSetDrainPausedRequest { paused: false })
+            .await,
+    )?;
+
+    let observed = drain_pending_message_events(&mut subscription, recorder).await?;
+    recorder.write(
+        "queue.probe.complete",
+        json!({"pendingMessagesModifiedEvents": observed}),
+    )?;
+    Ok(())
+}
+
+/// Drains buffered session events, counting the `pending_messages.modified`
+/// signals the queue mutations produced. Returns once the stream goes quiet.
+async fn drain_pending_message_events(
+    subscription: &mut github_copilot_sdk::subscription::EventSubscription,
+    recorder: &Recorder,
+) -> Result<usize> {
+    let mut observed = 0;
+    while let Ok(Ok(event)) =
+        tokio::time::timeout(Duration::from_millis(500), subscription.recv()).await
+    {
+        if event.event_type == "pending_messages.modified" {
+            observed += 1;
+            record_sdk_event(recorder, &event)?;
+        }
+    }
+    Ok(observed)
+}
+
+/// Calls a wire method directly, bypassing the typed client. This is the
+/// escape hatch for `session.queue.*` methods the generated Rust client does
+/// not surface.
+async fn raw_session_call(
+    session: &Session,
+    recorder: &Recorder,
+    method: &str,
+    mut params: Value,
+) -> Result<Option<Value>> {
+    params["sessionId"] = Value::String(session.id().to_string());
+    let started = Instant::now();
+    record_rpc_value(
+        recorder,
+        &format!("rpc.raw.{method}"),
+        started,
+        session.client().call(method, Some(params)).await,
+    )
+}
+
+async fn set_drain_paused(
+    session: &Session,
+    recorder: &Recorder,
+    paused: bool,
+    label: &str,
+) -> Result<bool> {
+    let started = Instant::now();
+    let result = record_rpc_value(
+        recorder,
+        &format!("rpc.session.queue.set_drain_paused.{label}"),
+        started,
+        session
+            .rpc()
+            .queue()
+            .set_drain_paused(QueueSetDrainPausedRequest { paused })
+            .await,
+    )?;
+    Ok(result.is_some())
+}
+
+/// Watches the event stream for a queued item actually being handed to the
+/// model. Returns true if a turn started.
+async fn observe_drain(
+    subscription: &mut github_copilot_sdk::subscription::EventSubscription,
+    recorder: &Recorder,
+    phase: &str,
+    window: Duration,
+) -> Result<bool> {
+    let deadline = tokio::time::Instant::now() + window;
+    let mut event_types = Vec::new();
+    let mut turn_started = false;
+    let mut reached_idle = false;
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, subscription.recv()).await {
+        event_types.push(event.event_type.clone());
+        if matches!(
+            event.event_type.as_str(),
+            "user.message" | "assistant.message_start"
+        ) {
+            turn_started = true;
+        }
+        if turn_started && event.event_type == "session.idle" {
+            reached_idle = true;
+            break;
+        }
+    }
+    recorder.write(
+        "queue.drain_observed",
+        json!({
+            "phase": phase,
+            "eventTypes": event_types,
+            "turnStarted": turn_started,
+            "reachedIdle": reached_idle,
+        }),
+    )?;
+    Ok(turn_started)
+}
+
+/// Determines whether unpausing the queue on an idle session drains it, and
+/// falls back to the raw `session.queue.process` wire method if it does not.
+///
+/// This sends real prompts to the model.
+async fn exercise_queue_drain(
+    session: &Session,
+    recorder: &Recorder,
+    timeout: Duration,
+) -> Result<()> {
+    let mut subscription = session.subscribe();
+    recorder.write("queue.drain_probe.start", Value::Null)?;
+
+    if !set_drain_paused(session, recorder, true, "pause").await? {
+        recorder.write(
+            "queue.drain_probe.aborted",
+            json!({"reason": "could not pause queue drain; refusing to enqueue prompts"}),
+        )?;
+        return Ok(());
+    }
+    insert_queue_item(session, recorder, "Reply with exactly: probe-one", 0).await?;
+    insert_queue_item(session, recorder, "Reply with exactly: probe-two", 1).await?;
+    record_pending_items(session, recorder, "drain-before-unpause").await?;
+
+    set_drain_paused(session, recorder, false, "resume").await?;
+    let drained = observe_drain(&mut subscription, recorder, "after-unpause", timeout).await?;
+    record_pending_items(session, recorder, "drain-after-unpause").await?;
+
+    if !drained {
+        recorder.write(
+            "queue.drain_probe.no_auto_drain",
+            json!({
+                "note": "unpausing an idle session did not start a turn; \
+                         falling back to the raw session.queue.process wire method",
+            }),
+        )?;
+        raw_session_call(session, recorder, "session.queue.process", json!({})).await?;
+        observe_drain(&mut subscription, recorder, "after-process", timeout).await?;
+        record_pending_items(session, recorder, "drain-after-process").await?;
+    }
+
+    let started = Instant::now();
+    record_rpc(
+        recorder,
+        "rpc.session.queue.clear",
+        started,
+        session.rpc().queue().clear().await,
+    )?;
+    record_pending_items(session, recorder, "drain-final").await?;
+    recorder.write("queue.drain_probe.complete", Value::Null)
+}
+
+/// Queues items, drops the session, and resumes it to see whether pending
+/// queue state survives a reconnect. Returns the resumed session.
+async fn exercise_queue_resume(
+    client: &Client,
+    session: Session,
+    args: &Args,
+    cwd: &Path,
+    recorder: &Recorder,
+) -> Result<Session> {
+    recorder.write("queue.resume_probe.start", Value::Null)?;
+    if !set_drain_paused(&session, recorder, true, "pause").await? {
+        recorder.write(
+            "queue.resume_probe.aborted",
+            json!({"reason": "could not pause queue drain; refusing to enqueue prompts"}),
+        )?;
+        return Ok(session);
+    }
+    insert_queue_item(&session, recorder, "gcabb resume probe: first", 0).await?;
+    insert_queue_item(&session, recorder, "gcabb resume probe: second", 1).await?;
+    record_pending_items(&session, recorder, "resume-before-disconnect").await?;
+
+    let session_id = session.id().to_string();
+    recorder.write(
+        "queue.resume_probe.disconnecting",
+        json!({"sessionId": &session_id}),
+    )?;
+    session.disconnect().await?;
+
+    let mut resume_args = args.clone();
+    resume_args.resume = Some(session_id.clone());
+    let resumed = match open_session(client, &resume_args, cwd, recorder).await {
+        Ok(resumed) => resumed,
+        Err(error) => {
+            recorder.write(
+                "queue.resume_probe.failed",
+                json!({
+                    "sessionId": session_id,
+                    "error": error.to_string(),
+                    "note": "the CLI only persists a session once it has taken a turn; \
+                             rerun with --prompt so the session is resumable",
+                }),
+            )?;
+            return Err(error);
+        }
+    };
+    record_pending_items(&resumed, recorder, "resume-after-reconnect").await?;
+
+    let started = Instant::now();
+    record_rpc(
+        recorder,
+        "rpc.session.queue.clear",
+        started,
+        resumed.rpc().queue().clear().await,
+    )?;
+    set_drain_paused(&resumed, recorder, false, "resume").await?;
+    record_pending_items(&resumed, recorder, "resume-final").await?;
+    recorder.write("queue.resume_probe.complete", Value::Null)?;
+    Ok(resumed)
+}
+
+/// Verifies that an immediate-delivery `session.send` steers a turn that is
+/// already running, which is the stable-surface equivalent of
+/// `session.queue.sendNow`.
+///
+/// Sends two real prompts to the model.
+async fn exercise_steering(
+    session: &Session,
+    recorder: &Recorder,
+    timeout: Duration,
+) -> Result<()> {
+    let mut subscription = session.subscribe();
+    recorder.write("steering_probe.start", Value::Null)?;
+
+    let long_prompt = "Count slowly from 1 to 40, one number per line, \
+                       with a short sentence about each number.";
+    let first = session
+        .send(long_prompt)
+        .await
+        .context("failed to send the long-running prompt")?;
+    recorder.write("steering_probe.long_send", json!({"messageId": first}))?;
+
+    // Wait until the turn is demonstrably running before interrupting it.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut turn_running = false;
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, subscription.recv()).await {
+        if matches!(
+            event.event_type.as_str(),
+            "assistant.message_delta" | "assistant.streaming_delta"
+        ) {
+            turn_running = true;
+            break;
+        }
+        if event.event_type == "session.idle" {
+            break;
+        }
+    }
+    recorder.write(
+        "steering_probe.turn_running",
+        json!({"running": turn_running}),
+    )?;
+    if !turn_running {
+        recorder.write(
+            "steering_probe.aborted",
+            json!({"reason": "the first turn never started streaming"}),
+        )?;
+        return Ok(());
+    }
+
+    record_pending_items(session, recorder, "steering-mid-turn").await?;
+
+    let started = Instant::now();
+    let steer = session
+        .send(
+            MessageOptions::from("Stop counting. Reply with exactly: steered".to_owned())
+                .with_mode(DeliveryMode::Immediate),
+        )
+        .await;
+    match steer {
+        Ok(message_id) => recorder.write(
+            "steering_probe.immediate_send",
+            json!({
+                "elapsedMs": started.elapsed().as_millis(),
+                "messageId": message_id,
+                "acceptedDuringActiveTurn": true,
+            }),
+        )?,
+        Err(error) => {
+            recorder.write(
+                "steering_probe.immediate_send.error",
+                json!({
+                    "elapsedMs": started.elapsed().as_millis(),
+                    "error": error.to_string(),
+                    "acceptedDuringActiveTurn": false,
+                }),
+            )?;
+            return Ok(());
+        }
+    }
+
+    record_pending_items(session, recorder, "steering-after-immediate-send").await?;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut event_types = Vec::new();
+    let mut saw_steered_reply = false;
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, subscription.recv()).await {
+        event_types.push(event.event_type.clone());
+        if event.event_type == "assistant.message"
+            && serde_json::to_value(&event)?
+                .to_string()
+                .contains("steered")
+        {
+            saw_steered_reply = true;
+        }
+        if event.event_type == "session.idle" {
+            break;
+        }
+    }
+    recorder.write(
+        "steering_probe.complete",
+        json!({
+            "eventTypes": event_types,
+            "sawSteeredReply": saw_steered_reply,
+        }),
     )
 }
 
@@ -607,15 +1164,24 @@ async fn main() -> Result<()> {
     )?;
 
     let client = start_client(&cwd, &recorder).await?;
-    let session = open_session(&client, &args, &cwd, &recorder).await?;
+    let mut session = open_session(&client, &args, &cwd, &recorder).await?;
     recorder.write(
         "session.ready",
         json!({"sessionId": session.id(), "capabilities": session.capabilities()}),
     )?;
+    let timeout = Duration::from_secs(args.timeout_seconds);
     exercise_read_only_rpcs(&session, &recorder).await?;
+    if args.queue_probe {
+        exercise_queue_rpcs(&session, &recorder).await?;
+    }
+    if args.queue_drain_probe {
+        exercise_queue_drain(&session, &recorder, timeout).await?;
+    }
+    if args.steering_probe {
+        exercise_steering(&session, &recorder, timeout).await?;
+    }
     recorder.write("sdk.history", session.get_events().await?)?;
 
-    let timeout = Duration::from_secs(args.timeout_seconds);
     if let Some(prompt) = args.fleet_prompt.as_deref() {
         run_fleet(&session, &recorder, prompt, timeout).await?;
     }
@@ -628,6 +1194,12 @@ async fn main() -> Result<()> {
             timeout,
         )
         .await?;
+    }
+
+    // Runs last: the CLI only persists a session once it has taken a turn, so
+    // resume is only meaningful after any prompt has been sent.
+    if args.queue_resume_probe {
+        session = exercise_queue_resume(&client, session, &args, &cwd, &recorder).await?;
     }
 
     recorder.write("session.disconnecting", json!({"sessionId": session.id()}))?;
