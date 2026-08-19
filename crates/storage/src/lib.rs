@@ -694,7 +694,7 @@ impl Storage {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, session_id, position, prompt, display_prompt, state, delivery,
-                    agent_mode, runtime_id, created_at, updated_at, error
+                    agent_mode, created_at, updated_at, error
              FROM queue_items WHERE session_id = ?1 ORDER BY position, created_at, id",
         )?;
         let items = statement
@@ -708,10 +708,9 @@ impl Storage {
                     state: queue_state_from_str(&row.get::<_, String>(5)?),
                     delivery: queue_delivery_from_str(&row.get::<_, String>(6)?),
                     agent_mode: row.get(7)?,
-                    runtime_id: row.get(8)?,
-                    created_at: row.get(9)?,
-                    updated_at: row.get(10)?,
-                    error: row.get(11)?,
+                    created_at: row.get(8)?,
+                    updated_at: row.get(9)?,
+                    error: row.get(10)?,
                 })
             })?
             .collect::<rusqlite::Result<Vec<_>>>()?;
@@ -727,9 +726,6 @@ impl Storage {
         Ok(QueueView {
             items,
             paused,
-            // Runtime-reported state is not durable; the session actor fills
-            // it in from the live runtime after loading.
-            runtime_steering: Vec::new(),
             error: None,
         })
     }
@@ -739,8 +735,8 @@ impl Storage {
         self.connection()?.execute(
             "INSERT INTO queue_items (
                 id, session_id, position, prompt, display_prompt, state, delivery,
-                agent_mode, runtime_id, created_at, updated_at, error
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                agent_mode, created_at, updated_at, error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)
              ON CONFLICT(id) DO UPDATE SET
                 position = excluded.position,
                 prompt = excluded.prompt,
@@ -748,7 +744,6 @@ impl Storage {
                 state = excluded.state,
                 delivery = excluded.delivery,
                 agent_mode = excluded.agent_mode,
-                runtime_id = excluded.runtime_id,
                 updated_at = excluded.updated_at,
                 error = excluded.error",
             params![
@@ -760,7 +755,6 @@ impl Storage {
                 queue_state_to_str(item.state),
                 queue_delivery_to_str(item.delivery),
                 item.agent_mode,
-                item.runtime_id,
                 item.created_at,
                 item.updated_at,
                 item.error,
@@ -816,19 +810,6 @@ impl Storage {
             "INSERT INTO queue_state (session_id, paused) VALUES (?1, ?2)
              ON CONFLICT(session_id) DO UPDATE SET paused = excluded.paused",
             params![session_id, i64::from(paused)],
-        )?;
-        Ok(())
-    }
-
-    /// Clear the runtime identifiers recorded for a session's queue items.
-    ///
-    /// The runtime mints its own ids and reissues them per session, so they
-    /// are meaningless once a session ends and must not be carried forward
-    /// into the next one.
-    pub fn clear_queue_runtime_ids(&self, session_id: &str) -> Result<()> {
-        self.connection()?.execute(
-            "UPDATE queue_items SET runtime_id = NULL WHERE session_id = ?1",
-            params![session_id],
         )?;
         Ok(())
     }
@@ -934,7 +915,6 @@ impl Storage {
                 state TEXT NOT NULL,
                 delivery TEXT NOT NULL,
                 agent_mode TEXT,
-                runtime_id TEXT,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL,
                 error TEXT
@@ -1964,7 +1944,6 @@ mod tests {
             state: QueueItemState::Pending,
             delivery: QueueDelivery::WhenIdle,
             agent_mode: None,
-            runtime_id: None,
             created_at: "1".to_owned(),
             updated_at: "2".to_owned(),
             error: None,
@@ -1998,14 +1977,12 @@ mod tests {
         let mut edited = queue_item("a", 1024);
         edited.prompt = "edited prompt".to_owned();
         edited.state = QueueItemState::Dispatched;
-        edited.runtime_id = Some("7".to_owned());
         storage.upsert_queue_item(&edited).unwrap();
 
         let view = storage.queue_view("app-session").unwrap();
         assert_eq!(view.items.len(), 1);
         assert_eq!(view.items[0].prompt, "edited prompt");
         assert_eq!(view.items[0].state, QueueItemState::Dispatched);
-        assert_eq!(view.items[0].runtime_id.as_deref(), Some("7"));
         assert_eq!(view.pending_count(), 0);
     }
 
@@ -2066,21 +2043,6 @@ mod tests {
 
         storage.set_queue_paused("app-session", false).unwrap();
         assert!(!storage.queue_view("app-session").unwrap().paused);
-    }
-
-    #[test]
-    fn runtime_ids_can_be_cleared_without_touching_the_queue() {
-        let storage = queue_storage();
-        let mut item = queue_item("a", 1024);
-        item.runtime_id = Some("0".to_owned());
-        storage.upsert_queue_item(&item).unwrap();
-
-        storage.clear_queue_runtime_ids("app-session").unwrap();
-
-        let view = storage.queue_view("app-session").unwrap();
-        assert_eq!(view.items.len(), 1);
-        assert!(view.items[0].runtime_id.is_none());
-        assert_eq!(view.items[0].state, QueueItemState::Pending);
     }
 
     #[test]

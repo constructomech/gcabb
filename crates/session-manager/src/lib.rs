@@ -2598,15 +2598,8 @@ impl SessionActor {
     }
 
     /// Load the durable queue into the snapshot.
-    ///
-    /// Runtime identifiers are dropped first: the runtime reissues them per
-    /// session, so an id recorded by a previous session would address the
-    /// wrong item, or nothing at all, in this one.
     fn load_queue(&mut self) {
         let session_id = self.state.metadata.id.clone();
-        if let Err(error) = self.storage.clear_queue_runtime_ids(&session_id) {
-            self.record_actor_error("clear_queue_runtime_ids", &error.to_string());
-        }
         match self.storage.queue_view(&session_id) {
             Ok(queue) => self.state.queue = queue,
             Err(error) => self.record_actor_error("queue_view", &error.to_string()),
@@ -2638,7 +2631,6 @@ impl SessionActor {
                     state: QueueItemState::Pending,
                     delivery,
                     agent_mode: self.state.controls.mode.clone(),
-                    runtime_id: None,
                     created_at: now.clone(),
                     updated_at: now,
                     error: None,
@@ -2668,7 +2660,6 @@ impl SessionActor {
                 self.storage.upsert_queue_item(&item)?;
             }
             QueueCommand::Remove { id } => {
-                self.withdraw_from_runtime(&id).await;
                 self.storage.delete_queue_item(&id)?;
             }
             QueueCommand::Reorder { ordered_ids } => {
@@ -2676,22 +2667,12 @@ impl SessionActor {
             }
             QueueCommand::SetPaused { paused } => {
                 self.storage.set_queue_paused(&session_id, paused)?;
-                // Best effort: the runtime mirror should stop draining too,
-                // but GCABB's own pause is what actually gates delivery.
-                if let Err(error) = self
-                    .provider
-                    .set_queue_paused(&self.sdk_session_id, paused)
-                    .await
-                {
-                    tracing::debug!(%error, "runtime queue pause not applied");
-                }
             }
             QueueCommand::Clear => {
                 for item in self.storage.queue_view(&session_id)?.items {
                     if !item.state.is_pending() {
                         continue;
                     }
-                    self.withdraw_from_runtime(&item.id).await;
                     self.storage.delete_queue_item(&item.id)?;
                 }
             }
@@ -2702,41 +2683,10 @@ impl SessionActor {
         Ok(queued_id)
     }
 
-    /// Withdraw an item from the runtime mirror, if it reached one.
-    async fn withdraw_from_runtime(&mut self, id: &str) {
-        let Ok(queue) = self.storage.queue_view(&self.state.metadata.id) else {
-            return;
-        };
-        let Some(runtime_id) = queue
-            .item(id)
-            .and_then(|item| item.runtime_id.as_deref())
-            .map(str::to_owned)
-        else {
-            return;
-        };
-        if let Err(error) = self
-            .provider
-            .withdraw_queued(&self.sdk_session_id, &runtime_id)
-            .await
-        {
-            tracing::debug!(%error, "runtime queue withdrawal failed");
-        }
-    }
-
     /// React to runtime signals that bear on the queue.
     async fn sync_queue(&mut self, raw: &Value) {
-        let event_type = raw.get("type").and_then(Value::as_str).unwrap_or_default();
-        match event_type {
-            // Signal-only: the runtime's pending set changed, so re-read the
-            // steering messages it is holding for the active turn.
-            "pending_messages.modified" => {
-                if let Ok(runtime) = self.provider.runtime_queue(&self.sdk_session_id).await {
-                    self.state.queue.runtime_steering = runtime.steering;
-                    self.publish(false);
-                }
-            }
-            "session.idle" => self.drain_queue().await,
-            _ => {}
+        if raw.get("type").and_then(Value::as_str) == Some("session.idle") {
+            self.drain_queue().await;
         }
     }
 
@@ -2759,7 +2709,6 @@ impl SessionActor {
         for mut item in dispatched {
             item.state = QueueItemState::Completed;
             item.updated_at = timestamp();
-            item.runtime_id = None;
             if let Err(error) = self.storage.upsert_queue_item(&item) {
                 self.record_actor_error("upsert_queue_item", &error.to_string());
             }
@@ -2772,8 +2721,7 @@ impl SessionActor {
     /// Hand the next pending item to the agent when the session can take it.
     ///
     /// One item at a time: the next is delivered when the session next goes
-    /// idle, which keeps GCABB's queue the thing that decides ordering rather
-    /// than racing the runtime's own drain loop.
+    /// idle, so a follow-up stays editable until the moment it is dispatched.
     async fn drain_queue(&mut self) {
         if self.state.status != SessionStatus::Idle {
             return;
@@ -2797,9 +2745,8 @@ impl SessionActor {
             .deliver_queued(&self.sdk_session_id, &request)
             .await
         {
-            Ok(receipt) => {
+            Ok(_) => {
                 item.state = QueueItemState::Dispatched;
-                item.runtime_id = receipt.runtime_id;
                 item.error = None;
             }
             Err(error) => {

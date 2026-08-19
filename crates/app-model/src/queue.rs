@@ -67,11 +67,10 @@ pub enum QueueDelivery {
     Steer,
 }
 
-/// A single prompt the developer has queued for a session.
+/// A single follow-up the developer has queued for a session.
 ///
 /// The identifier is minted by GCABB and is stable for the life of the item,
-/// including across restarts. Runtime-assigned identifiers are recorded
-/// separately in `runtime_id` because the runtime reissues them per session.
+/// including across restarts.
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct QueueItem {
     pub id: String,
@@ -91,10 +90,6 @@ pub struct QueueItem {
     /// Agent mode to request for this item, or the session's mode when unset.
     #[serde(default)]
     pub agent_mode: Option<String>,
-    /// Identifier the runtime assigned when the item was handed over. Cleared
-    /// whenever the runtime queue is rebuilt, since the runtime reissues ids.
-    #[serde(default)]
-    pub runtime_id: Option<String>,
     pub created_at: String,
     pub updated_at: String,
     /// Why delivery failed, when `state` is `Failed`.
@@ -138,10 +133,6 @@ pub struct QueueView {
     /// when the session is idle.
     #[serde(default)]
     pub paused: bool,
-    /// Steering messages the runtime is holding for the active turn. Reported
-    /// by the runtime, so it can include input from other clients.
-    #[serde(default)]
-    pub runtime_steering: Vec<String>,
     /// Set when the queue could not be synchronised with the runtime.
     #[serde(default)]
     pub error: Option<String>,
@@ -192,7 +183,6 @@ mod tests {
             state,
             delivery: QueueDelivery::WhenIdle,
             agent_mode: None,
-            runtime_id: None,
             created_at: "2026-01-01T00:00:00Z".to_owned(),
             updated_at: "2026-01-01T00:00:00Z".to_owned(),
             error: None,
@@ -252,7 +242,6 @@ mod tests {
         let view = QueueView {
             items: vec![item("a", 10, QueueItemState::Pending)],
             paused: true,
-            runtime_steering: vec!["steer".to_owned()],
             error: None,
         };
         let encoded = serde_json::to_string(&view).expect("serialize queue view");

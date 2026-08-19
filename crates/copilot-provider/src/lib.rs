@@ -43,10 +43,7 @@ pub const MINIMUM_PROTOCOL_VERSION: u32 = 3;
 
 pub mod queue;
 
-pub use queue::{
-    DeliveryReceipt, NativeQueueTransport, QueueDeliveryRequest, QueueTransport,
-    QueueTransportKind, RuntimeQueue, RuntimeQueueItem, SendOnIdleTransport,
-};
+pub use queue::{DeliveryReceipt, QueueDeliveryRequest, QueueTransport, SendOnIdleTransport};
 
 #[derive(Debug, Error)]
 pub enum ProviderError {
@@ -159,35 +156,12 @@ pub trait AgentProvider: Send + Sync {
         working_directory: &Path,
     ) -> Result<String>;
 
-    /// Which queue delivery strategy this session resolved to.
-    ///
-    /// Determined once per session by probing the runtime, so a runtime
-    /// without the queue surface degrades to sending rather than failing.
-    async fn queue_transport(&self, _sdk_session_id: &str) -> Result<QueueTransportKind> {
-        Ok(QueueTransportKind::SendOnIdle)
-    }
-
-    /// What the runtime is currently holding, for reconciliation.
-    async fn runtime_queue(&self, _sdk_session_id: &str) -> Result<RuntimeQueue> {
-        Ok(RuntimeQueue::default())
-    }
-
-    /// Hand one queued prompt to the agent.
+    /// Hand one queued follow-up to the agent.
     async fn deliver_queued(
         &self,
         sdk_session_id: &str,
         request: &QueueDeliveryRequest,
     ) -> Result<DeliveryReceipt>;
-
-    /// Withdraw an item the runtime is holding. Returns whether one was found.
-    async fn withdraw_queued(&self, _sdk_session_id: &str, _runtime_id: &str) -> Result<bool> {
-        Ok(false)
-    }
-
-    /// Suspend or resume the runtime's own draining.
-    async fn set_queue_paused(&self, _sdk_session_id: &str, _paused: bool) -> Result<()> {
-        Ok(())
-    }
 }
 
 /// Creates isolated provider runtimes for app sessions.
@@ -493,9 +467,6 @@ pub struct CopilotProvider {
     root: PathBuf,
     client: Mutex<Option<Client>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
-    /// Transport chosen per session, cached after the first probe so the
-    /// choice cannot change midway through a session's lifetime.
-    queue_transports: Mutex<HashMap<String, Arc<dyn QueueTransport>>>,
     diagnostics: Arc<dyn DiagnosticsSink>,
 }
 
@@ -561,35 +532,8 @@ impl CopilotProvider {
             root: root.into(),
             client: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
-            queue_transports: Mutex::new(HashMap::new()),
             diagnostics,
         }
-    }
-
-    /// Resolve the queue transport for a session, probing the runtime once.
-    ///
-    /// A runtime that has dropped the experimental queue surface falls back to
-    /// sending, which keeps the queue usable instead of failing every edit.
-    async fn transport(&self, sdk_session_id: &str) -> Result<Arc<dyn QueueTransport>> {
-        if let Some(transport) = self.queue_transports.lock().await.get(sdk_session_id) {
-            return Ok(transport.clone());
-        }
-        let session = self.session(sdk_session_id).await?;
-        let native = NativeQueueTransport;
-        let transport: Arc<dyn QueueTransport> = if native.probe(&session).await {
-            Arc::new(native)
-        } else {
-            tracing::warn!(
-                session = sdk_session_id,
-                "runtime queue unavailable; delivering queued prompts with session.send"
-            );
-            Arc::new(SendOnIdleTransport)
-        };
-        self.queue_transports
-            .lock()
-            .await
-            .insert(sdk_session_id.to_owned(), transport.clone());
-        Ok(transport)
     }
 
     async fn client(&self) -> Result<Client> {
@@ -972,25 +916,10 @@ impl AgentProvider for CopilotProvider {
             .await
             .remove(sdk_session_id)
             .ok_or_else(|| ProviderError::SessionNotFound(sdk_session_id.to_owned()))?;
-        // The cached transport belongs to this session's runtime, so it must
-        // not survive into a later session reusing the same identifier.
-        self.queue_transports.lock().await.remove(sdk_session_id);
         session
             .disconnect()
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))
-    }
-
-    async fn queue_transport(&self, sdk_session_id: &str) -> Result<QueueTransportKind> {
-        Ok(self.transport(sdk_session_id).await?.kind())
-    }
-
-    async fn runtime_queue(&self, sdk_session_id: &str) -> Result<RuntimeQueue> {
-        let session = self.session(sdk_session_id).await?;
-        self.transport(sdk_session_id)
-            .await?
-            .pending(&session)
-            .await
     }
 
     async fn deliver_queued(
@@ -1000,11 +929,7 @@ impl AgentProvider for CopilotProvider {
     ) -> Result<DeliveryReceipt> {
         let session = self.session(sdk_session_id).await?;
         let started = Instant::now();
-        let result = self
-            .transport(sdk_session_id)
-            .await?
-            .deliver(&session, request)
-            .await;
+        let result = SendOnIdleTransport.deliver(&session, request).await;
         self.record(
             "deliver_queued",
             millis(started.elapsed().as_millis()),
@@ -1013,22 +938,6 @@ impl AgentProvider for CopilotProvider {
             json!({"delivery": format!("{:?}", request.delivery)}),
         );
         result
-    }
-
-    async fn withdraw_queued(&self, sdk_session_id: &str, runtime_id: &str) -> Result<bool> {
-        let session = self.session(sdk_session_id).await?;
-        self.transport(sdk_session_id)
-            .await?
-            .withdraw(&session, runtime_id)
-            .await
-    }
-
-    async fn set_queue_paused(&self, sdk_session_id: &str, paused: bool) -> Result<()> {
-        let session = self.session(sdk_session_id).await?;
-        self.transport(sdk_session_id)
-            .await?
-            .set_paused(&session, paused)
-            .await
     }
 
     async fn discover_tools(&self, model: Option<&str>) -> Result<ToolCatalog> {
