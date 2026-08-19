@@ -68,6 +68,21 @@ pub enum SessionStatus {
     Unavailable,
 }
 
+impl SessionStatus {
+    /// Whether the session still has work the runtime can be asked to stop.
+    ///
+    /// `Waiting` counts because a session parked on an unanswered permission or
+    /// input request is still mid-turn; without it the composer would offer no
+    /// way out of a session that never comes back.
+    #[must_use]
+    pub const fn is_busy(self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::Recovering | Self::Running | Self::Waiting
+        )
+    }
+}
+
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
 pub enum TitleSource {
@@ -1064,6 +1079,9 @@ impl SessionSnapshot {
             }
         }
         self.pending_interactions.clear();
+        if self.status == SessionStatus::Waiting {
+            self.status = SessionStatus::Running;
+        }
     }
 }
 
