@@ -329,6 +329,7 @@ impl MarkdownInlineContent {
 struct TranscriptTextBlock {
     order: (u64, usize),
     content: SharedString,
+    links: Vec<(std::ops::Range<usize>, String)>,
     bounds: Option<Bounds<gpui::Pixels>>,
     layout: Option<TextLayout>,
 }
@@ -358,16 +359,30 @@ impl TranscriptTextSelection {
         index
     }
 
-    fn register_block(&mut self, block_id: &str, order: (u64, usize), content: SharedString) {
-        self.blocks.insert(
-            block_id.to_owned(),
-            TranscriptTextBlock {
+    /// Records a block's text and link ranges for the current frame.
+    ///
+    /// Geometry measured during prepaint is kept so a re-registration between
+    /// paints (a press, say) does not blind hit testing until the next frame.
+    fn register_block(
+        &mut self,
+        block_id: &str,
+        order: (u64, usize),
+        content: SharedString,
+        links: Vec<(std::ops::Range<usize>, String)>,
+    ) {
+        let block = self
+            .blocks
+            .entry(block_id.to_owned())
+            .or_insert_with(|| TranscriptTextBlock {
                 order,
-                content,
+                content: SharedString::default(),
+                links: Vec::new(),
                 bounds: None,
                 layout: None,
-            },
-        );
+            });
+        block.order = order;
+        block.content = content;
+        block.links = links;
         for endpoint in [&mut self.anchor, &mut self.focus] {
             if let Some(endpoint) = endpoint.as_mut()
                 && endpoint.block_id == block_id
@@ -377,6 +392,36 @@ impl TranscriptTextSelection {
                 endpoint.index = Self::clamp_index(&block.content, endpoint.index);
             }
         }
+    }
+
+    /// Refreshes a block's text without disturbing the link ranges recorded by
+    /// the element that rendered it.
+    fn touch_block(&mut self, block_id: &str, order: (u64, usize), content: SharedString) {
+        let links = self
+            .blocks
+            .get(block_id)
+            .map(|block| block.links.clone())
+            .unwrap_or_default();
+        self.register_block(block_id, order, content, links);
+    }
+
+    /// The link target under `position`, if any block has text there.
+    ///
+    /// Hit testing reads the shared block registry rather than one element's
+    /// own state, because every block registers a mouse-up handler and only
+    /// the first one to run gets to act on the release.
+    fn link_at(&self, position: gpui::Point<gpui::Pixels>) -> Option<String> {
+        self.blocks.values().find_map(|block| {
+            let bounds = block.bounds?;
+            if !bounds.contains(&position) {
+                return None;
+            }
+            let index = block.layout.as_ref()?.index_for_position(position).ok()?;
+            block
+                .links
+                .iter()
+                .find_map(|(range, target)| range.contains(&index).then(|| target.clone()))
+        })
     }
 
     fn update_geometry(
@@ -398,7 +443,7 @@ impl TranscriptTextSelection {
         content: &SharedString,
         index: usize,
     ) {
-        self.register_block(&block_id, order, content.clone());
+        self.touch_block(&block_id, order, content.clone());
         let endpoint = TranscriptTextEndpoint {
             block_id,
             order,
@@ -419,7 +464,7 @@ impl TranscriptTextSelection {
         if !self.dragging {
             return;
         }
-        self.register_block(&block_id, order, content.clone());
+        self.touch_block(&block_id, order, content.clone());
         self.focus = Some(TranscriptTextEndpoint {
             block_id,
             order,
@@ -538,7 +583,7 @@ impl SelectableTranscriptText {
         let content: SharedString = text.into();
         selection
             .borrow_mut()
-            .register_block(&block_id, order, content.clone());
+            .register_block(&block_id, order, content.clone(), links.clone());
         Self {
             block_id,
             order,
@@ -652,15 +697,11 @@ impl Element for SelectableTranscriptText {
         cx: &mut App,
     ) {
         let current_view = window.current_view();
-        let mouse_index = prepaint
+        let over_link = prepaint
             .layout
             .index_for_position(window.mouse_position())
-            .unwrap_or_else(|index| index)
-            .min(self.content.len());
-        let over_link = self
-            .links
-            .iter()
-            .any(|(range, _)| range.contains(&mouse_index));
+            .ok()
+            .is_some_and(|index| self.links.iter().any(|(range, _)| range.contains(&index)));
         window.set_cursor_style(
             if over_link {
                 CursorStyle::PointingHand
@@ -713,10 +754,7 @@ impl Element for SelectableTranscriptText {
             },
         );
 
-        let block_id = self.block_id.clone();
         let selection = self.selection.clone();
-        let links = self.links.clone();
-        let layout = prepaint.layout.clone();
         window.on_mouse_event(
             move |event: &gpui::MouseUpEvent, phase, _window: &mut Window, cx| {
                 if phase != gpui::DispatchPhase::Bubble || event.button != MouseButton::Left {
@@ -727,24 +765,12 @@ impl Element for SelectableTranscriptText {
                     return;
                 }
                 selected.dragging = false;
-                let clicked_this_block = selected
-                    .anchor
-                    .as_ref()
-                    .is_some_and(|anchor| anchor.block_id == block_id)
-                    && selected
-                        .focus
-                        .as_ref()
-                        .is_some_and(|focus| focus.block_id == block_id);
-                let open_target = (selected.is_empty() && clicked_this_block).then(|| {
-                    let index = layout
-                        .index_for_position(event.position)
-                        .unwrap_or_else(|index| index);
-                    links
-                        .iter()
-                        .find_map(|(range, target)| range.contains(&index).then(|| target.clone()))
-                });
+                let target = selected
+                    .is_empty()
+                    .then(|| selected.link_at(event.position))
+                    .flatten();
                 drop(selected);
-                if let Some(Some(target)) = open_target {
+                if let Some(target) = target {
                     cx.open_url(&target);
                 }
                 cx.notify(current_view);
@@ -11106,7 +11132,7 @@ mod tests {
         let original = gpui::SharedString::from("é");
         selection.begin("block".to_owned(), (1, 0), &original, 0);
         selection.extend("block".to_owned(), (1, 0), &original, "é".len());
-        selection.register_block("block", (1, 0), "x".into());
+        selection.register_block("block", (1, 0), "x".into(), Vec::new());
 
         assert_eq!(selection.selected_text().as_deref(), Some("x"));
     }
@@ -14110,6 +14136,111 @@ mod tests {
                 after_transcript, after_block,
                 "the transcript must not move when scrolling inside a tool entry"
             );
+        }
+
+        /// Regression: every transcript block registers a mouse-up handler on
+        /// the shared selection, and bubble-phase handlers run in reverse paint
+        /// order, so the last block always cleared the drag first and links in
+        /// any other message did nothing.
+        #[gpui::test]
+        fn clicking_a_transcript_link_opens_it(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let target = "https://example.com/docs";
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                let mut push = |index: usize, content: String| {
+                    state.transcript.push(app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content,
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
+                    });
+                };
+                push(0, format!("See {target} for details."));
+                // Later messages paint after the link, so their handlers get the
+                // release first.
+                for index in 1..4 {
+                    push(index, format!("a follow-up message {index}"));
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            let position = view.read_with(cx, |view, _| {
+                let selection = view.transcript_selection.borrow();
+                selection.blocks.values().find_map(|block| {
+                    let start = block.content.find(target)?;
+                    let layout = block.layout.as_ref()?;
+                    let left = layout.position_for_index(start)?;
+                    let right = layout.position_for_index(start + target.len())?;
+                    Some(gpui::point(
+                        (left.x + right.x) / 2.0,
+                        left.y + gpui::px(4.0),
+                    ))
+                })
+            });
+            let position = position.expect("the transcript rendered a link");
+
+            cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+            cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+
+            assert_eq!(cx.opened_url().as_deref(), Some(target));
+        }
+
+        /// Clicking past the end of a line must not open the link that happens
+        /// to sit at that text index.
+        #[gpui::test]
+        fn clicking_beside_a_link_opens_nothing(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let target = "https://example.com/docs";
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "m1".to_owned(),
+                    role: app_model::TranscriptRole::Assistant,
+                    content: format!("See {target}"),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            let position = view.read_with(cx, |view, _| {
+                let selection = view.transcript_selection.borrow();
+                selection.blocks.values().find_map(|block| {
+                    let end = block.content.find(target)? + target.len();
+                    let bounds = block.bounds?;
+                    let after = block.layout.as_ref()?.position_for_index(end)?;
+                    Some(gpui::point(
+                        after.x + (bounds.right() - after.x) / 2.0,
+                        after.y + gpui::px(4.0),
+                    ))
+                })
+            });
+            let position = position.expect("the transcript rendered a link");
+
+            cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+            cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+
+            assert_eq!(cx.opened_url(), None);
         }
 
         /// Regression: the thumb was drawn but inert, so the wheel was the only
