@@ -24,6 +24,9 @@ use uuid::Uuid;
 
 const SNAPSHOT_INTERVAL: u64 = 50;
 const BASE_REF_REFRESH_TTL: Duration = Duration::from_mins(5);
+/// Where an archived patch is dropped when it cannot be re-applied, so
+/// unarchiving never destroys the work it was holding.
+const ARCHIVED_PATCH_FILE: &str = "gcabb-archived-changes.patch";
 
 #[derive(Debug, Error)]
 pub enum SessionManagerError {
@@ -39,6 +42,11 @@ pub enum SessionManagerError {
     BackgroundTask(String),
     #[error("session not found: {0}")]
     SessionNotFound(String),
+    #[error(
+        "archived session {id} could not be restored: {error}. \
+         It is still archived, and its saved work is intact."
+    )]
+    ArchiveRestoreFailed { id: String, error: String },
     #[error("session is already being restored: {0}")]
     SessionRestoreInProgress(String),
     #[error(
@@ -99,6 +107,98 @@ pub struct SessionDeletion {
     pub attachments_removed: usize,
     /// Whether the runtime's own state directory was removed.
     pub runtime_state_removed: bool,
+}
+
+/// What happened to a session's worktree when the session was archived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum ArchiveOutcome {
+    /// The worktree was captured and removed; the branch was kept.
+    Captured {
+        path: PathBuf,
+        branch: String,
+        /// Whether uncommitted work was saved as a patch.
+        patch_saved: bool,
+    },
+    /// The directory was already gone; only the record needed writing.
+    AlreadyGone,
+    /// The worktree could not be reduced to a branch plus a patch, so it was
+    /// left alone. The session is archived; its checkout stays on disk.
+    Preserved { path: PathBuf, reason: String },
+}
+
+impl ArchiveOutcome {
+    /// A message worth showing the user, when there is one.
+    #[must_use]
+    pub fn notice(&self) -> Option<String> {
+        match self {
+            Self::Captured { .. } | Self::AlreadyGone => None,
+            Self::Preserved { path, reason } => Some(format!(
+                "Session archived, but its worktree at {} was kept: {reason}",
+                path.display()
+            )),
+        }
+    }
+}
+
+/// Result of archiving a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionArchival {
+    pub metadata: SessionMetadata,
+    pub worktree: Option<ArchiveOutcome>,
+}
+
+/// What happened to a session's worktree when the session was unarchived.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum RestoreOutcome {
+    /// The worktree was rebuilt from its branch.
+    Recreated {
+        path: PathBuf,
+        branch: String,
+        /// Whether the saved patch was re-applied on top.
+        patch_applied: bool,
+    },
+    /// The worktree was still on disk and was left as it was.
+    AlreadyPresent { path: PathBuf },
+    /// The worktree could not be rebuilt. The session is back, read-only,
+    /// until its working directory is restored or relocated.
+    Failed {
+        path: PathBuf,
+        error: String,
+        /// Whether nothing was consumed, so the session can stay archived and
+        /// the attempt be repeated.
+        recoverable: bool,
+    },
+}
+
+impl RestoreOutcome {
+    /// A message worth showing the user, when there is one.
+    #[must_use]
+    pub fn notice(&self) -> Option<String> {
+        match self {
+            Self::AlreadyPresent { .. } => None,
+            Self::Recreated {
+                path,
+                patch_applied,
+                ..
+            } => patch_applied.then(|| {
+                format!(
+                    "Session unarchived. Its uncommitted work was restored to {} and is staged.",
+                    path.display()
+                )
+            }),
+            Self::Failed { path, error, .. } => Some(format!(
+                "Session unarchived, but its worktree at {} could not be rebuilt: {error}",
+                path.display()
+            )),
+        }
+    }
+}
+
+/// Result of unarchiving a session.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionRestoration {
+    pub metadata: SessionMetadata,
+    pub worktree: Option<RestoreOutcome>,
 }
 
 /// Directories a session's files may live under.
@@ -903,11 +1003,9 @@ impl SessionManager {
         roots: &SessionRoots,
     ) -> Result<SessionDeletion> {
         let _lifecycle = self.lifecycle.lock().await;
-        let metadata = self
-            .storage
-            .list_sessions()?
-            .into_iter()
-            .find(|metadata| metadata.id == app_session_id);
+        // Archived sessions are hidden from `list_sessions`, so this looks the
+        // session up directly; deleting one from the archive must still work.
+        let metadata = self.storage.session_metadata(app_session_id)?;
 
         // Read the attachment paths before the rows are deleted, since the
         // snapshot is the only record of which files this session referenced.
@@ -961,8 +1059,340 @@ impl SessionManager {
         })
     }
 
-    /// Remove the session's worktree when GCABB created it.
+    /// Archive a session: keep everything it recorded, throw away its worktree.
     ///
+    /// The session's events, snapshots, and output stay exactly where they
+    /// were; only its visibility changes, so nothing has to be copied out and
+    /// back. The worktree is reducible to a branch plus a patch of whatever was
+    /// never committed, so it is captured and removed. The branch is kept --
+    /// deleting it would make the archive unrestorable.
+    ///
+    /// A worktree that cannot be reduced that way (no branch, a detached
+    /// `HEAD`, a checkout GCABB did not create) is left on disk and reported
+    /// rather than destroyed. Git-ignored files are not captured and go with
+    /// the directory, as they do when a session is deleted.
+    pub async fn archive_session(
+        &self,
+        app_session_id: &str,
+        roots: &SessionRoots,
+    ) -> Result<SessionArchival> {
+        // Restore recreates a missing managed worktree from its branch, so an
+        // archive racing one could see its own removal undone. Holding the
+        // restore guard keeps the two apart.
+        if !self.begin_restore(app_session_id).await {
+            return Err(SessionManagerError::SessionRestoreInProgress(
+                app_session_id.to_owned(),
+            ));
+        }
+        let result = self.archive_session_inner(app_session_id, roots).await;
+        self.finish_restore(app_session_id).await;
+        result
+    }
+
+    async fn archive_session_inner(
+        &self,
+        app_session_id: &str,
+        roots: &SessionRoots,
+    ) -> Result<SessionArchival> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let metadata = self
+            .storage
+            .session_metadata(app_session_id)?
+            .ok_or_else(|| SessionManagerError::SessionNotFound(app_session_id.to_owned()))?;
+
+        // Archiving twice must be a no-op. A second pass would find the
+        // worktree already gone and overwrite the record -- and the patch that
+        // record holds is the only copy of the session's uncommitted work.
+        if self.storage.is_session_archived(app_session_id)? {
+            return Ok(SessionArchival {
+                metadata,
+                worktree: None,
+            });
+        }
+
+        // Disconnect first so the agent cannot write into the worktree between
+        // the patch being captured and the directory being removed.
+        let runtime = self.sessions.lock().await.remove(app_session_id);
+        if let Some(runtime) = runtime {
+            let _ = runtime.handle.disconnect().await;
+            if let Some(provider) = runtime.provider
+                && runtime.isolated
+            {
+                let _ = provider.stop().await;
+            }
+        }
+        if self.selected_session()?.as_deref() == Some(app_session_id) {
+            self.set_selected_session(None)?;
+        }
+
+        let (mut outcome, record, removable) =
+            Self::capture_worktree(&metadata, roots.worktrees.as_deref());
+        // The record holds the only copy of work that was never committed, so
+        // it is committed to storage *before* the checkout is destroyed. If
+        // this fails the worktree is still there and nothing has been lost.
+        self.storage.archive_session(&record)?;
+        if let Some((repository, worktree, branch)) = removable {
+            // Forced because the patch in the record above already preserved
+            // anything the worktree still held.
+            if let Err(error) = GitService::new(&repository).force_remove_worktree(&worktree) {
+                outcome = Some(ArchiveOutcome::Preserved {
+                    path: worktree,
+                    reason: format!("git refused to remove it: {error}"),
+                });
+            } else {
+                outcome = Some(ArchiveOutcome::Captured {
+                    path: worktree,
+                    branch,
+                    patch_saved: record.patch.is_some(),
+                });
+            }
+        }
+        self.diagnostics.record(DiagnosticEvent {
+            timestamp: timestamp(),
+            category: "session_manager".to_owned(),
+            operation: "archive_session".to_owned(),
+            elapsed_ms: None,
+            session_id: Some(metadata.id.clone()),
+            success: true,
+            details: json!({
+                "branch": record.branch,
+                "patchBytes": record.patch.as_ref().map_or(0, String::len),
+                "worktree": outcome.as_ref().map(|outcome| format!("{outcome:?}")),
+            }),
+        });
+        Ok(SessionArchival {
+            metadata,
+            worktree: outcome,
+        })
+    }
+
+    /// Decide what archiving this session's worktree entails.
+    ///
+    /// Returns the outcome for cases that are already settled, the record to
+    /// store, and -- when the worktree really can be rebuilt later -- the
+    /// repository, path, and branch needed to remove it. Nothing is deleted
+    /// here; the caller removes the checkout only once the record is durable.
+    fn capture_worktree(
+        metadata: &SessionMetadata,
+        worktrees_root: Option<&Path>,
+    ) -> (
+        Option<ArchiveOutcome>,
+        storage::SessionArchiveRecord,
+        Option<(PathBuf, PathBuf, String)>,
+    ) {
+        let record = |branch, head_commit, patch| storage::SessionArchiveRecord {
+            session_id: metadata.id.clone(),
+            archived_at: timestamp(),
+            project_path: metadata.project_path.clone(),
+            repository_root: metadata.repository_root.clone(),
+            branch,
+            head_commit,
+            patch,
+        };
+        let bare = || (None, record(None, None, None), None);
+        // Chats have no repository, and a session running in the project
+        // directory is using the developer's own checkout.
+        if metadata.is_chat() {
+            return bare();
+        }
+        let Some(repository) = metadata.repository_root.as_ref() else {
+            return bare();
+        };
+        let worktree = PathBuf::from(&metadata.project_path);
+        if Path::new(repository) == worktree {
+            return bare();
+        }
+        // Only ever remove worktrees GCABB created. Anything outside the
+        // managed root belongs to the developer.
+        let Some(root) = worktrees_root else {
+            return bare();
+        };
+        if !worktree.starts_with(root) {
+            return bare();
+        }
+        if !worktree.exists() {
+            return (
+                Some(ArchiveOutcome::AlreadyGone),
+                record(None, None, None),
+                None,
+            );
+        }
+
+        let session_git = GitService::new(&worktree);
+        let preserved = |reason: &str, branch, head_commit, patch| {
+            (
+                Some(ArchiveOutcome::Preserved {
+                    path: worktree.clone(),
+                    reason: reason.to_owned(),
+                }),
+                record(branch, head_commit, patch),
+                None,
+            )
+        };
+        let Ok(branch) = session_git.current_branch() else {
+            return preserved("its branch could not be determined", None, None, None);
+        };
+        // A detached HEAD has no branch to rebuild the worktree from, and the
+        // commits it holds would become unreachable.
+        if branch == "HEAD" || branch.is_empty() {
+            return preserved(
+                "it is on a detached HEAD with no branch to restore from",
+                None,
+                None,
+                None,
+            );
+        }
+        let head_commit = session_git.head_commit().ok();
+        let patch = match session_git.capture_uncommitted_patch() {
+            Ok(patch) => patch,
+            Err(error) => {
+                return preserved(
+                    &format!("its uncommitted work could not be captured: {error}"),
+                    Some(branch),
+                    head_commit,
+                    None,
+                );
+            }
+        };
+        (
+            None,
+            record(Some(branch.clone()), head_commit, patch),
+            Some((PathBuf::from(repository), worktree, branch)),
+        )
+    }
+
+    /// Bring an archived session back and rebuild the worktree it ran in.
+    ///
+    /// The session data was never moved, so it becomes visible again as soon
+    /// as the archive record is cleared. The worktree is recreated from the
+    /// branch that was kept, and the patch taken at archive time is applied on
+    /// top so uncommitted work comes back with it.
+    ///
+    /// The record holds the only copy of that uncommitted work, so it is
+    /// cleared last. A rebuild that fails outright leaves the session archived
+    /// and the record intact, so the attempt can be repeated rather than
+    /// costing the user their work.
+    pub async fn unarchive_session(&self, app_session_id: &str) -> Result<SessionRestoration> {
+        let _lifecycle = self.lifecycle.lock().await;
+        let metadata = self
+            .storage
+            .session_metadata(app_session_id)?
+            .ok_or_else(|| SessionManagerError::SessionNotFound(app_session_id.to_owned()))?;
+        let Some(record) = self.storage.session_archive(app_session_id)? else {
+            // Already visible; nothing to restore.
+            return Ok(SessionRestoration {
+                metadata,
+                worktree: None,
+            });
+        };
+        let worktree = Self::rebuild_worktree(&record);
+        self.diagnostics.record(DiagnosticEvent {
+            timestamp: timestamp(),
+            category: "session_manager".to_owned(),
+            operation: "unarchive_session".to_owned(),
+            elapsed_ms: None,
+            session_id: Some(metadata.id.clone()),
+            success: !matches!(worktree, Some(RestoreOutcome::Failed { .. })),
+            details: json!({
+                "branch": record.branch,
+                "worktree": worktree.as_ref().map(|outcome| format!("{outcome:?}")),
+            }),
+        });
+        match worktree {
+            // Nothing was rebuilt and the patch is still the only copy, so the
+            // session stays archived and the user can try again.
+            Some(RestoreOutcome::Failed {
+                error,
+                recoverable: true,
+                ..
+            }) => Err(SessionManagerError::ArchiveRestoreFailed {
+                id: metadata.id,
+                error,
+            }),
+            worktree => {
+                self.storage.clear_session_archive(app_session_id)?;
+                Ok(SessionRestoration { metadata, worktree })
+            }
+        }
+    }
+
+    /// Recreate an archived worktree from its branch and saved patch.
+    fn rebuild_worktree(record: &storage::SessionArchiveRecord) -> Option<RestoreOutcome> {
+        let worktree = PathBuf::from(&record.project_path);
+        let branch = record.branch.clone()?;
+        let repository = record.repository_root.as_ref()?;
+        // Something is already at the path -- most likely the checkout was
+        // rebuilt behind our back. Applying the patch could conflict with
+        // whatever is there, so it is written out instead of thrown away.
+        if worktree.exists() {
+            let Some(patch) = record.patch.as_deref() else {
+                return Some(RestoreOutcome::AlreadyPresent { path: worktree });
+            };
+            return Some(Self::rescue_patch(
+                worktree,
+                patch,
+                "a directory is already at the worktree path, so the saved \
+                 uncommitted work was not re-applied",
+            ));
+        }
+        let repository_git = GitService::new(repository);
+        if let Err(error) = repository_git.recreate_worktree(&worktree, &branch) {
+            // Nothing has been consumed, so the caller can leave the session
+            // archived and the patch on record.
+            return Some(RestoreOutcome::Failed {
+                path: worktree,
+                error: error.to_string(),
+                recoverable: true,
+            });
+        }
+        let Some(patch) = record.patch.as_deref() else {
+            return Some(RestoreOutcome::Recreated {
+                path: worktree,
+                branch,
+                patch_applied: false,
+            });
+        };
+        if let Err(error) = GitService::new(&worktree).apply_patch(patch) {
+            return Some(Self::rescue_patch(
+                worktree,
+                patch,
+                &format!("saved uncommitted work could not be re-applied ({error})"),
+            ));
+        }
+        Some(RestoreOutcome::Recreated {
+            path: worktree,
+            branch,
+            patch_applied: true,
+        })
+    }
+
+    /// Write a patch that could not be applied into the checkout it belongs to.
+    ///
+    /// The archive record is about to be cleared, so a patch that is not
+    /// applied and not written out is a patch that is gone.
+    fn rescue_patch(worktree: PathBuf, patch: &str, reason: &str) -> RestoreOutcome {
+        let rescue = worktree.join(ARCHIVED_PATCH_FILE);
+        let written = std::fs::write(&rescue, patch).is_ok();
+        let error = if written {
+            format!("{reason}; it was written to {}", rescue.display())
+        } else {
+            format!("{reason}, and it could not be written to disk either")
+        };
+        RestoreOutcome::Failed {
+            path: worktree,
+            error,
+            // A rescue that did not land leaves the archive record as the only
+            // copy of the work, so it must not be cleared.
+            recoverable: !written,
+        }
+    }
+
+    /// Archived sessions, for the settings surface that unarchives them.
+    pub fn archived_sessions(&self) -> Result<Vec<storage::ArchivedSession>> {
+        self.storage.list_archived_sessions().map_err(Into::into)
+    }
+
+    /// Remove the session's worktree when GCABB created it.    ///
     /// Returns what happened, or `None` when the session had no managed
     /// worktree to reclaim.
     fn reclaim_worktree(
@@ -1147,7 +1577,21 @@ impl SessionManager {
     ) -> Result<Option<SessionHandle>> {
         let (installed, keeps_runtime): (Result<Option<SessionHandle>>, bool) = {
             let _lifecycle = self.lifecycle.lock().await;
-            match self.storage.session_exists(&metadata.id) {
+            // A session deleted or archived while it was being restored must
+            // not have its runtime installed after the fact.
+            let live = self
+                .storage
+                .session_exists(&metadata.id)
+                .and_then(|exists| {
+                    if exists {
+                        self.storage
+                            .is_session_archived(&metadata.id)
+                            .map(|archived| !archived)
+                    } else {
+                        Ok(false)
+                    }
+                });
+            match live {
                 Ok(true) => {
                     let mut sessions = self.sessions.lock().await;
                     if let Some(existing) = sessions.get(&metadata.id) {
@@ -1442,6 +1886,15 @@ impl SessionManager {
         let Some(worktrees_root) = worktrees_root else {
             return false;
         };
+        // An archive removed this worktree on purpose. Recreating it here
+        // would undo that and strand the patch the archive is holding.
+        if self
+            .storage
+            .is_session_archived(&metadata.id)
+            .unwrap_or(false)
+        {
+            return false;
+        }
         if metadata.kind != SessionKind::Project
             || !working_directory.starts_with(worktrees_root)
             || working_directory == worktrees_root
@@ -2286,6 +2739,15 @@ mod tests {
         );
     }
 
+    /// Read a file, normalising line endings.
+    ///
+    /// Windows CI runs with `core.autocrlf=true`, so git checks files out with
+    /// CRLF. That is git doing its job, not the archive losing content, and
+    /// the assertions here are about content.
+    fn read_text(path: &Path) -> String {
+        std::fs::read_to_string(path).unwrap().replace("\r\n", "\n")
+    }
+
     fn initialise_repository(path: &Path) {
         std::fs::create_dir_all(path).unwrap();
         git(path, &["init", "--initial-branch=main"]);
@@ -2791,6 +3253,320 @@ mod tests {
             replacement.path().canonicalize().unwrap().to_string_lossy()
         );
         assert_eq!(provider.active_sessions().await, 1);
+    }
+
+    /// Archiving reduces a worktree to a branch plus a patch, and unarchiving
+    /// puts both back. Uncommitted and untracked work must survive the trip.
+    #[tokio::test]
+    async fn archiving_discards_the_worktree_and_unarchiving_rebuilds_it() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let worktrees = directory.path().join("worktrees");
+        let worktree = worktrees.join("repository").join("session");
+        initialise_repository(&repository);
+        let repository_git = GitService::new(&repository);
+        repository_git
+            .create_worktree(&worktree, "gcabb/archive-me", "main")
+            .unwrap();
+        // Committed, modified, and untracked work: all three must come back.
+        std::fs::write(worktree.join("committed.txt"), "committed\n").unwrap();
+        git(&worktree, &["add", "."]);
+        git(&worktree, &["commit", "-m", "session work"]);
+        std::fs::write(worktree.join("base.txt"), "modified\n").unwrap();
+        std::fs::write(worktree.join("scratch.txt"), "untracked\n").unwrap();
+
+        let metadata = SessionMetadata {
+            id: "archivable-session".to_owned(),
+            sdk_session_id: "sdk-archivable".to_owned(),
+            project_path: worktree.to_string_lossy().into_owned(),
+            repository_root: Some(repository.to_string_lossy().into_owned()),
+            title: "Archive me".to_owned(),
+            title_source: TitleSource::Manual,
+            kind: SessionKind::Project,
+            model: None,
+            mode: None,
+            base_ref: Some("main".to_owned()),
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+        };
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        storage.upsert_session(&metadata).unwrap();
+        let manager = SessionManager::new(
+            Arc::new(FakeProvider::default()),
+            storage.clone(),
+            Arc::new(MemoryDiagnostics::default()),
+        )
+        .with_session_roots(SessionRoots {
+            worktrees: Some(worktrees),
+            ..SessionRoots::default()
+        });
+        let roots = SessionRoots {
+            worktrees: manager.roots.worktrees.clone(),
+            ..SessionRoots::default()
+        };
+
+        let archival = manager
+            .archive_session("archivable-session", &roots)
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                archival.worktree,
+                Some(ArchiveOutcome::Captured {
+                    patch_saved: true,
+                    ..
+                })
+            ),
+            "expected the worktree to be captured: {:?}",
+            archival.worktree
+        );
+        assert!(!worktree.exists(), "the worktree was not discarded");
+        assert!(
+            repository_git.branch_exists("gcabb/archive-me"),
+            "archiving took the branch with it, leaving nothing to restore from"
+        );
+        assert!(
+            storage.list_sessions().unwrap().is_empty(),
+            "an archived session is still visible to the client"
+        );
+        assert_eq!(storage.list_archived_sessions().unwrap().len(), 1);
+
+        let restoration = manager
+            .unarchive_session("archivable-session")
+            .await
+            .unwrap();
+
+        assert!(
+            matches!(
+                restoration.worktree,
+                Some(RestoreOutcome::Recreated {
+                    patch_applied: true,
+                    ..
+                })
+            ),
+            "expected the worktree to be rebuilt: {:?}",
+            restoration.worktree
+        );
+        assert_eq!(storage.list_sessions().unwrap().len(), 1);
+        assert!(storage.list_archived_sessions().unwrap().is_empty());
+        assert_eq!(read_text(&worktree.join("committed.txt")), "committed\n");
+        assert_eq!(
+            read_text(&worktree.join("base.txt")),
+            "modified\n",
+            "uncommitted changes did not survive archiving"
+        );
+        assert_eq!(
+            read_text(&worktree.join("scratch.txt")),
+            "untracked\n",
+            "untracked files did not survive archiving"
+        );
+    }
+
+    /// A chat has no worktree, so archiving is purely a visibility change.
+    /// A second archive must not overwrite the first one's record: that record
+    /// holds the only copy of the session's uncommitted work.
+    #[tokio::test]
+    async fn archiving_twice_keeps_the_first_archive_intact() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let worktrees = directory.path().join("worktrees");
+        let worktree = worktrees.join("repository").join("session");
+        initialise_repository(&repository);
+        GitService::new(&repository)
+            .create_worktree(&worktree, "gcabb/archive-twice", "main")
+            .unwrap();
+        std::fs::write(worktree.join("base.txt"), "precious\n").unwrap();
+
+        let metadata = SessionMetadata {
+            id: "twice-session".to_owned(),
+            sdk_session_id: "sdk-twice".to_owned(),
+            project_path: worktree.to_string_lossy().into_owned(),
+            repository_root: Some(repository.to_string_lossy().into_owned()),
+            title: "Archive twice".to_owned(),
+            title_source: TitleSource::Manual,
+            kind: SessionKind::Project,
+            model: None,
+            mode: None,
+            base_ref: Some("main".to_owned()),
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+        };
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        storage.upsert_session(&metadata).unwrap();
+        let manager = SessionManager::new(
+            Arc::new(FakeProvider::default()),
+            storage.clone(),
+            Arc::new(MemoryDiagnostics::default()),
+        );
+        let roots = SessionRoots {
+            worktrees: Some(worktrees),
+            ..SessionRoots::default()
+        };
+
+        manager
+            .archive_session("twice-session", &roots)
+            .await
+            .unwrap();
+        manager
+            .archive_session("twice-session", &roots)
+            .await
+            .unwrap();
+
+        let archived = storage.session_archive("twice-session").unwrap().unwrap();
+        assert_eq!(archived.branch.as_deref(), Some("gcabb/archive-twice"));
+        assert!(
+            archived
+                .patch
+                .as_deref()
+                .is_some_and(|patch| patch.contains("precious")),
+            "a second archive destroyed the first one's saved work"
+        );
+    }
+
+    /// A rebuild that cannot even start must not consume the archive: the
+    /// patch is the only copy of the user's uncommitted work.
+    #[tokio::test]
+    async fn a_failed_rebuild_leaves_the_session_archived_with_its_work_intact() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let worktrees = directory.path().join("worktrees");
+        let worktree = worktrees.join("repository").join("session");
+        initialise_repository(&repository);
+        let repository_git = GitService::new(&repository);
+        repository_git
+            .create_worktree(&worktree, "gcabb/doomed-restore", "main")
+            .unwrap();
+        std::fs::write(worktree.join("base.txt"), "precious\n").unwrap();
+
+        let metadata = SessionMetadata {
+            id: "unrestorable-session".to_owned(),
+            sdk_session_id: "sdk-unrestorable".to_owned(),
+            project_path: worktree.to_string_lossy().into_owned(),
+            repository_root: Some(repository.to_string_lossy().into_owned()),
+            title: "Unrestorable".to_owned(),
+            title_source: TitleSource::Manual,
+            kind: SessionKind::Project,
+            model: None,
+            mode: None,
+            base_ref: Some("main".to_owned()),
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+        };
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        storage.upsert_session(&metadata).unwrap();
+        let manager = SessionManager::new(
+            Arc::new(FakeProvider::default()),
+            storage.clone(),
+            Arc::new(MemoryDiagnostics::default()),
+        );
+        let roots = SessionRoots {
+            worktrees: Some(worktrees),
+            ..SessionRoots::default()
+        };
+        manager
+            .archive_session("unrestorable-session", &roots)
+            .await
+            .unwrap();
+        // Delete the branch out from under the archive, so the worktree can no
+        // longer be recreated.
+        git(&repository, &["branch", "-D", "gcabb/doomed-restore"]);
+
+        let error = manager
+            .unarchive_session("unrestorable-session")
+            .await
+            .expect_err("rebuilding from a deleted branch must fail");
+
+        assert!(matches!(
+            error,
+            SessionManagerError::ArchiveRestoreFailed { .. }
+        ));
+        let archived = storage.list_archived_sessions().unwrap();
+        assert_eq!(archived.len(), 1, "a failed restore consumed the archive");
+        assert!(
+            archived[0]
+                .archive
+                .patch
+                .as_deref()
+                .is_some_and(|patch| patch.contains("precious")),
+            "the only copy of the uncommitted work was discarded"
+        );
+    }
+
+    #[tokio::test]
+    async fn archiving_a_chat_only_hides_it() {
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let metadata = SessionMetadata {
+            id: "chat-session".to_owned(),
+            sdk_session_id: "sdk-chat".to_owned(),
+            project_path: "/tmp".to_owned(),
+            repository_root: None,
+            title: "A chat".to_owned(),
+            title_source: TitleSource::Manual,
+            kind: SessionKind::Chat,
+            model: None,
+            mode: None,
+            base_ref: None,
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+        };
+        storage.upsert_session(&metadata).unwrap();
+        let manager = SessionManager::new(
+            Arc::new(FakeProvider::default()),
+            storage.clone(),
+            Arc::new(MemoryDiagnostics::default()),
+        );
+
+        let archival = manager
+            .archive_session("chat-session", &SessionRoots::default())
+            .await
+            .unwrap();
+
+        assert!(archival.worktree.is_none());
+        assert!(storage.list_sessions().unwrap().is_empty());
+
+        manager.unarchive_session("chat-session").await.unwrap();
+
+        assert_eq!(storage.list_sessions().unwrap().len(), 1);
+    }
+
+    /// Deleting an archived session must still work, and must take its archive
+    /// record with it rather than orphaning a patch.
+    #[tokio::test]
+    async fn deleting_an_archived_session_clears_its_archive() {
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let metadata = SessionMetadata {
+            id: "doomed-session".to_owned(),
+            sdk_session_id: "sdk-doomed".to_owned(),
+            project_path: "/tmp".to_owned(),
+            repository_root: None,
+            title: "Doomed".to_owned(),
+            title_source: TitleSource::Manual,
+            kind: SessionKind::Chat,
+            model: None,
+            mode: None,
+            base_ref: None,
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+        };
+        storage.upsert_session(&metadata).unwrap();
+        let manager = SessionManager::new(
+            Arc::new(FakeProvider::default()),
+            storage.clone(),
+            Arc::new(MemoryDiagnostics::default()),
+        );
+        manager
+            .archive_session("doomed-session", &SessionRoots::default())
+            .await
+            .unwrap();
+
+        manager
+            .delete_session("doomed-session", &SessionRoots::default())
+            .await
+            .unwrap();
+
+        assert!(storage.list_archived_sessions().unwrap().is_empty());
+        assert!(!storage.session_exists("doomed-session").unwrap());
     }
 
     #[tokio::test]
