@@ -7508,20 +7508,42 @@ impl SessionMvpView {
 
     /// Running state at the conversation tail, where the user is already
     /// watching for the next activity.
+    ///
+    /// One row carries everything about the running turn: the spinner, the
+    /// elapsed time, and what the agent is currently doing.
     fn running_indicator(&self) -> Option<impl IntoElement + use<>> {
         let session = self.selected()?;
-        let running_since = session.running_since?;
-        if !session_is_running(session.snapshot.status) {
+        if !matches!(
+            session.snapshot.status,
+            SessionStatus::Running | SessionStatus::Starting
+        ) {
             return None;
         }
-        let elapsed = running_since.elapsed().as_secs();
+        let elapsed = session
+            .snapshot
+            .diagnostics
+            .turn_started_at
+            .as_deref()
+            .and_then(elapsed_since_timestamp)
+            .or_else(|| self.running_since.get(session.id()).map(Instant::elapsed))
+            .or_else(|| session.running_since.map(|since| since.elapsed()))
+            .unwrap_or_default();
+        let diagnostics = &session.snapshot.diagnostics;
+        let label = diagnostics
+            .latest_intent
+            .as_ref()
+            .or(diagnostics.activity.as_ref())
+            .map_or("Agent is working", String::as_str)
+            .to_owned();
+        let elapsed_label = format_elapsed(elapsed);
+
         Some(
             div()
-                .id("running-indicator")
-                .debug_selector(|| "running-indicator".to_owned())
+                .id("running-activity")
+                .debug_selector(|| "running-activity".to_owned())
                 .accessibility_id("running-indicator")
                 .role(Role::Status)
-                .aria_label(format!("Agent running, {elapsed} seconds"))
+                .aria_label(format!("{label}, {elapsed_label}"))
                 .mx_auto()
                 .w_full()
                 .max_w(px(CONVERSATION_COLUMN_WIDTH))
@@ -7532,8 +7554,27 @@ impl SessionMvpView {
                 .pb_3()
                 .text_xs()
                 .text_color(rgb(MUTED))
-                .child(progress_spinner("running-indicator-spinner".into()))
-                .child(format!("{elapsed}s")),
+                .child(
+                    div()
+                        .id("running-indicator")
+                        .debug_selector(|| "running-indicator".to_owned())
+                        .flex()
+                        .items_center()
+                        .child(progress_spinner("running-indicator-spinner".into())),
+                )
+                .child(
+                    div()
+                        .id("running-elapsed")
+                        .debug_selector(|| "running-elapsed".to_owned())
+                        .text_color(rgb(GREEN))
+                        .child(elapsed_label),
+                )
+                .child(
+                    div()
+                        .id("running-intent")
+                        .debug_selector(|| "running-intent".to_owned())
+                        .child(label),
+                ),
         )
     }
 
@@ -8390,66 +8431,6 @@ impl SessionMvpView {
                 )
             })
             .into_any_element()
-    }
-
-    fn running_activity(&self) -> Option<impl IntoElement> {
-        let session = self.selected()?;
-        if !matches!(
-            session.snapshot.status,
-            SessionStatus::Running | SessionStatus::Starting
-        ) {
-            return None;
-        }
-        let elapsed = self
-            .selected()
-            .and_then(|session| {
-                session
-                    .snapshot
-                    .diagnostics
-                    .turn_started_at
-                    .as_deref()
-                    .and_then(elapsed_since_timestamp)
-            })
-            .or_else(|| self.running_since.get(session.id()).map(Instant::elapsed))
-            .unwrap_or_default();
-        let diagnostics = &session.snapshot.diagnostics;
-        let label = diagnostics
-            .latest_intent
-            .as_ref()
-            .or(diagnostics.activity.as_ref())
-            .map_or("Agent is working", String::as_str);
-
-        Some(
-            div()
-                .id("running-activity")
-                .debug_selector(|| "running-activity".to_owned())
-                .role(Role::Status)
-                .aria_label(label)
-                .mx_auto()
-                .w_full()
-                .max_w(px(CONVERSATION_COLUMN_WIDTH))
-                .px_3()
-                .pb_2()
-                .flex()
-                .items_center()
-                .gap_2()
-                .text_xs()
-                .text_color(rgb(MUTED))
-                .child(div().w(px(6.0)).h(px(6.0)).rounded_full().bg(rgb(GREEN)))
-                .child(
-                    div()
-                        .id("running-elapsed")
-                        .debug_selector(|| "running-elapsed".to_owned())
-                        .text_color(rgb(GREEN))
-                        .child(format_elapsed(elapsed)),
-                )
-                .child(
-                    div()
-                        .id("running-intent")
-                        .debug_selector(|| "running-intent".to_owned())
-                        .child(label.to_owned()),
-                ),
-        )
     }
 
     #[allow(clippy::too_many_lines)]
@@ -9843,10 +9824,6 @@ impl Render for SessionMvpView {
                                         .min_w_0()
                                         .min_h_0()
                                         .child(self.transcript(cx))
-                                        .when_some(
-                                            self.running_activity(),
-                                            gpui::ParentElement::child,
-                                        )
                                         .when_some(session_error, |column, error| {
                                             column.child(
                                                 div()
