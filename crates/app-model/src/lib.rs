@@ -1153,6 +1153,50 @@ fn status_for_event(event: &DomainEvent) -> Option<SessionStatus> {
     }
 }
 
+/// Whether a `user.message` is the runtime injecting a loaded skill rather than
+/// something the user wrote.
+///
+/// The runtime replays a skill's `SKILL.md` into the conversation as a user
+/// turn tagged `skill-<name>`. Rendering it as a user-authored message
+/// misattributes it and dumps a large internal context block into the
+/// transcript, so the timeline shows the `skill` tool call instead.
+fn is_skill_injection(event: &DomainEvent) -> bool {
+    event
+        .details
+        .get("source")
+        .and_then(Value::as_str)
+        .is_some_and(|source| source.starts_with("skill-"))
+}
+
+fn project_user_message(transcript: &mut Vec<TranscriptMessage>, event: &DomainEvent) {
+    if is_skill_injection(event) {
+        return;
+    }
+    let content = event
+        .details
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let attachments = message_attachments(event);
+    // A screenshot on its own is a complete message, so an empty body
+    // is only uninteresting when nothing came with it.
+    if !content.is_empty() || !attachments.is_empty() {
+        transcript.push(TranscriptMessage {
+            id: event.id.clone(),
+            role: TranscriptRole::User,
+            content: content.to_owned(),
+            state: if event.details.get("delivery").and_then(Value::as_str) == Some("steering") {
+                TranscriptState::Pending
+            } else {
+                TranscriptState::Complete
+            },
+            timestamp: event.timestamp.clone(),
+            sequence: event.sequence,
+            attachments,
+        });
+    }
+}
+
 fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEvent) {
     if event.agent_id.is_some()
         || event
@@ -1170,33 +1214,7 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                 message.state = TranscriptState::Complete;
             }
         }
-        "user.message" => {
-            let content = event
-                .details
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let attachments = message_attachments(event);
-            // A screenshot on its own is a complete message, so an empty body
-            // is only uninteresting when nothing came with it.
-            if !content.is_empty() || !attachments.is_empty() {
-                transcript.push(TranscriptMessage {
-                    id: event.id.clone(),
-                    role: TranscriptRole::User,
-                    content: content.to_owned(),
-                    state: if event.details.get("delivery").and_then(Value::as_str)
-                        == Some("steering")
-                    {
-                        TranscriptState::Pending
-                    } else {
-                        TranscriptState::Complete
-                    },
-                    timestamp: event.timestamp.clone(),
-                    sequence: event.sequence,
-                    attachments,
-                });
-            }
-        }
+        "user.message" => project_user_message(transcript, event),
         "assistant.message_start" => {
             let id = message_id(event);
             if !transcript.iter().any(|message| message.id == id) {
@@ -2346,6 +2364,46 @@ mod tests {
         assert_eq!(edit.verb(), "Edit");
         assert_eq!(edit.summary(), "src/lib.rs");
         assert!(edit.diff().is_some_and(|diff| diff.contains("+new")));
+    }
+
+    /// Loading a skill injects the skill file as a `user.message`. Rendering it
+    /// as something the user typed misattributes it and dumps the whole skill
+    /// into the transcript, so only the tool call should appear.
+    #[test]
+    fn injected_skill_context_stays_out_of_the_transcript() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"u","type":"user.message","data":{"content":"open a pull request"}}),
+                json!({"id":"t","type":"tool.execution_start",
+                       "data":{"toolCallId":"c1","toolName":"skill",
+                               "arguments":{"skill":"create-pr"}}}),
+                json!({"id":"inject","type":"user.message","data":{
+                    "content":"<skill-context name=\"create-pr\">\nBase directory…",
+                    "source":"skill-create-pr"
+                }}),
+                json!({"id":"tc","type":"tool.execution_complete",
+                       "data":{"toolCallId":"c1","success":true}}),
+            ],
+        );
+
+        let user_messages: Vec<&str> = state
+            .transcript
+            .iter()
+            .filter(|message| message.role == TranscriptRole::User)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(user_messages, ["open a pull request"]);
+
+        // The skill still shows up, as the tool activity that loaded it.
+        let TimelineEntry::Tool(skill) = state.timeline()[1] else {
+            panic!("expected a tool entry");
+        };
+        assert_eq!(
+            format!("{} {}", skill.verb(), skill.summary_line()),
+            "Reading skill create-pr"
+        );
     }
 
     /// A multi-line command must not become a multi-line header; it filled the
