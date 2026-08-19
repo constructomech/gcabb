@@ -14,6 +14,9 @@ use github_copilot_sdk::handler::{
     ExitPlanModeResult, UserInputHandler, UserInputResponse,
 };
 use github_copilot_sdk::hooks::{HookEvent, HookOutput, SessionHooks};
+use github_copilot_sdk::rpc::{
+    AgentsDiscoverRequest, InstructionsDiscoverRequest, SkillsDiscoverRequest,
+};
 use github_copilot_sdk::session::Session;
 use github_copilot_sdk::tool::ToolHandler;
 use github_copilot_sdk::{
@@ -227,6 +230,56 @@ fn record_sdk_event(recorder: &Recorder, event: &github_copilot_sdk::SessionEven
     recorder.write("domain.normalized", DomainEvent::from_sdk_event(&raw))
 }
 
+async fn exercise_workspace_discovery(
+    client: &Client,
+    cwd: &Path,
+    recorder: &Recorder,
+) -> Result<()> {
+    let project_paths = Some(vec![cwd.to_string_lossy().into_owned()]);
+    let started = Instant::now();
+    record_rpc(
+        recorder,
+        "rpc.agents.discover",
+        started,
+        client
+            .rpc()
+            .agents()
+            .discover(AgentsDiscoverRequest {
+                exclude_host_agents: None,
+                project_paths: project_paths.clone(),
+            })
+            .await,
+    )?;
+    let started = Instant::now();
+    record_rpc(
+        recorder,
+        "rpc.skills.discover",
+        started,
+        client
+            .rpc()
+            .skills()
+            .discover(SkillsDiscoverRequest {
+                exclude_host_skills: None,
+                project_paths: project_paths.clone(),
+                skill_directories: None,
+            })
+            .await,
+    )?;
+    let started = Instant::now();
+    record_rpc(
+        recorder,
+        "rpc.instructions.discover",
+        started,
+        client
+            .rpc()
+            .instructions()
+            .discover(InstructionsDiscoverRequest {
+                exclude_host_instructions: None,
+                project_paths,
+            })
+            .await,
+    )
+}
 async fn exercise_read_only_rpcs(session: &Session, recorder: &Recorder) -> Result<()> {
     let started = Instant::now();
     record_rpc(
@@ -607,6 +660,7 @@ async fn main() -> Result<()> {
     )?;
 
     let client = start_client(&cwd, &recorder).await?;
+    exercise_workspace_discovery(&client, &cwd, &recorder).await?;
     let session = open_session(&client, &args, &cwd, &recorder).await?;
     recorder.write(
         "session.ready",

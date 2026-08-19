@@ -6,8 +6,9 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    ContextWindowOption, InteractionKind, InteractionRequest, InteractionResponse, ModelOption,
-    PromptAttachment, SessionControls, ToolCatalog, ToolClass, ToolDescriptor, ToolSource,
+    AgentOption, ContextWindowOption, InteractionKind, InteractionRequest, InteractionResponse,
+    ModelOption, PromptAttachment, SessionControls, ToolCatalog, ToolClass, ToolDescriptor,
+    ToolSource, WorkspaceConfiguration, WorkspaceResource,
 };
 use async_trait::async_trait;
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
@@ -16,6 +17,7 @@ use github_copilot_sdk::handler::{
     ExitPlanModeResult, PermissionHandler, PermissionResult, UserInputHandler, UserInputResponse,
 };
 use github_copilot_sdk::rpc::{
+    AgentInfo, AgentSelectRequest, AgentsDiscoverRequest, InstructionsDiscoverRequest,
     PermissionDecision, PermissionDecisionApproveForLocation,
     PermissionDecisionApproveForLocationApproval,
     PermissionDecisionApproveForLocationApprovalCommands,
@@ -24,7 +26,7 @@ use github_copilot_sdk::rpc::{
     PermissionDecisionApproveForSession, PermissionDecisionApproveForSessionApproval,
     PermissionDecisionApproveForSessionApprovalCommands,
     PermissionDecisionApproveForSessionApprovalRead,
-    PermissionDecisionApproveForSessionApprovalWrite, ToolsListRequest,
+    PermissionDecisionApproveForSessionApprovalWrite, SkillsDiscoverRequest, ToolsListRequest,
 };
 use github_copilot_sdk::session::Session;
 use github_copilot_sdk::{
@@ -136,8 +138,15 @@ pub trait AgentProvider: Send + Sync {
         context_tier: Option<&str>,
     ) -> Result<()>;
     async fn set_mode(&self, sdk_session_id: &str, mode: &str) -> Result<()>;
+    async fn set_agent(&self, sdk_session_id: &str, agent: Option<&str>) -> Result<()>;
     async fn set_reasoning_effort(&self, sdk_session_id: &str, effort: &str) -> Result<()>;
     async fn disconnect(&self, sdk_session_id: &str) -> Result<()>;
+    /// Discover user and project custom agents. The full result includes
+    /// subagent-only entries because the runtime uses them as its delegation roster.
+    async fn discover_configuration(
+        &self,
+        project_paths: &[PathBuf],
+    ) -> Result<WorkspaceConfiguration>;
     /// Discover the tools the runtime advertises for `model`.
     ///
     /// Phase 3 requires proving inherited capabilities through the SDK rather
@@ -367,6 +376,7 @@ pub struct CopilotProvider {
     root: PathBuf,
     client: Mutex<Option<Client>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
+    selected_agents: Mutex<HashMap<String, Option<String>>>,
     diagnostics: Arc<dyn DiagnosticsSink>,
 }
 
@@ -377,6 +387,7 @@ impl CopilotProvider {
             root: root.into(),
             client: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
+            selected_agents: Mutex::new(HashMap::new()),
             diagnostics,
         }
     }
@@ -439,6 +450,10 @@ impl CopilotProvider {
             .lock()
             .await
             .insert(sdk_session_id.clone(), session);
+        self.selected_agents
+            .lock()
+            .await
+            .insert(sdk_session_id.clone(), None);
         ProviderSession {
             sdk_session_id,
             events: event_rx,
@@ -450,6 +465,8 @@ impl CopilotProvider {
         let mut config = SessionConfig::default()
             .with_working_directory(&request.working_directory)
             .with_client_name("gcabb")
+            .with_enable_config_discovery(true)
+            .with_enable_on_demand_instruction_discovery(true)
             .with_enable_skills(true)
             .with_permission_handler(broker.clone())
             .with_elicitation_handler(broker.clone())
@@ -473,6 +490,8 @@ impl CopilotProvider {
         let mut config = ResumeSessionConfig::new(sdk_session_id.into())
             .with_working_directory(&request.working_directory)
             .with_client_name("gcabb")
+            .with_enable_config_discovery(true)
+            .with_enable_on_demand_instruction_discovery(true)
             .with_enable_skills(true)
             .with_permission_handler(broker.clone())
             .with_elicitation_handler(broker.clone())
@@ -553,6 +572,7 @@ impl AgentProvider for CopilotProvider {
                 .map(|(_, session)| session)
                 .collect::<Vec<_>>()
         };
+        self.selected_agents.lock().await.clear();
         let mut errors = Vec::new();
         for session in sessions {
             if let Err(error) = session.disconnect().await {
@@ -686,14 +706,29 @@ impl AgentProvider for CopilotProvider {
             .list()
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        let agents = session
+            .rpc()
+            .agent()
+            .list()
+            .await
+            .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        let agent = self
+            .selected_agents
+            .lock()
+            .await
+            .get(sdk_session_id)
+            .cloned()
+            .flatten();
         Ok(SessionControls {
             model: current.model_id,
             mode: serde_json::to_value(mode)
                 .ok()
                 .and_then(|value| value.as_str().map(str::to_owned)),
+            agent,
             reasoning_effort: current.reasoning_effort,
             context_tier: current.context_tier.as_ref().and_then(context_tier_id),
             available_models: models.list.iter().filter_map(model_option).collect(),
+            available_agents: agents.agents.iter().map(agent_option).collect(),
         })
     }
 
@@ -741,6 +776,33 @@ impl AgentProvider for CopilotProvider {
             .map_err(|error| ProviderError::Sdk(error.to_string()))
     }
 
+    async fn set_agent(&self, sdk_session_id: &str, agent: Option<&str>) -> Result<()> {
+        let session = self.session(sdk_session_id).await?;
+        match agent {
+            Some(agent) => {
+                session
+                    .rpc()
+                    .agent()
+                    .select(AgentSelectRequest {
+                        name: agent.to_owned(),
+                    })
+                    .await
+                    .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+            }
+            None => session
+                .rpc()
+                .agent()
+                .deselect()
+                .await
+                .map_err(|error| ProviderError::Sdk(error.to_string()))?,
+        }
+        self.selected_agents
+            .lock()
+            .await
+            .insert(sdk_session_id.to_owned(), agent.map(str::to_owned));
+        Ok(())
+    }
+
     async fn set_reasoning_effort(&self, sdk_session_id: &str, effort: &str) -> Result<()> {
         self.session(sdk_session_id)
             .await?
@@ -764,9 +826,66 @@ impl AgentProvider for CopilotProvider {
         session
             .disconnect()
             .await
-            .map_err(|error| ProviderError::Sdk(error.to_string()))
+            .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        self.selected_agents.lock().await.remove(sdk_session_id);
+        Ok(())
     }
 
+    async fn discover_configuration(
+        &self,
+        project_paths: &[PathBuf],
+    ) -> Result<WorkspaceConfiguration> {
+        let client = self.client().await?;
+        let project_paths = (!project_paths.is_empty()).then(|| {
+            project_paths
+                .iter()
+                .map(|path| path.to_string_lossy().into_owned())
+                .collect::<Vec<_>>()
+        });
+        let rpc = client.rpc();
+        let agents_rpc = rpc.agents();
+        let skills_rpc = rpc.skills();
+        let instructions_rpc = rpc.instructions();
+        let (agents, skills, instructions) = tokio::try_join!(
+            agents_rpc.discover(AgentsDiscoverRequest {
+                exclude_host_agents: None,
+                project_paths: project_paths.clone(),
+            }),
+            skills_rpc.discover(SkillsDiscoverRequest {
+                exclude_host_skills: None,
+                project_paths: project_paths.clone(),
+                skill_directories: None,
+            }),
+            instructions_rpc.discover(InstructionsDiscoverRequest {
+                exclude_host_instructions: None,
+                project_paths,
+            }),
+        )
+        .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        Ok(WorkspaceConfiguration {
+            agents: agents.agents.iter().map(agent_option).collect(),
+            skills: skills
+                .skills
+                .iter()
+                .filter(|skill| skill.enabled)
+                .map(|skill| WorkspaceResource {
+                    name: skill.name.clone(),
+                    description: skill.description.clone(),
+                    path: skill.path.clone(),
+                })
+                .collect(),
+            instructions: instructions
+                .sources
+                .iter()
+                .map(|instruction| WorkspaceResource {
+                    name: instruction.label.clone(),
+                    description: instruction.description.clone().unwrap_or_default(),
+                    path: Some(instruction.source_path.clone()),
+                })
+                .collect(),
+            errors: skills.errors.unwrap_or_default(),
+        })
+    }
     async fn discover_tools(&self, model: Option<&str>) -> Result<ToolCatalog> {
         let started = Instant::now();
         let request = ToolsListRequest {
@@ -1217,6 +1336,20 @@ fn model_option(value: &Value) -> Option<ModelOption> {
         supported_reasoning_efforts,
         context_windows: json_context_windows(value),
     })
+}
+
+fn agent_option(agent: &AgentInfo) -> AgentOption {
+    AgentOption {
+        id: agent.id.clone(),
+        name: if agent.display_name.is_empty() {
+            agent.name.clone()
+        } else {
+            agent.display_name.clone()
+        },
+        description: agent.description.clone(),
+        model: agent.model.clone(),
+        user_invocable: agent.user_invocable,
+    }
 }
 
 /// Builds the selectable context-window tiers for a model. The default tier is
@@ -1696,7 +1829,6 @@ mod tests {
         assert!(permission_for_session(&request).is_none());
         assert!(permission_for_location(&request, "C:/worktree").is_none());
     }
-
     #[test]
     fn url_permissions_normalise_the_domain() {
         let domain = |url: &str| {

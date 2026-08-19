@@ -110,6 +110,7 @@ pub struct CreateSessionRequest {
     pub title_source: TitleSource,
     pub model: Option<String>,
     pub mode: Option<String>,
+    pub agent: Option<String>,
     pub reasoning_effort: Option<String>,
     pub context_tier: Option<String>,
     /// Git ref the changes view compares against, e.g. `main`.
@@ -298,6 +299,10 @@ impl SessionHandle {
         self.control(SessionControlCommand::Mode(mode.into())).await
     }
 
+    pub async fn set_agent(&self, agent: Option<String>) -> Result<()> {
+        self.control(SessionControlCommand::Agent(agent)).await
+    }
+
     pub async fn set_reasoning_effort(&self, effort: impl Into<String>) -> Result<()> {
         self.control(SessionControlCommand::ReasoningEffort(effort.into()))
             .await
@@ -459,6 +464,44 @@ impl SessionManager {
         Ok(())
     }
 
+    pub async fn discover_configuration(
+        &self,
+        project_paths: &[PathBuf],
+    ) -> Result<app_model::WorkspaceConfiguration> {
+        self.provider
+            .discover_configuration(project_paths)
+            .await
+            .map_err(Into::into)
+    }
+
+    pub fn configuration_roots(&self) -> Result<Vec<String>> {
+        self.storage.configuration_roots().map_err(Into::into)
+    }
+
+    pub fn add_configuration_root(&self, root: &Path) -> Result<Vec<String>> {
+        let root = root.to_string_lossy().into_owned();
+        let mut roots = self.storage.configuration_roots()?;
+        if !roots.iter().any(|existing| existing.eq_ignore_ascii_case(&root)) {
+            roots.push(root);
+            self.storage.set_configuration_roots(&roots)?;
+        }
+        Ok(roots)
+    }
+    async fn select_agent_or_disconnect(
+        &self,
+        sdk_session_id: &str,
+        agent: Option<&str>,
+    ) -> Result<()> {
+        let Some(agent) = agent else {
+            return Ok(());
+        };
+        if let Err(error) = self.provider.set_agent(sdk_session_id, Some(agent)).await {
+            let _ = self.provider.disconnect(sdk_session_id).await;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionHandle> {
         let auto_approve_tools = is_gcabb_worktree(
             request.kind,
@@ -475,6 +518,8 @@ impl SessionManager {
                 context_tier: request.context_tier.clone(),
                 auto_approve_tools,
             })
+            .await?;
+        self.select_agent_or_disconnect(&provider_session.sdk_session_id, request.agent.as_deref())
             .await?;
         let controls = match self
             .provider
@@ -513,6 +558,9 @@ impl SessionManager {
         }
         if request.context_tier.is_some() {
             state.controls.context_tier = request.context_tier;
+        }
+        if request.agent.is_some() {
+            state.controls.agent = request.agent;
         }
         // Prove inherited tool capabilities through the SDK before the first
         // prompt, so a runtime that is missing file or shell tools is visible
@@ -933,6 +981,8 @@ impl SessionManager {
                 },
             )
             .await?;
+        self.select_agent_or_disconnect(&metadata.sdk_session_id, state.controls.agent.as_deref())
+            .await?;
         let resume_ms = elapsed_ms(resume_started);
         let history_started = Instant::now();
         let history = match self.provider.history(&metadata.sdk_session_id).await {
@@ -1111,6 +1161,7 @@ enum SessionControlCommand {
         context_tier: Option<String>,
     },
     Mode(String),
+    Agent(Option<String>),
     ReasoningEffort(String),
     ContextTier(String),
 }
@@ -1383,6 +1434,12 @@ impl SessionActor {
                 self.provider.set_mode(&self.sdk_session_id, &mode).await?;
                 self.state.controls.mode = Some(mode.clone());
                 self.state.metadata.mode = Some(mode);
+            }
+            SessionControlCommand::Agent(agent) => {
+                self.provider
+                    .set_agent(&self.sdk_session_id, agent.as_deref())
+                    .await?;
+                self.state.controls.agent = agent;
             }
             SessionControlCommand::ReasoningEffort(effort) => {
                 self.provider
@@ -1709,6 +1766,7 @@ mod tests {
             kind: SessionKind::Project,
             model: None,
             mode: Some("interactive".to_owned()),
+            agent: None,
             reasoning_effort: Some("medium".to_owned()),
             context_tier: None,
             base_ref: None,
@@ -2118,7 +2176,7 @@ mod tests {
         let provider = Arc::new(FakeProvider::default());
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let diagnostics = Arc::new(MemoryDiagnostics::default());
-        let manager = SessionManager::new(provider, storage.clone(), diagnostics);
+        let manager = SessionManager::new(provider.clone(), storage.clone(), diagnostics);
         manager.start().await.unwrap();
         let handle = manager
             .create_session(request(std::env::temp_dir()))
@@ -2127,6 +2185,10 @@ mod tests {
 
         handle.set_model("model-1").await.unwrap();
         handle.set_mode("plan").await.unwrap();
+        handle
+            .set_agent(Some("code-reviewer".to_owned()))
+            .await
+            .unwrap();
         handle.set_reasoning_effort("high").await.unwrap();
         handle
             .set_model_with_reasoning_effort("model-2", Some("medium".to_owned()))
@@ -2136,6 +2198,14 @@ mod tests {
         let snapshot = handle.snapshot();
         assert_eq!(snapshot.controls.model.as_deref(), Some("model-2"));
         assert_eq!(snapshot.controls.mode.as_deref(), Some("plan"));
+        assert_eq!(snapshot.controls.agent.as_deref(), Some("code-reviewer"));
+        assert_eq!(
+            provider
+                .selected_agent(&snapshot.metadata.sdk_session_id)
+                .await
+                .as_deref(),
+            Some("code-reviewer")
+        );
         assert_eq!(
             snapshot.controls.reasoning_effort.as_deref(),
             Some("medium")

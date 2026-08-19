@@ -5,14 +5,15 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use app_model::{
-    DomainEvent, OutputMetadata, OutputStreamKind, OutputStreamUpdate, ProjectMetadata,
-    SessionKind, SessionMetadata, SessionSnapshot, TitleSource, ToolActivity, rebuild,
+    Automation, AutomationRun, DomainEvent, OutputMetadata, OutputStreamKind, OutputStreamUpdate,
+    ProjectMetadata, SessionKind, SessionMetadata, SessionSnapshot, TitleSource, ToolActivity,
+    rebuild,
 };
 use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 /// Initial restored output window. Older chunks stay in `SQLite` and can be
 /// prepended through `read_output` without inflating every restored snapshot.
 pub const RESTORED_OUTPUT_CHUNKS: u64 = 64;
@@ -229,6 +230,29 @@ impl Storage {
         Ok(())
     }
 
+    pub fn set_configuration_roots(&self, roots: &[String]) -> Result<()> {
+        let value = serde_json::to_string(roots)?;
+        self.connection()?.execute(
+            "INSERT INTO app_state (key, value) VALUES ('configuration_roots', ?1)
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            [value],
+        )?;
+        Ok(())
+    }
+
+    pub fn configuration_roots(&self) -> Result<Vec<String>> {
+        self.connection()?
+            .query_row(
+                "SELECT value FROM app_state WHERE key = 'configuration_roots'",
+                [],
+                |row| row.get::<_, String>(0),
+            )
+            .optional()?
+            .map_or_else(
+                || Ok(Vec::new()),
+                |value| serde_json::from_str(&value).map_err(Into::into),
+            )
+    }
     pub fn selected_session(&self) -> Result<Option<String>> {
         self.connection()?
             .query_row(
@@ -249,6 +273,101 @@ impl Storage {
         let rows = statement.query_map([], metadata_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
             .map_err(Into::into)
+    }
+
+    pub fn upsert_automation(&self, automation: &Automation) -> Result<()> {
+        let payload = serde_json::to_string(automation)?;
+        self.connection()?.execute(
+            "INSERT INTO automations (id, name, enabled, next_run_at, updated_at, payload)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)
+             ON CONFLICT(id) DO UPDATE SET
+                name = excluded.name,
+                enabled = excluded.enabled,
+                next_run_at = excluded.next_run_at,
+                updated_at = excluded.updated_at,
+                payload = excluded.payload",
+            params![
+                automation.id,
+                automation.name,
+                automation.enabled,
+                automation.next_run_at,
+                automation.updated_at,
+                payload
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_automations(&self) -> Result<Vec<Automation>> {
+        self.read_automations(
+            "SELECT payload FROM automations ORDER BY updated_at DESC, name COLLATE NOCASE",
+            [],
+        )
+    }
+
+    pub fn due_automations(&self, now: &str) -> Result<Vec<Automation>> {
+        self.read_automations(
+            "SELECT payload FROM automations
+             WHERE enabled = 1 AND next_run_at IS NOT NULL AND next_run_at <= ?1
+             ORDER BY next_run_at, id",
+            [now],
+        )
+    }
+
+    pub fn delete_automation(&self, automation_id: &str) -> Result<()> {
+        self.connection()?
+            .execute("DELETE FROM automations WHERE id = ?1", [automation_id])?;
+        Ok(())
+    }
+
+    pub fn upsert_automation_run(&self, run: &AutomationRun) -> Result<()> {
+        let payload = serde_json::to_string(run)?;
+        self.connection()?.execute(
+            "INSERT INTO automation_runs (
+                id, automation_id, started_at, status, payload
+             ) VALUES (?1, ?2, ?3, ?4, ?5)
+             ON CONFLICT(id) DO UPDATE SET
+                status = excluded.status,
+                payload = excluded.payload",
+            params![
+                run.id,
+                run.automation_id,
+                run.started_at,
+                run.status.as_str(),
+                payload
+            ],
+        )?;
+        Ok(())
+    }
+
+    pub fn list_automation_runs(&self, limit: u32) -> Result<Vec<AutomationRun>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT payload FROM automation_runs
+             ORDER BY started_at DESC, id DESC LIMIT ?1",
+        )?;
+        let payloads = statement
+            .query_map([limit], |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        payloads
+            .into_iter()
+            .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
+            .collect()
+    }
+
+    fn read_automations<P>(&self, query: &str, params: P) -> Result<Vec<Automation>>
+    where
+        P: rusqlite::Params,
+    {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(query)?;
+        let payloads = statement
+            .query_map(params, |row| row.get::<_, String>(0))?
+            .collect::<std::result::Result<Vec<_>, _>>()?;
+        payloads
+            .into_iter()
+            .map(|payload| serde_json::from_str(&payload).map_err(Into::into))
+            .collect()
     }
 
     pub fn append_event(&self, event: &DomainEvent) -> Result<bool> {
@@ -599,6 +718,28 @@ impl Storage {
                 session_id TEXT,
                 success INTEGER NOT NULL,
                 details TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS automations (
+                id TEXT PRIMARY KEY,
+                name TEXT NOT NULL,
+                enabled INTEGER NOT NULL,
+                next_run_at TEXT,
+                updated_at TEXT NOT NULL,
+                payload TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS automations_due
+                ON automations(enabled, next_run_at);
+             CREATE TABLE IF NOT EXISTS automation_runs (
+                id TEXT PRIMARY KEY,
+                automation_id TEXT NOT NULL,
+                started_at TEXT NOT NULL,
+                status TEXT NOT NULL,
+                payload TEXT NOT NULL
+             );
+             CREATE INDEX IF NOT EXISTS automation_runs_started
+                ON automation_runs(started_at DESC);
+             CREATE INDEX IF NOT EXISTS automation_runs_automation
+                ON automation_runs(automation_id, started_at DESC
              );",
         )?;
         // Databases created before schema version 3 predate the changes view
@@ -814,6 +955,31 @@ mod tests {
             base_ref: Some("main".to_owned()),
             created_at: "1".to_owned(),
             updated_at: "2".to_owned(),
+        }
+    }
+
+    fn automation() -> Automation {
+        Automation {
+            id: "automation-1".to_owned(),
+            name: "Weekly maintenance".to_owned(),
+            schedule_description: "Every Wednesday at 2:00 PM".to_owned(),
+            schedule: app_model::AutomationSchedule::Weekly {
+                weekdays: vec![app_model::ScheduleWeekday::Wednesday],
+                minute_of_day: 14 * 60,
+            },
+            condition: Some("the repository has open pull requests".to_owned()),
+            instructions: "Summarize the open pull requests.".to_owned(),
+            model: Some("gpt-5".to_owned()),
+            agent: Some("reviewer".to_owned()),
+            mode: "autopilot".to_owned(),
+            reasoning_effort: Some("medium".to_owned()),
+            context_tier: None,
+            project_path: Some("/tmp/project".to_owned()),
+            enabled: true,
+            next_run_at: Some("2026-08-19T21:00:00Z".to_owned()),
+            last_run_at: None,
+            created_at: "2026-08-14T20:00:00Z".to_owned(),
+            updated_at: "2026-08-14T20:00:00Z".to_owned(),
         }
     }
 
@@ -1450,6 +1616,138 @@ mod tests {
         );
         storage.set_selected_session(None).unwrap();
         assert!(storage.selected_session().unwrap().is_none());
+    }
+
+    #[test]
+    fn automations_and_run_history_round_trip() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut saved = automation();
+        storage.upsert_automation(&saved).unwrap();
+
+        assert_eq!(storage.list_automations().unwrap(), vec![saved.clone()]);
+        assert!(
+            storage
+                .due_automations("2026-08-19T20:59:59Z")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            storage.due_automations("2026-08-19T21:00:00Z").unwrap(),
+            vec![saved.clone()]
+        );
+
+        saved.enabled = false;
+        saved.updated_at = "2026-08-15T00:00:00Z".to_owned();
+        storage.upsert_automation(&saved).unwrap();
+        assert!(
+            storage
+                .due_automations("2026-08-20T00:00:00Z")
+                .unwrap()
+                .is_empty()
+        );
+
+        let run = AutomationRun {
+            id: "run-1".to_owned(),
+            automation_id: saved.id.clone(),
+            automation_name: saved.name.clone(),
+            scheduled_for: "2026-08-19T21:00:00Z".to_owned(),
+            started_at: "2026-08-19T21:00:01Z".to_owned(),
+            finished_at: Some("2026-08-19T21:00:05Z".to_owned()),
+            status: app_model::AutomationRunStatus::Skipped,
+            condition_result: Some(false),
+            output: None,
+            error: None,
+            session_id: Some("session-1".to_owned()),
+        };
+        storage.upsert_automation_run(&run).unwrap();
+        assert_eq!(storage.list_automation_runs(20).unwrap(), vec![run]);
+
+        storage.delete_automation(&saved.id).unwrap();
+        assert!(storage.list_automations().unwrap().is_empty());
+        assert_eq!(storage.list_automation_runs(20).unwrap().len(), 1);
+    }
+
+    #[test]
+    fn automation_updates_replace_payload_and_due_index_fields() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut saved = automation();
+        storage.upsert_automation(&saved).unwrap();
+
+        saved.name = "Updated maintenance".to_owned();
+        saved.condition = None;
+        saved.instructions = "Run the updated task.".to_owned();
+        saved.next_run_at = Some("2026-08-20T08:00:00Z".to_owned());
+        saved.updated_at = "2026-08-15T01:00:00Z".to_owned();
+        storage.upsert_automation(&saved).unwrap();
+
+        assert_eq!(storage.list_automations().unwrap(), vec![saved.clone()]);
+        assert!(
+            storage
+                .due_automations("2026-08-20T07:59:59Z")
+                .unwrap()
+                .is_empty()
+        );
+        assert_eq!(
+            storage.due_automations("2026-08-20T08:00:00Z").unwrap(),
+            vec![saved]
+        );
+    }
+
+    #[test]
+    fn automation_run_updates_and_history_limit_are_respected() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut run = AutomationRun {
+            id: "run-1".to_owned(),
+            automation_id: "automation-1".to_owned(),
+            automation_name: "Maintenance".to_owned(),
+            scheduled_for: "2026-08-19T21:00:00Z".to_owned(),
+            started_at: "2026-08-19T21:00:01Z".to_owned(),
+            finished_at: None,
+            status: app_model::AutomationRunStatus::Running,
+            condition_result: None,
+            output: None,
+            error: None,
+            session_id: Some("session-1".to_owned()),
+        };
+        storage.upsert_automation_run(&run).unwrap();
+        run.finished_at = Some("2026-08-19T21:00:05Z".to_owned());
+        run.status = app_model::AutomationRunStatus::Succeeded;
+        run.condition_result = Some(true);
+        run.output = Some("Completed.".to_owned());
+        storage.upsert_automation_run(&run).unwrap();
+
+        let mut later = run.clone();
+        later.id = "run-2".to_owned();
+        later.started_at = "2026-08-20T21:00:01Z".to_owned();
+        storage.upsert_automation_run(&later).unwrap();
+
+        assert_eq!(storage.list_automation_runs(1).unwrap(), vec![later]);
+        assert_eq!(
+            storage.list_automation_runs(10).unwrap(),
+            vec![
+                AutomationRun {
+                    id: "run-2".to_owned(),
+                    started_at: "2026-08-20T21:00:01Z".to_owned(),
+                    ..run.clone()
+                },
+                run,
+            ]
+        );
+    }
+
+    #[test]
+    fn automation_without_next_run_is_never_due() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut saved = automation();
+        saved.next_run_at = None;
+        storage.upsert_automation(&saved).unwrap();
+
+        assert!(
+            storage
+                .due_automations("9999-12-31T23:59:59Z")
+                .unwrap()
+                .is_empty()
+        );
     }
 
     #[test]

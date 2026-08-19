@@ -26,6 +26,7 @@ async fn real_provider_streams_a_complete_transcript() {
             kind: SessionKind::Project,
             model: None,
             mode: Some("interactive".to_owned()),
+            agent: None,
             reasoning_effort: Some("low".to_owned()),
             context_tier: None,
             base_ref: None,

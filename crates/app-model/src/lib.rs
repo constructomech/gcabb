@@ -4,10 +4,15 @@ use std::sync::Arc;
 use serde::{Deserialize, Serialize};
 use serde_json::Value;
 
+mod automation;
 pub mod capability;
 pub mod changes;
 pub mod tools;
 
+pub use automation::{
+    Automation, AutomationRun, AutomationRunStatus, AutomationSchedule, ScheduleParseError,
+    ScheduleWeekday,
+};
 pub use capability::{Capability, CapabilityId, CapabilityReport, CapabilityStatus};
 pub use changes::{ChangeStage, ChangeStatus, ChangedFile, ChangesView, DiffStats};
 pub use tools::{
@@ -237,12 +242,46 @@ pub enum InteractionResponse {
 pub struct SessionControls {
     pub model: Option<String>,
     pub mode: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub context_tier: Option<String>,
     pub available_models: Vec<ModelOption>,
+    #[serde(default)]
+    pub available_agents: Vec<AgentOption>,
 }
 
+/// A custom agent discovered by the Copilot runtime.
+///
+/// The complete list is kept on the session so subagent-only entries remain in
+/// the delegation roster even though the UI selector filters them out.
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct AgentOption {
+    /// Stable identifier used by the runtime's agent selection API.
+    pub id: String,
+    pub name: String,
+    pub description: String,
+    pub model: Option<String>,
+    /// `false` means the agent may be delegated to but not selected as the
+    /// session's primary agent.
+    pub user_invocable: Option<bool>,
+}
+
+#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceConfiguration {
+    pub agents: Vec<AgentOption>,
+    pub skills: Vec<WorkspaceResource>,
+    pub instructions: Vec<WorkspaceResource>,
+    pub errors: Vec<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct WorkspaceResource {
+    pub name: String,
+    pub description: String,
+    pub path: Option<String>,
+}
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct ModelOption {
     pub id: String,
