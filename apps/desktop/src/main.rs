@@ -8659,12 +8659,7 @@ impl SessionMvpView {
         let supports_reasoning = !self.effort_options().is_empty();
         let context_control = self.context_control(cx);
         let selected = self.selected();
-        let running = selected.is_some_and(|session| {
-            matches!(
-                session.snapshot.status,
-                SessionStatus::Running | SessionStatus::Starting
-            )
-        });
+        let running = selected.is_some_and(|session| session.snapshot.status.is_busy());
         let has_draft =
             !self.composer.read(cx).value().trim().is_empty() || !self.draft_attachments.is_empty();
         let stops_running_session = running && !has_draft;
@@ -11937,6 +11932,31 @@ mod tests {
             let stop = cx
                 .debug_bounds("stop-session")
                 .expect("stop action rendered");
+            cx.simulate_click(stop.center(), Modifiers::none());
+
+            match commands.try_recv().expect("a command was sent") {
+                ServiceCommand::Cancel { app_session_id } => {
+                    assert_eq!(app_session_id, "session-1");
+                }
+                _ => panic!("expected a Cancel command"),
+            }
+        }
+
+        #[gpui::test]
+        fn session_waiting_on_a_request_can_still_be_stopped(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                let mut snapshot = (*view.sessions[0].snapshot).clone();
+                snapshot.status = SessionStatus::Waiting;
+                view.sessions[0].set_snapshot(Arc::new(snapshot));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let stop = cx
+                .debug_bounds("stop-session")
+                .expect("stop action rendered while waiting");
             cx.simulate_click(stop.center(), Modifiers::none());
 
             match commands.try_recv().expect("a command was sent") {

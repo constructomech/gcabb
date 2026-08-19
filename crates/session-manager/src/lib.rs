@@ -1683,10 +1683,15 @@ impl SessionActor {
                             kind: SessionCommandKind::Cancel,
                             response,
                         }) => {
+                            // Resolve outstanding requests first: a session parked on an
+                            // unanswered permission prompt never sees the abort until the
+                            // runtime is unblocked.
+                            self.cancel_pending_interactions();
                             let result = self.provider
                                 .cancel(&self.sdk_session_id)
                                 .await
                                 .map_err(SessionManagerError::from);
+                            self.publish(true);
                             let _ = response.send(result);
                         }
                         Some(SessionCommand::Lifecycle {
@@ -3366,5 +3371,48 @@ mod tests {
         manager.close_session(handle.id()).await.unwrap();
 
         assert_eq!(response.await.unwrap(), InteractionResponse::Cancel);
+    }
+
+    #[tokio::test]
+    async fn cancel_resolves_pending_interaction_callback() {
+        let provider = Arc::new(FakeProvider::default());
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        let diagnostics = Arc::new(MemoryDiagnostics::default());
+        let manager = SessionManager::new(provider.clone(), storage, diagnostics);
+        manager.start().await.unwrap();
+        let handle = manager
+            .create_session(request(std::env::temp_dir()))
+            .await
+            .unwrap();
+        let mut snapshots = handle.subscribe();
+        let sdk_session_id = handle.snapshot().metadata.sdk_session_id.clone();
+        let response = provider
+            .request_interaction(
+                &sdk_session_id,
+                app_model::InteractionRequest {
+                    id: "input-1".to_owned(),
+                    session_id: sdk_session_id.clone(),
+                    kind: app_model::InteractionKind::UserInput,
+                    title: "Input".to_owned(),
+                    message: "Continue?".to_owned(),
+                    choices: Vec::new(),
+                    allow_freeform: true,
+                    details: Value::Null,
+                },
+            )
+            .await
+            .unwrap();
+        snapshots
+            .wait_for(|snapshot| !snapshot.pending_interactions.is_empty())
+            .await
+            .unwrap();
+
+        handle.cancel().await.unwrap();
+
+        assert_eq!(response.await.unwrap(), InteractionResponse::Cancel);
+        snapshots
+            .wait_for(|snapshot| snapshot.pending_interactions.is_empty())
+            .await
+            .unwrap();
     }
 }
