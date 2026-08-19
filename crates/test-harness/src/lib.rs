@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use app_model::{
-    InteractionRequest, InteractionResponse, PromptAttachment, SessionControls,
-    ToolCatalog, ToolClass, ToolDescriptor, ToolSource,
+    InteractionRequest, InteractionResponse, PromptAttachment, SessionControls, ToolCatalog,
+    ToolClass, ToolDescriptor, ToolSource,
 };
 use async_trait::async_trait;
 use copilot_provider::{

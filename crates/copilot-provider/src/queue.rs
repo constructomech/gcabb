@@ -151,9 +151,15 @@ mod tests {
     fn unknown_modes_leave_the_session_mode_in_force() {
         let mut queued = request(QueueDelivery::WhenIdle);
         queued.agent_mode = Some("teleportation".to_owned());
-        assert!(message_options(&queued, DeliveryMode::Enqueue).agent_mode.is_none());
-        assert!(message_options(&request(QueueDelivery::WhenIdle), DeliveryMode::Enqueue)
-            .agent_mode
-            .is_none());
+        assert!(
+            message_options(&queued, DeliveryMode::Enqueue)
+                .agent_mode
+                .is_none()
+        );
+        assert!(
+            message_options(&request(QueueDelivery::WhenIdle), DeliveryMode::Enqueue)
+                .agent_mode
+                .is_none()
+        );
     }
 }

@@ -9,8 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
     ChangeStatus, ChangedFile, ContextWindowOption, InteractionKind, InteractionResponse,
-    OutputStreamKind, ProjectMetadata, PromptAttachment, SessionKind, SessionLocation,
-    SessionMetadata, SessionSnapshot, SessionStatus, TranscriptRole, TranscriptState,
+    OutputStreamKind, ProjectMetadata, PromptAttachment, QueueItemState, SessionKind,
+    SessionLocation, SessionMetadata, SessionSnapshot, SessionStatus, TranscriptRole,
+    TranscriptState,
 };
 use chrono::DateTime;
 use copilot_provider::{CopilotProviderFactory, ProviderCompatibility};
@@ -35,7 +36,9 @@ use session_orchestrator::{
 };
 use storage::Storage;
 use tokio::sync::watch;
-use ui_components::{ImagesPasted, InputSubmitted, PastedImage, TextInput, bind_text_input_keys};
+use ui_components::{
+    ImagesPasted, InputQueued, InputSubmitted, PastedImage, TextInput, bind_text_input_keys,
+};
 use updater::install::InstallLayout;
 use updater::version::BuildStamp;
 
@@ -976,6 +979,24 @@ enum ServiceCommand {
         app_session_id: String,
         force: bool,
     },
+    /// Add a prompt to the end of a session's follow-up queue.
+    EnqueuePrompt {
+        app_session_id: String,
+        prompt: String,
+    },
+    RemoveQueued {
+        app_session_id: String,
+        queue_item_id: String,
+    },
+    /// Reorder a session's follow-ups to the given order.
+    ReorderQueue {
+        app_session_id: String,
+        ordered_ids: Vec<String>,
+    },
+    SetQueuePaused {
+        app_session_id: String,
+        paused: bool,
+    },
     Select {
         app_session_id: Option<String>,
     },
@@ -1468,6 +1489,48 @@ async fn handle_service_command(
                 created = Some(result.handle);
             }
         }
+        ServiceCommand::EnqueuePrompt {
+            app_session_id,
+            prompt,
+        } => {
+            manager
+                .session(&app_session_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .enqueue(prompt)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        ServiceCommand::RemoveQueued {
+            app_session_id,
+            queue_item_id,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .remove_queued(queue_item_id)
+            .await
+            .map_err(|error| error.to_string())?,
+        ServiceCommand::ReorderQueue {
+            app_session_id,
+            ordered_ids,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .reorder_queue(ordered_ids)
+            .await
+            .map_err(|error| error.to_string())?,
+        ServiceCommand::SetQueuePaused {
+            app_session_id,
+            paused,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .set_queue_paused(paused)
+            .await
+            .map_err(|error| error.to_string())?,
         ServiceCommand::Cancel { app_session_id } => manager
             .session(&app_session_id)
             .await
@@ -1928,16 +1991,23 @@ enum SessionPanel {
     Changes,
     Terminals,
     Capabilities,
+    FollowUps,
 }
 
 impl SessionPanel {
-    const ALL: [Self; 3] = [Self::Changes, Self::Terminals, Self::Capabilities];
+    const ALL: [Self; 4] = [
+        Self::Changes,
+        Self::Terminals,
+        Self::Capabilities,
+        Self::FollowUps,
+    ];
 
     const fn label(self) -> &'static str {
         match self {
             Self::Changes => "Changes",
             Self::Terminals => "Terminals",
             Self::Capabilities => "Capabilities",
+            Self::FollowUps => "Follow-ups",
         }
     }
 
@@ -1946,6 +2016,7 @@ impl SessionPanel {
             Self::Changes => "panel-changes",
             Self::Terminals => "panel-terminals",
             Self::Capabilities => "panel-capabilities",
+            Self::FollowUps => "panel-follow-ups",
         }
     }
 }
@@ -2071,6 +2142,8 @@ struct SessionMvpView {
     /// Incomplete prompts keyed by the session they belong to.
     session_drafts: HashMap<String, String>,
     interaction_input: Entity<TextInput>,
+    /// Prompt the developer is adding to the follow-up queue.
+    follow_up_input: Entity<TextInput>,
     draft_mode: String,
     draft_model: Option<String>,
     draft_effort: String,
@@ -2179,6 +2252,14 @@ impl SessionMvpView {
             cx.notify();
         })
         .detach();
+        // Ctrl+Enter lines the prompt up behind the agent's current work
+        // instead of interrupting it, which Enter would do mid-turn.
+        cx.subscribe(&composer, |view, _, event: &InputQueued, cx| {
+            view.submit_follow_up(&event.text, cx);
+            view.composer.update(cx, TextInput::clear);
+            cx.notify();
+        })
+        .detach();
         cx.subscribe(&composer, |view, _, event: &ImagesPasted, cx| {
             view.attach_pasted_images(&event.images, cx);
         })
@@ -2190,6 +2271,12 @@ impl SessionMvpView {
             view.submit_interaction(event.text.clone());
             view.interaction_input.update(cx, TextInput::clear);
             cx.notify();
+        })
+        .detach();
+        let follow_up_input =
+            cx.new(|cx| TextInput::new(cx, "follow-up-input", "Add a follow-up..."));
+        cx.subscribe(&follow_up_input, |view, _, event: &InputSubmitted, cx| {
+            view.submit_follow_up(&event.text, cx);
         })
         .detach();
         let rename_input = cx.new(|cx| TextInput::new(cx, "rename-input", "Session name"));
@@ -2317,6 +2404,7 @@ impl SessionMvpView {
             home_draft: String::new(),
             session_drafts: HashMap::new(),
             interaction_input,
+            follow_up_input,
             draft_mode: "interactive".to_owned(),
             draft_model: None,
             draft_effort: "medium".to_owned(),
@@ -3428,6 +3516,76 @@ impl SessionMvpView {
             .into_iter()
             .map(|reference| (reference.clone(), reference, String::new()))
             .collect()
+    }
+
+    /// Queue a follow-up for the selected session.
+    fn submit_follow_up(&mut self, prompt: &str, cx: &mut Context<Self>) {
+        let prompt = prompt.trim();
+        // An empty prompt would queue a turn with nothing to act on.
+        if prompt.is_empty() {
+            return;
+        }
+        let Some(session) = self.selected() else {
+            return;
+        };
+        let _ = self.commands.send(ServiceCommand::EnqueuePrompt {
+            app_session_id: session.snapshot.metadata.id.clone(),
+            prompt: prompt.to_owned(),
+        });
+        self.follow_up_input.update(cx, TextInput::clear);
+        cx.notify();
+    }
+
+    fn remove_queued(&mut self, session_id: &str, item_id: &str, cx: &mut Context<Self>) {
+        let _ = self.commands.send(ServiceCommand::RemoveQueued {
+            app_session_id: session_id.to_owned(),
+            queue_item_id: item_id.to_owned(),
+        });
+        cx.notify();
+    }
+
+    fn set_queue_paused(&mut self, session_id: &str, paused: bool, cx: &mut Context<Self>) {
+        let _ = self.commands.send(ServiceCommand::SetQueuePaused {
+            app_session_id: session_id.to_owned(),
+            paused,
+        });
+        cx.notify();
+    }
+
+    /// Move a pending follow-up one place earlier or later in the queue.
+    ///
+    /// Only pending items take part: one already handed to the agent has no
+    /// place left in the ordering.
+    fn nudge_queued(
+        &mut self,
+        session_id: &str,
+        item_id: &str,
+        offset: isize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = self.selected().map(|session| session.snapshot.clone()) else {
+            return;
+        };
+        let mut ordered: Vec<String> = snapshot
+            .queue
+            .pending()
+            .map(|item| item.id.clone())
+            .collect();
+        let Some(index) = ordered.iter().position(|id| id == item_id) else {
+            return;
+        };
+        let Some(target) = index.checked_add_signed(offset) else {
+            return;
+        };
+        if target >= ordered.len() {
+            return;
+        }
+        ordered.swap(index, target);
+        let _ = self.commands.send(ServiceCommand::ReorderQueue {
+            app_session_id: session_id.to_owned(),
+            ordered_ids: ordered,
+        });
+        cx.notify();
     }
 
     fn submit_interaction(&mut self, value: String) {
@@ -7920,6 +8078,7 @@ impl SessionMvpView {
             SessionPanel::Changes => self.changes_panel(&snapshot, cx).into_any_element(),
             SessionPanel::Terminals => Self::terminals_panel(&snapshot).into_any_element(),
             SessionPanel::Capabilities => Self::capabilities_panel(&snapshot).into_any_element(),
+            SessionPanel::FollowUps => self.follow_ups_panel(&snapshot, cx).into_any_element(),
         };
 
         Some(
@@ -8622,6 +8781,245 @@ impl SessionMvpView {
             .overflow_hidden()
             .children(cards)
             .into_any_element()
+    }
+
+    /// Reorder and removal controls for a pending follow-up.
+    fn follow_up_controls(
+        session_id: &str,
+        item: &app_model::QueueItem,
+        position: usize,
+        last: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let (up_session, up_id) = (session_id.to_owned(), item.id.clone());
+        let (down_session, down_id) = (session_id.to_owned(), item.id.clone());
+        let (remove_session, remove_id) = (session_id.to_owned(), item.id.clone());
+        div()
+            .flex()
+            .gap_2()
+            .child(
+                div()
+                    .id(SharedString::from(format!("follow-up-up-{}", item.id)))
+                    .accessibility_id("follow-up-up")
+                    .debug_selector({
+                        let id = item.id.clone();
+                        move || format!("follow-up-up-{id}")
+                    })
+                    .aria_label("Move earlier")
+                    .text_xs()
+                    .text_color(rgb(if position == 0 { SUBTLE } else { MUTED }))
+                    .child("up")
+                    .when(position > 0, |button| {
+                        button
+                            .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.nudge_queued(&up_session, &up_id, -1, cx);
+                            }))
+                    }),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("follow-up-down-{}", item.id)))
+                    .accessibility_id("follow-up-down")
+                    .debug_selector({
+                        let id = item.id.clone();
+                        move || format!("follow-up-down-{id}")
+                    })
+                    .aria_label("Move later")
+                    .text_xs()
+                    .text_color(rgb(if position >= last { SUBTLE } else { MUTED }))
+                    .child("down")
+                    .when(position < last, |button| {
+                        button
+                            .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.nudge_queued(&down_session, &down_id, 1, cx);
+                            }))
+                    }),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("follow-up-remove-{}", item.id)))
+                    .accessibility_id("follow-up-remove")
+                    .debug_selector({
+                        let id = item.id.clone();
+                        move || format!("follow-up-remove-{id}")
+                    })
+                    .aria_label("Remove follow-up")
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("remove")
+                    .hover(|style| style.text_color(rgb(RED)).cursor_pointer())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.remove_queued(&remove_session, &remove_id, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// One queued follow-up.
+    ///
+    /// Reordering and removal are offered only while an item is still
+    /// pending: once it has been handed to the agent there is no place left
+    /// in the ordering to move it to.
+    fn follow_up_row(
+        session_id: &str,
+        item: &app_model::QueueItem,
+        position: usize,
+        last: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let state_color = match item.state {
+            QueueItemState::Dispatched => BLUE,
+            QueueItemState::Completed => GREEN,
+            QueueItemState::Failed => RED,
+            QueueItemState::Cancelled => MUTED,
+            QueueItemState::Pending => PRIMARY,
+        };
+        let pending = item.state.is_pending();
+
+        div()
+            .id(SharedString::from(format!("follow-up-{}", item.id)))
+            .role(Role::ListItem)
+            .aria_label(format!("{}: {}", item.summary(80), item.state.label()))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_md()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(if pending { BORDER } else { SUBTLE }))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(rgb(PRIMARY))
+                            .child(item.summary(160)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(state_color))
+                            .child(item.state.label()),
+                    ),
+            )
+            .when(pending, |row| {
+                row.child(Self::follow_up_controls(
+                    session_id, item, position, last, cx,
+                ))
+            })
+            .when_some(item.error.clone(), |row, error| {
+                row.child(div().text_xs().text_color(rgb(RED)).child(error))
+            })
+            .into_any_element()
+    }
+
+    /// How many follow-ups are waiting, and the hold that stops them going out.
+    fn follow_ups_header(
+        session_id: &str,
+        waiting: usize,
+        paused: bool,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let session_id = session_id.to_owned();
+        div()
+            .flex()
+            .justify_between()
+            .child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!("{waiting} waiting")),
+            )
+            .child(
+                div()
+                    .id("follow-ups-hold")
+                    .accessibility_id("follow-ups-hold")
+                    .debug_selector(|| "follow-ups-hold".to_owned())
+                    .aria_label(if paused {
+                        "Resume follow-ups"
+                    } else {
+                        "Hold follow-ups"
+                    })
+                    .text_xs()
+                    .text_color(rgb(if paused { AMBER } else { MUTED }))
+                    .child(if paused { "Held" } else { "Running" })
+                    .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.set_queue_paused(&session_id, !paused, cx);
+                    })),
+            )
+    }
+
+    /// Work the developer has lined up to send once the agent is done.
+    ///
+    /// The queue is GCABB's own, so it can be changed while the agent is
+    /// mid-turn and it survives the runtime forgetting everything.
+    fn follow_ups_panel(
+        &self,
+        snapshot: &SessionSnapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let session_id = snapshot.metadata.id.clone();
+        let queue = &snapshot.queue;
+        let pending: Vec<_> = queue.pending().cloned().collect();
+        let paused = queue.paused;
+        let last = pending.len().saturating_sub(1);
+
+        let mut rows = Vec::with_capacity(queue.items.len());
+        for item in &queue.items {
+            let position = pending
+                .iter()
+                .position(|candidate| candidate.id == item.id)
+                .unwrap_or(usize::MAX);
+            rows.push(Self::follow_up_row(&session_id, item, position, last, cx));
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap_2()
+            .overflow_hidden()
+            .child(Self::follow_ups_header(
+                &session_id,
+                queue.pending_count(),
+                paused,
+                cx,
+            ))
+            .child(
+                div()
+                    .id("follow-up-list")
+                    .role(Role::List)
+                    .aria_label("Follow-ups")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .child(self.follow_up_input.clone()),
+            )
+            .when(queue.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("Follow-ups are sent one at a time, once the agent is idle."),
+                )
+            })
     }
 
     #[allow(clippy::too_many_lines)]
@@ -13268,6 +13666,136 @@ mod tests {
                 wrapped_height > single_line_height * 2.,
                 "long composer text remained on one line: {wrapped_height:?}"
             );
+        }
+
+        fn queued(
+            id: &str,
+            position: i64,
+            state: app_model::QueueItemState,
+        ) -> app_model::QueueItem {
+            app_model::QueueItem {
+                id: id.to_owned(),
+                session_id: "session-1".to_owned(),
+                position,
+                prompt: format!("prompt {id}"),
+                display_prompt: None,
+                state,
+                delivery: app_model::QueueDelivery::WhenIdle,
+                agent_mode: None,
+                created_at: "1".to_owned(),
+                updated_at: "1".to_owned(),
+                error: None,
+            }
+        }
+
+        /// Opens the Follow-ups pane on a session holding the given queue.
+        fn with_follow_ups(
+            view: &gpui::Entity<SessionMvpView>,
+            cx: &mut VisualTestContext,
+            items: Vec<app_model::QueueItem>,
+        ) {
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                view.panel_open = true;
+                view.active_panel = crate::SessionPanel::FollowUps;
+                let mut snapshot = (*view.sessions[0].snapshot).clone();
+                snapshot.queue = app_model::QueueView {
+                    items,
+                    ..app_model::QueueView::default()
+                };
+                view.sessions[0].set_snapshot(Arc::new(snapshot));
+                cx.notify();
+            });
+            cx.simulate_resize(gpui::size(gpui::px(1_400.0), gpui::px(800.0)));
+            cx.run_until_parked();
+        }
+
+        #[gpui::test]
+        fn a_follow_up_can_be_removed_from_its_pane(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            with_follow_ups(
+                &view,
+                cx,
+                vec![queued("a", 1024, app_model::QueueItemState::Pending)],
+            );
+
+            let remove = cx
+                .debug_bounds("follow-up-remove-a")
+                .expect("remove control rendered");
+            cx.simulate_click(remove.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            match commands.try_recv().expect("a command was sent") {
+                ServiceCommand::RemoveQueued {
+                    app_session_id,
+                    queue_item_id,
+                } => {
+                    assert_eq!(app_session_id, "session-1");
+                    assert_eq!(queue_item_id, "a");
+                }
+                _ => panic!("removing a follow-up sent the wrong command"),
+            }
+        }
+
+        #[gpui::test]
+        fn only_pending_follow_ups_can_be_reordered(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            // A dispatched item is already with the agent, so it has no place
+            // left in the ordering to move within.
+            with_follow_ups(
+                &view,
+                cx,
+                vec![
+                    queued("running", 1024, app_model::QueueItemState::Dispatched),
+                    queued("a", 2048, app_model::QueueItemState::Pending),
+                    queued("b", 3072, app_model::QueueItemState::Pending),
+                ],
+            );
+
+            let down = cx
+                .debug_bounds("follow-up-down-a")
+                .expect("reorder control rendered");
+            cx.simulate_click(down.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            match commands.try_recv().expect("a command was sent") {
+                ServiceCommand::ReorderQueue { ordered_ids, .. } => {
+                    assert_eq!(ordered_ids, vec!["b".to_owned(), "a".to_owned()]);
+                }
+                _ => panic!("reordering follow-ups sent the wrong command"),
+            }
+        }
+
+        #[gpui::test]
+        fn ctrl_enter_queues_a_follow_up_instead_of_sending(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update_in(cx, |view, window, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                view.composer
+                    .update(cx, |input, cx| input.set_value("look at the logs", cx));
+                let handle = gpui::Focusable::focus_handle(view.composer.read(cx), cx);
+                window.focus(&handle, cx);
+            });
+            cx.run_until_parked();
+
+            cx.simulate_keystrokes("ctrl-enter");
+            cx.run_until_parked();
+
+            match commands.try_recv().expect("a command was sent") {
+                ServiceCommand::EnqueuePrompt {
+                    app_session_id,
+                    prompt,
+                } => {
+                    assert_eq!(app_session_id, "session-1");
+                    assert_eq!(prompt, "look at the logs");
+                }
+                _ => panic!("ctrl-enter sent a command other than a queued follow-up"),
+            }
+            // The composer has to empty out, or the same text would be sent
+            // again by the next Enter.
+            view.read_with(cx, |view, cx| {
+                assert!(view.composer.read(cx).value().is_empty());
+            });
         }
 
         #[gpui::test]

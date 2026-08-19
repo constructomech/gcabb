@@ -222,6 +222,7 @@ SessionState
   agent_tree
   terminals
   changes
+  follow_ups
   selected_base
   diagnostics
 
