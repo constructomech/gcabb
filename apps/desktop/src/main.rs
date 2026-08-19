@@ -9,9 +9,9 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
     AgentTodoStatus, ChangeStatus, ChangedFile, ContextWindowOption, InteractionKind,
-    InteractionResponse, OutputStreamKind, ProjectMetadata, PromptAttachment, SessionKind,
-    SessionLocation, SessionMetadata, SessionSnapshot, SessionStatus, TranscriptRole,
-    TranscriptState,
+    InteractionResponse, OutputStreamKind, ProjectMetadata, PromptAttachment, QueueDelivery,
+    QueueItemState, SessionKind, SessionLocation, SessionMetadata, SessionSnapshot, SessionStatus,
+    TranscriptRole, TranscriptState,
 };
 use chrono::DateTime;
 use copilot_provider::{CopilotProviderFactory, ProviderCompatibility};
@@ -939,6 +939,25 @@ enum ServiceCommand {
         app_session_id: String,
         todo_id: String,
     },
+    /// Add a prompt to the end of a session's queue.
+    EnqueuePrompt {
+        app_session_id: String,
+        prompt: String,
+        delivery: QueueDelivery,
+    },
+    RemoveQueued {
+        app_session_id: String,
+        queue_item_id: String,
+    },
+    /// Reorder a session's queue to the given order.
+    ReorderQueue {
+        app_session_id: String,
+        ordered_ids: Vec<String>,
+    },
+    SetQueuePaused {
+        app_session_id: String,
+        paused: bool,
+    },
     Select {
         app_session_id: Option<String>,
     },
@@ -1402,6 +1421,49 @@ async fn handle_service_command(
             .remove_todo(todo_id)
             .await
             .map_err(|error| error.to_string())?,
+        ServiceCommand::EnqueuePrompt {
+            app_session_id,
+            prompt,
+            delivery,
+        } => {
+            manager
+                .session(&app_session_id)
+                .await
+                .map_err(|error| error.to_string())?
+                .enqueue_with(prompt, None, delivery)
+                .await
+                .map_err(|error| error.to_string())?;
+        }
+        ServiceCommand::RemoveQueued {
+            app_session_id,
+            queue_item_id,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .remove_queued(queue_item_id)
+            .await
+            .map_err(|error| error.to_string())?,
+        ServiceCommand::ReorderQueue {
+            app_session_id,
+            ordered_ids,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .reorder_queue(ordered_ids)
+            .await
+            .map_err(|error| error.to_string())?,
+        ServiceCommand::SetQueuePaused {
+            app_session_id,
+            paused,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .set_queue_paused(paused)
+            .await
+            .map_err(|error| error.to_string())?,
         ServiceCommand::Resume {
             app_session_id,
             worktrees_root,
@@ -1856,14 +1918,16 @@ enum SessionPanel {
     Terminals,
     Capabilities,
     Plan,
+    Queue,
 }
 
 impl SessionPanel {
-    const ALL: [Self; 4] = [
+    const ALL: [Self; 5] = [
         Self::Changes,
         Self::Terminals,
         Self::Capabilities,
         Self::Plan,
+        Self::Queue,
     ];
 
     /// Panels worth offering for a session.
@@ -1876,6 +1940,9 @@ impl SessionPanel {
             .into_iter()
             .filter(|panel| match panel {
                 Self::Plan => !snapshot.agent_plan.is_empty() || snapshot.agent_plan.writable,
+                // The queue is always offered: it is how work is lined up for
+                // a session, so an empty one is a starting point rather than
+                // nothing to show.
                 _ => true,
             })
             .collect()
@@ -1887,6 +1954,7 @@ impl SessionPanel {
             Self::Terminals => "Terminals",
             Self::Capabilities => "Capabilities",
             Self::Plan => "Plan",
+            Self::Queue => "Queue",
         }
     }
 
@@ -1896,6 +1964,7 @@ impl SessionPanel {
             Self::Terminals => "panel-terminals",
             Self::Capabilities => "panel-capabilities",
             Self::Plan => "panel-plan",
+            Self::Queue => "panel-queue",
         }
     }
 }
@@ -2018,6 +2087,8 @@ struct SessionMvpView {
     interaction_input: Entity<TextInput>,
     /// Title for a todo the developer is adding to the agent's list.
     todo_input: Entity<TextInput>,
+    /// Prompt the developer is adding to the session's queue.
+    queue_input: Entity<TextInput>,
     draft_mode: String,
     draft_model: Option<String>,
     draft_effort: String,
@@ -2137,6 +2208,11 @@ impl SessionMvpView {
         let todo_input = cx.new(|cx| TextInput::new(cx, "todo-input", "Add a task..."));
         cx.subscribe(&todo_input, |view, _, event: &InputSubmitted, cx| {
             view.submit_todo(&event.text, cx);
+        })
+        .detach();
+        let queue_input = cx.new(|cx| TextInput::new(cx, "queue-input", "Queue a prompt..."));
+        cx.subscribe(&queue_input, |view, _, event: &InputSubmitted, cx| {
+            view.submit_queued_prompt(&event.text, cx);
         })
         .detach();
         let rename_input = cx.new(|cx| TextInput::new(cx, "rename-input", "Session name"));
@@ -2264,6 +2340,7 @@ impl SessionMvpView {
             session_drafts: HashMap::new(),
             interaction_input,
             todo_input,
+            queue_input,
             draft_mode: "interactive".to_owned(),
             draft_model: None,
             draft_effort: "medium".to_owned(),
@@ -3297,6 +3374,77 @@ impl SessionMvpView {
             title: title.to_owned(),
         });
         self.todo_input.update(cx, TextInput::clear);
+        cx.notify();
+    }
+
+    /// Queue a prompt for the selected session.
+    fn submit_queued_prompt(&mut self, prompt: &str, cx: &mut Context<Self>) {
+        let prompt = prompt.trim();
+        // An empty prompt would queue a turn with nothing to act on.
+        if prompt.is_empty() {
+            return;
+        }
+        let Some(session) = self.selected() else {
+            return;
+        };
+        let _ = self.commands.send(ServiceCommand::EnqueuePrompt {
+            app_session_id: session.snapshot.metadata.id.clone(),
+            prompt: prompt.to_owned(),
+            delivery: QueueDelivery::WhenIdle,
+        });
+        self.queue_input.update(cx, TextInput::clear);
+        cx.notify();
+    }
+
+    fn remove_queued(&mut self, session_id: &str, item_id: &str, cx: &mut Context<Self>) {
+        let _ = self.commands.send(ServiceCommand::RemoveQueued {
+            app_session_id: session_id.to_owned(),
+            queue_item_id: item_id.to_owned(),
+        });
+        cx.notify();
+    }
+
+    fn set_queue_paused(&mut self, session_id: &str, paused: bool, cx: &mut Context<Self>) {
+        let _ = self.commands.send(ServiceCommand::SetQueuePaused {
+            app_session_id: session_id.to_owned(),
+            paused,
+        });
+        cx.notify();
+    }
+
+    /// Move a pending item one place earlier or later in the queue.
+    ///
+    /// Only pending items take part: an item already handed to the agent has
+    /// no place left in the ordering.
+    fn nudge_queued(
+        &mut self,
+        session_id: &str,
+        item_id: &str,
+        offset: isize,
+        cx: &mut Context<Self>,
+    ) {
+        let Some(snapshot) = self.selected().map(|session| session.snapshot.clone()) else {
+            return;
+        };
+        let mut ordered: Vec<String> = snapshot
+            .queue
+            .pending()
+            .map(|item| item.id.clone())
+            .collect();
+        let Some(index) = ordered.iter().position(|id| id == item_id) else {
+            return;
+        };
+        let Some(target) = index.checked_add_signed(offset) else {
+            return;
+        };
+        if target >= ordered.len() {
+            return;
+        }
+        ordered.swap(index, target);
+        let _ = self.commands.send(ServiceCommand::ReorderQueue {
+            app_session_id: session_id.to_owned(),
+            ordered_ids: ordered,
+        });
         cx.notify();
     }
 
@@ -7622,6 +7770,7 @@ impl SessionMvpView {
             SessionPanel::Terminals => Self::terminals_panel(&snapshot).into_any_element(),
             SessionPanel::Capabilities => Self::capabilities_panel(&snapshot).into_any_element(),
             SessionPanel::Plan => self.plan_panel(&snapshot, cx).into_any_element(),
+            SessionPanel::Queue => self.queue_panel(&snapshot, cx).into_any_element(),
         };
 
         Some(
@@ -8429,6 +8578,224 @@ impl SessionMvpView {
                 )
             })
             .into_any_element()
+    }
+
+    /// Reorder and removal controls for a pending queue item.
+    fn queue_controls(
+        session_id: &str,
+        item: &app_model::QueueItem,
+        position: usize,
+        last: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let (up_session, up_id) = (session_id.to_owned(), item.id.clone());
+        let (down_session, down_id) = (session_id.to_owned(), item.id.clone());
+        let (remove_session, remove_id) = (session_id.to_owned(), item.id.clone());
+        div()
+            .flex()
+            .gap_2()
+            .child(
+                div()
+                    .id(SharedString::from(format!("queue-up-{}", item.id)))
+                    .aria_label("Move earlier")
+                    .text_xs()
+                    .text_color(rgb(if position == 0 { SUBTLE } else { MUTED }))
+                    .child("up")
+                    .when(position > 0, |button| {
+                        button
+                            .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.nudge_queued(&up_session, &up_id, -1, cx);
+                            }))
+                    }),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("queue-down-{}", item.id)))
+                    .aria_label("Move later")
+                    .text_xs()
+                    .text_color(rgb(if position >= last { SUBTLE } else { MUTED }))
+                    .child("down")
+                    .when(position < last, |button| {
+                        button
+                            .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.nudge_queued(&down_session, &down_id, 1, cx);
+                            }))
+                    }),
+            )
+            .child(
+                div()
+                    .id(SharedString::from(format!("queue-remove-{}", item.id)))
+                    .aria_label("Remove from queue")
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("remove")
+                    .hover(|style| style.text_color(rgb(RED)).cursor_pointer())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.remove_queued(&remove_session, &remove_id, cx);
+                    })),
+            )
+            .into_any_element()
+    }
+
+    /// One queued prompt.
+    ///
+    /// Reordering and removal are offered only while an item is still
+    /// pending: once it has been handed to the agent there is no place left
+    /// in the ordering to move it to.
+    fn queue_row(
+        session_id: &str,
+        item: &app_model::QueueItem,
+        position: usize,
+        last: usize,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let state_color = match item.state {
+            QueueItemState::Dispatched => BLUE,
+            QueueItemState::Completed => GREEN,
+            QueueItemState::Failed => RED,
+            QueueItemState::Cancelled => MUTED,
+            QueueItemState::Pending => PRIMARY,
+        };
+        let pending = item.state.is_pending();
+        let steering = item.delivery == QueueDelivery::Steer;
+
+        div()
+            .id(SharedString::from(format!("queue-item-{}", item.id)))
+            .role(Role::ListItem)
+            .aria_label(format!("{}: {}", item.summary(80), item.state.label()))
+            .flex()
+            .flex_col()
+            .gap_1()
+            .p_2()
+            .rounded_md()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(if pending { BORDER } else { SUBTLE }))
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .gap_2()
+                    .child(
+                        div()
+                            .flex_1()
+                            .min_w_0()
+                            .text_xs()
+                            .text_color(rgb(PRIMARY))
+                            .child(item.summary(160)),
+                    )
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(state_color))
+                            .child(item.state.label()),
+                    ),
+            )
+            .when(steering, |row| {
+                row.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(AMBER))
+                        .child("Interrupts the running turn"),
+                )
+            })
+            .when(pending, |row| {
+                row.child(Self::queue_controls(session_id, item, position, last, cx))
+            })
+            .when_some(item.error.clone(), |row, error| {
+                row.child(div().text_xs().text_color(rgb(RED)).child(error))
+            })
+            .into_any_element()
+    }
+
+    /// Work the developer has lined up for this session.
+    ///
+    /// The queue is GCABB's own, so it can be changed while the agent is
+    /// mid-turn and it survives the runtime forgetting everything.
+    fn queue_panel(&self, snapshot: &SessionSnapshot, cx: &mut Context<Self>) -> impl IntoElement {
+        let session_id = snapshot.metadata.id.clone();
+        let queue = &snapshot.queue;
+        let pending: Vec<_> = queue.pending().cloned().collect();
+        let paused = queue.paused;
+        let last = pending.len().saturating_sub(1);
+
+        let mut rows = Vec::with_capacity(queue.items.len());
+        for item in &queue.items {
+            let position = pending
+                .iter()
+                .position(|candidate| candidate.id == item.id)
+                .unwrap_or(usize::MAX);
+            rows.push(Self::queue_row(&session_id, item, position, last, cx));
+        }
+
+        let pause_session = session_id.clone();
+        div()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .gap_2()
+            .overflow_hidden()
+            .child(
+                div()
+                    .flex()
+                    .justify_between()
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(format!("{} waiting", queue.pending_count())),
+                    )
+                    .child(
+                        div()
+                            .id("queue-pause")
+                            .aria_label(if paused {
+                                "Resume the queue"
+                            } else {
+                                "Hold the queue"
+                            })
+                            .text_xs()
+                            .text_color(rgb(if paused { AMBER } else { MUTED }))
+                            .child(if paused { "Held" } else { "Running" })
+                            .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                view.set_queue_paused(&pause_session, !paused, cx);
+                            })),
+                    ),
+            )
+            .child(
+                div()
+                    .id("queue-list")
+                    .role(Role::List)
+                    .aria_label("Queued prompts")
+                    .flex()
+                    .flex_col()
+                    .gap_2()
+                    .children(rows),
+            )
+            .child(
+                div()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .rounded_md()
+                    .child(self.queue_input.clone()),
+            )
+            .when(queue.is_empty(), |panel| {
+                panel.child(
+                    div()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child("Queued prompts run one at a time as the session becomes idle."),
+                )
+            })
+            .when(!queue.runtime_steering.is_empty(), |panel| {
+                panel.child(div().text_xs().text_color(rgb(AMBER)).child(format!(
+                    "{} message(s) interrupting the running turn",
+                    queue.runtime_steering.len()
+                )))
+            })
     }
 
     /// The agent's own task list.
@@ -11195,6 +11562,47 @@ mod tests {
         assert!(super::SessionPanel::available(&with).contains(&super::SessionPanel::Plan));
     }
 
+    fn queued(id: &str, position: i64, state: app_model::QueueItemState) -> app_model::QueueItem {
+        app_model::QueueItem {
+            id: id.to_owned(),
+            session_id: "session".to_owned(),
+            position,
+            prompt: format!("prompt {id}"),
+            display_prompt: None,
+            state,
+            delivery: app_model::QueueDelivery::WhenIdle,
+            agent_mode: None,
+            runtime_id: None,
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+            error: None,
+        }
+    }
+
+    #[test]
+    fn the_queue_tab_is_always_offered() {
+        // An empty queue is where work gets lined up, so it is a starting
+        // point rather than nothing worth showing.
+        let snapshot = snapshot_with_plan(app_model::AgentPlan::default());
+        assert!(super::SessionPanel::available(&snapshot).contains(&super::SessionPanel::Queue));
+    }
+
+    #[test]
+    fn only_pending_items_take_part_in_the_ordering() {
+        let queue = app_model::QueueView {
+            items: vec![
+                queued("done", 10, app_model::QueueItemState::Completed),
+                queued("a", 20, app_model::QueueItemState::Pending),
+                queued("b", 30, app_model::QueueItemState::Pending),
+            ],
+            ..app_model::QueueView::default()
+        };
+        let pending: Vec<_> = queue.pending().map(|item| item.id.as_str()).collect();
+        assert_eq!(pending, vec!["a", "b"]);
+        // The completed item has no position in the ordering to move within.
+        assert!(!pending.contains(&"done"));
+    }
+
     #[test]
     fn an_empty_writable_plan_still_offers_its_tab() {
         // Hiding the tab would hide the only place to add the first task.
@@ -11212,7 +11620,8 @@ mod tests {
         assert!(panels.contains(&super::SessionPanel::Changes));
         assert!(panels.contains(&super::SessionPanel::Terminals));
         assert!(panels.contains(&super::SessionPanel::Capabilities));
-        assert_eq!(panels.len(), 3);
+        // The plan is the only panel a session can be without.
+        assert!(!panels.contains(&super::SessionPanel::Plan));
     }
 
     #[test]
