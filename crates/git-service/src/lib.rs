@@ -10,8 +10,9 @@
 //! reports committed, staged, unstaged, and untracked changes in one view.
 //! Selectable bases and merge-base discovery arrive in Phase 6.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use app_model::changes::{ChangeStage, ChangeStatus, ChangedFile, ChangesView, DiffStats};
 use thiserror::Error;
@@ -64,7 +65,12 @@ impl GitService {
     }
 
     fn run_raw(&self, args: &[&str]) -> Result<Output> {
-        Command::new("git")
+        self.command(args).output().map_err(GitError::from)
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(&self.worktree)
             // Keep output stable regardless of the developer's git config.
@@ -73,9 +79,34 @@ impl GitService {
             .arg("core.quotepath=false")
             .arg("-c")
             .arg("diff.noprefix=false")
-            .args(args)
-            .output()
-            .map_err(GitError::from)
+            .args(args);
+        command
+    }
+
+    /// Run a git command that reads its input from stdin.
+    fn run_with_stdin(&self, args: &[&str], input: &str) -> Result<String> {
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| GitError::Command {
+                command: args.join(" "),
+                stderr: "git did not provide a stdin pipe".to_owned(),
+            })?
+            .write_all(input.as_bytes())?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(GitError::Command {
+                command: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     /// Whether the configured path is inside a git worktree.
@@ -266,6 +297,56 @@ impl GitService {
         // Prune leaves the administrative files consistent even when the
         // directory was already gone.
         let _ = self.run(&["worktree", "prune"]);
+        Ok(())
+    }
+
+    /// Remove a linked worktree even when it still holds uncommitted work.
+    ///
+    /// Only for callers that have already preserved that work. Note that
+    /// git-ignored files -- build output, local configuration -- go with the
+    /// directory and are not preserved by anything.
+    pub fn force_remove_worktree(&self, path: &Path) -> Result<()> {
+        let path_string = path.to_string_lossy().into_owned();
+        self.run(&["worktree", "remove", "--force", &path_string])?;
+        let _ = self.run(&["worktree", "prune"]);
+        Ok(())
+    }
+
+    /// Capture everything in this worktree that is not in its `HEAD` commit as
+    /// a single patch.
+    ///
+    /// Staged, unstaged, and untracked files are all included, so a worktree
+    /// can be thrown away and rebuilt later without losing work. Everything is
+    /// staged first because an untracked file has no entry to diff against
+    /// otherwise; the worktree is being discarded, so its index does not
+    /// outlive the call. Returns `None` when there is nothing to capture.
+    ///
+    /// Git-ignored files are *not* captured. They are build output and local
+    /// configuration by declaration, and including directories like `target`
+    /// or `node_modules` would make the patch unusable. Callers that go on to
+    /// delete the worktree are deleting those files.
+    pub fn capture_uncommitted_patch(&self) -> Result<Option<String>> {
+        if self.is_clean() {
+            return Ok(None);
+        }
+        self.run(&["add", "--all"])?;
+        // `--binary` keeps images and other non-text files reconstructible.
+        let patch = self.run(&["diff", "--binary", "--cached", "HEAD"])?;
+        if patch.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(patch))
+    }
+
+    /// Re-apply a patch captured by [`Self::capture_uncommitted_patch`].
+    ///
+    /// The index is updated too, so files that were untracked when the patch
+    /// was taken come back tracked rather than as unexplained new files.
+    pub fn apply_patch(&self, patch: &str) -> Result<()> {
+        self.run_with_stdin(
+            &["apply", "--binary", "--index", "--whitespace=nowarn", "-"],
+            patch,
+        )?;
         Ok(())
     }
 

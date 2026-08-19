@@ -27,7 +27,8 @@ use gpui::{
     list, px, relative, rgb, size,
 };
 use session_manager::{
-    RestoreFailure, SessionHandle, SessionManager, SessionRoots, WorktreeOutcome,
+    ArchiveOutcome, RestoreFailure, RestoreOutcome, SessionHandle, SessionManager, SessionRoots,
+    WorktreeOutcome,
 };
 use session_orchestrator::{
     LaunchOrigin, LaunchProgress, LaunchRequest, LaunchTitle, SessionOrchestrator,
@@ -877,6 +878,18 @@ enum ServiceUpdate {
         app_session_id: String,
         error: String,
     },
+    /// A session was archived and must move from the sidebar into the archive.
+    SessionArchived {
+        session: SessionMetadata,
+        archived_at: String,
+    },
+    /// An archive operation failed; clear the in-flight spinner and say why.
+    SessionArchiveFailed {
+        app_session_id: String,
+        error: String,
+    },
+    /// An archived session came back and must reappear in the sidebar.
+    SessionUnarchived(SessionMetadata),
     /// The configured project list changed, with the project to select next.
     ProjectsChanged {
         projects: Vec<ProjectMetadata>,
@@ -975,6 +988,14 @@ enum ServiceCommand {
         /// Root that owned this particular worktree, including a previous root.
         worktrees_root: Option<PathBuf>,
     },
+    ArchiveSession {
+        app_session_id: String,
+        /// Root that owned this particular worktree, including a previous root.
+        worktrees_root: Option<PathBuf>,
+    },
+    UnarchiveSession {
+        app_session_id: String,
+    },
     /// Register a directory chosen by the user as a project.
     AddProject {
         path: PathBuf,
@@ -995,7 +1016,17 @@ struct AppService {
 struct BootstrapState {
     projects: Vec<ProjectMetadata>,
     sessions: Vec<SessionMetadata>,
+    /// Sessions the user archived, shown only in settings.
+    archived: Vec<ArchivedSessionRow>,
     selected_session: Option<String>,
+}
+
+/// One archived session as the settings list needs it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArchivedSessionRow {
+    id: String,
+    title: String,
+    archived_at: String,
 }
 
 impl AppService {
@@ -1023,6 +1054,19 @@ impl AppService {
                 tracing::error!(%error, "failed to list bootstrap sessions");
                 Vec::new()
             }),
+            archived: storage
+                .list_archived_sessions()
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "failed to list archived sessions");
+                    Vec::new()
+                })
+                .into_iter()
+                .map(|archived| ArchivedSessionRow {
+                    id: archived.metadata.id,
+                    title: archived.metadata.title,
+                    archived_at: archived.archive.archived_at,
+                })
+                .collect(),
             selected_session: storage.selected_session().unwrap_or(None),
         };
         diagnostics.record(DiagnosticEvent {
@@ -1182,6 +1226,56 @@ impl AppService {
                                 }
                                 Err(error) => {
                                     let _ = update_tx.send(ServiceUpdate::SessionDeleteFailed {
+                                        app_session_id,
+                                        error: error.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        ServiceCommand::ArchiveSession {
+                            app_session_id,
+                            worktrees_root,
+                        } => {
+                            let mut archive_roots = session_roots.clone();
+                            archive_roots.worktrees = worktrees_root;
+                            match runtime
+                                .block_on(manager.archive_session(&app_session_id, &archive_roots))
+                            {
+                                Ok(archival) => {
+                                    let notice =
+                                        archival.worktree.as_ref().and_then(ArchiveOutcome::notice);
+                                    let _ = update_tx.send(ServiceUpdate::SessionArchived {
+                                        session: archival.metadata,
+                                        archived_at: timestamp(),
+                                    });
+                                    if let Some(notice) = notice {
+                                        let _ = update_tx.send(ServiceUpdate::ActionFailed(notice));
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = update_tx.send(ServiceUpdate::SessionArchiveFailed {
+                                        app_session_id,
+                                        error: error.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        ServiceCommand::UnarchiveSession { app_session_id } => {
+                            match runtime.block_on(manager.unarchive_session(&app_session_id)) {
+                                Ok(restoration) => {
+                                    let notice = restoration
+                                        .worktree
+                                        .as_ref()
+                                        .and_then(RestoreOutcome::notice);
+                                    let _ = update_tx.send(ServiceUpdate::SessionUnarchived(
+                                        restoration.metadata,
+                                    ));
+                                    if let Some(notice) = notice {
+                                        let _ = update_tx.send(ServiceUpdate::ActionFailed(notice));
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = update_tx.send(ServiceUpdate::SessionArchiveFailed {
                                         app_session_id,
                                         error: error.to_string(),
                                     });
@@ -1510,6 +1604,8 @@ async fn handle_service_command(
         ServiceCommand::AddProject { .. }
         | ServiceCommand::RemoveProject { .. }
         | ServiceCommand::DeleteSession { .. }
+        | ServiceCommand::ArchiveSession { .. }
+        | ServiceCommand::UnarchiveSession { .. }
         | ServiceCommand::Stop => {}
     }
     Ok(created)
@@ -2009,6 +2105,11 @@ struct SessionMvpView {
     /// Sessions with a delete in flight, shown with a spinner in place of
     /// the status dot until the backend confirms removal.
     deleting_sessions: HashSet<String>,
+    /// Sessions with an archive or unarchive in flight, treated like a delete
+    /// so the row cannot be acted on twice.
+    archiving_sessions: HashSet<String>,
+    /// Archived sessions, newest first, offered for unarchiving in settings.
+    archived_sessions: Vec<ArchivedSessionRow>,
     /// Startup progress shown before the new session has an id or transcript.
     session_launch: Option<SessionLaunchProgress>,
     action_error: Option<String>,
@@ -2235,6 +2336,8 @@ impl SessionMvpView {
             renaming_session: None,
             rename_input,
             deleting_sessions: HashSet::new(),
+            archiving_sessions: HashSet::new(),
+            archived_sessions: Vec::new(),
             session_launch: None,
             action_error: None,
             settings_error: None,
@@ -2607,6 +2710,100 @@ impl SessionMvpView {
             )
     }
 
+    /// Archived sessions and the control that brings them back.
+    ///
+    /// Archiving is reachable from any session's context menu, so the reverse
+    /// has to live somewhere that outlives the session's absence from the
+    /// sidebar. Settings is that place.
+    fn settings_archive_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut rows = div()
+            .id("settings-archived-sessions")
+            .accessibility_id("settings-archived-sessions")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .max_h(px(220.0))
+            .overflow_y_scroll();
+        for archived in &self.archived_sessions {
+            let id = archived.id.clone();
+            let restoring = self.archiving_sessions.contains(&id);
+            let button_id = id.clone();
+            rows = rows.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_sm().child(archived.title.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("Archived {}", archived.archived_at)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("settings-unarchive-{id}")))
+                            .debug_selector(move || format!("settings-unarchive-{id}"))
+                            .accessibility_id("settings-unarchive")
+                            .role(Role::Button)
+                            .aria_label(format!("Unarchive {}", archived.title))
+                            .focusable()
+                            .tab_stop(!restoring)
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_sm()
+                            .text_color(if restoring { rgb(MUTED) } else { rgb(PRIMARY) })
+                            .child(if restoring {
+                                "Unarchiving…"
+                            } else {
+                                "Unarchive"
+                            })
+                            .when(!restoring, |button| {
+                                button
+                                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.unarchive_session(button_id.clone(), cx);
+                                    }))
+                            }),
+                    ),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().child("Archived sessions"))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "Archived sessions keep their full history. Unarchiving restores the session and \
+                 rebuilds its worktree, including tracked and untracked work that was never \
+                 committed. Ignored files, such as build output, are not kept.",
+            ))
+            .child(if self.archived_sessions.is_empty() {
+                div()
+                    .id("settings-archived-empty")
+                    .accessibility_id("settings-archived-empty")
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("No archived sessions.")
+                    .into_any_element()
+            } else {
+                rows.into_any_element()
+            })
+    }
+
     fn settings_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if self.settings_visibility != SettingsVisibility::Open {
             return None;
@@ -2649,6 +2846,7 @@ impl SessionMvpView {
                                 .child("Settings"),
                         )
                         .child(self.settings_worktrees_row(cx))
+                        .child(self.settings_archive_section(cx))
                         .when_some(self.settings_error.clone(), |panel, error| {
                             panel.child(
                                 div()
@@ -2746,22 +2944,8 @@ impl SessionMvpView {
                     self.session_launch = Some(progress);
                 }
                 ServiceUpdate::SessionDeleted(id) => {
-                    self.sessions.retain(|session| session.id() != id);
-                    self.restore_failures
-                        .retain(|failure| failure.app_session_id != id);
                     self.deleting_sessions.remove(&id);
-                    if self.selected_session.as_deref() == Some(id.as_str()) {
-                        self.switch_composer_draft(None, cx);
-                    }
-                    self.session_drafts.remove(&id);
-                    self.expanded_changes.remove(&id);
-                    self.expanded_tools.remove(&id);
-                    if self.session_menu.as_ref().is_some_and(|menu| menu.id == id) {
-                        self.session_menu = None;
-                    }
-                    if self.renaming_session.as_deref() == Some(id.as_str()) {
-                        self.renaming_session = None;
-                    }
+                    self.forget_session(&id, cx);
                 }
                 ServiceUpdate::SessionDeleteFailed {
                     app_session_id,
@@ -2769,6 +2953,41 @@ impl SessionMvpView {
                 } => {
                     self.deleting_sessions.remove(&app_session_id);
                     self.action_error = Some(error);
+                }
+                ServiceUpdate::SessionArchived {
+                    session,
+                    archived_at,
+                } => {
+                    let id = session.id.clone();
+                    self.archiving_sessions.remove(&id);
+                    self.forget_session(&id, cx);
+                    self.archived_sessions.retain(|row| row.id != id);
+                    self.archived_sessions.insert(
+                        0,
+                        ArchivedSessionRow {
+                            id,
+                            title: session.title,
+                            archived_at,
+                        },
+                    );
+                }
+                ServiceUpdate::SessionArchiveFailed {
+                    app_session_id,
+                    error,
+                } => {
+                    self.archiving_sessions.remove(&app_session_id);
+                    self.action_error = Some(error);
+                }
+                ServiceUpdate::SessionUnarchived(session) => {
+                    let id = session.id.clone();
+                    self.archiving_sessions.remove(&id);
+                    self.archived_sessions.retain(|row| row.id != id);
+                    if !self.sessions.iter().any(|existing| existing.id() == id) {
+                        // Restored as a metadata-only placeholder; selecting it
+                        // reconnects it the same way any stored session does.
+                        self.sessions
+                            .insert(0, SessionProjection::bootstrap(session));
+                    }
                 }
                 ServiceUpdate::PromptAccepted(origin) => {
                     if let Some(id) = origin.as_deref() {
@@ -2792,6 +3011,7 @@ impl SessionMvpView {
 
     fn apply_bootstrap(&mut self, bootstrap: BootstrapState) {
         self.projects = bootstrap.projects;
+        self.archived_sessions = bootstrap.archived;
         self.sessions = bootstrap
             .sessions
             .into_iter()
@@ -3531,8 +3751,49 @@ impl SessionMvpView {
     fn delete_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
         self.session_menu = None;
         self.action_error = None;
-        let worktrees_root = self
-            .sessions
+        let worktrees_root = self.owning_worktrees_root(&app_session_id);
+        self.deleting_sessions.insert(app_session_id.clone());
+        let _ = self.commands.send(ServiceCommand::DeleteSession {
+            app_session_id,
+            worktrees_root,
+        });
+        cx.notify();
+    }
+
+    /// Archive a session: its history is kept, its worktree is not.
+    fn archive_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
+        self.session_menu = None;
+        // A second archive while the first is still running would find the
+        // worktree already gone and have nothing left to capture.
+        if self.archiving_sessions.contains(&app_session_id) {
+            cx.notify();
+            return;
+        }
+        self.action_error = None;
+        let worktrees_root = self.owning_worktrees_root(&app_session_id);
+        self.archiving_sessions.insert(app_session_id.clone());
+        let _ = self.commands.send(ServiceCommand::ArchiveSession {
+            app_session_id,
+            worktrees_root,
+        });
+        cx.notify();
+    }
+
+    /// Bring an archived session back from the settings archive list.
+    fn unarchive_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
+        self.action_error = None;
+        self.settings_error = None;
+        self.archiving_sessions.insert(app_session_id.clone());
+        let _ = self
+            .commands
+            .send(ServiceCommand::UnarchiveSession { app_session_id });
+        cx.notify();
+    }
+
+    /// Managed root that owns a session's worktree, including a root the user
+    /// has since changed away from.
+    fn owning_worktrees_root(&self, app_session_id: &str) -> Option<PathBuf> {
+        self.sessions
             .iter()
             .find(|session| session.id() == app_session_id)
             .and_then(|session| {
@@ -3542,13 +3803,63 @@ impl SessionMvpView {
                         Path::new(&session.snapshot.metadata.project_path),
                         &self.worktree_configuration.default_root,
                     )
-            });
-        self.deleting_sessions.insert(app_session_id.clone());
-        let _ = self.commands.send(ServiceCommand::DeleteSession {
-            app_session_id,
-            worktrees_root,
-        });
-        cx.notify();
+            })
+    }
+
+    /// Drop every trace of a session from the UI.
+    ///
+    /// Deleting and archiving both remove the session from the sidebar; only
+    /// what the backend keeps behind differs.
+    fn forget_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.sessions.retain(|session| session.id() != id);
+        self.restore_failures
+            .retain(|failure| failure.app_session_id != id);
+        if self.selected_session.as_deref() == Some(id) {
+            self.switch_composer_draft(None, cx);
+        }
+        self.session_drafts.remove(id);
+        self.expanded_changes.remove(id);
+        self.expanded_tools.remove(id);
+        if self.session_menu.as_ref().is_some_and(|menu| menu.id == id) {
+            self.session_menu = None;
+        }
+        if self.renaming_session.as_deref() == Some(id) {
+            self.renaming_session = None;
+        }
+    }
+
+    /// One row of the session context menu.
+    ///
+    /// The four items differ only in their id, label, colour, and what they
+    /// do, so the shared chrome lives here rather than four times over.
+    fn session_menu_item(
+        name: &'static str,
+        label: impl Into<SharedString>,
+        aria_label: impl Into<SharedString>,
+        color: u32,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(name)
+            .debug_selector(move || name.to_owned())
+            .accessibility_id(name)
+            .role(Role::MenuItem)
+            .aria_label(aria_label.into())
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .text_sm()
+            .text_color(rgb(color))
+            .child(label.into())
+            .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+            .on_click(cx.listener(move |view, _, window, cx| on_click(view, window, cx)))
     }
 
     /// Context menu for a session, anchored where the user right-clicked.
@@ -3557,6 +3868,7 @@ impl SessionMvpView {
         let rename_id = menu.id.clone();
         let rename_title = menu.title.clone();
         let reveal_id = menu.id.clone();
+        let archive_id = menu.id.clone();
         let delete_id = menu.id.clone();
         let label = menu.title.clone();
         Some(
@@ -3577,78 +3889,40 @@ impl SessionMvpView {
                 .border_1()
                 .border_color(rgb(BORDER))
                 .shadow_lg()
-                .child(
-                    div()
-                        .id("session-menu-rename")
-                        .debug_selector(|| "session-menu-rename".to_owned())
-                        .accessibility_id("session-menu-rename")
-                        .role(Role::MenuItem)
-                        .aria_label("Rename session")
-                        .focusable()
-                        .tab_stop(true)
-                        .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .text_sm()
-                        .text_color(rgb(PRIMARY))
-                        .child("Rename")
-                        .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
-                        .on_click(cx.listener(move |view, _, window, cx| {
-                            view.begin_rename(rename_id.clone(), rename_title.clone(), window, cx);
-                        })),
-                )
-                .child(
-                    div()
-                        .id("session-menu-reveal")
-                        .debug_selector(|| "session-menu-reveal".to_owned())
-                        .accessibility_id("session-menu-reveal")
-                        .role(Role::MenuItem)
-                        .aria_label(format!("{REVEAL_IN_FILE_MANAGER_LABEL} session folder"))
-                        .focusable()
-                        .tab_stop(true)
-                        .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .text_sm()
-                        .text_color(rgb(PRIMARY))
-                        .child(REVEAL_IN_FILE_MANAGER_LABEL)
-                        .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.reveal_session_in_file_manager(&reveal_id, cx);
-                        })),
-                )
-                .child(
-                    div()
-                        .id("session-menu-delete")
-                        .debug_selector(|| "session-menu-delete".to_owned())
-                        .accessibility_id("session-menu-delete")
-                        .role(Role::MenuItem)
-                        .aria_label("Delete session")
-                        .focusable()
-                        .tab_stop(true)
-                        .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .text_sm()
-                        .text_color(rgb(RED))
-                        .child("Delete session")
-                        .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.delete_session(delete_id.clone(), cx);
-                        })),
-                ),
+                .child(Self::session_menu_item(
+                    "session-menu-rename",
+                    "Rename",
+                    "Rename session",
+                    PRIMARY,
+                    move |view, window, cx| {
+                        view.begin_rename(rename_id.clone(), rename_title.clone(), window, cx);
+                    },
+                    cx,
+                ))
+                .child(Self::session_menu_item(
+                    "session-menu-reveal",
+                    REVEAL_IN_FILE_MANAGER_LABEL,
+                    format!("{REVEAL_IN_FILE_MANAGER_LABEL} session folder"),
+                    PRIMARY,
+                    move |view, _, cx| view.reveal_session_in_file_manager(&reveal_id, cx),
+                    cx,
+                ))
+                .child(Self::session_menu_item(
+                    "session-menu-archive",
+                    "Archive session",
+                    "Archive session",
+                    PRIMARY,
+                    move |view, _, cx| view.archive_session(archive_id.clone(), cx),
+                    cx,
+                ))
+                .child(Self::session_menu_item(
+                    "session-menu-delete",
+                    "Delete session",
+                    "Delete session",
+                    RED,
+                    move |view, _, cx| view.delete_session(delete_id.clone(), cx),
+                    cx,
+                )),
         )
     }
 
@@ -5152,7 +5426,7 @@ impl SessionMvpView {
                             .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                             .on_click(cx.listener(|view, _, _, cx| {
                                 view.settings_error = None;
-                                view.settings_visibility = SettingsVisibility::Open;
+                                view.settings_visibility = crate::SettingsVisibility::Open;
                                 cx.notify();
                             })),
                     ),
@@ -11698,6 +11972,7 @@ mod tests {
             service.bootstrap = Some(super::super::BootstrapState {
                 projects: Vec::new(),
                 sessions: vec![first, second],
+                archived: Vec::new(),
                 selected_session: Some("session-2".to_owned()),
             });
             cx.update(super::super::bind_app_keys);
@@ -11734,6 +12009,7 @@ mod tests {
             service.bootstrap = Some(super::super::BootstrapState {
                 projects: Vec::new(),
                 sessions: vec![metadata],
+                archived: Vec::new(),
                 selected_session: Some("session-1".to_owned()),
             });
             cx.update(super::super::bind_app_keys);
@@ -11784,6 +12060,7 @@ mod tests {
                 view.apply_bootstrap(super::super::BootstrapState {
                     projects: Vec::new(),
                     sessions: vec![snapshot("session-1", "First session").metadata],
+                    archived: Vec::new(),
                     selected_session: Some("session-1".to_owned()),
                 });
             });
@@ -11801,6 +12078,7 @@ mod tests {
                 view.apply_bootstrap(super::super::BootstrapState {
                     projects: Vec::new(),
                     sessions: vec![snapshot("session-1", "First session").metadata],
+                    archived: Vec::new(),
                     selected_session: Some("session-1".to_owned()),
                 });
             });
@@ -11918,6 +12196,7 @@ mod tests {
                 view.apply_bootstrap(super::super::BootstrapState {
                     projects: Vec::new(),
                     sessions: vec![legacy],
+                    archived: Vec::new(),
                     selected_session: Some("session-1".to_owned()),
                 });
             });
@@ -11953,6 +12232,7 @@ mod tests {
                 view.apply_bootstrap(super::super::BootstrapState {
                     projects: Vec::new(),
                     sessions: vec![snapshot("session-1", "First session").metadata],
+                    archived: Vec::new(),
                     selected_session: Some("session-1".to_owned()),
                 });
             });
@@ -12461,6 +12741,74 @@ mod tests {
                     assert_eq!(app_session_id, "session-1");
                 }
                 _ => panic!("expected a DeleteSession command"),
+            }
+        }
+
+        #[gpui::test]
+        fn clicking_archive_sends_an_archive_command(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            let row = cx
+                .debug_bounds("session-row")
+                .expect("session row rendered");
+            cx.simulate_mouse_down(row.center(), MouseButton::Right, Modifiers::none());
+            cx.simulate_mouse_up(row.center(), MouseButton::Right, Modifiers::none());
+            cx.run_until_parked();
+
+            let item = cx
+                .debug_bounds("session-menu-archive")
+                .expect("archive item rendered");
+            cx.simulate_click(item.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(view.session_menu.is_none());
+                assert!(view.archiving_sessions.contains("session-1"));
+            });
+            let command = commands.try_recv().expect("a command was sent");
+            match command {
+                ServiceCommand::ArchiveSession { app_session_id, .. } => {
+                    assert_eq!(app_session_id, "session-1");
+                }
+                _ => panic!("expected an ArchiveSession command"),
+            }
+        }
+
+        /// An archived session leaves the sidebar and turns up in settings,
+        /// which is the only place it can be brought back from.
+        #[gpui::test]
+        fn settings_offers_to_unarchive_an_archived_session(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+
+            view.update(cx, |view, cx| {
+                view.forget_session("session-1", cx);
+                view.archived_sessions = vec![crate::ArchivedSessionRow {
+                    id: "session-1".to_owned(),
+                    title: "First session".to_owned(),
+                    archived_at: "2026-01-01T00:00:00Z".to_owned(),
+                }];
+                view.settings_visibility = crate::SettingsVisibility::Open;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(
+                    view.sessions.is_empty(),
+                    "an archived session stayed in the sidebar"
+                );
+            });
+            let unarchive = cx
+                .debug_bounds("settings-unarchive-session-1")
+                .expect("unarchive button rendered");
+            cx.simulate_click(unarchive.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            let command = commands.try_recv().expect("a command was sent");
+            match command {
+                ServiceCommand::UnarchiveSession { app_session_id } => {
+                    assert_eq!(app_session_id, "session-1");
+                }
+                _ => panic!("expected an UnarchiveSession command"),
             }
         }
 

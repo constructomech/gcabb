@@ -9,6 +9,9 @@ activity, commands, and changes visible as they happen.
 ## What you can do
 
 - Create, resume, cancel, close, and switch between coding sessions.
+- Archive a session to reclaim its worktree while keeping its full history,
+  and unarchive it from Settings to rebuild the worktree along with any
+  tracked or untracked work that was never committed.
 - Work in isolated project worktrees without blocking other sessions.
 - Stream the conversation and inspect main-agent, subagent, and tool activity.
 - Respond to permission, elicitation, user-input, plan, and mode requests.

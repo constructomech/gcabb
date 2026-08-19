@@ -12,7 +12,7 @@ use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 8;
+const SCHEMA_VERSION: i64 = 9;
 /// Initial restored output window. Older chunks stay in `SQLite` and can be
 /// prepended through `read_output` without inflating every restored snapshot.
 pub const RESTORED_OUTPUT_CHUNKS: u64 = 64;
@@ -60,6 +60,31 @@ pub struct OutputRead {
     pub content: String,
     pub metadata: OutputMetadata,
     pub next_chunk: u64,
+}
+
+/// What was recorded about a session's worktree when it was archived.
+///
+/// Archiving throws the worktree away, so everything needed to rebuild it --
+/// the branch it was on, the commit it sat at, and a patch of the work that
+/// was never committed -- is kept here instead.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SessionArchiveRecord {
+    pub session_id: String,
+    pub archived_at: String,
+    /// Worktree path the session ran in, recreated on unarchive.
+    pub project_path: String,
+    pub repository_root: Option<String>,
+    /// Branch the worktree was checked out on, when it had one.
+    pub branch: Option<String>,
+    pub head_commit: Option<String>,
+    /// Patch of staged, unstaged, and untracked work, when there was any.
+    pub patch: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ArchivedSession {
+    pub metadata: SessionMetadata,
+    pub archive: SessionArchiveRecord,
 }
 
 impl Storage {
@@ -122,6 +147,23 @@ impl Storage {
             ],
         )?;
         Ok(())
+    }
+
+    /// Look one session up by id, whether or not it is archived.
+    ///
+    /// `list_sessions` hides archived sessions, so anything that must still
+    /// address one -- unarchiving it, deleting it from the archive -- asks
+    /// here instead.
+    pub fn session_metadata(&self, app_session_id: &str) -> Result<Option<SessionMetadata>> {
+        self.connection()?
+            .query_row(
+                "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, model, mode, base_ref, created_at, updated_at
+                 FROM app_sessions WHERE id = ?1",
+                [app_session_id],
+                metadata_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
     }
 
     pub fn session_exists(&self, app_session_id: &str) -> Result<bool> {
@@ -254,10 +296,126 @@ impl Storage {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
             "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, model, mode, base_ref, created_at, updated_at
-             FROM app_sessions ORDER BY updated_at DESC, id",
+             FROM app_sessions
+             WHERE id NOT IN (SELECT session_id FROM session_archives)
+             ORDER BY updated_at DESC, id",
         )?;
         let rows = statement.query_map([], metadata_from_row)?;
         rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Sessions the user has archived, newest archive first.
+    ///
+    /// Archived sessions keep every row they had -- events, snapshots, and
+    /// output are untouched -- so this is a visibility change rather than a
+    /// copy. [`Self::list_sessions`] excludes them, which is what keeps them
+    /// out of the sidebar and out of startup restore.
+    pub fn list_archived_sessions(&self) -> Result<Vec<ArchivedSession>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(
+            "SELECT s.id, s.sdk_session_id, s.project_path, s.repository_root, s.title, s.title_source, s.kind, s.model, s.mode, s.base_ref, s.created_at, s.updated_at,
+                    a.archived_at, a.project_path, a.repository_root, a.branch, a.head_commit, a.patch
+             FROM app_sessions s
+             JOIN session_archives a ON a.session_id = s.id
+             ORDER BY a.archived_at DESC, s.id",
+        )?;
+        let rows = statement.query_map([], |row| {
+            Ok(ArchivedSession {
+                metadata: metadata_from_row(row)?,
+                archive: SessionArchiveRecord {
+                    session_id: row.get(0)?,
+                    archived_at: row.get(12)?,
+                    project_path: row.get(13)?,
+                    repository_root: row.get(14)?,
+                    branch: row.get(15)?,
+                    head_commit: row.get(16)?,
+                    patch: row.get(17)?,
+                },
+            })
+        })?;
+        rows.collect::<std::result::Result<Vec<_>, _>>()
+            .map_err(Into::into)
+    }
+
+    /// Record a session as archived, along with what is needed to rebuild its
+    /// worktree later.
+    pub fn archive_session(&self, record: &SessionArchiveRecord) -> Result<()> {
+        let connection = self.connection()?;
+        if !connection.query_row(
+            "SELECT EXISTS(SELECT 1 FROM app_sessions WHERE id = ?1)",
+            [&record.session_id],
+            |row| row.get::<_, bool>(0),
+        )? {
+            return Err(StorageError::SessionNotFound(record.session_id.clone()));
+        }
+        connection.execute(
+            "INSERT INTO session_archives (
+                session_id, archived_at, project_path, repository_root, branch, head_commit, patch
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+             ON CONFLICT(session_id) DO UPDATE SET
+                archived_at = excluded.archived_at,
+                project_path = excluded.project_path,
+                repository_root = excluded.repository_root,
+                branch = excluded.branch,
+                head_commit = excluded.head_commit,
+                patch = excluded.patch",
+            params![
+                record.session_id,
+                record.archived_at,
+                record.project_path,
+                record.repository_root,
+                record.branch,
+                record.head_commit,
+                record.patch,
+            ],
+        )?;
+        Ok(())
+    }
+
+    /// Read a session's archive record without clearing it.
+    pub fn session_archive(&self, session_id: &str) -> Result<Option<SessionArchiveRecord>> {
+        self.connection()?
+            .query_row(
+                "SELECT session_id, archived_at, project_path, repository_root, branch, head_commit, patch
+                 FROM session_archives WHERE session_id = ?1",
+                [session_id],
+                |row| {
+                    Ok(SessionArchiveRecord {
+                        session_id: row.get(0)?,
+                        archived_at: row.get(1)?,
+                        project_path: row.get(2)?,
+                        repository_root: row.get(3)?,
+                        branch: row.get(4)?,
+                        head_commit: row.get(5)?,
+                        patch: row.get(6)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Clear a session's archived state, making it visible to the client again.
+    ///
+    /// Deliberately separate from [`Self::session_archive`]: the record holds
+    /// the only copy of the session's uncommitted work, so a caller must be
+    /// able to read it, rebuild from it, and only then discard it.
+    pub fn clear_session_archive(&self, session_id: &str) -> Result<bool> {
+        let removed = self.connection()?.execute(
+            "DELETE FROM session_archives WHERE session_id = ?1",
+            [session_id],
+        )?;
+        Ok(removed > 0)
+    }
+
+    pub fn is_session_archived(&self, session_id: &str) -> Result<bool> {
+        self.connection()?
+            .query_row(
+                "SELECT EXISTS(SELECT 1 FROM session_archives WHERE session_id = ?1)",
+                [session_id],
+                |row| row.get(0),
+            )
             .map_err(Into::into)
     }
 
@@ -609,6 +767,15 @@ impl Storage {
                 session_id TEXT,
                 success INTEGER NOT NULL,
                 details TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS session_archives (
+                session_id TEXT PRIMARY KEY REFERENCES app_sessions(id) ON DELETE CASCADE,
+                archived_at TEXT NOT NULL,
+                project_path TEXT NOT NULL,
+                repository_root TEXT,
+                branch TEXT,
+                head_commit TEXT,
+                patch TEXT
              );",
         )?;
         // Databases created before schema version 3 predate the changes view
@@ -1437,6 +1604,81 @@ mod tests {
             vec![4],
             "superseded snapshots survived the upgrade"
         );
+    }
+
+    /// Archiving hides a session from the client without touching anything it
+    /// recorded, and unarchiving hands back what is needed to rebuild it.
+    #[test]
+    fn archiving_hides_a_session_but_keeps_its_history() {
+        let storage = Storage::open_in_memory().unwrap();
+        let metadata = metadata();
+        storage.upsert_session(&metadata).unwrap();
+        storage.append_event(&event(1, "session.started")).unwrap();
+        let record = SessionArchiveRecord {
+            session_id: metadata.id.clone(),
+            archived_at: "3".to_owned(),
+            project_path: "/tmp/worktrees/session".to_owned(),
+            repository_root: Some("/tmp/project".to_owned()),
+            branch: Some("gcabb/task".to_owned()),
+            head_commit: Some("abc123".to_owned()),
+            patch: Some("diff --git a/a b/a\n".to_owned()),
+        };
+
+        storage.archive_session(&record).unwrap();
+
+        assert!(storage.list_sessions().unwrap().is_empty());
+        assert!(storage.is_session_archived("app-session").unwrap());
+        assert_eq!(
+            storage.list_archived_sessions().unwrap(),
+            vec![ArchivedSession {
+                metadata: metadata.clone(),
+                archive: record.clone(),
+            }]
+        );
+        // The event log is untouched, so nothing had to be copied out.
+        assert_eq!(
+            storage
+                .recover_session("app-session")
+                .unwrap()
+                .state
+                .metadata,
+            metadata
+        );
+        assert_eq!(
+            storage.session_metadata("app-session").unwrap().as_ref(),
+            Some(&metadata),
+            "an archived session must stay addressable by id"
+        );
+
+        assert_eq!(
+            storage.session_archive("app-session").unwrap(),
+            Some(record)
+        );
+        assert!(storage.clear_session_archive("app-session").unwrap());
+
+        assert_eq!(storage.list_sessions().unwrap(), vec![metadata]);
+        assert!(storage.list_archived_sessions().unwrap().is_empty());
+        assert_eq!(storage.session_archive("app-session").unwrap(), None);
+        assert!(!storage.clear_session_archive("app-session").unwrap());
+    }
+
+    /// A session cannot be archived unless it exists, so a stale id cannot
+    /// leave an archive row pointing at nothing.
+    #[test]
+    fn archiving_an_unknown_session_is_rejected() {
+        let storage = Storage::open_in_memory().unwrap();
+
+        let result = storage.archive_session(&SessionArchiveRecord {
+            session_id: "missing".to_owned(),
+            archived_at: "1".to_owned(),
+            project_path: "/tmp".to_owned(),
+            repository_root: None,
+            branch: None,
+            head_commit: None,
+            patch: None,
+        });
+
+        assert!(matches!(result, Err(StorageError::SessionNotFound(id)) if id == "missing"));
     }
 
     #[test]
