@@ -235,6 +235,36 @@ async fn an_idle_session_drains_one_item_at_a_time() {
 }
 
 #[tokio::test]
+async fn the_last_item_is_reported_done_once_its_turn_ends() {
+    let (harness, session) = harness().await;
+    session.enqueue("only").await.expect("enqueue");
+    idle(&harness, &session).await;
+    await_snapshot(&session, |snapshot| {
+        snapshot
+            .queue
+            .items
+            .iter()
+            .any(|item| item.state == QueueItemState::Dispatched)
+    })
+    .await;
+
+    // The turn this item asked for finishes and there is nothing behind it.
+    // Retiring it has to reach the UI on its own, or the last follow-up of a
+    // queue sits there reporting itself as still running.
+    idle(&harness, &session).await;
+
+    let snapshot = await_snapshot(&session, |snapshot| {
+        snapshot
+            .queue
+            .items
+            .iter()
+            .all(|item| item.state == QueueItemState::Completed)
+    })
+    .await;
+    assert_eq!(snapshot.queue.pending_count(), 0);
+}
+
+#[tokio::test]
 async fn a_paused_queue_does_not_deliver_on_idle() {
     let (harness, session) = harness().await;
     session.set_queue_paused(true).await.expect("pause");

@@ -2694,7 +2694,11 @@ impl SessionActor {
     ///
     /// Called only when the session is idle, so anything still marked as
     /// dispatched has had its turn run to completion.
-    fn complete_dispatched(&mut self) {
+    /// Returns whether anything was retired, so the caller can publish. The
+    /// last item in a queue retires with nothing left to dispatch behind it,
+    /// and without a publish of its own it would sit in the UI as running
+    /// forever.
+    fn complete_dispatched(&mut self) -> bool {
         let dispatched: Vec<_> = self
             .state
             .queue
@@ -2704,7 +2708,7 @@ impl SessionActor {
             .cloned()
             .collect();
         if dispatched.is_empty() {
-            return;
+            return false;
         }
         for mut item in dispatched {
             item.state = QueueItemState::Completed;
@@ -2716,6 +2720,7 @@ impl SessionActor {
         if let Err(error) = self.reload_queue() {
             self.record_actor_error("queue_view", &error.to_string());
         }
+        true
     }
 
     /// Hand the next pending item to the agent when the session can take it.
@@ -2726,7 +2731,9 @@ impl SessionActor {
         if self.state.status != SessionStatus::Idle {
             return;
         }
-        self.complete_dispatched();
+        if self.complete_dispatched() {
+            self.publish(false);
+        }
         if self.state.queue.paused {
             return;
         }
