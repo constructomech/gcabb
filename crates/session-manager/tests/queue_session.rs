@@ -501,3 +501,74 @@ async fn editing_a_task_list_that_is_not_writable_fails_rather_than_pretending()
         .expect_err("edit is refused");
     assert!(error.to_string().contains("hosts the session filesystem"));
 }
+
+#[tokio::test]
+async fn a_runtime_without_a_queue_is_reported_as_degraded_not_broken() {
+    let dir = tempdir().expect("tempdir");
+    let provider = Arc::new(FakeProvider::default());
+    provider.without_runtime_queue(true);
+    let storage = Arc::new(Storage::open_in_memory().expect("storage"));
+    let manager = SessionManager::new(
+        provider.clone(),
+        storage,
+        Arc::new(MemoryDiagnostics::default()),
+    );
+    manager.start().await.expect("start");
+    let session = manager
+        .create_session(request(dir.path()))
+        .await
+        .expect("session");
+
+    let snapshot = await_snapshot(&session, |snapshot| {
+        snapshot
+            .capabilities
+            .get(app_model::CapabilityId::NativeQueue)
+            .is_some()
+    })
+    .await;
+
+    let native = snapshot
+        .capabilities
+        .get(app_model::CapabilityId::NativeQueue)
+        .expect("capability recorded");
+    assert_eq!(native.status, app_model::CapabilityStatus::Unavailable);
+    // Losing the runtime queue must not block the session, only degrade it.
+    assert!(
+        !snapshot
+            .capabilities
+            .blocking()
+            .iter()
+            .any(|capability| capability.id == app_model::CapabilityId::NativeQueue)
+    );
+    // And the queue still works through the fallback.
+    session.enqueue("still works").await.expect("enqueue");
+}
+
+#[tokio::test]
+async fn a_hosted_task_list_is_reported_as_shared() {
+    let (harness, session) = harness().await;
+    harness
+        .provider
+        .set_agent_plan(AgentPlan {
+            todos: Vec::new(),
+            writable: true,
+        })
+        .await;
+
+    // Recorded when the actor starts, so a fresh session is needed to observe
+    // it; the queue capability alone proves the recording ran.
+    let snapshot = await_snapshot(&session, |snapshot| {
+        snapshot
+            .capabilities
+            .get(app_model::CapabilityId::NativeQueue)
+            .is_some()
+    })
+    .await;
+    assert_eq!(
+        snapshot
+            .capabilities
+            .get(app_model::CapabilityId::NativeQueue)
+            .map(|capability| capability.status),
+        Some(app_model::CapabilityStatus::Available)
+    );
+}

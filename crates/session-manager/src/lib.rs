@@ -6,14 +6,14 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    AgentTodo, AgentTodoStatus, ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus,
-    DomainEvent, InteractionResponse, OutputStreamKind, ProjectMetadata, PromptAttachment,
-    QueueDelivery, QueueItem, QueueItemState, SessionKind, SessionMetadata, SessionSnapshot,
-    SessionStatus, TitleSource, ToolCatalog,
+    AgentTodo, AgentTodoStatus, ApplyOutcome, Capability, CapabilityId, CapabilityReport,
+    CapabilityStatus, DomainEvent, InteractionResponse, OutputStreamKind, ProjectMetadata,
+    PromptAttachment, QueueDelivery, QueueItem, QueueItemState, SessionKind, SessionMetadata,
+    SessionSnapshot, SessionStatus, TitleSource, ToolCatalog,
 };
 use copilot_provider::{
     AgentProvider, AgentProviderFactory, ProviderCompatibility, ProviderError, ProviderEvent,
-    ProviderInteraction, ProviderSession, QueueDeliveryRequest, SessionRequest,
+    ProviderInteraction, ProviderSession, QueueDeliveryRequest, QueueTransportKind, SessionRequest,
 };
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
 use git_service::GitService;
@@ -1821,6 +1821,7 @@ impl SessionActor {
     async fn run(mut self) {
         self.load_queue();
         self.refresh_agent_plan().await;
+        self.record_runtime_capabilities().await;
         self.publish(false);
         loop {
             tokio::select! {
@@ -2360,6 +2361,53 @@ impl SessionActor {
             "session.todos_changed" => self.refresh_agent_plan().await,
             _ => {}
         }
+    }
+
+    /// Record what this session's runtime turned out to support.
+    ///
+    /// Both capabilities degrade rather than block, so they are reported for
+    /// the developer's benefit rather than to stop the session: the queue
+    /// falls back to sending when idle, and the agent's task list falls back
+    /// to being read-only.
+    async fn record_runtime_capabilities(&mut self) {
+        let transport = self
+            .provider
+            .queue_transport(&self.sdk_session_id)
+            .await
+            .unwrap_or(QueueTransportKind::SendOnIdle);
+        let native = transport == QueueTransportKind::Native;
+        self.state.capabilities.set(Capability {
+            id: CapabilityId::NativeQueue,
+            status: if native {
+                CapabilityStatus::Available
+            } else {
+                CapabilityStatus::Unavailable
+            },
+            detail: if native {
+                "The runtime holds a copy of the queue and drains it itself.".to_owned()
+            } else {
+                "The runtime has no queue surface, so GCABB sends queued prompts as the session becomes idle.".to_owned()
+            },
+            evidence: Vec::new(),
+        });
+
+        let shared = self.state.agent_plan.writable;
+        self.state.capabilities.set(Capability {
+            id: CapabilityId::SharedPlan,
+            status: if shared {
+                CapabilityStatus::Available
+            } else {
+                CapabilityStatus::Unavailable
+            },
+            detail: if shared {
+                "GCABB owns this session's database, so the agent's task list can be changed."
+                    .to_owned()
+            } else {
+                "The runtime owns this session's database, so the agent's task list is read-only."
+                    .to_owned()
+            },
+            evidence: Vec::new(),
+        });
     }
 
     /// Apply an edit to the agent's task list, then re-read it.

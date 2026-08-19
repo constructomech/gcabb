@@ -35,6 +35,10 @@ pub enum CapabilityId {
     GithubMcp,
     Skills,
     Changes,
+    /// The runtime mirrors GCABB's prompt queue and can drain it itself.
+    NativeQueue,
+    /// GCABB owns the session database, so the agent's task list is shared.
+    SharedPlan,
 }
 
 impl CapabilityId {
@@ -48,6 +52,8 @@ impl CapabilityId {
             Self::GithubMcp => "GitHub MCP",
             Self::Skills => "Skills",
             Self::Changes => "Changes view",
+            Self::NativeQueue => "Runtime queue",
+            Self::SharedPlan => "Shared task list",
         }
     }
 }
@@ -161,6 +167,8 @@ impl CapabilityReport {
             | CapabilityId::Shell => true,
             // Reviewing a diff needs a checkout to diff against.
             CapabilityId::Changes => matches!(kind, SessionKind::Project),
+            // The rest degrade rather than block. The queue falls back to
+            // sending when idle, and the task list to being read-only.
             _ => false,
         }
     }
