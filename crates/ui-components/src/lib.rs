@@ -31,6 +31,7 @@ actions!(
         SelectHome,
         SelectEnd,
         Submit,
+        SubmitQueued,
         InsertNewline,
         Paste,
         Copy,
@@ -44,6 +45,15 @@ const CURSOR_BLINK_TICK: Duration = Duration::from_millis(50);
 
 #[derive(Clone, Debug)]
 pub struct InputSubmitted {
+    pub text: String,
+}
+
+/// A submit the caller asked to handle differently from the ordinary one.
+///
+/// The input has no opinion on what the difference is; it only reports that
+/// the alternate submit key was used and leaves the meaning to the caller.
+#[derive(Clone, Debug)]
+pub struct InputQueued {
     pub text: String,
 }
 
@@ -252,6 +262,13 @@ impl TextInput {
         let text = self.content.trim().to_owned();
         if !text.is_empty() {
             cx.emit(InputSubmitted { text });
+        }
+    }
+
+    fn submit_queued(&mut self, _: &SubmitQueued, _: &mut Window, cx: &mut Context<Self>) {
+        let text = self.content.trim().to_owned();
+        if !text.is_empty() {
+            cx.emit(InputQueued { text });
         }
     }
 
@@ -501,6 +518,7 @@ fn line_range(content: &str, offset: usize) -> Range<usize> {
 }
 
 impl EventEmitter<InputSubmitted> for TextInput {}
+impl EventEmitter<InputQueued> for TextInput {}
 impl EventEmitter<ImagesPasted> for TextInput {}
 
 impl EntityInputHandler for TextInput {
@@ -836,6 +854,7 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::select_home))
             .on_action(cx.listener(Self::select_end))
             .on_action(cx.listener(Self::submit))
+            .on_action(cx.listener(Self::submit_queued))
             .on_action(cx.listener(Self::insert_newline))
             .on_action(cx.listener(Self::paste))
             .on_action(cx.listener(Self::copy))
@@ -877,6 +896,7 @@ pub fn bind_text_input_keys(cx: &mut App) {
         KeyBinding::new("shift-home", SelectHome, Some("TextInput")),
         KeyBinding::new("shift-end", SelectEnd, Some("TextInput")),
         KeyBinding::new("enter", Submit, Some("TextInput")),
+        KeyBinding::new("ctrl-enter", SubmitQueued, Some("TextInput")),
         KeyBinding::new("shift-enter", InsertNewline, Some("TextInput")),
         // `secondary` is cmd on macOS and ctrl everywhere else. Binding cmd
         // directly meant paste was unreachable on Linux and Windows.

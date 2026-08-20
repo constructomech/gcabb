@@ -43,6 +43,10 @@ use uuid::Uuid;
 pub const SDK_CRATE_VERSION: &str = "1.0.9";
 pub const MINIMUM_PROTOCOL_VERSION: u32 = 3;
 
+pub mod queue;
+
+pub use queue::{DeliveryReceipt, QueueDeliveryRequest, QueueTransport, SendOnIdleTransport};
+
 #[derive(Debug, Error)]
 pub enum ProviderError {
     #[error("provider has not been started")]
@@ -160,6 +164,13 @@ pub trait AgentProvider: Send + Sync {
         model: Option<&str>,
         working_directory: &Path,
     ) -> Result<String>;
+
+    /// Hand one queued follow-up to the agent.
+    async fn deliver_queued(
+        &self,
+        sdk_session_id: &str,
+        request: &QueueDeliveryRequest,
+    ) -> Result<DeliveryReceipt>;
 }
 
 /// Creates isolated provider runtimes for app sessions.
@@ -1030,6 +1041,25 @@ impl AgentProvider for CopilotProvider {
             errors: skills.errors.unwrap_or_default(),
         })
     }
+
+    async fn deliver_queued(
+        &self,
+        sdk_session_id: &str,
+        request: &QueueDeliveryRequest,
+    ) -> Result<DeliveryReceipt> {
+        let session = self.session(sdk_session_id).await?;
+        let started = Instant::now();
+        let result = SendOnIdleTransport.deliver(&session, request).await;
+        self.record(
+            "deliver_queued",
+            millis(started.elapsed().as_millis()),
+            Some(sdk_session_id.to_owned()),
+            result.is_ok(),
+            json!({"delivery": format!("{:?}", request.delivery)}),
+        );
+        result
+    }
+
     async fn discover_tools(&self, model: Option<&str>) -> Result<ToolCatalog> {
         let started = Instant::now();
         let request = ToolsListRequest {

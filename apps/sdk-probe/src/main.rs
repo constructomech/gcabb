@@ -20,8 +20,8 @@ use github_copilot_sdk::rpc::{
 use github_copilot_sdk::session::Session;
 use github_copilot_sdk::tool::ToolHandler;
 use github_copilot_sdk::{
-    Client, ClientOptions, ElicitationRequest, ElicitationResult, RequestId, ResumeSessionConfig,
-    SessionConfig, SessionId, Tool, ToolInvocation, ToolResult,
+    Client, ClientOptions, DeliveryMode, ElicitationRequest, ElicitationResult, MessageOptions,
+    RequestId, ResumeSessionConfig, SessionConfig, SessionId, Tool, ToolInvocation, ToolResult,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -30,8 +30,9 @@ use tokio::sync::mpsc;
 use tracing::{info, warn};
 use tracing_subscriber::EnvFilter;
 
-#[derive(Debug, Parser)]
+#[derive(Clone, Debug, Parser)]
 #[command(about = "Record Copilot SDK events for the GCABB Phase 0 feasibility matrix")]
+#[allow(clippy::struct_excessive_bools, reason = "CLI flags map to bools")]
 struct Args {
     #[arg(long, default_value = ".")]
     cwd: PathBuf,
@@ -49,6 +50,10 @@ struct Args {
     approve_permissions: bool,
     #[arg(long)]
     fleet_prompt: Option<String>,
+    /// Interrupt a running turn with an immediate-delivery send to verify
+    /// steering works on the stable `session.send` surface. Consumes quota.
+    #[arg(long)]
+    steering_probe: bool,
 }
 
 #[derive(Clone)]
@@ -212,15 +217,30 @@ fn record_rpc<T: Serialize>(
     started: Instant,
     result: github_copilot_sdk::Result<T>,
 ) -> Result<()> {
+    record_rpc_value(recorder, name, started, result).map(|_| ())
+}
+
+fn record_rpc_value<T: Serialize>(
+    recorder: &Recorder,
+    name: &str,
+    started: Instant,
+    result: github_copilot_sdk::Result<T>,
+) -> Result<Option<T>> {
     match result {
-        Ok(value) => recorder.write(
-            name,
-            json!({"elapsedMs": started.elapsed().as_millis(), "result": value}),
-        ),
-        Err(error) => recorder.write(
-            &format!("{name}.error"),
-            json!({"elapsedMs": started.elapsed().as_millis(), "error": error.to_string()}),
-        ),
+        Ok(value) => {
+            recorder.write(
+                name,
+                json!({"elapsedMs": started.elapsed().as_millis(), "result": &value}),
+            )?;
+            Ok(Some(value))
+        }
+        Err(error) => {
+            recorder.write(
+                &format!("{name}.error"),
+                json!({"elapsedMs": started.elapsed().as_millis(), "error": error.to_string()}),
+            )?;
+            Ok(None)
+        }
     }
 }
 
@@ -329,6 +349,147 @@ async fn exercise_read_only_rpcs(session: &Session, recorder: &Recorder) -> Resu
         "rpc.session.tasks.list",
         started,
         session.rpc().tasks().list().await,
+    )
+}
+
+/// Records the current queue contents as a compact, order-preserving list so
+/// consecutive snapshots in the JSONL output can be diffed by eye.
+async fn record_pending_items(session: &Session, recorder: &Recorder, step: &str) -> Result<()> {
+    let started = Instant::now();
+    let pending = record_rpc_value(
+        recorder,
+        "rpc.session.queue.pending_items",
+        started,
+        session.rpc().queue().pending_items().await,
+    )?;
+    let Some(pending) = pending else {
+        return Ok(());
+    };
+    let order: Vec<Value> = pending
+        .items
+        .iter()
+        .map(|item| {
+            json!({
+                "id": item.id,
+                "kind": item.kind,
+                "agentMode": item.agent_mode,
+                "displayText": item.display_text,
+            })
+        })
+        .collect();
+    recorder.write(
+        "queue.order",
+        json!({
+            "step": step,
+            "items": order,
+            "steeringMessages": pending.steering_messages,
+        }),
+    )
+}
+
+/// Verifies that an immediate-delivery `session.send` steers a turn that is
+/// already running, which is the stable-surface equivalent of
+/// `session.queue.sendNow`.
+///
+/// Sends two real prompts to the model.
+async fn exercise_steering(
+    session: &Session,
+    recorder: &Recorder,
+    timeout: Duration,
+) -> Result<()> {
+    let mut subscription = session.subscribe();
+    recorder.write("steering_probe.start", Value::Null)?;
+
+    let long_prompt = "Count slowly from 1 to 40, one number per line, \
+                       with a short sentence about each number.";
+    let first = session
+        .send(long_prompt)
+        .await
+        .context("failed to send the long-running prompt")?;
+    recorder.write("steering_probe.long_send", json!({"messageId": first}))?;
+
+    // Wait until the turn is demonstrably running before interrupting it.
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut turn_running = false;
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, subscription.recv()).await {
+        if matches!(
+            event.event_type.as_str(),
+            "assistant.message_delta" | "assistant.streaming_delta"
+        ) {
+            turn_running = true;
+            break;
+        }
+        if event.event_type == "session.idle" {
+            break;
+        }
+    }
+    recorder.write(
+        "steering_probe.turn_running",
+        json!({"running": turn_running}),
+    )?;
+    if !turn_running {
+        recorder.write(
+            "steering_probe.aborted",
+            json!({"reason": "the first turn never started streaming"}),
+        )?;
+        return Ok(());
+    }
+
+    record_pending_items(session, recorder, "steering-mid-turn").await?;
+
+    let started = Instant::now();
+    let steer = session
+        .send(
+            MessageOptions::from("Stop counting. Reply with exactly: steered".to_owned())
+                .with_mode(DeliveryMode::Immediate),
+        )
+        .await;
+    match steer {
+        Ok(message_id) => recorder.write(
+            "steering_probe.immediate_send",
+            json!({
+                "elapsedMs": started.elapsed().as_millis(),
+                "messageId": message_id,
+                "acceptedDuringActiveTurn": true,
+            }),
+        )?,
+        Err(error) => {
+            recorder.write(
+                "steering_probe.immediate_send.error",
+                json!({
+                    "elapsedMs": started.elapsed().as_millis(),
+                    "error": error.to_string(),
+                    "acceptedDuringActiveTurn": false,
+                }),
+            )?;
+            return Ok(());
+        }
+    }
+
+    record_pending_items(session, recorder, "steering-after-immediate-send").await?;
+
+    let deadline = tokio::time::Instant::now() + timeout;
+    let mut event_types = Vec::new();
+    let mut saw_steered_reply = false;
+    while let Ok(Ok(event)) = tokio::time::timeout_at(deadline, subscription.recv()).await {
+        event_types.push(event.event_type.clone());
+        if event.event_type == "assistant.message"
+            && serde_json::to_value(&event)?
+                .to_string()
+                .contains("steered")
+        {
+            saw_steered_reply = true;
+        }
+        if event.event_type == "session.idle" {
+            break;
+        }
+    }
+    recorder.write(
+        "steering_probe.complete",
+        json!({
+            "eventTypes": event_types,
+            "sawSteeredReply": saw_steered_reply,
+        }),
     )
 }
 
@@ -666,10 +827,13 @@ async fn main() -> Result<()> {
         "session.ready",
         json!({"sessionId": session.id(), "capabilities": session.capabilities()}),
     )?;
+    let timeout = Duration::from_secs(args.timeout_seconds);
     exercise_read_only_rpcs(&session, &recorder).await?;
+    if args.steering_probe {
+        exercise_steering(&session, &recorder, timeout).await?;
+    }
     recorder.write("sdk.history", session.get_events().await?)?;
 
-    let timeout = Duration::from_secs(args.timeout_seconds);
     if let Some(prompt) = args.fleet_prompt.as_deref() {
         run_fleet(&session, &recorder, prompt, timeout).await?;
     }

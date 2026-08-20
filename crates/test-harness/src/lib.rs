@@ -11,8 +11,9 @@ use app_model::{
 };
 use async_trait::async_trait;
 use copilot_provider::{
-    AgentProvider, AgentProviderFactory, ProviderCompatibility, ProviderError, ProviderEvent,
-    ProviderInteraction, ProviderSession, Result, SDK_CRATE_VERSION, SessionRequest,
+    AgentProvider, AgentProviderFactory, DeliveryReceipt, ProviderCompatibility, ProviderError,
+    ProviderEvent, ProviderInteraction, ProviderSession, QueueDeliveryRequest, Result,
+    SDK_CRATE_VERSION, SessionRequest,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -143,6 +144,9 @@ pub struct FakeProvider {
     instructions: Mutex<Vec<WorkspaceResource>>,
     selected_agents: Mutex<HashMap<String, Option<String>>>,
     sent_prompts: Mutex<Vec<String>>,
+    /// Follow-ups handed to the fake agent, in delivery order, keyed by session.
+    delivered_queue: Mutex<HashMap<String, Vec<QueueDeliveryRequest>>>,
+    fail_queue_delivery: AtomicBool,
 }
 
 impl FakeProvider {
@@ -224,6 +228,21 @@ impl FakeProvider {
     /// Prompts carried by each send, in order.
     pub async fn sent_prompts(&self) -> Vec<String> {
         self.sent_prompts.lock().await.clone()
+    }
+
+    /// Fail every queue delivery.
+    pub fn fail_queue_delivery(&self, fail: bool) {
+        self.fail_queue_delivery.store(fail, Ordering::SeqCst);
+    }
+
+    /// Follow-ups handed to the fake agent, in delivery order.
+    pub async fn delivered_queue(&self, sdk_session_id: &str) -> Vec<QueueDeliveryRequest> {
+        self.delivered_queue
+            .lock()
+            .await
+            .get(sdk_session_id)
+            .cloned()
+            .unwrap_or_default()
     }
 
     async fn tool_names(&self) -> Vec<String> {
@@ -407,6 +426,26 @@ impl AgentProvider for FakeProvider {
             self.emit(sdk_session_id, event).await?;
         }
         Ok(format!("message-{sdk_session_id}"))
+    }
+
+    async fn deliver_queued(
+        &self,
+        sdk_session_id: &str,
+        request: &QueueDeliveryRequest,
+    ) -> Result<DeliveryReceipt> {
+        if self.fail_queue_delivery.load(Ordering::SeqCst) {
+            return Err(ProviderError::Sdk("configured queue failure".to_owned()));
+        }
+        self.delivered_queue
+            .lock()
+            .await
+            .entry(sdk_session_id.to_owned())
+            .or_default()
+            .push(request.clone());
+        let message_id = self.send(sdk_session_id, &request.prompt, &[]).await?;
+        Ok(DeliveryReceipt {
+            message_id: Some(message_id),
+        })
     }
 
     async fn cancel(&self, sdk_session_id: &str) -> Result<()> {
