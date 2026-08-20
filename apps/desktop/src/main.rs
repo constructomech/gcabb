@@ -1043,6 +1043,9 @@ enum ServiceCommand {
     RemoveProject {
         project_id: String,
     },
+    // Handled by the service, but nothing sends it yet: the workspace
+    // configuration UI that would add a root is still to come.
+    #[allow(dead_code)]
     AddConfigurationRoot {
         path: PathBuf,
     },
@@ -2150,21 +2153,6 @@ enum SettingsVisibility {
     Open,
 }
 
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AutomationsTab {
-    Saved,
-    History,
-}
-
-#[derive(Clone, Copy, Debug, Eq, PartialEq)]
-enum AutomationMenu {
-    Model,
-    Agent,
-    Project,
-    Mode,
-    Effort,
-    Context,
-}
 #[derive(Clone)]
 struct WorktreeConfiguration {
     data_dir: Option<PathBuf>,
@@ -3146,6 +3134,7 @@ impl SessionMvpView {
 
     /// Drains pending service updates, returning whether any were applied so the
     /// caller can skip repainting when the poll tick found nothing to do.
+    #[allow(clippy::too_many_lines)]
     fn apply_service_updates(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         loop {

@@ -222,9 +222,10 @@ impl SessionMvpView {
         });
         let now = automation_runner::timestamp();
         let automation = Automation {
-            id: existing
-                .map(|automation| automation.id.clone())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
+            id: existing.map_or_else(
+                || uuid::Uuid::new_v4().to_string(),
+                |automation| automation.id.clone(),
+            ),
             name: name.to_owned(),
             schedule_description: schedule_description.to_owned(),
             schedule,
@@ -240,8 +241,7 @@ impl SessionMvpView {
             next_run_at: None,
             last_run_at: existing.and_then(|automation| automation.last_run_at.clone()),
             created_at: existing
-                .map(|automation| automation.created_at.clone())
-                .unwrap_or_else(|| now.clone()),
+                .map_or_else(|| now.clone(), |automation| automation.created_at.clone()),
             updated_at: now,
         };
         self.automations_panel.editing = Some(automation.id.clone());
@@ -291,6 +291,7 @@ impl SessionMvpView {
             (self.automations_panel.open_menu != Some(menu)).then_some(menu);
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn automation_menu_options(
         &self,
         menu: AutomationMenu,
@@ -439,6 +440,7 @@ impl SessionMvpView {
         self.automations_panel.open_menu = None;
     }
 
+    #[allow(clippy::too_many_lines)]
     pub fn automation_choice_control(
         &self,
         menu: AutomationMenu,
@@ -711,7 +713,7 @@ impl SessionMvpView {
                         "+ New automation",
                         ELEVATED,
                         cx,
-                        |view, cx| view.begin_new_automation(cx),
+                        SessionMvpView::begin_new_automation,
                     ))
                     .child(
                         div()
@@ -887,7 +889,7 @@ impl SessionMvpView {
                                     .flex()
                                     .items_center()
                                     .gap_2()
-                                    .hover(|style| style.cursor_pointer())
+                                    .hover(gpui::Styled::cursor_pointer)
                                     .on_click(cx.listener(|view, _, _, cx| {
                                         view.automations_panel.draft_enabled =
                                             !view.automations_panel.draft_enabled;
@@ -955,7 +957,7 @@ impl SessionMvpView {
                                         "Save automation",
                                         BLUE,
                                         cx,
-                                        |view, cx| view.save_automation(cx),
+                                        SessionMvpView::save_automation,
                                     )),
                             )
                             .child(div().h(px(1.0)).w_full().flex_shrink_0()),
@@ -1265,8 +1267,8 @@ fn automation_tab_button(
 mod tests {
     use gpui::{Modifiers, TestAppContext};
 
-    use crate::ServiceCommand;
     use crate::tests::interaction::setup;
+    use crate::{ServiceCommand, SessionMvpView};
 
     #[gpui::test]
     fn saving_an_automation_sends_a_valid_definition(cx: &mut TestAppContext) {
@@ -1315,7 +1317,7 @@ mod tests {
     #[gpui::test]
     fn automation_configuration_controls_keep_readable_height(cx: &mut TestAppContext) {
         let (view, cx, _commands) = setup(cx);
-        view.update(cx, |view, cx| view.open_automations(cx));
+        view.update(cx, SessionMvpView::open_automations);
         cx.run_until_parked();
 
         for selector in [
@@ -1339,7 +1341,7 @@ mod tests {
     #[gpui::test]
     fn automation_selectors_open_listboxes_and_scroll_overflow(cx: &mut TestAppContext) {
         let (view, cx, _commands) = setup(cx);
-        view.update(cx, |view, cx| view.open_automations(cx));
+        view.update(cx, SessionMvpView::open_automations);
         cx.run_until_parked();
 
         let mode = cx
@@ -1386,7 +1388,7 @@ mod tests {
     #[gpui::test]
     fn every_automation_selector_opens_and_closes_its_listbox(cx: &mut TestAppContext) {
         let (view, cx, _commands) = setup(cx);
-        view.update(cx, |view, cx| view.open_automations(cx));
+        view.update(cx, SessionMvpView::open_automations);
         cx.run_until_parked();
 
         for (selector, menu_selector) in [

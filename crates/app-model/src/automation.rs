@@ -289,8 +289,8 @@ fn parse_schedule(value: &str) -> Result<AutomationSchedule, ScheduleParseError>
 fn parse_interval(value: &str) -> Result<Option<AutomationSchedule>, ScheduleParseError> {
     let tokens = value.split_whitespace().collect::<Vec<_>>();
     let (amount, unit) = match tokens.as_slice() {
-        ["hourly"] | ["every", "hour"] | ["every", "hourly"] => (1_u32, "hours"),
-        ["every", amount, unit] | ["each", amount, unit] => {
+        ["hourly"] | ["every", "hour" | "hourly"] => (1_u32, "hours"),
+        ["every" | "each", amount, unit] => {
             let Ok(amount) = amount.parse::<u32>() else {
                 return Ok(None);
             };
@@ -361,15 +361,12 @@ fn parse_monthly(
         .split_whitespace()
         .find_map(parse_ordinal)
         .unwrap_or(1);
-    if day == 0 || day > 31 {
+    let Some(day) = u8::try_from(day).ok().filter(|day| (1..=31).contains(day)) else {
         return Err(ScheduleParseError(
             "Monthly schedules require a day from 1 through 31.".to_owned(),
         ));
-    }
-    Ok(Some(AutomationSchedule::Monthly {
-        day: day as u8,
-        minute_of_day,
-    }))
+    };
+    Ok(Some(AutomationSchedule::Monthly { day, minute_of_day }))
 }
 
 fn parse_yearly(
@@ -387,14 +384,18 @@ fn parse_yearly(
         .get(1)
         .and_then(|token| parse_ordinal(token))
         .unwrap_or(1);
-    if NaiveDate::from_ymd_opt(2024, month, day).is_none() {
+    let narrowed = u8::try_from(month).ok().zip(u8::try_from(day).ok());
+    let (Some((month, day)), true) = (
+        narrowed,
+        NaiveDate::from_ymd_opt(2024, month, day).is_some(),
+    ) else {
         return Err(ScheduleParseError(
             "The yearly schedule contains an invalid month and day.".to_owned(),
         ));
-    }
+    };
     Ok(Some(AutomationSchedule::Yearly {
-        month: month as u8,
-        day: day as u8,
+        month,
+        day,
         minute_of_day,
     }))
 }
