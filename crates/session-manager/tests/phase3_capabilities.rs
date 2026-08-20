@@ -69,6 +69,7 @@ fn request(path: &Path) -> CreateSessionRequest {
         reasoning_effort: None,
         base_ref: Some("main".to_owned()),
         context_tier: None,
+        unattended: false,
     }
 }
 

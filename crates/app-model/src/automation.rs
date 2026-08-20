@@ -470,6 +470,66 @@ fn schedule_help() -> ScheduleParseError {
     )
 }
 
+/// The next time a schedule should fire, given when it last fired.
+///
+/// Interval schedules stay anchored to `previous` so a late dispatch does not
+/// drift the cadence, and missed ticks collapse into the next future slot
+/// rather than firing a backlog. Calendar schedules walk forward from the
+/// previous occurrence until they pass `now`.
+///
+/// Returns `None` when `previous` is not a valid RFC 3339 timestamp or the
+/// schedule has no representable next occurrence.
+#[must_use]
+pub fn next_automation_occurrence(
+    schedule: &AutomationSchedule,
+    previous: &str,
+    now: DateTime<Utc>,
+) -> Option<DateTime<Utc>> {
+    let previous = DateTime::parse_from_rfc3339(previous)
+        .ok()?
+        .with_timezone(&Utc);
+    if let AutomationSchedule::IntervalMinutes { minutes } = schedule {
+        let interval = i64::from(*minutes);
+        let elapsed_minutes = (now - previous).num_minutes().max(0);
+        let steps = elapsed_minutes / interval + 1;
+        return previous.checked_add_signed(Duration::minutes(interval.checked_mul(steps)?));
+    }
+    let mut next = schedule.next_after(previous)?;
+    for _ in 0..10_000 {
+        if next > now {
+            return Some(next);
+        }
+        next = schedule.next_after(next)?;
+    }
+    None
+}
+
+/// Interpret an automation condition's final answer.
+///
+/// The condition prompt demands a single word, but models wrap it in
+/// backticks or punctuation often enough that tolerating that is worth more
+/// than being strict. Anything else is an error rather than a guess, so an
+/// ambiguous answer never silently decides whether the action runs.
+///
+/// # Errors
+///
+/// Returns an error when the response does not reduce to `true` or `false`.
+pub fn parse_automation_condition(response: &str) -> Result<bool, String> {
+    let normalized = response
+        .trim_matches(|character: char| {
+            character.is_whitespace() || matches!(character, '`' | '.' | '!')
+        })
+        .to_ascii_lowercase();
+    match normalized.as_str() {
+        "true" => Ok(true),
+        "false" => Ok(false),
+        _ => Err(format!(
+            "Automation condition did not return true or false: {}",
+            response.trim()
+        )),
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use chrono::{TimeZone, Utc};
@@ -686,5 +746,40 @@ mod tests {
             AutomationRunStatus::from_str_or_running("unknown"),
             AutomationRunStatus::Running
         );
+    }
+
+    #[test]
+    fn automation_condition_requires_an_unambiguous_boolean() {
+        assert_eq!(parse_automation_condition("true"), Ok(true));
+        assert_eq!(parse_automation_condition("`false`."), Ok(false));
+        assert!(parse_automation_condition("It looks true").is_err());
+    }
+
+    #[test]
+    fn interval_automation_stays_anchored_when_dispatch_is_late() {
+        let now = DateTime::parse_from_rfc3339("2026-08-14T10:10:07Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let next = next_automation_occurrence(
+            &AutomationSchedule::IntervalMinutes { minutes: 5 },
+            "2026-08-14T10:10:00Z",
+            now,
+        )
+        .unwrap();
+        assert_eq!(next.to_rfc3339(), "2026-08-14T10:15:00+00:00");
+    }
+
+    #[test]
+    fn interval_automation_skips_missed_ticks_without_drifting() {
+        let now = DateTime::parse_from_rfc3339("2026-08-14T10:27:31Z")
+            .unwrap()
+            .with_timezone(&Utc);
+        let next = next_automation_occurrence(
+            &AutomationSchedule::IntervalMinutes { minutes: 5 },
+            "2026-08-14T10:10:00Z",
+            now,
+        )
+        .unwrap();
+        assert_eq!(next.to_rfc3339(), "2026-08-14T10:30:00+00:00");
     }
 }

@@ -27,6 +27,7 @@ fn request(path: &std::path::Path) -> CreateSessionRequest {
         reasoning_effort: None,
         base_ref: None,
         context_tier: None,
+        unattended: false,
     }
 }
 

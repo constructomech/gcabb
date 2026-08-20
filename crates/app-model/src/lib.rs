@@ -12,7 +12,7 @@ pub mod tools;
 
 pub use automation::{
     Automation, AutomationRun, AutomationRunStatus, AutomationSchedule, ScheduleParseError,
-    ScheduleWeekday,
+    ScheduleWeekday, next_automation_occurrence, parse_automation_condition,
 };
 pub use capability::{Capability, CapabilityId, CapabilityReport, CapabilityStatus};
 pub use changes::{ChangeStage, ChangeStatus, ChangedFile, ChangesView, DiffStats};

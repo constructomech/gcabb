@@ -8,29 +8,28 @@ use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    AgentOption, Automation, AutomationRun, AutomationRunStatus, AutomationSchedule, ChangeStatus,
-    ChangedFile, ContextWindowOption, InteractionKind, InteractionResponse, OutputStreamKind,
-    ProjectMetadata, PromptAttachment, QueueItemState, SessionKind, SessionLocation,
-    SessionMetadata, SessionSnapshot, SessionStatus, TitleSource, TranscriptRole, TranscriptState,
-    WorkspaceConfiguration, WorkspaceResource,
+    AgentOption, Automation, AutomationRun, ChangeStatus, ChangedFile, ContextWindowOption,
+    InteractionKind, InteractionResponse, OutputStreamKind, ProjectMetadata, PromptAttachment,
+    QueueItemState, SessionKind, SessionLocation, SessionMetadata, SessionSnapshot, SessionStatus,
+    TranscriptRole, TranscriptState, WorkspaceConfiguration, WorkspaceResource,
 };
-use chrono::{DateTime, SecondsFormat, Utc};
+use chrono::DateTime;
 use copilot_provider::{CopilotProviderFactory, ProviderCompatibility};
 use diagnostics::{DiagnosticEvent, DiagnosticsSink, TracingDiagnostics, init_tracing};
 use git_service::GitService;
 use gpui::prelude::FluentBuilder;
 use gpui::{
-    Anchor, AnchoredPositionMode, Animation, AnimationExt, App, AppContext, Bounds, Context,
-    CursorStyle, Element, ElementId, Entity, ExternalPaths, FocusHandle, Focusable, FollowMode,
-    FontStyle, GlobalElementId, HighlightStyle, InteractiveElement, IntoElement, KeyBinding,
-    LayoutId, ListAlignment, ListState, MouseButton, ParentElement, PathPromptOptions, Render,
-    Role, SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled, StyledText,
-    TextLayout, TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowOptions, actions,
-    anchored, deferred, div, list, point, px, relative, rgb, size,
+    Animation, AnimationExt, App, AppContext, Bounds, Context, CursorStyle, Element, ElementId,
+    Entity, ExternalPaths, FocusHandle, Focusable, FollowMode, FontStyle, GlobalElementId,
+    HighlightStyle, InteractiveElement, IntoElement, KeyBinding, LayoutId, ListAlignment,
+    ListState, MouseButton, ParentElement, PathPromptOptions, Render, Role, SharedString,
+    StatefulInteractiveElement, StrikethroughStyle, Styled, StyledText, TextLayout,
+    TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowOptions, actions, deferred, div,
+    list, px, relative, rgb, size,
 };
 use session_manager::{
-    ArchiveOutcome, CreateSessionRequest, RestoreFailure, RestoreOutcome, SessionHandle,
-    SessionManager, SessionRoots, WorktreeOutcome,
+    ArchiveOutcome, RestoreFailure, RestoreOutcome, SessionHandle, SessionManager, SessionRoots,
+    WorktreeOutcome,
 };
 use session_orchestrator::{
     LaunchOrigin, LaunchProgress, LaunchRequest, LaunchTitle, SessionOrchestrator,
@@ -43,11 +42,15 @@ use ui_components::{
 use updater::install::InstallLayout;
 use updater::version::BuildStamp;
 
+mod automation_runner;
+mod automations_ui;
 mod markdown;
 mod settings;
 mod syntax;
 mod updates;
 
+use automation_runner::AutomationContext;
+use automations_ui::AutomationsPanel;
 use markdown::{MarkdownDocument, MarkdownNode, MarkdownTag};
 use settings::AppSettings;
 use updates::{UpdateRequest, UpdateService, UpdateUi};
@@ -1096,7 +1099,7 @@ impl AppService {
                 ));
             }
         };
-        recover_interrupted_automation_runs(&storage);
+        automation_runner::recover_interrupted_runs(&storage);
         let storage_ms = elapsed_millis(storage_started);
         let bootstrap = BootstrapState {
             projects: storage.list_projects().unwrap_or_else(|error| {
@@ -1174,7 +1177,6 @@ impl AppService {
                 let runtime_ms = elapsed_millis(runtime_started);
                 let provider_factory =
                     CopilotProviderFactory::new(project_root.clone(), diagnostics.clone());
-                let running_automations = Arc::new(Mutex::new(HashSet::new()));
                 let session_roots = SessionRoots {
                     worktrees: None,
                     attachments: attachments_directory(),
@@ -1185,6 +1187,12 @@ impl AppService {
                         .with_session_roots(session_roots.clone()),
                 );
                 let orchestrator = SessionOrchestrator::new(manager.clone(), session_roots.clone());
+                let automations = AutomationContext::new(
+                    manager.clone(),
+                    storage.clone(),
+                    update_tx.clone(),
+                    automation_workspace,
+                );
                 // Projects are configured by the user, not inferred from the
                 // launch directory. Auto-registering the launch repository
                 // would silently re-add a project the user had removed.
@@ -1266,14 +1274,7 @@ impl AppService {
                     .unwrap_or_else(Instant::now);
                 loop {
                     if last_automation_tick.elapsed() >= Duration::from_secs(15) {
-                        dispatch_due_automations(
-                            &runtime,
-                            &manager,
-                            &storage,
-                            &update_tx,
-                            &automation_workspace,
-                            &running_automations,
-                        );
+                        automations.dispatch_due(&runtime);
                         last_automation_tick = Instant::now();
                     }
                     let command = match command_rx.recv_timeout(Duration::from_secs(1)) {
@@ -1423,65 +1424,14 @@ impl AppService {
                                 }
                             }
                         }
-                        ServiceCommand::SaveAutomation(mut automation) => {
-                            let now = automation_timestamp();
-                            if automation.created_at.is_empty() {
-                                automation.created_at.clone_from(&now);
-                            }
-                            automation.updated_at = now.clone();
-                            automation.next_run_at = if automation.enabled {
-                                automation
-                                    .schedule
-                                    .next_after(Utc::now())
-                                    .map(automation_date_time)
-                            } else {
-                                None
-                            };
-                            if let Err(error) = storage.upsert_automation(&automation) {
-                                let _ =
-                                    update_tx.send(ServiceUpdate::ActionFailed(error.to_string()));
-                            } else {
-                                let _ = update_tx.send(ServiceUpdate::AutomationsChanged(
-                                    storage.list_automations().unwrap_or_default(),
-                                ));
-                            }
+                        ServiceCommand::SaveAutomation(automation) => {
+                            automations.save(automation);
                         }
                         ServiceCommand::DeleteAutomation { automation_id } => {
-                            if let Err(error) = storage.delete_automation(&automation_id) {
-                                let _ =
-                                    update_tx.send(ServiceUpdate::ActionFailed(error.to_string()));
-                            } else {
-                                let _ = update_tx.send(ServiceUpdate::AutomationsChanged(
-                                    storage.list_automations().unwrap_or_default(),
-                                ));
-                            }
+                            automations.delete(&automation_id);
                         }
                         ServiceCommand::RunAutomationNow { automation_id } => {
-                            let automation = storage
-                                .list_automations()
-                                .unwrap_or_default()
-                                .into_iter()
-                                .find(|automation| automation.id == automation_id);
-                            if let Some(automation) = automation {
-                                if !spawn_automation_run(
-                                    &runtime,
-                                    &manager,
-                                    &storage,
-                                    &update_tx,
-                                    &automation_workspace,
-                                    &running_automations,
-                                    automation,
-                                    automation_timestamp(),
-                                ) {
-                                    let _ = update_tx.send(ServiceUpdate::ActionFailed(
-                                        "That automation is already running.".to_owned(),
-                                    ));
-                                }
-                            } else {
-                                let _ = update_tx.send(ServiceUpdate::ActionFailed(
-                                    "Automation no longer exists.".to_owned(),
-                                ));
-                            }
+                            automations.run_now(&runtime, &automation_id);
                         }
                         command => {
                             let submit_origin = match &command {
@@ -1570,411 +1520,6 @@ impl AppService {
             update_tx,
         )
     }
-}
-
-fn automation_timestamp() -> String {
-    automation_date_time(Utc::now())
-}
-
-fn automation_date_time(value: DateTime<Utc>) -> String {
-    value.to_rfc3339_opts(SecondsFormat::Secs, true)
-}
-
-fn recover_interrupted_automation_runs(storage: &Storage) {
-    let Ok(runs) = storage.list_automation_runs(1_000) else {
-        return;
-    };
-    for mut run in runs
-        .into_iter()
-        .filter(|run| run.status == AutomationRunStatus::Running)
-    {
-        if let Some(session_id) = run.session_id.as_deref()
-            && let Err(error) = storage.delete_session(session_id)
-        {
-            tracing::warn!(%error, %session_id, "failed to remove interrupted automation session");
-        }
-        run.status = AutomationRunStatus::Failed;
-        run.finished_at = Some(automation_timestamp());
-        run.error = Some("GCABB closed before this automation run completed.".to_owned());
-        if let Err(error) = storage.upsert_automation_run(&run) {
-            tracing::warn!(%error, run_id = %run.id, "failed to mark automation run interrupted");
-        }
-    }
-}
-
-fn next_automation_occurrence(
-    schedule: &AutomationSchedule,
-    previous: &str,
-    now: DateTime<Utc>,
-) -> Option<DateTime<Utc>> {
-    let previous = DateTime::parse_from_rfc3339(previous)
-        .ok()?
-        .with_timezone(&Utc);
-    if let AutomationSchedule::IntervalMinutes { minutes } = schedule {
-        let interval = i64::from(*minutes);
-        let elapsed_minutes = (now - previous).num_minutes().max(0);
-        let steps = elapsed_minutes / interval + 1;
-        return previous
-            .checked_add_signed(chrono::Duration::minutes(interval.checked_mul(steps)?));
-    }
-    let mut next = schedule.next_after(previous)?;
-    for _ in 0..10_000 {
-        if next > now {
-            return Some(next);
-        }
-        next = schedule.next_after(next)?;
-    }
-    None
-}
-
-fn dispatch_due_automations(
-    runtime: &tokio::runtime::Runtime,
-    manager: &Arc<SessionManager>,
-    storage: &Arc<Storage>,
-    updates: &Sender<ServiceUpdate>,
-    fallback_workspace: &Path,
-    running_automations: &Arc<Mutex<HashSet<String>>>,
-) {
-    let now = Utc::now();
-    let now_text = automation_date_time(now);
-    let automations = match storage.due_automations(&now_text) {
-        Ok(automations) => automations,
-        Err(error) => {
-            let _ = updates.send(ServiceUpdate::ActionFailed(format!(
-                "Failed to check automations: {error}"
-            )));
-            return;
-        }
-    };
-    if automations.is_empty() {
-        return;
-    }
-
-    for mut automation in automations {
-        if automation_is_running(running_automations, &automation.id) {
-            continue;
-        }
-        let scheduled_for = automation
-            .next_run_at
-            .clone()
-            .unwrap_or_else(|| now_text.clone());
-        automation.last_run_at = Some(now_text.clone());
-        automation.next_run_at =
-            next_automation_occurrence(&automation.schedule, &scheduled_for, now)
-                .map(automation_date_time);
-        if automation.next_run_at.is_none() {
-            automation.enabled = false;
-        }
-        automation.updated_at.clone_from(&now_text);
-        if let Err(error) = storage.upsert_automation(&automation) {
-            let _ = updates.send(ServiceUpdate::ActionFailed(format!(
-                "Failed to advance automation \"{}\": {error}",
-                automation.name
-            )));
-            continue;
-        }
-        spawn_automation_run(
-            runtime,
-            manager,
-            storage,
-            updates,
-            fallback_workspace,
-            running_automations,
-            automation,
-            scheduled_for,
-        );
-    }
-    let _ = updates.send(ServiceUpdate::AutomationsChanged(
-        storage.list_automations().unwrap_or_default(),
-    ));
-}
-
-fn spawn_automation_run(
-    runtime: &tokio::runtime::Runtime,
-    manager: &Arc<SessionManager>,
-    storage: &Arc<Storage>,
-    updates: &Sender<ServiceUpdate>,
-    fallback_workspace: &Path,
-    running_automations: &Arc<Mutex<HashSet<String>>>,
-    automation: Automation,
-    scheduled_for: String,
-) -> bool {
-    let Ok(mut running) = running_automations.lock() else {
-        return false;
-    };
-    if !running.insert(automation.id.clone()) {
-        return false;
-    }
-    drop(running);
-    let manager = manager.clone();
-    let storage = storage.clone();
-    let updates = updates.clone();
-    let fallback_workspace = fallback_workspace.to_owned();
-    let running_automations = running_automations.clone();
-    let automation_id = automation.id.clone();
-    runtime.spawn(async move {
-        execute_automation(
-            manager,
-            storage,
-            updates,
-            fallback_workspace,
-            automation,
-            scheduled_for,
-        )
-        .await;
-        if let Ok(mut running) = running_automations.lock() {
-            running.remove(&automation_id);
-        }
-    });
-    true
-}
-
-fn automation_is_running(
-    running_automations: &Arc<Mutex<HashSet<String>>>,
-    automation_id: &str,
-) -> bool {
-    running_automations
-        .lock()
-        .map_or(true, |running| running.contains(automation_id))
-}
-
-async fn execute_automation(
-    manager: Arc<SessionManager>,
-    storage: Arc<Storage>,
-    updates: Sender<ServiceUpdate>,
-    fallback_workspace: PathBuf,
-    automation: Automation,
-    scheduled_for: String,
-) {
-    let mut run = AutomationRun {
-        id: uuid::Uuid::new_v4().to_string(),
-        automation_id: automation.id.clone(),
-        automation_name: automation.name.clone(),
-        scheduled_for,
-        started_at: automation_timestamp(),
-        finished_at: None,
-        status: AutomationRunStatus::Running,
-        condition_result: None,
-        output: None,
-        error: None,
-        session_id: None,
-    };
-    persist_automation_run(&storage, &updates, &run);
-
-    let (working_directory, repository, kind) = automation.project_path.as_ref().map_or_else(
-        || (fallback_workspace, None, SessionKind::Chat),
-        |path| {
-            let path = PathBuf::from(path);
-            let repository = repository_root(&path).to_string_lossy().into_owned();
-            (path, Some(repository), SessionKind::Project)
-        },
-    );
-    if !working_directory.is_dir() {
-        finish_automation_run(
-            &storage,
-            &updates,
-            &mut run,
-            AutomationRunStatus::Failed,
-            None,
-            None,
-            Some(format!(
-                "Automation workspace is unavailable: {}",
-                working_directory.display()
-            )),
-        );
-        return;
-    }
-
-    let handle = match manager
-        .create_session(CreateSessionRequest {
-            project_path: working_directory,
-            title: format!("Automation: {}", automation.name),
-            title_source: TitleSource::Manual,
-            model: automation.model.clone(),
-            mode: Some(automation.mode.clone()),
-            agent: automation.agent.clone(),
-            reasoning_effort: automation.reasoning_effort.clone(),
-            context_tier: automation.context_tier.clone(),
-            base_ref: None,
-            repository_root: repository,
-            kind,
-        })
-        .await
-    {
-        Ok(handle) => handle,
-        Err(error) => {
-            finish_automation_run(
-                &storage,
-                &updates,
-                &mut run,
-                AutomationRunStatus::Failed,
-                None,
-                None,
-                Some(error.to_string()),
-            );
-            return;
-        }
-    };
-    let session_id = handle.id().to_owned();
-    run.session_id = Some(session_id.clone());
-    persist_automation_run(&storage, &updates, &run);
-
-    let execution = async {
-        if let Some(condition) = automation
-            .condition
-            .as_deref()
-            .map(str::trim)
-            .filter(|condition| !condition.is_empty())
-        {
-            let condition_prompt = format!(
-                "Evaluate this saved automation condition at the current moment:\n\n\
-                 {condition}\n\n\
-                 Use available read-only inspection tools when needed. Do not perform the \
-                 automation action and do not change files or external state. Your final response \
-                 must be exactly one word: true or false."
-            );
-            let response = send_automation_prompt(&handle, condition_prompt).await?;
-            let result = parse_automation_condition(&response)?;
-            run.condition_result = Some(result);
-            persist_automation_run(&storage, &updates, &run);
-            if !result {
-                return Ok((AutomationRunStatus::Skipped, Some(false), Some(response)));
-            }
-        }
-
-        let action_prompt = format!(
-            "Run the saved automation \"{}\" now.\n\nInstructions:\n{}",
-            automation.name, automation.instructions
-        );
-        let output = send_automation_prompt(&handle, action_prompt).await?;
-        Ok((
-            AutomationRunStatus::Succeeded,
-            automation.condition.as_ref().map(|_| true),
-            Some(output),
-        ))
-    }
-    .await;
-
-    if let Err(error) = manager.close_session(&session_id).await {
-        tracing::warn!(%error, %session_id, "failed to close automation session");
-    }
-    if let Err(error) = storage.delete_session(&session_id) {
-        tracing::warn!(%error, %session_id, "failed to remove ephemeral automation session");
-    }
-
-    match execution {
-        Ok((status, condition_result, output)) => finish_automation_run(
-            &storage,
-            &updates,
-            &mut run,
-            status,
-            condition_result,
-            output,
-            None,
-        ),
-        Err(error) => {
-            let condition_result = run.condition_result;
-            finish_automation_run(
-                &storage,
-                &updates,
-                &mut run,
-                AutomationRunStatus::Failed,
-                condition_result,
-                None,
-                Some(error),
-            );
-        }
-    }
-}
-
-async fn send_automation_prompt(handle: &SessionHandle, prompt: String) -> Result<String, String> {
-    let before_sequence = handle.snapshot().last_sequence;
-    let mut snapshots = handle.subscribe();
-    handle
-        .send(prompt)
-        .await
-        .map_err(|error| error.to_string())?;
-    let snapshot = tokio::time::timeout(
-        Duration::from_hours(1),
-        snapshots.wait_for(|snapshot| {
-            snapshot.last_sequence > before_sequence
-                && matches!(
-                    snapshot.status,
-                    SessionStatus::Idle | SessionStatus::Failed | SessionStatus::Disconnected
-                )
-        }),
-    )
-    .await
-    .map_err(|_| "Automation run timed out after one hour.".to_owned())?
-    .map_err(|_| "Automation session closed before it completed.".to_owned())?
-    .clone();
-    if matches!(
-        snapshot.status,
-        SessionStatus::Failed | SessionStatus::Disconnected
-    ) {
-        return Err(snapshot
-            .last_error
-            .clone()
-            .unwrap_or_else(|| "Automation session failed.".to_owned()));
-    }
-    snapshot
-        .transcript
-        .iter()
-        .rev()
-        .find(|message| {
-            message.role == TranscriptRole::Assistant
-                && message.state == TranscriptState::Complete
-                && message.sequence > before_sequence
-        })
-        .map(|message| message.content.clone())
-        .filter(|content| !content.trim().is_empty())
-        .ok_or_else(|| "Automation completed without an assistant response.".to_owned())
-}
-
-fn parse_automation_condition(response: &str) -> Result<bool, String> {
-    let normalized = response
-        .trim_matches(|character: char| {
-            character.is_whitespace() || matches!(character, '`' | '.' | '!')
-        })
-        .to_ascii_lowercase();
-    match normalized.as_str() {
-        "true" => Ok(true),
-        "false" => Ok(false),
-        _ => Err(format!(
-            "Automation condition did not return true or false: {}",
-            response.trim()
-        )),
-    }
-}
-
-fn persist_automation_run(storage: &Storage, updates: &Sender<ServiceUpdate>, run: &AutomationRun) {
-    if let Err(error) = storage.upsert_automation_run(run) {
-        let _ = updates.send(ServiceUpdate::ActionFailed(format!(
-            "Failed to save automation run: {error}"
-        )));
-        return;
-    }
-    let _ = updates.send(ServiceUpdate::AutomationRunsChanged(
-        storage.list_automation_runs(100).unwrap_or_default(),
-    ));
-}
-
-#[allow(clippy::too_many_arguments)]
-fn finish_automation_run(
-    storage: &Storage,
-    updates: &Sender<ServiceUpdate>,
-    run: &mut AutomationRun,
-    status: AutomationRunStatus,
-    condition_result: Option<bool>,
-    output: Option<String>,
-    error: Option<String>,
-) {
-    run.finished_at = Some(automation_timestamp());
-    run.status = status;
-    run.condition_result = condition_result;
-    run.output = output;
-    run.error = error;
-    persist_automation_run(storage, updates, run);
 }
 
 #[allow(clippy::too_many_lines)]
@@ -2791,27 +2336,11 @@ struct SessionMvpView {
     /// Background update worker, absent for developer builds that never update.
     update_service: Option<UpdateService>,
     settings_visibility: SettingsVisibility,
-    automations_open: bool,
-    automations_tab: AutomationsTab,
-    automations: Vec<Automation>,
-    automation_runs: Vec<AutomationRun>,
-    editing_automation: Option<String>,
-    automation_name_input: Entity<TextInput>,
-    automation_schedule_input: Entity<TextInput>,
-    automation_condition_input: Entity<TextInput>,
-    automation_instructions_input: Entity<TextInput>,
-    automation_draft_model: Option<String>,
-    automation_draft_agent: Option<String>,
-    automation_draft_mode: String,
-    automation_draft_effort: Option<String>,
-    automation_draft_context_tier: Option<String>,
-    automation_draft_project: Option<String>,
-    automation_draft_enabled: bool,
-    open_automation_menu: Option<AutomationMenu>,
     diagnostics_visibility: SettingsVisibility,
     running_since: HashMap<String, Instant>,
     last_event_seen: HashMap<String, (u64, Instant)>,
     last_activity_repaint: Instant,
+    automations_panel: AutomationsPanel,
     _poll_task: gpui::Task<()>,
     _running_tick_task: gpui::Task<()>,
     _update_poll_task: gpui::Task<()>,
@@ -2900,32 +2429,7 @@ impl SessionMvpView {
             view.commit_rename(&event.text, cx);
         })
         .detach();
-        let automation_name_input =
-            cx.new(|cx| TextInput::new(cx, "automation-name", "Automation name"));
-        let automation_schedule_input =
-            cx.new(|cx| TextInput::new(cx, "automation-schedule", "Every Wednesday at 2:00 PM"));
-        let automation_condition_input = cx.new(|cx| {
-            TextInput::new(
-                cx,
-                "automation-condition",
-                "Optional condition, for example: the build is failing",
-            )
-        });
-        let automation_instructions_input = cx.new(|cx| {
-            TextInput::new(
-                cx,
-                "automation-instructions",
-                "What should Copilot do when the condition is true?",
-            )
-        });
-        for input in [
-            &automation_name_input,
-            &automation_schedule_input,
-            &automation_condition_input,
-            &automation_instructions_input,
-        ] {
-            cx.observe(input, |_, _, cx| cx.notify()).detach();
-        }
+        let automations_panel = AutomationsPanel::new(cx);
 
         let poll_task = cx.spawn(async move |view, cx| {
             loop {
@@ -3080,27 +2584,11 @@ impl SessionMvpView {
             update_ui: UpdateUi::default(),
             update_service,
             settings_visibility: SettingsVisibility::Closed,
-            automations_open: false,
-            automations_tab: AutomationsTab::Saved,
-            automations: Vec::new(),
-            automation_runs: Vec::new(),
-            editing_automation: None,
-            automation_name_input,
-            automation_schedule_input,
-            automation_condition_input,
-            automation_instructions_input,
-            automation_draft_model: None,
-            automation_draft_agent: None,
-            automation_draft_mode: "autopilot".to_owned(),
-            automation_draft_effort: Some("medium".to_owned()),
-            automation_draft_context_tier: None,
-            automation_draft_project: None,
-            automation_draft_enabled: true,
-            open_automation_menu: None,
             diagnostics_visibility: SettingsVisibility::Closed,
             running_since: HashMap::new(),
             last_event_seen: HashMap::new(),
             last_activity_repaint: Instant::now(),
+            automations_panel,
             _poll_task: poll_task,
             _running_tick_task: running_tick_task,
             _update_poll_task: update_poll_task,
@@ -3249,1010 +2737,6 @@ impl SessionMvpView {
         if let Some(service) = self.update_service.as_ref() {
             service.request(request);
         }
-    }
-
-    fn open_automations(&mut self, cx: &mut Context<Self>) {
-        self.automations_open = true;
-        self.automations_tab = AutomationsTab::Saved;
-        if let Some(automation) = self.automations.first().cloned() {
-            self.edit_automation(automation, cx);
-        } else {
-            self.begin_new_automation(cx);
-        }
-        cx.notify();
-    }
-
-    fn close_automations(&mut self, cx: &mut Context<Self>) {
-        self.automations_open = false;
-        self.open_automation_menu = None;
-        self.action_error = None;
-        cx.notify();
-    }
-
-    fn begin_new_automation(&mut self, cx: &mut Context<Self>) {
-        self.editing_automation = None;
-        self.open_automation_menu = None;
-        for input in [
-            &self.automation_name_input,
-            &self.automation_schedule_input,
-            &self.automation_condition_input,
-            &self.automation_instructions_input,
-        ] {
-            input.update(cx, TextInput::clear);
-        }
-        self.automation_draft_model = None;
-        self.automation_draft_agent = None;
-        self.automation_draft_mode = self
-            .mode_options()
-            .into_iter()
-            .find(|(mode, _, _)| mode == "autopilot")
-            .or_else(|| self.mode_options().into_iter().next())
-            .map_or_else(|| "autopilot".to_owned(), |(mode, _, _)| mode);
-        self.automation_draft_effort = Some("medium".to_owned());
-        self.automation_draft_context_tier = None;
-        self.automation_draft_project = None;
-        self.automation_draft_enabled = true;
-        self.action_error = None;
-        cx.notify();
-    }
-
-    fn edit_automation(&mut self, automation: Automation, cx: &mut Context<Self>) {
-        self.editing_automation = Some(automation.id);
-        self.open_automation_menu = None;
-        for (input, value) in [
-            (&self.automation_name_input, automation.name),
-            (
-                &self.automation_schedule_input,
-                automation.schedule_description,
-            ),
-            (
-                &self.automation_condition_input,
-                automation.condition.unwrap_or_default(),
-            ),
-            (&self.automation_instructions_input, automation.instructions),
-        ] {
-            input.update(cx, |input, cx| input.set_value(value, cx));
-        }
-        self.automation_draft_model = automation.model;
-        self.automation_draft_agent = automation.agent;
-        self.automation_draft_mode = automation.mode;
-        self.automation_draft_effort = automation.reasoning_effort;
-        self.automation_draft_context_tier = automation.context_tier;
-        self.automation_draft_project = automation.project_path;
-        self.automation_draft_enabled = automation.enabled;
-        self.action_error = None;
-        cx.notify();
-    }
-
-    fn save_automation(&mut self, cx: &mut Context<Self>) {
-        let name = self.automation_name_input.read(cx).value();
-        let name = name.trim();
-        if name.is_empty() {
-            self.action_error = Some("Automation name is required.".to_owned());
-            return;
-        }
-        let schedule_description = self.automation_schedule_input.read(cx).value();
-        let schedule_description = schedule_description.trim();
-        let schedule = match schedule_description.parse::<AutomationSchedule>() {
-            Ok(schedule) => schedule,
-            Err(error) => {
-                self.action_error = Some(error.to_string());
-                return;
-            }
-        };
-        let instructions = self.automation_instructions_input.read(cx).value();
-        let instructions = instructions.trim();
-        if instructions.is_empty() {
-            self.action_error = Some("Automation instructions are required.".to_owned());
-            return;
-        }
-        let condition = self.automation_condition_input.read(cx).value();
-        let condition = (!condition.trim().is_empty()).then(|| condition.trim().to_owned());
-        let existing = self.editing_automation.as_deref().and_then(|id| {
-            self.automations
-                .iter()
-                .find(|automation| automation.id == id)
-        });
-        let now = automation_timestamp();
-        let automation = Automation {
-            id: existing
-                .map(|automation| automation.id.clone())
-                .unwrap_or_else(|| uuid::Uuid::new_v4().to_string()),
-            name: name.to_owned(),
-            schedule_description: schedule_description.to_owned(),
-            schedule,
-            condition,
-            instructions: instructions.to_owned(),
-            model: self.automation_draft_model.clone(),
-            agent: self.automation_draft_agent.clone(),
-            mode: self.automation_draft_mode.clone(),
-            reasoning_effort: self.automation_draft_effort.clone(),
-            context_tier: self.automation_draft_context_tier.clone(),
-            project_path: self.automation_draft_project.clone(),
-            enabled: self.automation_draft_enabled,
-            next_run_at: None,
-            last_run_at: existing.and_then(|automation| automation.last_run_at.clone()),
-            created_at: existing
-                .map(|automation| automation.created_at.clone())
-                .unwrap_or_else(|| now.clone()),
-            updated_at: now,
-        };
-        self.editing_automation = Some(automation.id.clone());
-        self.action_error = None;
-        if self
-            .commands
-            .send(ServiceCommand::SaveAutomation(automation))
-            .is_err()
-        {
-            self.action_error = Some("Automation service is unavailable.".to_owned());
-        }
-        cx.notify();
-    }
-
-    fn delete_current_automation(&mut self, cx: &mut Context<Self>) {
-        let Some(automation_id) = self.editing_automation.clone() else {
-            return;
-        };
-        if self
-            .commands
-            .send(ServiceCommand::DeleteAutomation { automation_id })
-            .is_err()
-        {
-            self.action_error = Some("Automation service is unavailable.".to_owned());
-            return;
-        }
-        self.begin_new_automation(cx);
-    }
-
-    fn run_current_automation(&mut self) {
-        let Some(automation_id) = self.editing_automation.clone() else {
-            return;
-        };
-        if self
-            .commands
-            .send(ServiceCommand::RunAutomationNow { automation_id })
-            .is_err()
-        {
-            self.action_error = Some("Automation service is unavailable.".to_owned());
-        } else {
-            self.automations_tab = AutomationsTab::History;
-        }
-    }
-
-    fn toggle_automation_menu(&mut self, menu: AutomationMenu) {
-        self.open_automation_menu = (self.open_automation_menu != Some(menu)).then_some(menu);
-    }
-
-    fn automation_menu_options(
-        &self,
-        menu: AutomationMenu,
-    ) -> (&'static str, String, Vec<(String, String, String)>) {
-        match menu {
-            AutomationMenu::Model => {
-                let mut options = vec![(
-                    String::new(),
-                    "Default model".to_owned(),
-                    "Use the provider's default model".to_owned(),
-                )];
-                options.extend(self.model_options());
-                (
-                    "Model",
-                    self.automation_draft_model.clone().unwrap_or_default(),
-                    options,
-                )
-            }
-            AutomationMenu::Agent => (
-                "Agent",
-                self.automation_draft_agent.clone().unwrap_or_default(),
-                self.agent_options(),
-            ),
-            AutomationMenu::Project => {
-                let mut options = vec![(
-                    String::new(),
-                    "No workspace".to_owned(),
-                    "Run without repository context".to_owned(),
-                )];
-                options.extend(
-                    self.projects
-                        .iter()
-                        .filter(|project| Path::new(&project.path).is_dir())
-                        .map(|project| {
-                            (
-                                project.path.clone(),
-                                project.name.clone(),
-                                project.path.clone(),
-                            )
-                        }),
-                );
-                (
-                    "Workspace",
-                    self.automation_draft_project.clone().unwrap_or_default(),
-                    options,
-                )
-            }
-            AutomationMenu::Mode => {
-                let mut options = self.mode_options();
-                if options.is_empty() {
-                    options = ["autopilot", "interactive", "plan"]
-                        .into_iter()
-                        .map(|mode| (mode.to_owned(), title_case(mode), String::new()))
-                        .collect();
-                }
-                ("Mode", self.automation_draft_mode.clone(), options)
-            }
-            AutomationMenu::Effort => {
-                let mut options = vec![(
-                    String::new(),
-                    "Default reasoning".to_owned(),
-                    "Use the model's default reasoning effort".to_owned(),
-                )];
-                if let Some(model) = self.automation_draft_model.as_deref() {
-                    options.extend(self.supported_reasoning_efforts(model).into_iter().map(
-                        |effort| {
-                            let label = effort_label(&effort);
-                            (effort, label, String::new())
-                        },
-                    ));
-                }
-                (
-                    "Reasoning effort",
-                    self.automation_draft_effort.clone().unwrap_or_default(),
-                    options,
-                )
-            }
-            AutomationMenu::Context => {
-                let mut options = vec![(
-                    String::new(),
-                    "Default context".to_owned(),
-                    "Use the model's default context window".to_owned(),
-                )];
-                if let Some(model) = self.automation_draft_model.as_deref() {
-                    options.extend(self.context_windows(model).into_iter().map(|window| {
-                        let label = context_window_label(&window);
-                        (window.tier, label, String::new())
-                    }));
-                }
-                (
-                    "Context length",
-                    self.automation_draft_context_tier
-                        .clone()
-                        .unwrap_or_default(),
-                    options,
-                )
-            }
-        }
-    }
-
-    fn choose_automation_option(&mut self, menu: AutomationMenu, value: String) {
-        match menu {
-            AutomationMenu::Model => {
-                self.automation_draft_model = (!value.is_empty()).then_some(value);
-                if let Some(model) = self.automation_draft_model.as_deref() {
-                    let efforts = self.supported_reasoning_efforts(model);
-                    self.automation_draft_effort = efforts
-                        .iter()
-                        .find(|effort| effort.as_str() == "medium")
-                        .or_else(|| efforts.first())
-                        .cloned();
-                    self.automation_draft_context_tier =
-                        default_context_tier(&self.context_windows(model));
-                } else {
-                    self.automation_draft_effort = None;
-                    self.automation_draft_context_tier = None;
-                }
-            }
-            AutomationMenu::Agent => {
-                self.automation_draft_agent = (!value.is_empty()).then_some(value);
-            }
-            AutomationMenu::Project => {
-                self.automation_draft_project = (!value.is_empty()).then_some(value);
-            }
-            AutomationMenu::Mode => self.automation_draft_mode = value,
-            AutomationMenu::Effort => {
-                self.automation_draft_effort = (!value.is_empty()).then_some(value);
-            }
-            AutomationMenu::Context => {
-                self.automation_draft_context_tier = (!value.is_empty()).then_some(value);
-            }
-        }
-        self.open_automation_menu = None;
-    }
-
-    fn automation_choice_control(
-        &self,
-        menu: AutomationMenu,
-        id: &'static str,
-        label: String,
-        cx: &mut Context<Self>,
-    ) -> impl IntoElement {
-        let expanded = self.open_automation_menu == Some(menu);
-        div()
-            .relative()
-            .flex()
-            .flex_col()
-            .min_w_0()
-            .child(automation_choice_button(id, label, expanded, menu, cx))
-            .when(expanded, |control| {
-                let (title, selected, options) = self.automation_menu_options(menu);
-                let menu_above = !matches!(menu, AutomationMenu::Model | AutomationMenu::Agent);
-                let anchor = if menu_above {
-                    Anchor::BottomLeft
-                } else {
-                    Anchor::TopLeft
-                };
-                let position = if menu_above {
-                    point(px(0.0), px(-42.0))
-                } else {
-                    point(px(0.0), px(42.0))
-                };
-                control.child(deferred(
-                    anchored()
-                        .anchor(anchor)
-                        .position(position)
-                        .position_mode(AnchoredPositionMode::Local)
-                        .snap_to_window_with_margin(px(12.0))
-                        .child(
-                            div()
-                                .id(SharedString::from(format!("{id}-menu")))
-                                .debug_selector(move || format!("{id}-menu"))
-                                .occlude()
-                                .role(Role::ListBox)
-                                .aria_label(title)
-                                .w_full()
-                                .min_w(px(260.0))
-                                .max_h(px(260.0))
-                                .overflow_y_scroll()
-                                .p_1()
-                                .rounded_md()
-                                .border_1()
-                                .border_color(rgb(BORDER))
-                                .bg(rgb(PANEL))
-                                .shadow_lg()
-                                .children(options.into_iter().enumerate().map(
-                                    |(index, (value, label, description))| {
-                                        let selected = value == selected;
-                                        let option_value = value.clone();
-                                        let has_description = !description.is_empty();
-                                        let option_selector = format!("{id}-option-{index}");
-                                        div()
-                                            .id((id, index))
-                                            .debug_selector(move || option_selector.clone())
-                                            .role(Role::ListBoxOption)
-                                            .aria_label(label.clone())
-                                            .aria_selected(selected)
-                                            .when(has_description, |option| {
-                                                option.aria_description(description.clone())
-                                            })
-                                            .focusable()
-                                            .tab_stop(true)
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .px_2()
-                                            .py_2()
-                                            .rounded_md()
-                                            .bg(rgb(if selected { ELEVATED } else { PANEL }))
-                                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                                            .on_click(cx.listener(move |view, _, _, cx| {
-                                                view.choose_automation_option(
-                                                    menu,
-                                                    option_value.clone(),
-                                                );
-                                                cx.notify();
-                                            }))
-                                            .child(
-                                                div()
-                                                    .w(px(16.0))
-                                                    .flex_shrink_0()
-                                                    .text_color(rgb(BLUE))
-                                                    .child(if selected { "\u{2713}" } else { "" }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .child(label)
-                                                    .when(has_description, |content| {
-                                                        content.child(
-                                                            div()
-                                                                .text_xs()
-                                                                .text_color(rgb(MUTED))
-                                                                .child(description),
-                                                        )
-                                                    }),
-                                            )
-                                    },
-                                )),
-                        ),
-                ))
-            })
-    }
-
-    #[allow(clippy::too_many_lines)]
-    fn automations_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
-        if !self.automations_open {
-            return None;
-        }
-
-        let (list_scroll, form_scroll, history_scroll) = {
-            let mut scrolls = self.detail_scrolls.borrow_mut();
-            (
-                scrolls
-                    .entry(AUTOMATION_LIST_SCROLL_ID.to_owned())
-                    .or_default()
-                    .clone(),
-                scrolls
-                    .entry(AUTOMATION_FORM_SCROLL_ID.to_owned())
-                    .or_default()
-                    .clone(),
-                scrolls
-                    .entry(AUTOMATION_HISTORY_SCROLL_ID.to_owned())
-                    .or_default()
-                    .clone(),
-            )
-        };
-        let list_group = SharedString::from("automation-list-scroll-group");
-        let form_group = SharedString::from("automation-form-scroll-group");
-        let history_group = SharedString::from("automation-history-scroll-group");
-        let list_scrollbar = Self::visible_scrollbar(
-            AUTOMATION_LIST_SCROLL_ID,
-            &list_scroll,
-            list_group.clone(),
-            cx,
-        );
-        let form_scrollbar = Self::visible_scrollbar(
-            AUTOMATION_FORM_SCROLL_ID,
-            &form_scroll,
-            form_group.clone(),
-            cx,
-        );
-        let history_scrollbar = Self::visible_scrollbar(
-            AUTOMATION_HISTORY_SCROLL_ID,
-            &history_scroll,
-            history_group.clone(),
-            cx,
-        );
-
-        let automation_rows = self
-            .automations
-            .iter()
-            .cloned()
-            .map(|automation| {
-                let selected = self.editing_automation.as_deref() == Some(&automation.id);
-                let status = if automation.enabled {
-                    automation
-                        .next_run_at
-                        .as_deref()
-                        .map_or_else(|| "Enabled".to_owned(), |next| format!("Next: {next}"))
-                } else {
-                    "Disabled".to_owned()
-                };
-                let automation_for_click = automation.clone();
-                div()
-                    .id(SharedString::from(format!(
-                        "automation-row-{}",
-                        automation.id
-                    )))
-                    .role(Role::Button)
-                    .aria_label(format!("Edit {}", automation.name))
-                    .focusable()
-                    .tab_stop(true)
-                    .w_full()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgb(if selected { ELEVATED } else { PANEL }))
-                    .border_1()
-                    .border_color(rgb(if selected { BLUE } else { BORDER }))
-                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                    .on_click(cx.listener(move |view, _, _, cx| {
-                        view.edit_automation(automation_for_click.clone(), cx);
-                    }))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .w(px(7.0))
-                                    .h(px(7.0))
-                                    .rounded_full()
-                                    .bg(rgb(if automation.enabled { GREEN } else { MUTED })),
-                            )
-                            .child(
-                                div()
-                                    .text_sm()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(automation.name),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(automation.schedule_description),
-                    )
-                    .child(div().text_xs().text_color(rgb(MUTED)).child(status))
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-        let model_name = self.automation_draft_model.as_ref().map_or_else(
-            || "Default".to_owned(),
-            |model| {
-                self.model_options()
-                    .into_iter()
-                    .find(|(id, _, _)| id == model)
-                    .map_or_else(|| model.clone(), |(_, name, _)| name)
-            },
-        );
-        let agent_name = self.automation_draft_agent.as_ref().map_or_else(
-            || "Default".to_owned(),
-            |agent| {
-                self.agent_options()
-                    .into_iter()
-                    .find(|(id, _, _)| id == agent)
-                    .map_or_else(|| agent.clone(), |(_, name, _)| name)
-            },
-        );
-        let project_name = self.automation_draft_project.as_ref().map_or_else(
-            || "None".to_owned(),
-            |path| {
-                self.projects
-                    .iter()
-                    .find(|project| &project.path == path)
-                    .map_or_else(|| path.clone(), |project| project.name.clone())
-            },
-        );
-
-        let saved_body = div()
-            .flex()
-            .flex_1()
-            .min_h_0()
-            .child(
-                div()
-                    .w(px(270.0))
-                    .h_full()
-                    .flex_shrink_0()
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .pr_4()
-                    .border_r_1()
-                    .border_color(rgb(BORDER))
-                    .child(automation_dialog_button(
-                        "automation-new",
-                        "+ New automation",
-                        ELEVATED,
-                        cx,
-                        |view, cx| view.begin_new_automation(cx),
-                    ))
-                    .child(
-                        div()
-                            .id("automation-list-scroll-frame")
-                            .group(list_group)
-                            .relative()
-                            .flex_1()
-                            .min_h_0()
-                            .child(
-                                div()
-                                    .id(AUTOMATION_LIST_SCROLL_ID)
-                                    .track_scroll(&list_scroll)
-                                    .flex()
-                                    .flex_col()
-                                    .gap_2()
-                                    .size_full()
-                                    .pr_3()
-                                    .overflow_y_scroll()
-                                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                                    .children(automation_rows)
-                                    .when(self.automations.is_empty(), |list| {
-                                        list.child(
-                                            div()
-                                                .px_2()
-                                                .py_4()
-                                                .text_sm()
-                                                .text_color(rgb(MUTED))
-                                                .child("No automations saved yet."),
-                                        )
-                                    }),
-                            )
-                            .children(list_scrollbar),
-                    ),
-            )
-            .child(
-                div()
-                    .id("automation-form-scroll-frame")
-                    .group(form_group)
-                    .relative()
-                    .flex_1()
-                    .min_w_0()
-                    .h_full()
-                    .child(
-                        div()
-                            .id(AUTOMATION_FORM_SCROLL_ID)
-                            .track_scroll(&form_scroll)
-                            .flex()
-                            .flex_col()
-                            .gap_3()
-                            .size_full()
-                            .pl_4()
-                            .pr_5()
-                            .pb_1()
-                            .overflow_y_scroll()
-                            .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_lg()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(if self.editing_automation.is_some() {
-                                        "Edit automation"
-                                    } else {
-                                        "New automation"
-                                    }),
-                            )
-                            .child(automation_input_field(
-                                "Name",
-                                self.automation_name_input.clone(),
-                                None,
-                            ))
-                            .child(automation_input_field(
-                                "Schedule",
-                                self.automation_schedule_input.clone(),
-                                None,
-                            ))
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child(
-                                        "Uses local time and 5-minute increments. Supports \
-                                         intervals, weekdays, named days, monthly, and yearly \
-                                         schedules.",
-                                    ),
-                            )
-                            .child(automation_input_field(
-                                "Condition (optional)",
-                                self.automation_condition_input.clone(),
-                                None,
-                            ))
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .text_xs()
-                                    .text_color(rgb(MUTED))
-                                    .child(
-                                        "Copilot evaluates this as true or false before running \
-                                         the action.",
-                                    ),
-                            )
-                            .child(automation_input_field(
-                                "Instructions",
-                                self.automation_instructions_input.clone(),
-                                Some(84.0),
-                            ))
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .grid()
-                                    .grid_cols(2)
-                                    .gap_2()
-                                    .child(self.automation_choice_control(
-                                        AutomationMenu::Model,
-                                        "automation-model",
-                                        format!("Model: {model_name}"),
-                                        cx,
-                                    ))
-                                    .child(self.automation_choice_control(
-                                        AutomationMenu::Agent,
-                                        "automation-agent",
-                                        format!("Agent: {agent_name}"),
-                                        cx,
-                                    ))
-                                    .child(self.automation_choice_control(
-                                        AutomationMenu::Project,
-                                        "automation-project",
-                                        format!("Workspace: {project_name}"),
-                                        cx,
-                                    ))
-                                    .child(self.automation_choice_control(
-                                        AutomationMenu::Mode,
-                                        "automation-mode",
-                                        format!(
-                                            "Mode: {}",
-                                            title_case(&self.automation_draft_mode)
-                                        ),
-                                        cx,
-                                    ))
-                                    .child(self.automation_choice_control(
-                                        AutomationMenu::Effort,
-                                        "automation-effort",
-                                        format!(
-                                            "Reasoning: {}",
-                                            self.automation_draft_effort
-                                                .as_deref()
-                                                .map_or("Default".to_owned(), effort_label)
-                                        ),
-                                        cx,
-                                    ))
-                                    .child(self.automation_choice_control(
-                                        AutomationMenu::Context,
-                                        "automation-context",
-                                        format!(
-                                            "Context: {}",
-                                            self.automation_draft_context_tier
-                                                .as_deref()
-                                                .unwrap_or("Default")
-                                        ),
-                                        cx,
-                                    )),
-                            )
-                            .child(
-                                div()
-                                    .id("automation-enabled")
-                                    .role(Role::CheckBox)
-                                    .aria_label("Enable automation")
-                                    .aria_selected(self.automation_draft_enabled)
-                                    .focusable()
-                                    .tab_stop(true)
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .gap_2()
-                                    .hover(|style| style.cursor_pointer())
-                                    .on_click(cx.listener(|view, _, _, cx| {
-                                        view.automation_draft_enabled =
-                                            !view.automation_draft_enabled;
-                                        cx.notify();
-                                    }))
-                                    .child(
-                                        div()
-                                            .w(px(18.0))
-                                            .h(px(18.0))
-                                            .flex()
-                                            .items_center()
-                                            .justify_center()
-                                            .rounded_sm()
-                                            .border_1()
-                                            .border_color(rgb(BORDER))
-                                            .bg(rgb(if self.automation_draft_enabled {
-                                                BLUE
-                                            } else {
-                                                SUBTLE
-                                            }))
-                                            .child(if self.automation_draft_enabled {
-                                                "✓"
-                                            } else {
-                                                ""
-                                            }),
-                                    )
-                                    .child("Enabled"),
-                            )
-                            .when_some(self.action_error.clone(), |form, error| {
-                                form.child(div().text_sm().text_color(rgb(RED)).child(error))
-                            })
-                            .child(
-                                div()
-                                    .flex_shrink_0()
-                                    .flex()
-                                    .items_center()
-                                    .justify_between()
-                                    .gap_2()
-                                    .child(div().flex().gap_2().when(
-                                        self.editing_automation.is_some(),
-                                        |buttons| {
-                                            buttons
-                                                .child(automation_dialog_button(
-                                                    "automation-delete",
-                                                    "Delete",
-                                                    RED,
-                                                    cx,
-                                                    |view, cx| {
-                                                        view.delete_current_automation(cx);
-                                                    },
-                                                ))
-                                                .child(automation_dialog_button(
-                                                    "automation-run-now",
-                                                    "Run now",
-                                                    GREEN,
-                                                    cx,
-                                                    |view, _| {
-                                                        view.run_current_automation();
-                                                    },
-                                                ))
-                                        },
-                                    ))
-                                    .child(automation_dialog_button(
-                                        "automation-save",
-                                        "Save automation",
-                                        BLUE,
-                                        cx,
-                                        |view, cx| view.save_automation(cx),
-                                    )),
-                            )
-                            .child(div().h(px(1.0)).w_full().flex_shrink_0()),
-                    )
-                    .children(form_scrollbar),
-            )
-            .into_any_element();
-
-        let history_rows = self
-            .automation_runs
-            .iter()
-            .map(|run| {
-                let color = match run.status {
-                    AutomationRunStatus::Running | AutomationRunStatus::Succeeded => GREEN,
-                    AutomationRunStatus::Skipped => MUTED,
-                    AutomationRunStatus::Failed => RED,
-                };
-                let detail = run
-                    .error
-                    .as_ref()
-                    .or(run.output.as_ref())
-                    .cloned()
-                    .unwrap_or_else(|| {
-                        run.condition_result.map_or_else(
-                            || "Run in progress…".to_owned(),
-                            |result| format!("Condition evaluated to {result}."),
-                        )
-                    });
-                div()
-                    .id(SharedString::from(format!("automation-run-{}", run.id)))
-                    .flex()
-                    .flex_col()
-                    .gap_2()
-                    .p_3()
-                    .rounded_md()
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .bg(rgb(SUBTLE))
-                    .child(
-                        div()
-                            .flex()
-                            .items_center()
-                            .gap_2()
-                            .child(div().w(px(8.0)).h(px(8.0)).rounded_full().bg(rgb(color)))
-                            .child(
-                                div()
-                                    .font_weight(gpui::FontWeight::SEMIBOLD)
-                                    .child(run.automation_name.clone()),
-                            )
-                            .child(
-                                div()
-                                    .ml_auto()
-                                    .text_xs()
-                                    .text_color(rgb(color))
-                                    .child(title_case(run.status.as_str())),
-                            ),
-                    )
-                    .child(
-                        div()
-                            .text_xs()
-                            .text_color(rgb(MUTED))
-                            .child(format!("Started {}", run.started_at)),
-                    )
-                    .child(div().text_sm().child(detail))
-                    .into_any_element()
-            })
-            .collect::<Vec<_>>();
-        let history_body = div()
-            .id("automation-history-scroll-frame")
-            .group(history_group)
-            .relative()
-            .flex_1()
-            .min_h_0()
-            .child(
-                div()
-                    .id(AUTOMATION_HISTORY_SCROLL_ID)
-                    .track_scroll(&history_scroll)
-                    .flex()
-                    .flex_col()
-                    .gap_3()
-                    .size_full()
-                    .pr_3()
-                    .overflow_y_scroll()
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
-                    .children(history_rows)
-                    .when(self.automation_runs.is_empty(), |history| {
-                        history.child(
-                            div()
-                                .py_8()
-                                .text_center()
-                                .text_color(rgb(MUTED))
-                                .child("Automation runs will appear here."),
-                        )
-                    }),
-            )
-            .children(history_scrollbar)
-            .into_any_element();
-
-        let body = match self.automations_tab {
-            AutomationsTab::Saved => saved_body,
-            AutomationsTab::History => history_body,
-        };
-
-        Some(
-            div()
-                .id("automations-dialog")
-                .accessibility_id("automations-dialog")
-                .role(Role::Dialog)
-                .aria_label("Automations")
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .p_4()
-                .bg(gpui::rgba(0x0000_00a8))
-                .child(
-                    div()
-                        .w(px(960.0))
-                        .h(px(720.0))
-                        .max_w(relative(0.96))
-                        .max_h(relative(0.94))
-                        .flex()
-                        .flex_col()
-                        .gap_4()
-                        .p_5()
-                        .rounded_lg()
-                        .bg(rgb(PANEL))
-                        .border_1()
-                        .border_color(rgb(BORDER))
-                        .shadow_lg()
-                        .child(
-                            div()
-                                .flex_shrink_0()
-                                .flex()
-                                .items_center()
-                                .gap_2()
-                                .child(
-                                    div()
-                                        .text_xl()
-                                        .font_weight(gpui::FontWeight::BOLD)
-                                        .child("Automations"),
-                                )
-                                .child(automation_tab_button(
-                                    "automation-tab-saved",
-                                    "Saved",
-                                    self.automations_tab == AutomationsTab::Saved,
-                                    cx,
-                                    AutomationsTab::Saved,
-                                ))
-                                .child(automation_tab_button(
-                                    "automation-tab-history",
-                                    "Run history",
-                                    self.automations_tab == AutomationsTab::History,
-                                    cx,
-                                    AutomationsTab::History,
-                                ))
-                                .child(
-                                    div()
-                                        .id("automations-close")
-                                        .role(Role::Button)
-                                        .aria_label("Close automations")
-                                        .focusable()
-                                        .tab_stop(true)
-                                        .ml_auto()
-                                        .px_3()
-                                        .py_2()
-                                        .rounded_md()
-                                        .bg(rgb(ELEVATED))
-                                        .child("Close")
-                                        .hover(|style| style.opacity(0.85).cursor_pointer())
-                                        .on_click(cx.listener(|view, _, _, cx| {
-                                            view.close_automations(cx);
-                                        })),
-                                ),
-                        )
-                        .child(body),
-                ),
-        )
     }
 
     fn current_worktrees_root(&self) -> PathBuf {
@@ -4681,8 +3165,8 @@ impl SessionMvpView {
                 } => {
                     self.startup = StartupState::Ready(compatibility);
                     self.projects = projects;
-                    self.automations = automations;
-                    self.automation_runs = automation_runs;
+                    self.automations_panel.automations = automations;
+                    self.automations_panel.runs = automation_runs;
                     self.configuration_roots =
                         configuration_roots.into_iter().map(PathBuf::from).collect();
                     self.apply_restore_failures(failures);
@@ -4714,9 +3198,10 @@ impl SessionMvpView {
                     self.request_agent_discovery();
                 }
                 ServiceUpdate::AutomationsChanged(automations) => {
-                    self.automations = automations;
-                    if self.editing_automation.as_ref().is_some_and(|id| {
+                    self.automations_panel.automations = automations;
+                    if self.automations_panel.editing.as_ref().is_some_and(|id| {
                         !self
+                            .automations_panel
                             .automations
                             .iter()
                             .any(|automation| &automation.id == id)
@@ -4725,7 +3210,7 @@ impl SessionMvpView {
                     }
                 }
                 ServiceUpdate::AutomationRunsChanged(runs) => {
-                    self.automation_runs = runs;
+                    self.automations_panel.runs = runs;
                 }
                 ServiceUpdate::SessionLaunchProgress(progress) => {
                     self.session_launch = Some(progress);
@@ -4798,9 +3283,9 @@ impl SessionMvpView {
 
     fn apply_bootstrap(&mut self, bootstrap: BootstrapState) {
         self.projects = bootstrap.projects;
-        self.automations = bootstrap.automations;
-        self.automation_runs = bootstrap.automation_runs;
         self.archived_sessions = bootstrap.archived;
+        self.automations_panel.automations = bootstrap.automations;
+        self.automations_panel.runs = bootstrap.automation_runs;
         self.sessions = bootstrap
             .sessions
             .into_iter()
@@ -12278,8 +10763,8 @@ impl Render for SessionMvpView {
                 view.dismiss_image_preview(cx);
                 view.diagnostics_visibility = SettingsVisibility::Closed;
                 view.settings_visibility = SettingsVisibility::Closed;
-                view.automations_open = false;
-                view.open_automation_menu = None;
+                view.automations_panel.open = false;
+                view.automations_panel.open_menu = None;
                 if view.renaming_session.is_some() {
                     view.cancel_rename(cx);
                 }
@@ -12952,128 +11437,6 @@ fn title_case(value: &str) -> String {
     })
 }
 
-fn automation_input_field(
-    label: &'static str,
-    input: Entity<TextInput>,
-    min_height: Option<f32>,
-) -> impl IntoElement {
-    div()
-        .flex_shrink_0()
-        .flex()
-        .flex_col()
-        .gap_1()
-        .child(div().text_xs().text_color(rgb(MUTED)).child(label))
-        .child(
-            div()
-                .when_some(min_height, |field, height| field.min_h(px(height)))
-                .border_1()
-                .border_color(rgb(BORDER))
-                .rounded_md()
-                .bg(rgb(BACKGROUND))
-                .child(input),
-        )
-}
-
-fn automation_choice_button(
-    id: &'static str,
-    label: String,
-    expanded: bool,
-    menu: AutomationMenu,
-    cx: &mut Context<SessionMvpView>,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .debug_selector(move || id.to_owned())
-        .role(Role::Button)
-        .aria_label(label.clone())
-        .aria_expanded(expanded)
-        .focusable()
-        .tab_stop(true)
-        .focus_visible(|style| style.border_color(rgb(BLUE)))
-        .h(px(40.0))
-        .flex_shrink_0()
-        .flex()
-        .items_center()
-        .gap_2()
-        .px_3()
-        .rounded_md()
-        .border_1()
-        .border_color(rgb(BORDER))
-        .bg(rgb(SUBTLE))
-        .text_sm()
-        .child(div().min_w_0().flex_1().truncate().child(label))
-        .child(
-            div()
-                .flex_shrink_0()
-                .text_color(rgb(MUTED))
-                .child(if expanded { "\u{25b4}" } else { "\u{25be}" }),
-        )
-        .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-        .on_click(cx.listener(move |view, _, _, cx| {
-            view.toggle_automation_menu(menu);
-            cx.notify();
-        }))
-}
-
-fn automation_dialog_button(
-    id: &'static str,
-    label: &'static str,
-    color: u32,
-    cx: &mut Context<SessionMvpView>,
-    action: impl Fn(&mut SessionMvpView, &mut Context<SessionMvpView>) + 'static,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .role(Role::Button)
-        .aria_label(label)
-        .focusable()
-        .tab_stop(true)
-        .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
-        .px_3()
-        .py_2()
-        .rounded_md()
-        .bg(rgb(color))
-        .text_sm()
-        .text_color(rgb(if color == ELEVATED {
-            PRIMARY
-        } else {
-            BACKGROUND
-        }))
-        .child(label)
-        .hover(|style| style.opacity(0.85).cursor_pointer())
-        .on_click(cx.listener(move |view, _, _, cx| {
-            action(view, cx);
-            cx.notify();
-        }))
-}
-
-fn automation_tab_button(
-    id: &'static str,
-    label: &'static str,
-    selected: bool,
-    cx: &mut Context<SessionMvpView>,
-    tab: AutomationsTab,
-) -> impl IntoElement {
-    div()
-        .id(id)
-        .role(Role::Tab)
-        .aria_label(label)
-        .aria_selected(selected)
-        .focusable()
-        .tab_stop(true)
-        .px_3()
-        .py_2()
-        .rounded_md()
-        .bg(rgb(if selected { BLUE } else { ELEVATED }))
-        .text_color(rgb(if selected { BACKGROUND } else { PRIMARY }))
-        .child(label)
-        .hover(|style| style.opacity(0.85).cursor_pointer())
-        .on_click(cx.listener(move |view, _, _, cx| {
-            view.automations_tab = tab;
-            cx.notify();
-        }))
-}
-
 fn effort_label(value: &str) -> String {
     match value {
         "xhigh" => "Extra high".to_owned(),
@@ -13674,7 +12037,7 @@ fn main() {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use app_model::{ContextWindowOption, InteractionKind, InteractionResponse};
 
     use super::{
@@ -14196,102 +12559,7 @@ mod tests {
         );
     }
 
-    #[test]
-    fn automation_condition_requires_an_unambiguous_boolean() {
-        assert_eq!(super::parse_automation_condition("true"), Ok(true));
-        assert_eq!(super::parse_automation_condition("`false`."), Ok(false));
-        assert!(super::parse_automation_condition("It looks true").is_err());
-    }
-
-    #[test]
-    fn interval_automation_stays_anchored_when_dispatch_is_late() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-08-14T10:10:07Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let next = super::next_automation_occurrence(
-            &app_model::AutomationSchedule::IntervalMinutes { minutes: 5 },
-            "2026-08-14T10:10:00Z",
-            now,
-        )
-        .unwrap();
-        assert_eq!(next.to_rfc3339(), "2026-08-14T10:15:00+00:00");
-    }
-
-    #[test]
-    fn interval_automation_skips_missed_ticks_without_drifting() {
-        let now = chrono::DateTime::parse_from_rfc3339("2026-08-14T10:27:31Z")
-            .unwrap()
-            .with_timezone(&chrono::Utc);
-        let next = super::next_automation_occurrence(
-            &app_model::AutomationSchedule::IntervalMinutes { minutes: 5 },
-            "2026-08-14T10:10:00Z",
-            now,
-        )
-        .unwrap();
-        assert_eq!(next.to_rfc3339(), "2026-08-14T10:30:00+00:00");
-    }
-
-    #[test]
-    fn running_automation_guard_detects_and_releases_ids() {
-        let running = std::sync::Arc::new(std::sync::Mutex::new(std::collections::HashSet::new()));
-        assert!(!super::automation_is_running(&running, "automation-1"));
-        running.lock().unwrap().insert("automation-1".to_owned());
-        assert!(super::automation_is_running(&running, "automation-1"));
-        running.lock().unwrap().remove("automation-1");
-        assert!(!super::automation_is_running(&running, "automation-1"));
-    }
-
-    #[test]
-    fn interrupted_automation_runs_are_failed_and_ephemeral_sessions_removed() {
-        let storage = storage::Storage::open_in_memory().unwrap();
-        storage
-            .upsert_session(&app_model::SessionMetadata {
-                id: "automation-session".to_owned(),
-                sdk_session_id: "automation-sdk-session".to_owned(),
-                project_path: std::env::temp_dir().to_string_lossy().into_owned(),
-                repository_root: None,
-                title: "Automation: maintenance".to_owned(),
-                title_source: app_model::TitleSource::Manual,
-                kind: app_model::SessionKind::Chat,
-                model: None,
-                mode: Some("autopilot".to_owned()),
-                base_ref: None,
-                created_at: "2026-08-14T10:00:00Z".to_owned(),
-                updated_at: "2026-08-14T10:00:00Z".to_owned(),
-            })
-            .unwrap();
-        storage
-            .upsert_automation_run(&app_model::AutomationRun {
-                id: "run-1".to_owned(),
-                automation_id: "automation-1".to_owned(),
-                automation_name: "Maintenance".to_owned(),
-                scheduled_for: "2026-08-14T10:00:00Z".to_owned(),
-                started_at: "2026-08-14T10:00:01Z".to_owned(),
-                finished_at: None,
-                status: app_model::AutomationRunStatus::Running,
-                condition_result: None,
-                output: None,
-                error: None,
-                session_id: Some("automation-session".to_owned()),
-            })
-            .unwrap();
-
-        super::recover_interrupted_automation_runs(&storage);
-
-        assert!(storage.list_sessions().unwrap().is_empty());
-        let runs = storage.list_automation_runs(10).unwrap();
-        assert_eq!(runs.len(), 1);
-        assert_eq!(runs[0].status, app_model::AutomationRunStatus::Failed);
-        assert!(runs[0].finished_at.is_some());
-        assert!(
-            runs[0]
-                .error
-                .as_deref()
-                .is_some_and(|error| error.contains("closed before"))
-        );
-    }
-
-    mod interaction {
+    pub(crate) mod interaction {
         use app_model::{
             InteractionKind, InteractionRequest, InteractionResponse, SessionKind, SessionMetadata,
             SessionSnapshot, SessionStatus, TitleSource,
@@ -14344,7 +12612,7 @@ mod tests {
         }
 
         /// Build the real view with one session row rendered.
-        fn setup(
+        pub(crate) fn setup(
             cx: &mut TestAppContext,
         ) -> (
             gpui::Entity<SessionMvpView>,
@@ -14425,185 +12693,6 @@ mod tests {
             });
             cx.run_until_parked();
             (view, cx, commands, attachments)
-        }
-
-        #[gpui::test]
-        fn saving_an_automation_sends_a_valid_definition(cx: &mut TestAppContext) {
-            let (view, cx, commands) = setup(cx);
-            view.update(cx, |view, cx| {
-                view.open_automations(cx);
-                view.automation_name_input.update(cx, |input, cx| {
-                    input.set_value("Review pull requests", cx);
-                });
-                view.automation_schedule_input.update(cx, |input, cx| {
-                    input.set_value("Every Wednesday at 2:00 PM", cx);
-                });
-                view.automation_condition_input.update(cx, |input, cx| {
-                    input.set_value("there are open pull requests", cx);
-                });
-                view.automation_instructions_input.update(cx, |input, cx| {
-                    input.set_value("Summarize the open pull requests.", cx);
-                });
-                view.save_automation(cx);
-            });
-
-            let ServiceCommand::SaveAutomation(automation) = commands.try_recv().unwrap() else {
-                panic!("expected save automation command");
-            };
-            assert_eq!(automation.name, "Review pull requests");
-            assert_eq!(
-                automation.condition.as_deref(),
-                Some("there are open pull requests")
-            );
-            assert_eq!(
-                automation.schedule,
-                app_model::AutomationSchedule::Weekly {
-                    weekdays: vec![app_model::ScheduleWeekday::Wednesday],
-                    minute_of_day: 14 * 60,
-                }
-            );
-            assert!(automation.enabled);
-        }
-
-        #[gpui::test]
-        fn automation_configuration_controls_keep_readable_height(cx: &mut TestAppContext) {
-            let (view, cx, _commands) = setup(cx);
-            view.update(cx, |view, cx| view.open_automations(cx));
-            cx.run_until_parked();
-
-            for selector in [
-                "automation-model",
-                "automation-agent",
-                "automation-project",
-                "automation-mode",
-                "automation-effort",
-                "automation-context",
-            ] {
-                let bounds = cx
-                    .debug_bounds(selector)
-                    .unwrap_or_else(|| panic!("{selector} was not rendered"));
-                assert!(
-                    f32::from(bounds.size.height) >= 39.0,
-                    "{selector} was compressed to {bounds:?}"
-                );
-            }
-        }
-
-        #[gpui::test]
-        fn automation_selectors_open_listboxes_and_scroll_overflow(cx: &mut TestAppContext) {
-            let (view, cx, _commands) = setup(cx);
-            view.update(cx, |view, cx| view.open_automations(cx));
-            cx.run_until_parked();
-
-            let mode = cx
-                .debug_bounds("automation-mode")
-                .expect("mode selector rendered");
-            cx.simulate_click(mode.center(), Modifiers::none());
-            cx.run_until_parked();
-
-            assert!(
-                cx.debug_bounds("automation-mode-menu").is_some(),
-                "mode selector opens an actual listbox"
-            );
-            let interactive = cx
-                .debug_bounds("automation-mode-option-1")
-                .expect("interactive mode option rendered");
-            cx.simulate_click(interactive.center(), Modifiers::none());
-            cx.run_until_parked();
-            view.read_with(cx, |view, _| {
-                assert_eq!(view.automation_draft_mode, "interactive");
-                assert!(view.open_automation_menu.is_none());
-            });
-
-            let model = cx
-                .debug_bounds("automation-model")
-                .expect("model selector rendered");
-            cx.simulate_click(model.center(), Modifiers::none());
-            cx.run_until_parked();
-            view.read_with(cx, |view, _| {
-                let handle = view
-                    .scroll_handle(super::super::AUTOMATION_FORM_SCROLL_ID)
-                    .expect("automation form tracks its scroll position");
-                assert!(
-                    f32::from(handle.max_offset().y) > 0.0,
-                    "expanded dropdown makes overflow scrollable"
-                );
-            });
-            assert!(
-                cx.debug_bounds("automation-form-scroll-visible-scrollbar")
-                    .is_some(),
-                "overflow shows a persistent styled scrollbar"
-            );
-        }
-
-        #[gpui::test]
-        fn every_automation_selector_opens_and_closes_its_listbox(cx: &mut TestAppContext) {
-            let (view, cx, _commands) = setup(cx);
-            view.update(cx, |view, cx| view.open_automations(cx));
-            cx.run_until_parked();
-
-            for (selector, menu_selector) in [
-                ("automation-model", "automation-model-menu"),
-                ("automation-agent", "automation-agent-menu"),
-                ("automation-project", "automation-project-menu"),
-                ("automation-mode", "automation-mode-menu"),
-                ("automation-effort", "automation-effort-menu"),
-                ("automation-context", "automation-context-menu"),
-            ] {
-                let trigger = cx
-                    .debug_bounds(selector)
-                    .unwrap_or_else(|| panic!("{selector} trigger was not rendered"));
-                cx.simulate_click(trigger.center(), Modifiers::none());
-                cx.run_until_parked();
-                assert!(
-                    cx.debug_bounds(menu_selector).is_some(),
-                    "{selector} did not open a floating listbox"
-                );
-
-                cx.simulate_click(trigger.center(), Modifiers::none());
-                cx.run_until_parked();
-                assert!(
-                    cx.debug_bounds(menu_selector).is_none(),
-                    "{selector} did not close its listbox"
-                );
-            }
-        }
-
-        #[gpui::test]
-        fn automation_form_validation_blocks_invalid_saves(cx: &mut TestAppContext) {
-            let (view, cx, commands) = setup(cx);
-            view.update(cx, |view, cx| {
-                view.open_automations(cx);
-                view.save_automation(cx);
-                assert_eq!(
-                    view.action_error.as_deref(),
-                    Some("Automation name is required.")
-                );
-
-                view.automation_name_input
-                    .update(cx, |input, cx| input.set_value("Maintenance", cx));
-                view.automation_schedule_input
-                    .update(cx, |input, cx| input.set_value("every 3 minutes", cx));
-                view.save_automation(cx);
-                assert!(
-                    view.action_error
-                        .as_deref()
-                        .is_some_and(|error| error.contains("5-minute increments"))
-                );
-
-                view.automation_schedule_input.update(cx, |input, cx| {
-                    input.set_value("Every Wednesday at 2:00 PM", cx);
-                });
-                view.save_automation(cx);
-                assert_eq!(
-                    view.action_error.as_deref(),
-                    Some("Automation instructions are required.")
-                );
-            });
-            assert!(
-                commands.try_recv().is_err(),
-                "invalid drafts must not reach the automation service"
-            );
         }
 
         fn assert_horizontally_aligned(

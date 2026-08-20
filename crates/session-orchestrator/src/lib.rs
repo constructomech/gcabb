@@ -339,6 +339,7 @@ impl SessionOrchestrator {
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned()),
                 kind: request.kind,
+                unattended: false,
             })
             .await
     }

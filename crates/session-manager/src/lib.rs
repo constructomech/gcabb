@@ -232,6 +232,14 @@ pub struct CreateSessionRequest {
     pub repository_root: Option<String>,
     /// Whether this is a project session or a standalone chat.
     pub kind: SessionKind,
+    /// Whether the session runs without a human who could answer prompts.
+    ///
+    /// Automation runs have no window and no one to approve a permission
+    /// request, so a prompt would otherwise park the session in
+    /// [`SessionStatus::Waiting`](app_model::SessionStatus::Waiting) until the
+    /// caller's timeout expires. Unattended sessions approve tool use up front
+    /// instead of stalling on a question nobody can see.
+    pub unattended: bool,
 }
 
 #[derive(Clone)]
@@ -785,11 +793,7 @@ impl SessionManager {
 
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionHandle> {
         let app_session_id = Uuid::new_v4().to_string();
-        let auto_approve_tools = is_gcabb_worktree(
-            request.kind,
-            &request.project_path,
-            request.repository_root.as_deref(),
-        );
+        let auto_approve_tools = auto_approves_tools(&request);
         let provider = self.provider_factory.create(&request.project_path);
         let isolated = self.provider_factory.isolates_session_runtimes();
         let compatibility = match provider.start().await {
@@ -3084,6 +3088,20 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Whether a session should approve tool use without asking.
+///
+/// Attended sessions only skip prompts inside a GCABB-created worktree, where
+/// the checkout is disposable. Unattended sessions have no one to ask, so a
+/// prompt would stall them rather than protect anything.
+fn auto_approves_tools(request: &CreateSessionRequest) -> bool {
+    request.unattended
+        || is_gcabb_worktree(
+            request.kind,
+            &request.project_path,
+            request.repository_root.as_deref(),
+        )
+}
+
 fn is_gcabb_worktree(
     kind: SessionKind,
     working_directory: &Path,
@@ -3158,6 +3176,24 @@ mod tests {
         assert!(!is_gcabb_worktree(SessionKind::Project, &worktree, None,));
     }
 
+    #[test]
+    fn unattended_sessions_auto_approve_tools_outside_a_worktree() {
+        let repository = PathBuf::from("repository");
+        let mut attended = request(repository.clone());
+        attended.repository_root = repository.to_str().map(str::to_owned);
+
+        // A session in the repository root itself normally prompts.
+        assert!(!auto_approves_tools(&attended));
+
+        // An automation run has no window in which to answer that prompt, so
+        // it approves up front instead of stalling in `Waiting`.
+        let unattended = CreateSessionRequest {
+            unattended: true,
+            ..attended
+        };
+        assert!(auto_approves_tools(&unattended));
+    }
+
     fn request(path: PathBuf) -> CreateSessionRequest {
         CreateSessionRequest {
             project_path: path,
@@ -3171,6 +3207,7 @@ mod tests {
             reasoning_effort: Some("medium".to_owned()),
             context_tier: None,
             base_ref: None,
+            unattended: false,
         }
     }
 
