@@ -59,23 +59,6 @@ Host tests cannot prove the other two platforms pass. A platform-specific
 failure may still appear after pushing; that is expected, and it is the only
 class of failure CI should be discovering.
 
-### Heavy compilation on shared machines
-
-Where the machine has the shared heavy-job queue, route compilation-based
-validation through it instead of running cargo directly:
-
-```powershell
-& "$HOME\.copilot\tools\Invoke-HeavyJob.ps1" "Validate pull request" {
-    cargo clippy --workspace --all-targets -- -D warnings
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    cargo build --workspace --locked
-    if ($LASTEXITCODE -ne 0) { exit $LASTEXITCODE }
-    cargo test --workspace --locked
-}
-```
-
-`cargo fmt --all -- --check` is cheap and runs directly.
-
 ## 4. Fix and re-run
 
 If any check fails, fix the cause and re-run the failed command plus anything

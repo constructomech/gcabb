@@ -1,0 +1,3 @@
+scripts:
+  - name: Run GCABB
+    command: cargo run -p gcabb-desktop

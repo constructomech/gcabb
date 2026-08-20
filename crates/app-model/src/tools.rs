@@ -331,6 +331,11 @@ impl ToolInvocation {
             }
             .to_owned();
         }
+        if self.class == ToolClass::Skill {
+            return self
+                .string_argument("skill")
+                .map_or_else(|| "skill".to_owned(), |skill| format!("skill {skill}"));
+        }
         let argument = self
             .file_path()
             .map(str::to_owned)
@@ -390,7 +395,7 @@ impl ToolInvocation {
             ToolClass::Web => "Fetch",
             ToolClass::Delegation => "Task",
             ToolClass::Data => "Query",
-            ToolClass::Skill => "Skill",
+            ToolClass::Skill => "Reading",
             ToolClass::Interaction => "Ask",
             ToolClass::Other => "Tool",
         }

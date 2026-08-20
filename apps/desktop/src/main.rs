@@ -1,6 +1,7 @@
 use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
+use std::rc::Rc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
@@ -14,22 +15,25 @@ use app_model::{
     WorkspaceConfiguration, WorkspaceResource,
 };
 use chrono::{DateTime, SecondsFormat, Utc};
-use copilot_provider::{CopilotProvider, ProviderCompatibility};
+use copilot_provider::{CopilotProviderFactory, ProviderCompatibility};
 use diagnostics::{DiagnosticEvent, DiagnosticsSink, TracingDiagnostics, init_tracing};
 use git_service::GitService;
 use gpui::prelude::FluentBuilder;
 use gpui::{
     Anchor, AnchoredPositionMode, Animation, AnimationExt, App, AppContext, Bounds, Context,
-    Entity, ExternalPaths, FocusHandle, Focusable, FollowMode, FontStyle, HighlightStyle,
-    InteractiveElement, InteractiveText, IntoElement, KeyBinding, ListAlignment, ListState,
-    MouseButton, ParentElement, PathPromptOptions, Render, Role, SharedString,
-    StatefulInteractiveElement, StrikethroughStyle, Styled, StyledText, TitlebarOptions,
-    UnderlineStyle, Window, WindowBounds, WindowOptions, actions, anchored, deferred, div, list,
-    point, px, relative, rgb, size,
+    CursorStyle, Element, ElementId, Entity, ExternalPaths, FocusHandle, Focusable, FollowMode,
+    FontStyle, GlobalElementId, HighlightStyle, InteractiveElement, IntoElement, KeyBinding,
+    LayoutId, ListAlignment, ListState, MouseButton, ParentElement, PathPromptOptions, Render,
+    Role, SharedString, StatefulInteractiveElement, StrikethroughStyle, Styled, StyledText,
+    TextLayout, TitlebarOptions, UnderlineStyle, Window, WindowBounds, WindowOptions, actions,
+    anchored, deferred, div, list, point, px, relative, rgb, size,
 };
 use session_manager::{
-    CreateSessionRequest, RestoreFailure, SessionHandle, SessionManager, SessionRoots,
-    WorktreeOutcome,
+    ArchiveOutcome, CreateSessionRequest, RestoreFailure, RestoreOutcome, SessionHandle,
+    SessionManager, SessionRoots, WorktreeOutcome,
+};
+use session_orchestrator::{
+    LaunchOrigin, LaunchProgress, LaunchRequest, LaunchTitle, SessionOrchestrator,
 };
 use storage::Storage;
 use tokio::sync::watch;
@@ -38,9 +42,12 @@ use updater::install::InstallLayout;
 use updater::version::BuildStamp;
 
 mod markdown;
+mod settings;
+mod syntax;
 mod updates;
 
 use markdown::{MarkdownDocument, MarkdownNode, MarkdownTag};
+use settings::AppSettings;
 use updates::{UpdateRequest, UpdateService, UpdateUi};
 
 const BACKGROUND: u32 = 0x000d_1117;
@@ -57,6 +64,7 @@ const PERSISTENT_DATA_ENTRIES: &[&str] = &[
     "gcabb.db",
     "gcabb.db-shm",
     "gcabb.db-wal",
+    settings::SETTINGS_FILE,
     "update-settings.json",
     "attachments",
     "chats",
@@ -92,6 +100,16 @@ struct ScrollbarDrag {
     grab_offset: f32,
 }
 
+/// A glide back to the conversation tail in progress.
+#[derive(Clone, Copy, Debug)]
+struct ScrollToBottom {
+    /// When the glide started. Progress is derived from wall time rather than
+    /// step count so the duration holds regardless of frame rate.
+    started: Instant,
+    /// Scroll offset the glide started from, in pixels below the top.
+    from: f32,
+}
+
 /// Smallest usable scrollbar thumb.
 const MIN_THUMB_HEIGHT: f32 = 24.0;
 /// Scrollbar track width; wide enough to aim at without crowding content.
@@ -100,18 +118,53 @@ const SCROLLBAR_WIDTH: f32 = 14.0;
 const THUMB_WIDTH: f32 = 10.0;
 /// Scrollbar id for the conversation itself.
 const TRANSCRIPT_SCROLL_ID: &str = "transcript";
+/// A wheel listener that claims the gesture only when its region moved.
+type ScrollWheelGuard = Box<dyn Fn(&gpui::ScrollWheelEvent, &mut Window, &mut App)>;
+
 /// Scroll region behind the Changes panel's single scrollbar.
 const CHANGES_SCROLL_ID: &str = "changes-scroll";
 const AUTOMATION_LIST_SCROLL_ID: &str = "automation-list-scroll";
 const AUTOMATION_FORM_SCROLL_ID: &str = "automation-form-scroll";
 const AUTOMATION_HISTORY_SCROLL_ID: &str = "automation-history-scroll";
+/// Scroll region of the composer's mode, model, and effort menus.
+const CONTROL_MENU_SCROLL_ID: &str = "control-menu-scroll";
+/// Scroll region for a permission request's requested-action detail, which
+/// can run to many pages of JSON for tool calls with large payloads.
+const PERMISSION_DETAIL_SCROLL_ID: &str = "permission-detail-scroll";
+/// Fraction of the window's viewport height allotted to a permission's
+/// requested-action detail panel, so it scales with the window rather than
+/// using a fixed pixel cap that under- or over-shoots on very short or very
+/// tall windows.
+const PERMISSION_DETAIL_HEIGHT_FRACTION: f32 = 0.35;
+/// Smallest a permission detail panel is allowed to shrink to, so it still
+/// shows a few lines even in a very short window.
+const PERMISSION_DETAIL_MIN_HEIGHT: f32 = 180.0;
+/// Largest a permission detail panel is allowed to grow to, so a single
+/// panel doesn't dominate a very tall window.
+const PERMISSION_DETAIL_MAX_HEIGHT: f32 = 480.0;
 /// Extra content laid out above and below the viewport to avoid blank flashes
 /// during fast trackpad and scrollbar movement.
 const TRANSCRIPT_OVERDRAW: f32 = 720.0;
 /// Initial height estimate used to size the scrollbar without laying out every
 /// row. Measured dynamic heights replace it as rows enter the window.
-const TRANSCRIPT_ROW_HEIGHT_HINT: f32 = 144.0;
+const TRANSCRIPT_ROW_HEIGHT_HINT: f32 = 96.0;
+/// How long the transcript takes to glide back to the tail.
+///
+/// Long enough that the intervening content is visibly flying past — which is
+/// what tells the reader how far the view moved and in which direction — and
+/// short enough that it reads as a snap that happens to be traceable rather
+/// than a trip to sit through.
+const SCROLL_TO_BOTTOM_DURATION: Duration = Duration::from_millis(250);
+/// Step interval for the glide, around 120Hz so the motion stays smooth on
+/// high refresh rate displays.
+const SCROLL_TO_BOTTOM_STEP: Duration = Duration::from_millis(8);
+/// Height of the fade that dims the conversation tail while the transcript is
+/// parked above it, marking the content the reader has scrolled past.
+const TRANSCRIPT_TAIL_FADE: f32 = 112.0;
 const MARKDOWN_CACHE_CAPACITY: usize = 128;
+const DIFF_CACHE_CAPACITY: usize = 64;
+const DIFF_ADDED_BACKGROUND: u32 = 0x2386_3626;
+const DIFF_DELETED_BACKGROUND: u32 = 0xf851_6126;
 /// Maximum live shell output shaped on the UI thread for one tool row.
 const LIVE_OUTPUT_PREVIEW_BYTES: usize = 16 * 1_024;
 const LIVE_OUTPUT_PREVIEW_LINES: usize = 64;
@@ -124,7 +177,10 @@ const COMMAND_BLOCK_HEIGHT: f32 = ENTRY_DETAIL_BUDGET / 3.0;
 /// installed `com.constructomech.gcabb.desktop` entry that supplies the icon.
 const APP_ID: &str = "com.constructomech.gcabb";
 
-actions!(gcabb, [DismissPopup, FocusNext, FocusPrevious]);
+actions!(
+    gcabb,
+    [CopyTranscript, DismissPopup, FocusNext, FocusPrevious]
+);
 
 const MARKDOWN_STRONG: u8 = 1;
 const MARKDOWN_EMPHASIS: u8 = 1 << 1;
@@ -152,11 +208,94 @@ struct MarkdownInlineContent {
     links: Vec<(std::ops::Range<usize>, String)>,
 }
 
+struct DiffDocument {
+    source: SharedString,
+    lines: Vec<DiffLine>,
+    muted: bool,
+}
+
+struct DiffLine {
+    source: SharedString,
+    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    background: Option<u32>,
+}
+
+#[derive(Default)]
+struct DiffCache {
+    documents: HashMap<String, Arc<DiffDocument>>,
+    order: VecDeque<String>,
+}
+
+fn diff_lines(
+    source: &str,
+    highlights: &[(std::ops::Range<usize>, HighlightStyle)],
+) -> Vec<DiffLine> {
+    let mut line_start = 0;
+    let mut highlight_index = 0;
+
+    source
+        .split_inclusive('\n')
+        .map(|line| {
+            let text = line.strip_suffix('\n').unwrap_or(line);
+            let line_end = line_start + text.len();
+            while highlight_index < highlights.len()
+                && highlights[highlight_index].0.end <= line_start
+            {
+                highlight_index += 1;
+            }
+
+            let mut line_highlights = Vec::new();
+            let mut index = highlight_index;
+            while index < highlights.len() && highlights[index].0.start < line_end {
+                let (range, style) = &highlights[index];
+                let start = range.start.max(line_start) - line_start;
+                let end = range.end.min(line_end) - line_start;
+                if start < end {
+                    line_highlights.push((start..end, *style));
+                }
+                index += 1;
+            }
+
+            let background = if text.starts_with('+') && !text.starts_with("+++ ") {
+                Some(DIFF_ADDED_BACKGROUND)
+            } else if text.starts_with('-') && !text.starts_with("--- ") {
+                Some(DIFF_DELETED_BACKGROUND)
+            } else {
+                None
+            };
+            line_start += line.len();
+            DiffLine {
+                source: text.to_owned().into(),
+                highlights: line_highlights,
+                background,
+            }
+        })
+        .collect()
+}
+
+#[cfg(test)]
+mod diff_line_tests {
+    use super::*;
+
+    #[test]
+    fn change_backgrounds_belong_to_rows_not_text_runs() {
+        let lines = diff_lines("--- a/file\n+++ b/file\n-old\n+new\n context\n", &[]);
+
+        assert_eq!(lines[0].background, None);
+        assert_eq!(lines[1].background, None);
+        assert_eq!(lines[2].background, Some(DIFF_DELETED_BACKGROUND));
+        assert_eq!(lines[3].background, Some(DIFF_ADDED_BACKGROUND));
+        assert_eq!(lines[4].background, None);
+        assert!(lines.iter().all(|line| line.highlights.is_empty()));
+    }
+}
+
 impl MarkdownInlineContent {
     fn push(&mut self, text: &str, style: &MarkdownInlineStyle) {
         if text.is_empty() {
             return;
         }
+
         let range = self.text.len()..self.text.len() + text.len();
         self.text.push_str(text);
 
@@ -189,6 +328,472 @@ impl MarkdownInlineContent {
             self.links.push((range.clone(), target.clone()));
         }
         self.highlights.push((range, highlight));
+    }
+}
+
+#[derive(Clone)]
+struct TranscriptTextBlock {
+    order: (u64, usize),
+    content: SharedString,
+    links: Vec<(std::ops::Range<usize>, String)>,
+    bounds: Option<Bounds<gpui::Pixels>>,
+    layout: Option<TextLayout>,
+}
+
+#[derive(Clone)]
+struct TranscriptTextEndpoint {
+    block_id: String,
+    order: (u64, usize),
+    index: usize,
+}
+
+#[derive(Default)]
+struct TranscriptTextSelection {
+    message_orders: HashMap<String, u64>,
+    blocks: HashMap<String, TranscriptTextBlock>,
+    anchor: Option<TranscriptTextEndpoint>,
+    focus: Option<TranscriptTextEndpoint>,
+    dragging: bool,
+}
+
+impl TranscriptTextSelection {
+    fn clamp_index(content: &str, index: usize) -> usize {
+        let mut index = index.min(content.len());
+        while !content.is_char_boundary(index) {
+            index -= 1;
+        }
+        index
+    }
+
+    /// Records a block's text and link ranges for the current frame.
+    ///
+    /// Geometry measured during prepaint is kept so a re-registration between
+    /// paints (a press, say) does not blind hit testing until the next frame.
+    fn register_block(
+        &mut self,
+        block_id: &str,
+        order: (u64, usize),
+        content: SharedString,
+        links: Vec<(std::ops::Range<usize>, String)>,
+    ) {
+        let block = self
+            .blocks
+            .entry(block_id.to_owned())
+            .or_insert_with(|| TranscriptTextBlock {
+                order,
+                content: SharedString::default(),
+                links: Vec::new(),
+                bounds: None,
+                layout: None,
+            });
+        block.order = order;
+        block.content = content;
+        block.links = links;
+        for endpoint in [&mut self.anchor, &mut self.focus] {
+            if let Some(endpoint) = endpoint.as_mut()
+                && endpoint.block_id == block_id
+                && let Some(block) = self.blocks.get(block_id)
+            {
+                endpoint.order = order;
+                endpoint.index = Self::clamp_index(&block.content, endpoint.index);
+            }
+        }
+    }
+
+    /// Refreshes a block's text without disturbing the link ranges recorded by
+    /// the element that rendered it.
+    fn touch_block(&mut self, block_id: &str, order: (u64, usize), content: SharedString) {
+        let links = self
+            .blocks
+            .get(block_id)
+            .map(|block| block.links.clone())
+            .unwrap_or_default();
+        self.register_block(block_id, order, content, links);
+    }
+
+    /// The link target under `position`, if any block has text there.
+    ///
+    /// Hit testing reads the shared block registry rather than one element's
+    /// own state, because every block registers a mouse-up handler and only
+    /// the first one to run gets to act on the release.
+    fn link_at(&self, position: gpui::Point<gpui::Pixels>) -> Option<String> {
+        self.blocks.values().find_map(|block| {
+            let bounds = block.bounds?;
+            if !bounds.contains(&position) {
+                return None;
+            }
+            let index = block.layout.as_ref()?.index_for_position(position).ok()?;
+            block
+                .links
+                .iter()
+                .find_map(|(range, target)| range.contains(&index).then(|| target.clone()))
+        })
+    }
+
+    fn update_geometry(
+        &mut self,
+        block_id: &str,
+        bounds: Bounds<gpui::Pixels>,
+        layout: TextLayout,
+    ) {
+        if let Some(block) = self.blocks.get_mut(block_id) {
+            block.bounds = Some(bounds);
+            block.layout = Some(layout);
+        }
+    }
+
+    fn begin(
+        &mut self,
+        block_id: String,
+        order: (u64, usize),
+        content: &SharedString,
+        index: usize,
+    ) {
+        self.touch_block(&block_id, order, content.clone());
+        let endpoint = TranscriptTextEndpoint {
+            block_id,
+            order,
+            index: Self::clamp_index(content, index),
+        };
+        self.anchor = Some(endpoint.clone());
+        self.focus = Some(endpoint);
+        self.dragging = true;
+    }
+
+    fn extend(
+        &mut self,
+        block_id: String,
+        order: (u64, usize),
+        content: &SharedString,
+        index: usize,
+    ) {
+        if !self.dragging {
+            return;
+        }
+        self.touch_block(&block_id, order, content.clone());
+        self.focus = Some(TranscriptTextEndpoint {
+            block_id,
+            order,
+            index: Self::clamp_index(content, index),
+        });
+    }
+
+    fn extend_to_position(&mut self, position: gpui::Point<gpui::Pixels>) {
+        if !self.dragging {
+            return;
+        }
+        let destination = self.blocks.iter().find_map(|(block_id, block)| {
+            let bounds = block.bounds?;
+            if !bounds.contains(&position) {
+                return None;
+            }
+            let layout = block.layout.as_ref()?;
+            let index = layout
+                .index_for_position(position)
+                .unwrap_or_else(|index| index)
+                .min(block.content.len());
+            Some((block_id.clone(), block.order, block.content.clone(), index))
+        });
+        if let Some((block_id, order, content, index)) = destination {
+            self.extend(block_id, order, &content, index);
+        }
+    }
+
+    fn ordered_endpoints(&self) -> Option<(&TranscriptTextEndpoint, &TranscriptTextEndpoint)> {
+        let anchor = self.anchor.as_ref()?;
+        let focus = self.focus.as_ref()?;
+        if (anchor.order, anchor.index) <= (focus.order, focus.index) {
+            Some((anchor, focus))
+        } else {
+            Some((focus, anchor))
+        }
+    }
+
+    fn range_for(&self, block_id: &str, content: &str) -> Option<std::ops::Range<usize>> {
+        let block = self.blocks.get(block_id)?;
+        let (start, end) = self.ordered_endpoints()?;
+        if block.order < start.order || block.order > end.order {
+            return None;
+        }
+        let range = if start.block_id == end.block_id {
+            Self::clamp_index(content, start.index)..Self::clamp_index(content, end.index)
+        } else if block_id == start.block_id {
+            Self::clamp_index(content, start.index)..content.len()
+        } else if block_id == end.block_id {
+            0..Self::clamp_index(content, end.index)
+        } else {
+            0..content.len()
+        };
+        (!range.is_empty()).then_some(range)
+    }
+
+    fn is_empty(&self) -> bool {
+        self.ordered_endpoints()
+            .is_none_or(|(start, end)| start.block_id == end.block_id && start.index == end.index)
+    }
+
+    fn selected_text(&self) -> Option<String> {
+        if self.is_empty() {
+            return None;
+        }
+        let mut blocks = self
+            .blocks
+            .iter()
+            .filter_map(|(block_id, block)| {
+                self.range_for(block_id, &block.content)
+                    .map(|range| (block.order, block.content[range].to_owned()))
+            })
+            .collect::<Vec<_>>();
+        blocks.sort_by_key(|(order, _)| *order);
+        Some(
+            blocks
+                .into_iter()
+                .map(|(_, text)| text)
+                .collect::<Vec<_>>()
+                .join("\n"),
+        )
+    }
+}
+
+struct SelectableTranscriptText {
+    block_id: String,
+    order: (u64, usize),
+    content: SharedString,
+    highlights: Vec<(std::ops::Range<usize>, HighlightStyle)>,
+    font_family_overrides: Vec<(std::ops::Range<usize>, SharedString)>,
+    links: Vec<(std::ops::Range<usize>, String)>,
+    selection: Rc<RefCell<TranscriptTextSelection>>,
+    focus: FocusHandle,
+}
+
+struct SelectableTextPrepaint {
+    text: StyledText,
+    layout: TextLayout,
+    hitbox: gpui::Hitbox,
+}
+
+impl SelectableTranscriptText {
+    fn new(
+        block_id: String,
+        order: (u64, usize),
+        content: MarkdownInlineContent,
+        selection: Rc<RefCell<TranscriptTextSelection>>,
+        focus: FocusHandle,
+    ) -> Self {
+        let MarkdownInlineContent {
+            text,
+            highlights,
+            font_family_overrides,
+            links,
+        } = content;
+        let content: SharedString = text.into();
+        selection
+            .borrow_mut()
+            .register_block(&block_id, order, content.clone(), links.clone());
+        Self {
+            block_id,
+            order,
+            content,
+            highlights,
+            font_family_overrides,
+            links,
+            selection,
+            focus,
+        }
+    }
+
+    fn merged_highlights(&self) -> Vec<(std::ops::Range<usize>, HighlightStyle)> {
+        let selected = self.selection.borrow();
+        let selected = selected.range_for(&self.block_id, &self.content);
+        let mut boundaries = vec![0, self.content.len()];
+        for (range, _) in &self.highlights {
+            boundaries.extend([range.start, range.end]);
+        }
+        if let Some(range) = &selected {
+            boundaries.extend([range.start, range.end]);
+        }
+        boundaries.sort_unstable();
+        boundaries.dedup();
+        boundaries
+            .windows(2)
+            .filter_map(|pair| {
+                let range = pair[0]..pair[1];
+                if range.is_empty() {
+                    return None;
+                }
+                let mut style = self
+                    .highlights
+                    .iter()
+                    .find_map(|(highlight_range, style)| {
+                        (range.start >= highlight_range.start && range.end <= highlight_range.end)
+                            .then_some(*style)
+                    })
+                    .unwrap_or_default();
+                if selected.as_ref().is_some_and(|selected| {
+                    range.start >= selected.start && range.end <= selected.end
+                }) {
+                    style.background_color = Some(gpui::rgba(0x2f81_f766).into());
+                }
+                Some((range, style))
+            })
+            .collect()
+    }
+}
+
+impl Element for SelectableTranscriptText {
+    type RequestLayoutState = StyledText;
+    type PrepaintState = SelectableTextPrepaint;
+
+    fn id(&self) -> Option<ElementId> {
+        Some(self.block_id.clone().into())
+    }
+
+    fn source_location(&self) -> Option<&'static core::panic::Location<'static>> {
+        None
+    }
+
+    fn request_layout(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> (LayoutId, Self::RequestLayoutState) {
+        let mut text = StyledText::new(self.content.clone())
+            .with_highlights(self.merged_highlights())
+            .with_font_family_overrides(self.font_family_overrides.clone());
+        let (layout_id, ()) = text.request_layout(id, inspector_id, window, cx);
+        (layout_id, text)
+    }
+
+    fn prepaint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<gpui::Pixels>,
+        text: &mut Self::RequestLayoutState,
+        window: &mut Window,
+        cx: &mut App,
+    ) -> Self::PrepaintState {
+        text.prepaint(id, inspector_id, bounds, &mut (), window, cx);
+        let layout = text.layout().clone();
+        self.selection
+            .borrow_mut()
+            .update_geometry(&self.block_id, bounds, layout.clone());
+        let hitbox = window.insert_hitbox(bounds, gpui::HitboxBehavior::Normal);
+        SelectableTextPrepaint {
+            text: std::mem::replace(text, StyledText::new("")),
+            layout,
+            hitbox,
+        }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "painting selectable text registers its drag, release, link, and copy interactions"
+    )]
+    fn paint(
+        &mut self,
+        id: Option<&GlobalElementId>,
+        inspector_id: Option<&gpui::InspectorElementId>,
+        bounds: Bounds<gpui::Pixels>,
+        _: &mut Self::RequestLayoutState,
+        prepaint: &mut Self::PrepaintState,
+        window: &mut Window,
+        cx: &mut App,
+    ) {
+        let current_view = window.current_view();
+        let over_link = prepaint
+            .layout
+            .index_for_position(window.mouse_position())
+            .ok()
+            .is_some_and(|index| self.links.iter().any(|(range, _)| range.contains(&index)));
+        window.set_cursor_style(
+            if over_link {
+                CursorStyle::PointingHand
+            } else {
+                CursorStyle::IBeam
+            },
+            &prepaint.hitbox,
+        );
+
+        let block_id = self.block_id.clone();
+        let order = self.order;
+        let content = self.content.clone();
+        let selection = self.selection.clone();
+        let focus = self.focus.clone();
+        let layout = prepaint.layout.clone();
+        let hitbox = prepaint.hitbox.clone();
+        window.on_mouse_event(
+            move |event: &gpui::MouseDownEvent, phase, window: &mut Window, cx| {
+                if phase != gpui::DispatchPhase::Bubble
+                    || event.button != MouseButton::Left
+                    || !hitbox.is_hovered(window)
+                {
+                    return;
+                }
+                let index = layout
+                    .index_for_position(event.position)
+                    .unwrap_or_else(|index| index)
+                    .min(content.len());
+                let mut selected = selection.borrow_mut();
+                selected.begin(block_id.clone(), order, &content, index);
+                drop(selected);
+                window.focus(&focus, cx);
+                cx.notify(current_view);
+            },
+        );
+
+        let selection = self.selection.clone();
+        window.on_mouse_event(
+            move |event: &gpui::MouseMoveEvent, phase, _window: &mut Window, cx| {
+                if phase != gpui::DispatchPhase::Bubble {
+                    return;
+                }
+                let mut selected = selection.borrow_mut();
+                if !selected.dragging {
+                    return;
+                }
+                selected.extend_to_position(event.position);
+                drop(selected);
+                cx.notify(current_view);
+            },
+        );
+
+        let selection = self.selection.clone();
+        window.on_mouse_event(
+            move |event: &gpui::MouseUpEvent, phase, _window: &mut Window, cx| {
+                if phase != gpui::DispatchPhase::Bubble || event.button != MouseButton::Left {
+                    return;
+                }
+                let mut selected = selection.borrow_mut();
+                if !selected.dragging {
+                    return;
+                }
+                selected.dragging = false;
+                let target = selected
+                    .is_empty()
+                    .then(|| selected.link_at(event.position))
+                    .flatten();
+                drop(selected);
+                if let Some(target) = target {
+                    cx.open_url(&target);
+                }
+                cx.notify(current_view);
+            },
+        );
+
+        prepaint
+            .text
+            .paint(id, inspector_id, bounds, &mut (), &mut (), window, cx);
+    }
+}
+
+impl IntoElement for SelectableTranscriptText {
+    type Element = Self;
+
+    fn into_element(self) -> Self::Element {
+        self
     }
 }
 
@@ -271,7 +876,6 @@ enum ServiceUpdate {
         automation_runs: Vec<AutomationRun>,
     },
     SessionHydrated(SessionHandle),
-    RestorationFinished(Vec<RestoreFailure>),
     SessionAdded(SessionHandle),
     SessionsDiscovered(Vec<SessionHandle>),
     /// A session was deleted and must be dropped from the UI.
@@ -282,6 +886,18 @@ enum ServiceUpdate {
         app_session_id: String,
         error: String,
     },
+    /// A session was archived and must move from the sidebar into the archive.
+    SessionArchived {
+        session: SessionMetadata,
+        archived_at: String,
+    },
+    /// An archive operation failed; clear the in-flight spinner and say why.
+    SessionArchiveFailed {
+        app_session_id: String,
+        error: String,
+    },
+    /// An archived session came back and must reappear in the sidebar.
+    SessionUnarchived(SessionMetadata),
     /// The configured project list changed, with the project to select next.
     ProjectsChanged {
         projects: Vec<ProjectMetadata>,
@@ -291,9 +907,16 @@ enum ServiceUpdate {
     ConfigurationRootsChanged(Vec<String>),
     AutomationsChanged(Vec<Automation>),
     AutomationRunsChanged(Vec<AutomationRun>),
+    SessionLaunchProgress(SessionLaunchProgress),
     PromptAccepted(Option<String>),
     ActionFailed(String),
     Failed(String),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+enum SessionLaunchProgress {
+    CreatingWorktree,
+    WorktreeReady(PathBuf),
 }
 
 enum ServiceCommand {
@@ -315,12 +938,20 @@ enum ServiceCommand {
         kind: SessionKind,
         /// Where a new project session should run.
         location: SessionLocation,
+        /// Root under which a new worktree should be created.
+        worktrees_root: PathBuf,
     },
     Cancel {
         app_session_id: String,
     },
     Resume {
         app_session_id: String,
+        /// Managed root used to recreate a missing worktree, when known.
+        worktrees_root: Option<PathBuf>,
+    },
+    RelocateSession {
+        app_session_id: String,
+        working_directory: PathBuf,
     },
     Respond {
         app_session_id: String,
@@ -354,6 +985,14 @@ enum ServiceCommand {
         app_session_id: String,
         tier: String,
     },
+    SetBaseRef {
+        app_session_id: String,
+        base_ref: String,
+    },
+    RefreshChanges {
+        app_session_id: String,
+        force: bool,
+    },
     Select {
         app_session_id: Option<String>,
     },
@@ -362,6 +1001,16 @@ enum ServiceCommand {
         title: String,
     },
     DeleteSession {
+        app_session_id: String,
+        /// Root that owned this particular worktree, including a previous root.
+        worktrees_root: Option<PathBuf>,
+    },
+    ArchiveSession {
+        app_session_id: String,
+        /// Root that owned this particular worktree, including a previous root.
+        worktrees_root: Option<PathBuf>,
+    },
+    UnarchiveSession {
         app_session_id: String,
     },
     /// Register a directory chosen by the user as a project.
@@ -397,9 +1046,19 @@ struct AppService {
 struct BootstrapState {
     projects: Vec<ProjectMetadata>,
     sessions: Vec<SessionMetadata>,
+    /// Sessions the user archived, shown only in settings.
+    archived: Vec<ArchivedSessionRow>,
     selected_session: Option<String>,
     automations: Vec<Automation>,
     automation_runs: Vec<AutomationRun>,
+}
+
+/// One archived session as the settings list needs it.
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct ArchivedSessionRow {
+    id: String,
+    title: String,
+    archived_at: String,
 }
 
 impl AppService {
@@ -428,6 +1087,19 @@ impl AppService {
                 tracing::error!(%error, "failed to list bootstrap sessions");
                 Vec::new()
             }),
+            archived: storage
+                .list_archived_sessions()
+                .unwrap_or_else(|error| {
+                    tracing::error!(%error, "failed to list archived sessions");
+                    Vec::new()
+                })
+                .into_iter()
+                .map(|archived| ArchivedSessionRow {
+                    id: archived.metadata.id,
+                    title: archived.metadata.title,
+                    archived_at: archived.archive.archived_at,
+                })
+                .collect(),
             selected_session: storage.selected_session().unwrap_or(None),
             automations: storage.list_automations().unwrap_or_else(|error| {
                 tracing::error!(%error, "failed to list bootstrap automations");
@@ -480,21 +1152,19 @@ impl AppService {
                     }
                 };
                 let runtime_ms = elapsed_millis(runtime_started);
-                let provider = Arc::new(CopilotProvider::new(
-                    project_root.clone(),
-                    diagnostics.clone(),
-                ));
-                let manager = Arc::new(SessionManager::new(
-                    provider,
-                    storage.clone(),
-                    diagnostics.clone(),
-                ));
+                let provider_factory =
+                    CopilotProviderFactory::new(project_root.clone(), diagnostics.clone());
                 let running_automations = Arc::new(Mutex::new(HashSet::new()));
                 let session_roots = SessionRoots {
-                    worktrees: Some(worktrees_root()),
+                    worktrees: None,
                     attachments: attachments_directory(),
                     runtime_state: runtime_state_root(),
                 };
+                let manager = Arc::new(
+                    SessionManager::new(provider_factory, storage.clone(), diagnostics.clone())
+                        .with_session_roots(session_roots.clone()),
+                );
+                let orchestrator = SessionOrchestrator::new(manager.clone(), session_roots.clone());
                 // Projects are configured by the user, not inferred from the
                 // launch directory. Auto-registering the launch repository
                 // would silently re-add a project the user had removed.
@@ -518,7 +1188,6 @@ impl AppService {
                 let adoption_ms = elapsed_millis(adoption_started);
 
                 let manager_started = Instant::now();
-                let mut restoration_task = None;
                 match runtime.block_on(manager.start_preferred_session(
                     preferred_session.as_deref(),
                     |handle| {
@@ -552,6 +1221,10 @@ impl AppService {
                                 "remainingSessions": remaining.len()
                             }),
                         });
+                        // Other stored sessions are left as metadata-only
+                        // placeholders; they are only actively reconnected
+                        // when the user selects them (see ServiceCommand::Select).
+                        let _ = remaining;
                         let _ = update_tx.send(ServiceUpdate::Ready {
                             compatibility,
                             projects,
@@ -560,18 +1233,6 @@ impl AppService {
                             automations: storage.list_automations().unwrap_or_default(),
                             automation_runs: storage.list_automation_runs(100).unwrap_or_default(),
                         });
-                        let background_manager = manager.clone();
-                        let background_updates = update_tx.clone();
-                        restoration_task = Some(runtime.spawn(async move {
-                            let report = background_manager
-                                .restore_remaining_sessions(remaining, |handle| {
-                                    let _ = background_updates
-                                        .send(ServiceUpdate::SessionHydrated(handle));
-                                })
-                                .await;
-                            let _ = background_updates
-                                .send(ServiceUpdate::RestorationFinished(report.failed));
-                        }));
                     }
                     Err(error) => {
                         let _ = update_tx.send(ServiceUpdate::Failed(format!(
@@ -601,18 +1262,20 @@ impl AppService {
                         Err(RecvTimeoutError::Disconnected) => break,
                     };
                     if matches!(command, ServiceCommand::Stop) {
-                        if let Some(task) = restoration_task.take() {
-                            let _ = runtime.block_on(task);
-                        }
                         let _ = runtime.block_on(manager.stop());
                         break;
                     }
                     // Project changes publish a project list rather than a
                     // session, so they are handled before the session commands.
                     match command {
-                        ServiceCommand::DeleteSession { app_session_id } => {
+                        ServiceCommand::DeleteSession {
+                            app_session_id,
+                            worktrees_root,
+                        } => {
+                            let mut deletion_roots = session_roots.clone();
+                            deletion_roots.worktrees = worktrees_root;
                             match runtime
-                                .block_on(manager.delete_session(&app_session_id, &session_roots))
+                                .block_on(manager.delete_session(&app_session_id, &deletion_roots))
                             {
                                 Ok(deletion) => {
                                     let _ =
@@ -628,6 +1291,56 @@ impl AppService {
                                 }
                                 Err(error) => {
                                     let _ = update_tx.send(ServiceUpdate::SessionDeleteFailed {
+                                        app_session_id,
+                                        error: error.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        ServiceCommand::ArchiveSession {
+                            app_session_id,
+                            worktrees_root,
+                        } => {
+                            let mut archive_roots = session_roots.clone();
+                            archive_roots.worktrees = worktrees_root;
+                            match runtime
+                                .block_on(manager.archive_session(&app_session_id, &archive_roots))
+                            {
+                                Ok(archival) => {
+                                    let notice =
+                                        archival.worktree.as_ref().and_then(ArchiveOutcome::notice);
+                                    let _ = update_tx.send(ServiceUpdate::SessionArchived {
+                                        session: archival.metadata,
+                                        archived_at: timestamp(),
+                                    });
+                                    if let Some(notice) = notice {
+                                        let _ = update_tx.send(ServiceUpdate::ActionFailed(notice));
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = update_tx.send(ServiceUpdate::SessionArchiveFailed {
+                                        app_session_id,
+                                        error: error.to_string(),
+                                    });
+                                }
+                            }
+                        }
+                        ServiceCommand::UnarchiveSession { app_session_id } => {
+                            match runtime.block_on(manager.unarchive_session(&app_session_id)) {
+                                Ok(restoration) => {
+                                    let notice = restoration
+                                        .worktree
+                                        .as_ref()
+                                        .and_then(RestoreOutcome::notice);
+                                    let _ = update_tx.send(ServiceUpdate::SessionUnarchived(
+                                        restoration.metadata,
+                                    ));
+                                    if let Some(notice) = notice {
+                                        let _ = update_tx.send(ServiceUpdate::ActionFailed(notice));
+                                    }
+                                }
+                                Err(error) => {
+                                    let _ = update_tx.send(ServiceUpdate::SessionArchiveFailed {
                                         app_session_id,
                                         error: error.to_string(),
                                     });
@@ -757,36 +1470,13 @@ impl AppService {
                                 }
                                 _ => None,
                             };
-                            let naming_prompt = match &command {
-                                ServiceCommand::Submit {
-                                    app_session_id: None,
-                                    prompt,
-                                    ..
-                                } => Some(prompt.clone()),
-                                _ => None,
-                            };
                             match runtime.block_on(handle_service_command(
                                 &manager,
+                                &orchestrator,
                                 command,
-                                &session_roots.worktrees.clone().unwrap_or_default(),
+                                &update_tx,
                             )) {
                                 Ok(Some(handle)) => {
-                                    if let Some(prompt) = naming_prompt {
-                                        let manager = manager.clone();
-                                        let session_id = handle.id().to_owned();
-                                        runtime.spawn(async move {
-                                            if let Err(error) = manager
-                                                .generate_session_title(&session_id, &prompt)
-                                                .await
-                                            {
-                                                tracing::warn!(
-                                                    %error,
-                                                    %session_id,
-                                                    "session title generation failed"
-                                                );
-                                            }
-                                        });
-                                    }
                                     let _ = update_tx.send(ServiceUpdate::SessionAdded(handle));
                                     if let Some(origin) = submit_origin {
                                         let _ =
@@ -1270,8 +1960,9 @@ fn finish_automation_run(
 #[allow(clippy::too_many_lines)]
 async fn handle_service_command(
     manager: &SessionManager,
+    orchestrator: &SessionOrchestrator,
     command: ServiceCommand,
-    worktrees_root: &Path,
+    updates: &Sender<ServiceUpdate>,
 ) -> Result<Option<SessionHandle>, String> {
     let mut created = None;
     match command {
@@ -1289,80 +1980,56 @@ async fn handle_service_command(
             repository_root,
             kind,
             location,
+            worktrees_root,
         } => {
-            let handle = if let Some(id) = app_session_id {
-                manager
+            if let Some(id) = app_session_id {
+                let handle = manager
                     .session(&id)
                     .await
-                    .map_err(|error| error.to_string())?
+                    .map_err(|error| error.to_string())?;
+                manager
+                    .set_selected_session(Some(handle.id()))
+                    .map_err(|error| error.to_string())?;
+                handle
+                    .send_with_attachments(prompt, attachments)
+                    .await
+                    .map_err(|error| error.to_string())?;
             } else {
-                let initial_mode = mode.clone();
-                let fallback_title = session_title(&prompt);
-                let repository = repository_root
-                    .as_deref()
-                    .map_or_else(|| project_path.as_path(), Path::new);
-                let generated_title = if kind == SessionKind::Project
-                    && location == SessionLocation::NewWorktree
-                    && GitService::new(repository).is_worktree()
-                {
-                    match manager
-                        .generate_task_title(&prompt, model.as_deref(), &project_path)
-                        .await
-                    {
-                        Ok(title) => title,
-                        Err(error) => {
-                            tracing::warn!(%error, "worktree name generation failed");
-                            None
-                        }
-                    }
-                } else {
-                    None
-                };
-                let (title, title_source) = generated_title.map_or_else(
-                    || (fallback_title, TitleSource::Fallback),
-                    |title| (title, TitleSource::Generated),
-                );
-                // A worktree session runs in its own checkout, created before
-                // the provider session so the CLI starts in the right place.
-                let project_path = resolve_session_workspace(
-                    location,
-                    kind,
-                    &project_path,
-                    repository_root.as_deref(),
-                    base_ref.as_deref(),
-                    &title,
-                    worktrees_root,
-                )?;
-                let handle = manager
-                    .create_session(CreateSessionRequest {
-                        project_path,
-                        title,
-                        title_source,
-                        model,
-                        mode: Some(mode),
-                        agent,
-                        reasoning_effort,
-                        context_tier,
-                        base_ref,
-                        repository_root,
-                        kind,
-                    })
+                let result = orchestrator
+                    .launch(
+                        LaunchRequest {
+                            project_path,
+                            repository_root: repository_root.map(PathBuf::from),
+                            worktrees_root,
+                            kind,
+                            location,
+                            prompt,
+                            attachments,
+                            model,
+                            mode,
+                            agent,
+                            reasoning_effort,
+                            context_tier,
+                            base_ref,
+                            title: LaunchTitle::Automatic,
+                            origin: LaunchOrigin::UserActivation,
+                        },
+                        |progress| {
+                            let progress = match progress {
+                                LaunchProgress::CreatingWorktree => {
+                                    SessionLaunchProgress::CreatingWorktree
+                                }
+                                LaunchProgress::WorktreeReady(path) => {
+                                    SessionLaunchProgress::WorktreeReady(path)
+                                }
+                            };
+                            let _ = updates.send(ServiceUpdate::SessionLaunchProgress(progress));
+                        },
+                    )
                     .await
                     .map_err(|error| error.to_string())?;
-                created = Some(handle.clone());
-                handle
-                    .set_mode(initial_mode)
-                    .await
-                    .map_err(|error| error.to_string())?;
-                handle
-            };
-            manager
-                .set_selected_session(Some(handle.id()))
-                .map_err(|error| error.to_string())?;
-            handle
-                .send_with_attachments(prompt, attachments)
-                .await
-                .map_err(|error| error.to_string())?;
+                created = Some(result.handle);
+            }
         }
         ServiceCommand::Cancel { app_session_id } => manager
             .session(&app_session_id)
@@ -1371,10 +2038,27 @@ async fn handle_service_command(
             .cancel()
             .await
             .map_err(|error| error.to_string())?,
-        ServiceCommand::Resume { app_session_id } => {
+        ServiceCommand::Resume {
+            app_session_id,
+            worktrees_root,
+        } => {
             created = Some(
                 manager
-                    .resume_closed_session(&app_session_id)
+                    .resume_closed_session_from_worktrees_root(
+                        &app_session_id,
+                        worktrees_root.as_deref(),
+                    )
+                    .await
+                    .map_err(|error| error.to_string())?,
+            );
+        }
+        ServiceCommand::RelocateSession {
+            app_session_id,
+            working_directory,
+        } => {
+            created = Some(
+                manager
+                    .relocate_session(&app_session_id, &working_directory)
                     .await
                     .map_err(|error| error.to_string())?,
             );
@@ -1458,6 +2142,26 @@ async fn handle_service_command(
             .set_context_tier(tier)
             .await
             .map_err(|error| error.to_string())?,
+        ServiceCommand::SetBaseRef {
+            app_session_id,
+            base_ref,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .set_base_ref(base_ref)
+            .await
+            .map_err(|error| error.to_string())?,
+        ServiceCommand::RefreshChanges {
+            app_session_id,
+            force,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .refresh_changes(force)
+            .await
+            .map_err(|error| error.to_string())?,
         ServiceCommand::RenameSession {
             app_session_id,
             title,
@@ -1478,6 +2182,8 @@ async fn handle_service_command(
         | ServiceCommand::DeleteAutomation { .. }
         | ServiceCommand::RunAutomationNow { .. }
         | ServiceCommand::DeleteSession { .. }
+        | ServiceCommand::ArchiveSession { .. }
+        | ServiceCommand::UnarchiveSession { .. }
         | ServiceCommand::Stop => {}
     }
     Ok(created)
@@ -1514,103 +2220,6 @@ fn register_directory_as_project(manager: &SessionManager, path: &Path) -> Resul
     Ok(path_string)
 }
 
-/// Decide the directory a new session runs in.
-///
-/// `LocalRepository` uses the project directory as-is. `NewWorktree` creates a
-/// linked worktree on a fresh branch so the session cannot disturb the
-/// repository the developer is using, which is what makes parallel sessions in
-/// one repository safe.
-///
-/// Chats and non-repository directories always run in place; there is nothing
-/// to branch from.
-fn resolve_session_workspace(
-    location: SessionLocation,
-    kind: SessionKind,
-    project_path: &Path,
-    repository_root: Option<&str>,
-    base_ref: Option<&str>,
-    title: &str,
-    worktrees_root: &Path,
-) -> Result<PathBuf, String> {
-    if kind.is_chat() || location == SessionLocation::LocalRepository {
-        return Ok(project_path.to_owned());
-    }
-    let repository = repository_root.map_or_else(|| project_path.to_owned(), PathBuf::from);
-    let service = GitService::new(&repository);
-    if !service.is_worktree() {
-        // Not a repository, so there is nothing to create a worktree from.
-        return Ok(project_path.to_owned());
-    }
-
-    let base = base_ref
-        .map(str::to_owned)
-        .or_else(|| default_branch(&repository))
-        .unwrap_or_else(|| "HEAD".to_owned());
-    let branch = unique_worktree_branch(&service, title, worktrees_root, &repository);
-    let path = worktree_path(worktrees_root, &repository, &branch)?;
-    service
-        .create_worktree(&path, &branch, &base)
-        .map_err(|error| format!("failed to create session worktree: {error}"))?;
-    Ok(path)
-}
-
-/// A branch name derived from the semantic session title, made unique in both
-/// the repository and GCABB's managed worktree directory.
-fn unique_worktree_branch(
-    service: &GitService,
-    title: &str,
-    worktrees_root: &Path,
-    repository: &Path,
-) -> String {
-    let slug = slugify(title);
-    let candidate = format!("gcabb/{slug}");
-    if worktree_name_available(service, &candidate, worktrees_root, repository) {
-        return candidate;
-    }
-    for suffix in 2..100 {
-        let candidate = format!("gcabb/{slug}-{suffix}");
-        if worktree_name_available(service, &candidate, worktrees_root, repository) {
-            return candidate;
-        }
-    }
-    format!("gcabb/{slug}-{}", timestamp())
-}
-
-fn worktree_name_available(
-    service: &GitService,
-    branch: &str,
-    worktrees_root: &Path,
-    repository: &Path,
-) -> bool {
-    !service.branch_exists(branch)
-        && !worktree_candidate_path(worktrees_root, repository, branch).exists()
-}
-
-/// Location on disk for a session worktree, outside the repository so it never
-/// appears as untracked content in the changes view.
-fn worktree_path(
-    worktrees_root: &Path,
-    repository: &Path,
-    branch: &str,
-) -> Result<PathBuf, String> {
-    let path = worktree_candidate_path(worktrees_root, repository, branch);
-    let parent = path
-        .parent()
-        .ok_or_else(|| format!("{} has no parent directory", path.display()))?;
-    std::fs::create_dir_all(parent)
-        .map_err(|error| format!("failed to create {}: {error}", parent.display()))?;
-    Ok(path)
-}
-
-fn worktree_candidate_path(worktrees_root: &Path, repository: &Path, branch: &str) -> PathBuf {
-    let repository_name = repository
-        .file_name()
-        .and_then(|name| name.to_str())
-        .unwrap_or("repository");
-    let leaf = branch.replace('/', "-");
-    worktrees_root.join(repository_name).join(leaf)
-}
-
 /// Root directory session worktrees are created under.
 ///
 /// Kept beside the application database so it follows `GCABB_DATA_DIR` during
@@ -1624,46 +2233,30 @@ fn runtime_state_root() -> Option<PathBuf> {
     path.is_dir().then_some(path)
 }
 
-fn worktrees_root() -> PathBuf {
+fn default_worktrees_root() -> PathBuf {
     data_directory().map_or_else(
         |_| PathBuf::from(".gcabb").join("worktrees"),
         |base| base.join("worktrees"),
     )
 }
 
-/// Lowercase, hyphenated slug suitable for a git branch component.
-fn slugify(value: &str) -> String {
-    let mut slug = String::new();
-    for character in value.chars() {
-        if character.is_ascii_alphanumeric() {
-            slug.extend(character.to_lowercase());
-        } else if !slug.ends_with('-') {
-            slug.push('-');
-        }
-    }
-    let slug = slug.trim_matches('-');
-    let slug: String = slug.chars().take(50).collect();
-    let slug = slug.trim_matches('-').to_owned();
-    if slug.is_empty() {
-        "session".to_owned()
+fn summary_line(summary: &str) -> String {
+    let first = summary.lines().next().unwrap_or_default().trim();
+    let truncated: String = first.chars().take(120).collect();
+    if truncated.len() < first.len() {
+        format!("{truncated}…")
+    } else if summary.lines().count() > 1 {
+        format!("{truncated} …")
     } else {
-        slug
+        truncated
     }
 }
-
-fn session_title(prompt: &str) -> String {
-    let title = prompt
-        .split_whitespace()
-        .take(7)
-        .collect::<Vec<_>>()
-        .join(" ");
-    if title.is_empty() {
-        "New session".to_owned()
-    } else if title.chars().count() > 56 {
-        title.chars().take(53).collect::<String>() + "..."
-    } else {
-        title
-    }
+fn session_uses_worktree(metadata: &SessionMetadata) -> bool {
+    !metadata.is_chat()
+        && metadata
+            .repository_root
+            .as_deref()
+            .is_some_and(|root| Path::new(root) != Path::new(&metadata.project_path))
 }
 
 struct SessionProjection {
@@ -1676,8 +2269,17 @@ struct SessionProjection {
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 enum TimelineItemKind {
+    SessionStart(SessionStartItem),
     Message(usize),
     Tool(usize),
+    Interaction(usize),
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum SessionStartItem {
+    CreatingWorktree,
+    WorktreeReady,
+    CopilotSessionStarted,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1693,6 +2295,7 @@ struct TimelineIndex {
     items: Vec<TimelineItem>,
     scanned_messages: usize,
     scanned_invocations: usize,
+    scanned_interactions: usize,
     children: HashMap<String, Vec<usize>>,
 }
 
@@ -1702,7 +2305,23 @@ impl TimelineIndex {
         self.items.clear();
         self.scanned_messages = 0;
         self.scanned_invocations = 0;
+        self.scanned_interactions = 0;
         self.children.clear();
+        if session_uses_worktree(&snapshot.metadata) {
+            self.items.extend(
+                [
+                    SessionStartItem::CreatingWorktree,
+                    SessionStartItem::WorktreeReady,
+                    SessionStartItem::CopilotSessionStarted,
+                ]
+                .into_iter()
+                .map(|item| TimelineItem {
+                    id: format!("session-start-{item:?}"),
+                    sequence: 0,
+                    kind: TimelineItemKind::SessionStart(item),
+                }),
+            );
+        }
         self.append(snapshot);
     }
 
@@ -1735,16 +2354,33 @@ impl TimelineIndex {
                 });
             }
         }
+        additions.extend(
+            snapshot.interaction_history[self.scanned_interactions..]
+                .iter()
+                .enumerate()
+                .filter(|(_, record)| record.request.kind == InteractionKind::Permission)
+                .map(|(offset, record)| TimelineItem {
+                    id: format!(
+                        "permission-{}-{}",
+                        self.scanned_interactions + offset,
+                        record.request.id
+                    ),
+                    sequence: record.sequence,
+                    kind: TimelineItemKind::Interaction(self.scanned_interactions + offset),
+                }),
+        );
         additions.sort_by_key(|item| item.sequence);
         self.items.extend(additions);
         self.scanned_messages = snapshot.transcript.len();
         self.scanned_invocations = snapshot.tool_activity.invocations.len();
+        self.scanned_interactions = snapshot.interaction_history.len();
     }
 
     fn sync(&mut self, snapshot: &SessionSnapshot) -> bool {
         let reset = self.session_id != snapshot.metadata.id
             || self.scanned_messages > snapshot.transcript.len()
-            || self.scanned_invocations > snapshot.tool_activity.invocations.len();
+            || self.scanned_invocations > snapshot.tool_activity.invocations.len()
+            || self.scanned_interactions > snapshot.interaction_history.len();
         let previous_len = self.items.len();
         if reset {
             self.reset(snapshot);
@@ -1799,6 +2435,14 @@ impl SessionProjection {
         &self.snapshot.metadata.id
     }
 
+    /// True when this session is still a metadata-only placeholder that has
+    /// never been actively resumed with the provider (or was disconnected).
+    /// These are the sessions the startup path intentionally leaves alone;
+    /// they must be reconnected on demand when the user selects them.
+    fn needs_resume(&self) -> bool {
+        self.receiver.is_none() || self.snapshot.status == SessionStatus::Disconnected
+    }
+
     #[cfg(test)]
     fn for_test(handle: SessionHandle) -> Self {
         Self::new(handle)
@@ -1821,6 +2465,7 @@ enum StartupNavigation {
 enum ControlMenu {
     Project,
     Location,
+    Base,
     Mode,
     Agent,
     Model,
@@ -1832,6 +2477,15 @@ enum ControlMenu {
 const ADD_PROJECT_OPTION: &str = "\u{0}add-project";
 /// Sentinel option value that switches the composer to a standalone chat.
 const CHAT_OPTION: &str = "\u{0}chat";
+
+/// Menu label for revealing a folder in the platform's file manager.
+const REVEAL_IN_FILE_MANAGER_LABEL: &str = if cfg!(target_os = "macos") {
+    "Show in Finder"
+} else if cfg!(target_os = "windows") {
+    "Show in File Explorer"
+} else {
+    "Show in File Manager"
+};
 
 /// An open session context menu, anchored at the click position.
 struct SessionMenu {
@@ -1896,6 +2550,28 @@ enum AutomationMenu {
     Effort,
     Context,
 }
+#[derive(Clone)]
+struct WorktreeConfiguration {
+    data_dir: Option<PathBuf>,
+    settings: AppSettings,
+    default_root: PathBuf,
+}
+
+impl WorktreeConfiguration {
+    fn load(data_dir: &Result<PathBuf, String>) -> Self {
+        let default_root = data_dir
+            .as_ref()
+            .map_or_else(|_| default_worktrees_root(), |path| path.join("worktrees"));
+        let settings = data_dir
+            .as_ref()
+            .map_or_else(|_| AppSettings::default(), |path| AppSettings::load(path));
+        Self {
+            data_dir: data_dir.as_ref().ok().cloned(),
+            settings,
+            default_root,
+        }
+    }
+}
 
 struct SessionMvpView {
     startup: StartupState,
@@ -1914,6 +2590,7 @@ struct SessionMvpView {
     chats_workspace: PathBuf,
     /// Where pasted images are written so they can be referenced by path.
     attachments_root: Option<PathBuf>,
+    worktree_configuration: WorktreeConfiguration,
     /// Whether the composer will start a chat rather than a project session.
     composing_chat: bool,
     /// Where the next project session will run.
@@ -1929,16 +2606,32 @@ struct SessionMvpView {
     project_branch: Option<String>,
     /// Variable-height virtual list state for the transcript.
     transcript_list: ListState,
+    /// Shared selection for the currently dragged transcript text block.
+    transcript_selection: Rc<RefCell<TranscriptTextSelection>>,
+    /// Receives copy shortcuts while transcript text is selected.
+    transcript_selection_focus: FocusHandle,
     /// Geometry used to paint the transcript thumb, retained so hit testing
     /// cannot race later dynamic-height measurements.
     drawn_transcript_scrollbar: Option<ScrollbarGeometry>,
+    /// Glide back to the conversation tail in progress, if any.
+    scroll_to_bottom: Option<ScrollToBottom>,
+    /// Task stepping the glide. Dropping it stops the motion, so replacing it
+    /// is how a second press or a manual scroll takes over.
+    scroll_to_bottom_task: Option<gpui::Task<()>>,
     /// Stable, incrementally maintained order and child lookup for transcript rows.
     timeline: TimelineIndex,
     /// Parsed documents for immutable completed messages.
     markdown_cache: HashMap<String, CachedMarkdown>,
     markdown_cache_order: VecDeque<String>,
+    /// Syntax-highlighted changed files, bounded because one diff may be large.
+    diff_cache: RefCell<DiffCache>,
     /// Number of transcript rows instantiated during the latest render pass.
     transcript_rows_rendered: usize,
+    /// Latest window viewport height, refreshed every render, so height-capped
+    /// panels (like a permission's requested-action detail) can scale with the
+    /// window instead of using a fixed pixel cap that under- or over-shoots on
+    /// very short or very tall windows.
+    viewport_height: gpui::Pixels,
     /// Last snapshot revision whose mutable rows were invalidated.
     transcript_snapshot_sequence: u64,
     transcript_snapshot_ptr: usize,
@@ -1948,8 +2641,13 @@ struct SessionMvpView {
     /// Last rendered content length for each detail block, used to follow
     /// streaming shell output without resetting blocks the user scrolled up.
     detail_extents: RefCell<HashMap<String, usize>>,
+    /// Where each scroll region sat before the wheel event being handled, so a
+    /// region can tell whether it actually moved.
+    scroll_positions: RefCell<HashMap<String, gpui::Point<gpui::Pixels>>>,
     /// Large completed outputs the user explicitly chose to lay out in full.
     expanded_tool_outputs: HashSet<String>,
+    /// Tool rows whose detailed card is open, keyed by session.
+    expanded_tools: HashMap<String, HashSet<String>>,
     /// Scrollbar currently being dragged, if any.
     ///
     /// Tracked on the view rather than the thumb so a drag keeps working once
@@ -1977,6 +2675,10 @@ struct SessionMvpView {
     discovered_instructions: Vec<WorkspaceResource>,
     configuration_errors: Vec<String>,
     configuration_roots: Vec<PathBuf>,
+    /// Base branch chosen for the next new session's worktree, overriding
+    /// the project's default branch. Resets whenever the project changes so
+    /// a stale override from a different repository cannot leak in.
+    draft_base_ref: Option<String>,
     sidebar_open: bool,
     panel_open: bool,
     active_panel: SessionPanel,
@@ -1986,6 +2688,12 @@ struct SessionMvpView {
     /// Focus handles for changed-file rows, keyed by session and path so a row
     /// keeps its focus identity while change data refreshes.
     change_focus: RefCell<HashMap<String, FocusHandle>>,
+    /// Whether the Changes base selector is open.
+    base_menu_visibility: SettingsVisibility,
+    /// Branches discovered when the base selector was opened.
+    base_ref_options: Vec<String>,
+    /// Cached project default shown by the open Base menu.
+    base_default_ref: Option<String>,
     open_control_menu: Option<ControlMenu>,
     /// Session whose context menu is open, and where to draw it.
     session_menu: Option<SessionMenu>,
@@ -1997,7 +2705,15 @@ struct SessionMvpView {
     /// Sessions with a delete in flight, shown with a spinner in place of
     /// the status dot until the backend confirms removal.
     deleting_sessions: HashSet<String>,
+    /// Sessions with an archive or unarchive in flight, treated like a delete
+    /// so the row cannot be acted on twice.
+    archiving_sessions: HashSet<String>,
+    /// Archived sessions, newest first, offered for unarchiving in settings.
+    archived_sessions: Vec<ArchivedSessionRow>,
+    /// Startup progress shown before the new session has an id or transcript.
+    session_launch: Option<SessionLaunchProgress>,
     action_error: Option<String>,
+    settings_error: Option<String>,
     /// What the update banner is showing.
     update_ui: UpdateUi,
     /// Background update worker, absent for developer builds that never update.
@@ -2020,6 +2736,10 @@ struct SessionMvpView {
     automation_draft_project: Option<String>,
     automation_draft_enabled: bool,
     open_automation_menu: Option<AutomationMenu>,
+    diagnostics_visibility: SettingsVisibility,
+    running_since: HashMap<String, Instant>,
+    last_event_seen: HashMap<String, (u64, Instant)>,
+    last_activity_repaint: Instant,
     _poll_task: gpui::Task<()>,
     _running_tick_task: gpui::Task<()>,
     _update_poll_task: gpui::Task<()>,
@@ -2033,6 +2753,7 @@ impl SessionMvpView {
         branch: String,
         chats_workspace: PathBuf,
         attachments_root: Option<PathBuf>,
+        worktree_configuration: WorktreeConfiguration,
         cx: &mut Context<Self>,
     ) -> Self {
         let AppService {
@@ -2131,7 +2852,10 @@ impl SessionMvpView {
                         let updated = view.apply_service_updates(cx);
                         let refreshed = view.refresh_snapshots();
                         let banner_changed = view.apply_update_events();
-                        if updated || refreshed || banner_changed {
+                        let timers_changed = view.sync_activity_timers();
+                        let repaint_timer = view.activity_timer_due();
+                        if updated || refreshed || banner_changed || timers_changed || repaint_timer
+                        {
                             cx.notify();
                         }
                     })
@@ -2200,6 +2924,7 @@ impl SessionMvpView {
             launch_workspace: project_root,
             chats_workspace,
             attachments_root,
+            worktree_configuration,
             composing_chat: false,
             draft_location: SessionLocation::default(),
             draft_attachments: Vec::new(),
@@ -2207,16 +2932,24 @@ impl SessionMvpView {
             image_preview_focus: cx.focus_handle(),
             project_branch: None,
             transcript_list,
+            transcript_selection: Rc::new(RefCell::new(TranscriptTextSelection::default())),
+            transcript_selection_focus: cx.focus_handle(),
             drawn_transcript_scrollbar: None,
+            scroll_to_bottom: None,
+            scroll_to_bottom_task: None,
             timeline: TimelineIndex::default(),
             markdown_cache: HashMap::new(),
             markdown_cache_order: VecDeque::new(),
+            diff_cache: RefCell::new(DiffCache::default()),
             transcript_rows_rendered: 0,
+            viewport_height: px(860.0),
             transcript_snapshot_sequence: 0,
             transcript_snapshot_ptr: 0,
             detail_scrolls: RefCell::new(HashMap::new()),
             detail_extents: RefCell::new(HashMap::new()),
+            scroll_positions: RefCell::new(HashMap::new()),
             expanded_tool_outputs: HashSet::new(),
+            expanded_tools: HashMap::new(),
             dragging_scrollbar: None,
             transcript_extent: (String::new(), 0, 0, 0, 0),
             restore_failures: Vec::new(),
@@ -2237,18 +2970,26 @@ impl SessionMvpView {
             discovered_instructions: Vec::new(),
             configuration_errors: Vec::new(),
             configuration_roots: Vec::new(),
+            draft_base_ref: None,
             sidebar_open: true,
             panel_open: false,
             active_panel: SessionPanel::Changes,
             expanded_changes: HashMap::new(),
             change_focus: RefCell::new(HashMap::new()),
+            base_menu_visibility: SettingsVisibility::Closed,
+            base_ref_options: Vec::new(),
+            base_default_ref: None,
             open_control_menu: None,
             session_menu: None,
             project_menu: None,
             renaming_session: None,
             rename_input,
             deleting_sessions: HashSet::new(),
+            archiving_sessions: HashSet::new(),
+            archived_sessions: Vec::new(),
+            session_launch: None,
             action_error: None,
+            settings_error: None,
             update_ui: UpdateUi::default(),
             update_service,
             settings_visibility: SettingsVisibility::Closed,
@@ -2269,6 +3010,10 @@ impl SessionMvpView {
             automation_draft_project: None,
             automation_draft_enabled: true,
             open_automation_menu: None,
+            diagnostics_visibility: SettingsVisibility::Closed,
+            running_since: HashMap::new(),
+            last_event_seen: HashMap::new(),
+            last_activity_repaint: Instant::now(),
             _poll_task: poll_task,
             _running_tick_task: running_tick_task,
             _update_poll_task: update_poll_task,
@@ -2362,18 +3107,20 @@ impl SessionMvpView {
 
         let banner = match &self.update_ui {
             UpdateUi::Available { .. } => banner
-                .child(action_button("Update", BLUE, cx, |view| {
+                .child(action_button("Update", BLUE, cx, |view, _| {
                     view.request_update(UpdateRequest::Install);
                 }))
-                .child(action_button("Later", ELEVATED, cx, |view| {
+                .child(action_button("Later", ELEVATED, cx, |view, _| {
                     view.request_update(UpdateRequest::Defer);
                 })),
             UpdateUi::ReadyToRestart { version } => {
                 banner.child(Self::restart_button(version.clone(), cx))
             }
-            UpdateUi::Failed(_) => banner.child(action_button("Dismiss", ELEVATED, cx, |view| {
-                view.update_ui = UpdateUi::Hidden;
-            })),
+            UpdateUi::Failed(_) => {
+                banner.child(action_button("Dismiss", ELEVATED, cx, |view, _| {
+                    view.update_ui = UpdateUi::Hidden;
+                }))
+            }
             _ => banner,
         };
 
@@ -3421,6 +4168,93 @@ impl SessionMvpView {
         )
     }
 
+    fn current_worktrees_root(&self) -> PathBuf {
+        self.worktree_configuration
+            .settings
+            .worktrees_root(&self.worktree_configuration.default_root)
+    }
+
+    fn display_worktree_path(&self, path: &Path) -> String {
+        self.worktree_configuration
+            .settings
+            .display_worktree_path(path, &self.worktree_configuration.default_root)
+    }
+
+    fn persist_worktrees_root(&mut self, root: Option<PathBuf>) -> Result<(), String> {
+        let mut settings = self.worktree_configuration.settings.clone();
+        match root {
+            Some(root) => {
+                settings.set_worktrees_root(root, &self.worktree_configuration.default_root);
+            }
+            None => settings.use_default_worktrees_root(&self.worktree_configuration.default_root),
+        }
+        if let Some(data_dir) = self.worktree_configuration.data_dir.as_deref() {
+            settings
+                .save(data_dir)
+                .map_err(|error| format!("could not save worktree location: {error}"))?;
+        }
+        self.worktree_configuration.settings = settings;
+        Ok(())
+    }
+
+    fn choose_worktrees_root(&mut self, cx: &mut Context<Self>) {
+        self.settings_error = None;
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Choose worktree location".into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let selection = match paths.await {
+                Ok(Ok(paths)) => paths.and_then(|paths| paths.into_iter().next()),
+                Ok(Err(error)) => {
+                    let _ = view.update(cx, |view, cx| {
+                        view.settings_error =
+                            Some(format!("could not open the folder picker: {error}"));
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_) => None,
+            };
+            let Some(path) = selection else {
+                return;
+            };
+            let path = path.canonicalize().unwrap_or(path);
+            let _ = view.update(cx, |view, cx| {
+                if let Err(error) = view.persist_worktrees_root(Some(path)) {
+                    view.settings_error = Some(error);
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+    }
+
+    fn settings_worktrees_button(cx: &mut Context<Self>) -> gpui::AnyElement {
+        div()
+            .id("settings-change-worktrees")
+            .accessibility_id("settings-change-worktrees")
+            .role(Role::Button)
+            .aria_label("Change worktree location")
+            .focusable()
+            .tab_stop(true)
+            .px_4()
+            .py_2()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .text_sm()
+            .child("Change…")
+            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+            .on_click(cx.listener(|view, _, _, cx| {
+                view.choose_worktrees_root(cx);
+                cx.notify();
+            }))
+            .into_any_element()
+    }
+
     fn settings_check_button(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         let updates_available = self.update_service.is_some();
         let checking = self.update_ui == UpdateUi::Checking;
@@ -3483,6 +4317,163 @@ impl SessionMvpView {
             .into_any_element()
     }
 
+    fn settings_worktrees_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let worktrees_root = self.current_worktrees_root();
+        let uses_default = self
+            .worktree_configuration
+            .settings
+            .uses_default_worktrees_root();
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().child("Worktree location"))
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child(worktrees_root.to_string_lossy().into_owned()),
+                    )
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(
+                        "Changes apply to new worktrees only. Existing sessions keep their \
+                         current locations.",
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .when(!uses_default, |buttons| {
+                        buttons.child(
+                            div()
+                                .id("settings-default-worktrees")
+                                .accessibility_id("settings-default-worktrees")
+                                .role(Role::Button)
+                                .aria_label("Use default worktree location")
+                                .focusable()
+                                .tab_stop(true)
+                                .px_3()
+                                .py_2()
+                                .rounded_md()
+                                .text_sm()
+                                .text_color(rgb(MUTED))
+                                .child("Use default")
+                                .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                                .on_click(cx.listener(|view, _, _, cx| {
+                                    if let Err(error) = view.persist_worktrees_root(None) {
+                                        view.settings_error = Some(error);
+                                    }
+                                    cx.notify();
+                                })),
+                        )
+                    })
+                    .child(Self::settings_worktrees_button(cx)),
+            )
+    }
+
+    /// Archived sessions and the control that brings them back.
+    ///
+    /// Archiving is reachable from any session's context menu, so the reverse
+    /// has to live somewhere that outlives the session's absence from the
+    /// sidebar. Settings is that place.
+    fn settings_archive_section(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        let mut rows = div()
+            .id("settings-archived-sessions")
+            .accessibility_id("settings-archived-sessions")
+            .flex()
+            .flex_col()
+            .gap_2()
+            .max_h(px(220.0))
+            .overflow_y_scroll();
+        for archived in &self.archived_sessions {
+            let id = archived.id.clone();
+            let restoring = self.archiving_sessions.contains(&id);
+            let button_id = id.clone();
+            rows = rows.child(
+                div()
+                    .flex()
+                    .items_center()
+                    .justify_between()
+                    .gap_3()
+                    .child(
+                        div()
+                            .min_w_0()
+                            .flex_1()
+                            .flex()
+                            .flex_col()
+                            .gap_1()
+                            .child(div().text_sm().child(archived.title.clone()))
+                            .child(
+                                div()
+                                    .text_xs()
+                                    .text_color(rgb(MUTED))
+                                    .child(format!("Archived {}", archived.archived_at)),
+                            ),
+                    )
+                    .child(
+                        div()
+                            .id(SharedString::from(format!("settings-unarchive-{id}")))
+                            .debug_selector(move || format!("settings-unarchive-{id}"))
+                            .accessibility_id("settings-unarchive")
+                            .role(Role::Button)
+                            .aria_label(format!("Unarchive {}", archived.title))
+                            .focusable()
+                            .tab_stop(!restoring)
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_sm()
+                            .text_color(if restoring { rgb(MUTED) } else { rgb(PRIMARY) })
+                            .child(if restoring {
+                                "Unarchiving…"
+                            } else {
+                                "Unarchive"
+                            })
+                            .when(!restoring, |button| {
+                                button
+                                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        view.unarchive_session(button_id.clone(), cx);
+                                    }))
+                            }),
+                    ),
+            );
+        }
+
+        div()
+            .flex()
+            .flex_col()
+            .gap_2()
+            .child(div().child("Archived sessions"))
+            .child(div().text_xs().text_color(rgb(MUTED)).child(
+                "Archived sessions keep their full history. Unarchiving restores the session and \
+                 rebuilds its worktree, including tracked and untracked work that was never \
+                 committed. Ignored files, such as build output, are not kept.",
+            ))
+            .child(if self.archived_sessions.is_empty() {
+                div()
+                    .id("settings-archived-empty")
+                    .accessibility_id("settings-archived-empty")
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("No archived sessions.")
+                    .into_any_element()
+            } else {
+                rows.into_any_element()
+            })
+    }
+
     fn settings_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         if self.settings_visibility != SettingsVisibility::Open {
             return None;
@@ -3504,7 +4495,7 @@ impl SessionMvpView {
                 .child(
                     div()
                         .id("settings-panel")
-                        .w(px(460.0))
+                        .w(px(620.0))
                         .flex()
                         .flex_col()
                         .gap_4()
@@ -3524,6 +4515,19 @@ impl SessionMvpView {
                                 .font_weight(gpui::FontWeight::BOLD)
                                 .child("Settings"),
                         )
+                        .child(self.settings_worktrees_row(cx))
+                        .child(self.settings_archive_section(cx))
+                        .when_some(self.settings_error.clone(), |panel, error| {
+                            panel.child(
+                                div()
+                                    .id("settings-error")
+                                    .role(Role::Alert)
+                                    .aria_label(error.clone())
+                                    .text_xs()
+                                    .text_color(rgb(RED))
+                                    .child(error),
+                            )
+                        })
                         .child(
                             div()
                                 .flex()
@@ -3600,11 +4604,9 @@ impl SessionMvpView {
                 ServiceUpdate::SessionHydrated(handle) => {
                     self.upsert_hydrated_session(handle, cx);
                 }
-                ServiceUpdate::RestorationFinished(failures) => {
-                    self.apply_restore_failures(failures);
-                }
                 ServiceUpdate::SessionAdded(handle) => {
                     let id = handle.id().to_owned();
+                    self.session_launch = None;
                     self.upsert_hydrated_session(handle, cx);
                     self.switch_composer_draft(Some(id), cx);
                 }
@@ -3638,20 +4640,12 @@ impl SessionMvpView {
                 ServiceUpdate::AutomationRunsChanged(runs) => {
                     self.automation_runs = runs;
                 }
+                ServiceUpdate::SessionLaunchProgress(progress) => {
+                    self.session_launch = Some(progress);
+                }
                 ServiceUpdate::SessionDeleted(id) => {
-                    self.sessions.retain(|session| session.id() != id);
                     self.deleting_sessions.remove(&id);
-                    if self.selected_session.as_deref() == Some(id.as_str()) {
-                        self.switch_composer_draft(None, cx);
-                    }
-                    self.session_drafts.remove(&id);
-                    self.expanded_changes.remove(&id);
-                    if self.session_menu.as_ref().is_some_and(|menu| menu.id == id) {
-                        self.session_menu = None;
-                    }
-                    if self.renaming_session.as_deref() == Some(id.as_str()) {
-                        self.renaming_session = None;
-                    }
+                    self.forget_session(&id, cx);
                 }
                 ServiceUpdate::SessionDeleteFailed {
                     app_session_id,
@@ -3659,6 +4653,41 @@ impl SessionMvpView {
                 } => {
                     self.deleting_sessions.remove(&app_session_id);
                     self.action_error = Some(error);
+                }
+                ServiceUpdate::SessionArchived {
+                    session,
+                    archived_at,
+                } => {
+                    let id = session.id.clone();
+                    self.archiving_sessions.remove(&id);
+                    self.forget_session(&id, cx);
+                    self.archived_sessions.retain(|row| row.id != id);
+                    self.archived_sessions.insert(
+                        0,
+                        ArchivedSessionRow {
+                            id,
+                            title: session.title,
+                            archived_at,
+                        },
+                    );
+                }
+                ServiceUpdate::SessionArchiveFailed {
+                    app_session_id,
+                    error,
+                } => {
+                    self.archiving_sessions.remove(&app_session_id);
+                    self.action_error = Some(error);
+                }
+                ServiceUpdate::SessionUnarchived(session) => {
+                    let id = session.id.clone();
+                    self.archiving_sessions.remove(&id);
+                    self.archived_sessions.retain(|row| row.id != id);
+                    if !self.sessions.iter().any(|existing| existing.id() == id) {
+                        // Restored as a metadata-only placeholder; selecting it
+                        // reconnects it the same way any stored session does.
+                        self.sessions
+                            .insert(0, SessionProjection::bootstrap(session));
+                    }
                 }
                 ServiceUpdate::PromptAccepted(origin) => {
                     if let Some(id) = origin.as_deref() {
@@ -3670,7 +4699,10 @@ impl SessionMvpView {
                         self.composer.update(cx, TextInput::clear);
                     }
                 }
-                ServiceUpdate::ActionFailed(error) => self.action_error = Some(error),
+                ServiceUpdate::ActionFailed(error) => {
+                    self.session_launch = None;
+                    self.action_error = Some(error);
+                }
                 ServiceUpdate::Failed(error) => self.startup = StartupState::Failed(error),
             }
         }
@@ -3681,6 +4713,7 @@ impl SessionMvpView {
         self.projects = bootstrap.projects;
         self.automations = bootstrap.automations;
         self.automation_runs = bootstrap.automation_runs;
+        self.archived_sessions = bootstrap.archived;
         self.sessions = bootstrap
             .sessions
             .into_iter()
@@ -3716,13 +4749,18 @@ impl SessionMvpView {
 
     fn upsert_hydrated_session(&mut self, handle: SessionHandle, cx: &mut Context<Self>) {
         let id = handle.id().to_owned();
+        let unavailable = handle.snapshot().status == SessionStatus::Unavailable;
         if let Some(index) = self.sessions.iter().position(|session| session.id() == id) {
             self.sessions[index] = SessionProjection::new(handle);
         } else {
             self.sessions.insert(0, SessionProjection::new(handle));
         }
+        if unavailable && self.selected_session.as_deref() == Some(id.as_str()) {
+            self.switch_composer_draft(None, cx);
+            return;
+        }
         if self.startup_navigation == StartupNavigation::Untouched {
-            if self.selected_session.is_none() {
+            if self.selected_session.is_none() && !unavailable {
                 self.switch_composer_draft(Some(id), cx);
             }
             self.adopt_selected_session_location();
@@ -3843,12 +4881,73 @@ impl SessionMvpView {
         changed
     }
 
+    fn sync_activity_timers(&mut self) -> bool {
+        let now = Instant::now();
+        let mut changed = false;
+        let live: HashMap<_, _> = self
+            .sessions
+            .iter()
+            .map(|session| {
+                (
+                    session.id().to_owned(),
+                    (
+                        matches!(
+                            session.snapshot.status,
+                            SessionStatus::Running | SessionStatus::Starting
+                        ),
+                        session.snapshot.last_sequence,
+                    ),
+                )
+            })
+            .collect();
+
+        self.running_since.retain(|id, _| {
+            let keep = live.get(id).is_some_and(|(running, _)| *running);
+            changed |= !keep;
+            keep
+        });
+        self.last_event_seen.retain(|id, _| live.contains_key(id));
+
+        for (id, (running, sequence)) in live {
+            if running && !self.running_since.contains_key(&id) {
+                self.running_since.insert(id.clone(), now);
+                changed = true;
+            }
+            match self.last_event_seen.get_mut(&id) {
+                Some((seen_sequence, seen_at)) if *seen_sequence != sequence => {
+                    *seen_sequence = sequence;
+                    *seen_at = now;
+                    changed = true;
+                }
+                None => {
+                    self.last_event_seen.insert(id, (sequence, now));
+                    changed = true;
+                }
+                _ => {}
+            }
+        }
+        changed
+    }
+
+    fn activity_timer_due(&mut self) -> bool {
+        if self.running_since.is_empty()
+            || self.last_activity_repaint.elapsed() < Duration::from_secs(1)
+        {
+            return false;
+        }
+        self.last_activity_repaint = Instant::now();
+        true
+    }
+
     fn selected(&self) -> Option<&SessionProjection> {
         let id = self.selected_session.as_deref()?;
         self.sessions.iter().find(|session| session.id() == id)
     }
 
     fn submit_prompt(&mut self, prompt: String) {
+        if self.session_launch.is_some() {
+            return;
+        }
         let attachments = std::mem::take(&mut self.draft_attachments);
         self.action_error = None;
         let supported_efforts = self
@@ -3867,6 +4966,15 @@ impl SessionMvpView {
                 SessionKind::Project,
             )
         };
+        if self.selected_session.is_none()
+            && kind == SessionKind::Project
+            && self.draft_location == SessionLocation::NewWorktree
+            && repository_root
+                .as_deref()
+                .is_some_and(|root| GitService::new(root).is_worktree())
+        {
+            self.session_launch = Some(SessionLaunchProgress::CreatingWorktree);
+        }
         let _ = self.commands.send(ServiceCommand::Submit {
             app_session_id: self.selected_session.clone(),
             prompt,
@@ -3881,6 +4989,7 @@ impl SessionMvpView {
             repository_root,
             kind,
             location: self.draft_location,
+            worktrees_root: self.current_worktrees_root(),
         });
     }
 
@@ -3925,12 +5034,14 @@ impl SessionMvpView {
             }
             self.timeline = TimelineIndex::default();
             self.transcript_list.reset(0);
+            *self.transcript_selection.borrow_mut() = TranscriptTextSelection::default();
             return;
         };
         let old_len = self.timeline.items.len();
         let old_session = self.timeline.session_id.clone();
         let changed_shape = self.timeline.sync(&snapshot);
         if old_session != snapshot.metadata.id {
+            self.cancel_scroll_to_bottom();
             self.transcript_list.reset_with_uniform_height(
                 self.timeline.items.len(),
                 px(TRANSCRIPT_ROW_HEIGHT_HINT),
@@ -3939,6 +5050,7 @@ impl SessionMvpView {
             self.transcript_list.scroll_to_end();
             self.markdown_cache.clear();
             self.markdown_cache_order.clear();
+            *self.transcript_selection.borrow_mut() = TranscriptTextSelection::default();
         } else if changed_shape {
             self.transcript_list
                 .splice(old_len..old_len, self.timeline.items.len() - old_len);
@@ -3980,9 +5092,10 @@ impl SessionMvpView {
     /// Branch shown beside the location pill.
     ///
     /// A new worktree does not exist yet, so it names the base branch it will
-    /// be created from. Running in the local repository names the branch that
-    /// repository currently has checked out. Neither is the branch of the
-    /// directory GCABB happened to be launched from.
+    /// be created from — the user's chosen override when one is set,
+    /// otherwise the project default. Running in the local repository names
+    /// the branch that repository currently has checked out. Neither is the
+    /// branch of the directory GCABB happened to be launched from.
     fn composer_branch_label(&self) -> String {
         let default_branch = self
             .projects
@@ -3990,7 +5103,10 @@ impl SessionMvpView {
             .find(|project| Path::new(&project.path) == self.selected_project)
             .and_then(|project| project.default_branch.clone());
         match self.draft_location {
-            SessionLocation::NewWorktree => default_branch
+            SessionLocation::NewWorktree => self
+                .draft_base_ref
+                .clone()
+                .or(default_branch)
                 .or_else(|| self.project_branch.clone())
                 .unwrap_or_else(|| "HEAD".to_owned()),
             SessionLocation::LocalRepository => self
@@ -4005,6 +5121,7 @@ impl SessionMvpView {
     fn new_chat(&mut self, cx: &mut Context<Self>) {
         self.open_control_menu = None;
         self.composing_chat = true;
+        self.draft_base_ref = None;
         self.switch_composer_draft(None, cx);
         self.startup_navigation = StartupNavigation::Changed;
         self.action_error = None;
@@ -4022,23 +5139,44 @@ impl SessionMvpView {
 
     /// Base ref new sessions in the selected project compare against.
     ///
-    /// The repository's default branch is the natural base for a session
-    /// worktree; sessions record it once so later movement on that branch does
-    /// not silently change what the changes view reports. Falls back to
-    /// resolving it directly when the project has none recorded.
+    /// The user's chosen override takes priority; otherwise the repository's
+    /// default branch is the natural base for a session worktree. Sessions
+    /// record it once so later movement on that branch does not silently
+    /// change what the changes view reports. Falls back to resolving it
+    /// directly when the project has none recorded.
     fn selected_project_base_ref(&self) -> Option<String> {
-        self.projects
-            .iter()
-            .find(|project| Path::new(&project.path) == self.selected_project)
-            .and_then(|project| project.default_branch.clone())
-            .or_else(|| default_branch(&self.selected_project))
+        self.draft_base_ref.clone().or_else(|| {
+            self.projects
+                .iter()
+                .find(|project| Path::new(&project.path) == self.selected_project)
+                .and_then(|project| project.default_branch.clone())
+                .or_else(|| default_branch(&self.selected_project))
+        })
+    }
+
+    /// Branches available for the new-session base-branch picker.
+    ///
+    /// Reuses the same discovery as the existing-session Changes base
+    /// selector so both pickers agree on what counts as a base.
+    fn base_ref_menu_options(&self) -> Vec<(String, String, String)> {
+        GitService::new(&self.selected_project)
+            .base_refs()
+            .unwrap_or_default()
+            .into_iter()
+            .map(|reference| (reference.clone(), reference, String::new()))
+            .collect()
     }
 
     fn submit_interaction(&mut self, value: String) {
         let Some(session) = self.selected() else {
             return;
         };
-        let Some(interaction) = session.snapshot.pending_interactions.first() else {
+        let Some(interaction) = session
+            .snapshot
+            .pending_interactions
+            .iter()
+            .find(|interaction| interaction.kind != InteractionKind::Permission)
+        else {
             return;
         };
         let _ = self.commands.send(ServiceCommand::Respond {
@@ -4053,11 +5191,23 @@ impl SessionMvpView {
 
     fn select_session(&mut self, id: String, cx: &mut Context<Self>) {
         self.open_control_menu = None;
-        self.switch_composer_draft(Some(id), cx);
+        self.base_menu_visibility = SettingsVisibility::Closed;
+        self.base_default_ref = None;
+        self.switch_composer_draft(Some(id.clone()), cx);
         self.startup_navigation = StartupNavigation::Changed;
         let _ = self.commands.send(ServiceCommand::Select {
             app_session_id: self.selected_session.clone(),
         });
+        // A session that hasn't been actively hydrated yet (startup only
+        // resumes the previously-selected session) needs to be reconnected
+        // now that the user has chosen it.
+        if self.selected().is_some_and(SessionProjection::needs_resume) {
+            let worktrees_root = Some(self.current_worktrees_root());
+            let _ = self.commands.send(ServiceCommand::Resume {
+                app_session_id: id,
+                worktrees_root,
+            });
+        }
         if let Some(controls) = self
             .selected()
             .map(|session| session.snapshot.controls.clone())
@@ -4086,6 +5236,13 @@ impl SessionMvpView {
                 .unwrap_or_else(|| "medium".to_owned());
             self.draft_context_tier = controls.context_tier;
         }
+        if self.active_panel == SessionPanel::Changes
+            && self
+                .selected()
+                .is_some_and(|session| !session.snapshot.metadata.is_chat())
+        {
+            self.refresh_selected_changes(false, cx);
+        }
         cx.notify();
     }
 
@@ -4097,6 +5254,7 @@ impl SessionMvpView {
         // from the menu, and restoring a session all clear the flag here.
         self.composing_chat = false;
         self.selected_project = PathBuf::from(path);
+        self.draft_base_ref = None;
         self.project_branch = git_output(Path::new(path), &["branch", "--show-current"]);
         // New sessions run in the project directory the user chose.
         self.workspace_root = PathBuf::from(path);
@@ -4187,6 +5345,43 @@ impl SessionMvpView {
             };
             let _ = view.update(cx, |view, cx| {
                 let _ = view.commands.send(ServiceCommand::AddProject { path });
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
+    }
+
+    /// Choose a replacement directory for a session whose original path vanished.
+    fn locate_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
+        self.action_error = None;
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Locate session working directory".into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let selection = match paths.await {
+                Ok(Ok(paths)) => paths.and_then(|paths| paths.into_iter().next()),
+                Ok(Err(error)) => {
+                    let message = format!("could not open the folder picker: {error}");
+                    let _ = view.update(cx, |view, cx| {
+                        view.action_error = Some(message);
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_) => None,
+            };
+            let Some(working_directory) = selection else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                let _ = view.commands.send(ServiceCommand::RelocateSession {
+                    app_session_id: app_session_id.clone(),
+                    working_directory,
+                });
                 cx.notify();
             });
         })
@@ -4298,14 +5493,148 @@ impl SessionMvpView {
         cx.notify();
     }
 
+    /// Open a session's working directory in the platform file manager.
+    ///
+    /// The session's `project_path` is its own worktree, and that is the folder
+    /// to show. Revealing selects the folder inside its *parent*, which lands
+    /// the user in the worktrees root instead, so open the directory itself.
+    fn reveal_session_in_file_manager(&mut self, app_session_id: &str, cx: &mut Context<Self>) {
+        self.session_menu = None;
+        self.action_error = None;
+        let Some(path) = self
+            .sessions
+            .iter()
+            .find(|session| session.id() == app_session_id)
+            .map(|session| PathBuf::from(&session.snapshot.metadata.project_path))
+        else {
+            cx.notify();
+            return;
+        };
+        // A worktree can be deleted outside the app; opening a path that no
+        // longer exists silently does nothing on some platforms.
+        if path.is_dir() {
+            cx.open_with_system(&path);
+        } else {
+            self.action_error = Some(format!(
+                "could not show {}: the folder no longer exists",
+                path.display()
+            ));
+        }
+        cx.notify();
+    }
+
     fn delete_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
         self.session_menu = None;
         self.action_error = None;
+        let worktrees_root = self.owning_worktrees_root(&app_session_id);
         self.deleting_sessions.insert(app_session_id.clone());
+        let _ = self.commands.send(ServiceCommand::DeleteSession {
+            app_session_id,
+            worktrees_root,
+        });
+        cx.notify();
+    }
+
+    /// Archive a session: its history is kept, its worktree is not.
+    fn archive_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
+        self.session_menu = None;
+        // A second archive while the first is still running would find the
+        // worktree already gone and have nothing left to capture.
+        if self.archiving_sessions.contains(&app_session_id) {
+            cx.notify();
+            return;
+        }
+        self.action_error = None;
+        let worktrees_root = self.owning_worktrees_root(&app_session_id);
+        self.archiving_sessions.insert(app_session_id.clone());
+        let _ = self.commands.send(ServiceCommand::ArchiveSession {
+            app_session_id,
+            worktrees_root,
+        });
+        cx.notify();
+    }
+
+    /// Bring an archived session back from the settings archive list.
+    fn unarchive_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
+        self.action_error = None;
+        self.settings_error = None;
+        self.archiving_sessions.insert(app_session_id.clone());
         let _ = self
             .commands
-            .send(ServiceCommand::DeleteSession { app_session_id });
+            .send(ServiceCommand::UnarchiveSession { app_session_id });
         cx.notify();
+    }
+
+    /// Managed root that owns a session's worktree, including a root the user
+    /// has since changed away from.
+    fn owning_worktrees_root(&self, app_session_id: &str) -> Option<PathBuf> {
+        self.sessions
+            .iter()
+            .find(|session| session.id() == app_session_id)
+            .and_then(|session| {
+                self.worktree_configuration
+                    .settings
+                    .owning_root_for_worktree(
+                        Path::new(&session.snapshot.metadata.project_path),
+                        &self.worktree_configuration.default_root,
+                    )
+            })
+    }
+
+    /// Drop every trace of a session from the UI.
+    ///
+    /// Deleting and archiving both remove the session from the sidebar; only
+    /// what the backend keeps behind differs.
+    fn forget_session(&mut self, id: &str, cx: &mut Context<Self>) {
+        self.sessions.retain(|session| session.id() != id);
+        self.restore_failures
+            .retain(|failure| failure.app_session_id != id);
+        if self.selected_session.as_deref() == Some(id) {
+            self.switch_composer_draft(None, cx);
+        }
+        self.session_drafts.remove(id);
+        self.expanded_changes.remove(id);
+        self.expanded_tools.remove(id);
+        if self.session_menu.as_ref().is_some_and(|menu| menu.id == id) {
+            self.session_menu = None;
+        }
+        if self.renaming_session.as_deref() == Some(id) {
+            self.renaming_session = None;
+        }
+    }
+
+    /// One row of the session context menu.
+    ///
+    /// The four items differ only in their id, label, colour, and what they
+    /// do, so the shared chrome lives here rather than four times over.
+    fn session_menu_item(
+        name: &'static str,
+        label: impl Into<SharedString>,
+        aria_label: impl Into<SharedString>,
+        color: u32,
+        on_click: impl Fn(&mut Self, &mut Window, &mut Context<Self>) + 'static,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        div()
+            .id(name)
+            .debug_selector(move || name.to_owned())
+            .accessibility_id(name)
+            .role(Role::MenuItem)
+            .aria_label(aria_label.into())
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+            .flex()
+            .items_center()
+            .gap_2()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .text_sm()
+            .text_color(rgb(color))
+            .child(label.into())
+            .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+            .on_click(cx.listener(move |view, _, window, cx| on_click(view, window, cx)))
     }
 
     /// Context menu for a session, anchored where the user right-clicked.
@@ -4313,6 +5642,8 @@ impl SessionMvpView {
         let menu = self.session_menu.as_ref()?;
         let rename_id = menu.id.clone();
         let rename_title = menu.title.clone();
+        let reveal_id = menu.id.clone();
+        let archive_id = menu.id.clone();
         let delete_id = menu.id.clone();
         let label = menu.title.clone();
         Some(
@@ -4333,54 +5664,40 @@ impl SessionMvpView {
                 .border_1()
                 .border_color(rgb(BORDER))
                 .shadow_lg()
-                .child(
-                    div()
-                        .id("session-menu-rename")
-                        .debug_selector(|| "session-menu-rename".to_owned())
-                        .accessibility_id("session-menu-rename")
-                        .role(Role::MenuItem)
-                        .aria_label("Rename session")
-                        .focusable()
-                        .tab_stop(true)
-                        .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .text_sm()
-                        .text_color(rgb(PRIMARY))
-                        .child("Rename")
-                        .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
-                        .on_click(cx.listener(move |view, _, window, cx| {
-                            view.begin_rename(rename_id.clone(), rename_title.clone(), window, cx);
-                        })),
-                )
-                .child(
-                    div()
-                        .id("session-menu-delete")
-                        .debug_selector(|| "session-menu-delete".to_owned())
-                        .accessibility_id("session-menu-delete")
-                        .role(Role::MenuItem)
-                        .aria_label("Delete session")
-                        .focusable()
-                        .tab_stop(true)
-                        .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
-                        .flex()
-                        .items_center()
-                        .gap_2()
-                        .px_3()
-                        .py_2()
-                        .rounded_md()
-                        .text_sm()
-                        .text_color(rgb(RED))
-                        .child("Delete session")
-                        .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
-                        .on_click(cx.listener(move |view, _, _, cx| {
-                            view.delete_session(delete_id.clone(), cx);
-                        })),
-                ),
+                .child(Self::session_menu_item(
+                    "session-menu-rename",
+                    "Rename",
+                    "Rename session",
+                    PRIMARY,
+                    move |view, window, cx| {
+                        view.begin_rename(rename_id.clone(), rename_title.clone(), window, cx);
+                    },
+                    cx,
+                ))
+                .child(Self::session_menu_item(
+                    "session-menu-reveal",
+                    REVEAL_IN_FILE_MANAGER_LABEL,
+                    format!("{REVEAL_IN_FILE_MANAGER_LABEL} session folder"),
+                    PRIMARY,
+                    move |view, _, cx| view.reveal_session_in_file_manager(&reveal_id, cx),
+                    cx,
+                ))
+                .child(Self::session_menu_item(
+                    "session-menu-archive",
+                    "Archive session",
+                    "Archive session",
+                    PRIMARY,
+                    move |view, _, cx| view.archive_session(archive_id.clone(), cx),
+                    cx,
+                ))
+                .child(Self::session_menu_item(
+                    "session-menu-delete",
+                    "Delete session",
+                    "Delete session",
+                    RED,
+                    move |view, _, cx| view.delete_session(delete_id.clone(), cx),
+                    cx,
+                )),
         )
     }
 
@@ -4849,7 +6166,77 @@ impl SessionMvpView {
     }
 
     fn toggle_control_menu(&mut self, menu: ControlMenu) {
+        self.base_menu_visibility = SettingsVisibility::Closed;
         self.open_control_menu = toggled_menu(self.open_control_menu, menu);
+    }
+
+    fn toggle_base_menu(&mut self, cx: &mut Context<Self>) {
+        if self.base_menu_visibility == SettingsVisibility::Open {
+            self.base_menu_visibility = SettingsVisibility::Closed;
+            cx.notify();
+            return;
+        }
+        let Some(snapshot) = self.selected().map(|session| session.snapshot.clone()) else {
+            return;
+        };
+        match GitService::new(&snapshot.metadata.project_path).base_refs() {
+            Ok(mut options) => {
+                if let Some(selected) = snapshot.metadata.base_ref.clone()
+                    && !options.contains(&selected)
+                {
+                    options.push(selected);
+                }
+                options.sort_by_key(|reference| (reference.contains('/'), reference.clone()));
+                self.base_ref_options = options;
+                self.base_default_ref = self.default_base_ref(&snapshot);
+                self.base_menu_visibility = SettingsVisibility::Open;
+                self.open_control_menu = None;
+                cx.notify();
+            }
+            Err(error) => {
+                self.action_error = Some(error.to_string());
+                cx.notify();
+            }
+        }
+    }
+
+    fn default_base_ref(&self, snapshot: &SessionSnapshot) -> Option<String> {
+        self.projects
+            .iter()
+            .find(|project| project.path == snapshot.metadata.project_key())
+            .and_then(|project| project.default_branch.clone())
+            .or_else(|| {
+                snapshot
+                    .metadata
+                    .repository_root
+                    .as_deref()
+                    .and_then(|root| default_branch(Path::new(root)))
+            })
+    }
+
+    fn set_changes_base(&mut self, base_ref: String, cx: &mut Context<Self>) {
+        let Some(session_id) = self.selected_session.clone() else {
+            return;
+        };
+        self.base_menu_visibility = SettingsVisibility::Closed;
+        self.action_error = None;
+        let _ = self.commands.send(ServiceCommand::SetBaseRef {
+            app_session_id: session_id,
+            base_ref,
+        });
+        cx.notify();
+    }
+
+    fn refresh_selected_changes(&mut self, force: bool, cx: &mut Context<Self>) {
+        let Some(session_id) = self.selected_session.clone() else {
+            return;
+        };
+        self.action_error = None;
+        let _ = self.commands.send(ServiceCommand::RefreshChanges {
+            app_session_id: session_id,
+            force,
+        });
+        cx.notify();
     }
 
     fn dismiss_control_menu(&mut self, cx: &mut Context<Self>) {
@@ -4873,6 +6260,9 @@ impl SessionMvpView {
             }
             ControlMenu::Location => {
                 self.draft_location = SessionLocation::from_str_or_default(&value);
+            }
+            ControlMenu::Base => {
+                self.draft_base_ref = Some(value);
             }
             ControlMenu::Mode => {
                 value.clone_into(&mut self.draft_mode);
@@ -5283,6 +6673,15 @@ impl SessionMvpView {
                 })
                 .collect(),
             ),
+            ControlMenu::Base => {
+                let options = self.base_ref_menu_options();
+                let selected = self
+                    .draft_base_ref
+                    .clone()
+                    .or_else(|| self.selected_project_base_ref())
+                    .unwrap_or_default();
+                ("Base branch", selected, options)
+            }
             ControlMenu::Mode => ("Mode", self.draft_mode.clone(), self.mode_options()),
             ControlMenu::Agent => (
                 "Agent",
@@ -5322,6 +6721,12 @@ impl SessionMvpView {
         } else {
             px(260.0)
         };
+        let handle = self
+            .detail_scrolls
+            .borrow_mut()
+            .entry(CONTROL_MENU_SCROLL_ID.to_owned())
+            .or_default()
+            .clone();
         Some(
             div()
                 .id("composer-control-menu")
@@ -5330,7 +6735,9 @@ impl SessionMvpView {
                 .aria_label(title)
                 .w(width)
                 .max_h(px(460.0))
+                .track_scroll(&handle)
                 .overflow_y_scroll()
+                .on_scroll_wheel(self.claim_scroll_when_moved(CONTROL_MENU_SCROLL_ID, &handle, cx))
                 .p_2()
                 .rounded_lg()
                 .border_1()
@@ -5904,7 +7311,8 @@ impl SessionMvpView {
                             .child("Settings")
                             .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                             .on_click(cx.listener(|view, _, _, cx| {
-                                view.settings_visibility = SettingsVisibility::Open;
+                                view.settings_error = None;
+                                view.settings_visibility = crate::SettingsVisibility::Open;
                                 cx.notify();
                             })),
                     ),
@@ -5995,12 +7403,90 @@ impl SessionMvpView {
         })
     }
 
+    /// Whether the transcript is parked away from its tail, so newer output
+    /// sits below the viewport.
+    ///
+    /// Follow-tail is the source of truth rather than a fresh offset
+    /// comparison: the list re-engages it during layout once the true bottom
+    /// is reached, which accounts for rows whose height is still an estimate.
+    fn transcript_is_away_from_tail(&self) -> bool {
+        !self.transcript_list.is_following_tail()
+            && self.transcript_list.max_offset_for_scrollbar().y > px(0.0)
+    }
+
+    /// Glide the transcript back to the conversation tail.
+    ///
+    /// The view travels rather than snapping so the content flying past shows
+    /// how far it moved, which a jump cut cannot convey.
+    fn scroll_transcript_to_bottom(&mut self, cx: &mut Context<Self>) {
+        let from = -f32::from(self.transcript_list.scroll_px_offset_for_scrollbar().y);
+        self.scroll_to_bottom = Some(ScrollToBottom {
+            started: Instant::now(),
+            from,
+        });
+        self.scroll_to_bottom_task = Some(cx.spawn(async move |view, cx| {
+            loop {
+                cx.background_executor().timer(SCROLL_TO_BOTTOM_STEP).await;
+                let still_gliding = view.update(cx, |view, cx| {
+                    let still_gliding = view.step_scroll_to_bottom(Instant::now());
+                    cx.notify();
+                    still_gliding
+                });
+                if !matches!(still_gliding, Ok(true)) {
+                    break;
+                }
+            }
+        }));
+        cx.notify();
+    }
+
+    /// Advance the glide, reporting whether it is still running.
+    ///
+    /// The destination is re-read every step, so output arriving mid-flight
+    /// extends the glide instead of leaving it stranded above the new tail.
+    fn step_scroll_to_bottom(&mut self, now: Instant) -> bool {
+        let Some(glide) = self.scroll_to_bottom else {
+            return false;
+        };
+        let elapsed = now.saturating_duration_since(glide.started).as_secs_f32();
+        let progress = (elapsed / SCROLL_TO_BOTTOM_DURATION.as_secs_f32()).clamp(0.0, 1.0);
+        if progress >= 1.0 {
+            self.scroll_to_bottom = None;
+            // The measured maximum trails the true bottom while rows below the
+            // viewport are still estimated, so the landing re-engages
+            // follow-tail instead of settling on the estimate.
+            self.transcript_list.set_follow_mode(FollowMode::Tail);
+            return false;
+        }
+        // Ease out: quick departure, gentle arrival, so the tail is readable
+        // the instant it comes to rest.
+        let eased = 1.0 - (1.0 - progress).powi(5);
+        let target = f32::from(self.transcript_list.max_offset_for_scrollbar().y);
+        let offset = glide.from + (target - glide.from) * eased;
+        self.transcript_list
+            .set_offset_from_scrollbar(gpui::point(px(0.0), px(-offset)));
+        true
+    }
+
+    /// Abandon a glide in progress, leaving the transcript where it is.
+    ///
+    /// Scrolling by hand during the glide means the reader wants a different
+    /// destination, and fighting them for the scroll position would be worse
+    /// than arriving nowhere.
+    fn cancel_scroll_to_bottom(&mut self) {
+        self.scroll_to_bottom = None;
+        self.scroll_to_bottom_task = None;
+    }
+
     /// Begin a scrollbar drag, remembering where the thumb was grabbed.
     ///
     /// Pressing the track jumps the thumb under the pointer; pressing the
     /// thumb keeps it where it is so the content does not lurch on grab.
     fn begin_scrollbar_drag(&mut self, id: &str, pointer_y: gpui::Pixels) {
         if id == TRANSCRIPT_SCROLL_ID {
+            // Grabbing the thumb is another way of choosing a destination, so
+            // it takes over from a glide rather than competing with it.
+            self.cancel_scroll_to_bottom();
             let Some(geometry) = self
                 .drawn_transcript_scrollbar
                 .or_else(|| self.transcript_scrollbar_geometry())
@@ -6093,7 +7579,7 @@ impl SessionMvpView {
         &mut self,
         group: SharedString,
         cx: &mut Context<Self>,
-    ) -> Option<impl IntoElement> {
+    ) -> Option<impl IntoElement + use<>> {
         self.drawn_transcript_scrollbar = None;
         let geometry = self.transcript_scrollbar_geometry()?;
         self.drawn_transcript_scrollbar = Some(geometry);
@@ -6112,7 +7598,7 @@ impl SessionMvpView {
         group: SharedString,
         cx: &mut Context<Self>,
         always_visible: bool,
-    ) -> impl IntoElement {
+    ) -> impl IntoElement + use<> {
         let track_id = id.to_owned();
         let thumb_id = id.to_owned();
         let debug_id = id.to_owned();
@@ -6187,6 +7673,83 @@ impl SessionMvpView {
             )
     }
 
+    /// Height cap for a permission's requested-action detail panel: a
+    /// fraction of the window's viewport height, clamped so it never shrinks
+    /// to a sliver in a short window or swallows a tall one.
+    fn permission_detail_max_height(&self) -> gpui::Pixels {
+        px(
+            (f32::from(self.viewport_height) * PERMISSION_DETAIL_HEIGHT_FRACTION)
+                .clamp(PERMISSION_DETAIL_MIN_HEIGHT, PERMISSION_DETAIL_MAX_HEIGHT),
+        )
+    }
+
+    /// Hand the wheel to a scroll region only while the region can use it.
+    ///
+    /// GPUI applies a wheel event to every scrollable container under the
+    /// pointer and leaves it propagating, so a nested region and the surface
+    /// behind it both move. Claiming the event unconditionally is just as
+    /// wrong, and is what this replaces: a region with nothing to scroll, or
+    /// one already at its extent, swallowed the wheel and the surface behind
+    /// it never moved.
+    ///
+    /// GPUI has already applied this event by the time the returned listener
+    /// runs, so comparing where the region sat before with where it sits now
+    /// says whether it consumed the gesture.
+    fn claim_scroll_when_moved(
+        &self,
+        id: &str,
+        handle: &gpui::ScrollHandle,
+        cx: &Context<Self>,
+    ) -> ScrollWheelGuard {
+        self.scroll_positions
+            .borrow_mut()
+            .insert(id.to_owned(), Self::clamped_offset(handle));
+        let id = id.to_owned();
+        let handle = handle.clone();
+        Box::new(cx.listener(move |view, _: &gpui::ScrollWheelEvent, _, cx| {
+            let after = Self::clamped_offset(&handle);
+            let before = view
+                .scroll_positions
+                .borrow()
+                .get(&id)
+                .copied()
+                .unwrap_or(after);
+            view.scroll_positions.borrow_mut().insert(id.clone(), after);
+            // GPUI lets the offset run past the extent and only clamps it at
+            // the next paint, which would read as movement next time.
+            if handle.offset() != after {
+                handle.set_offset(after);
+            }
+            if before != after {
+                cx.stop_propagation();
+            }
+        }))
+    }
+
+    /// Where a scroll region sits, with the overscroll GPUI allows removed.
+    fn clamped_offset(handle: &gpui::ScrollHandle) -> gpui::Point<gpui::Pixels> {
+        let max = handle.max_offset();
+        let offset = handle.offset();
+        gpui::point(
+            offset.x.clamp(-max.x, px(0.0)),
+            offset.y.clamp(-max.y, px(0.0)),
+        )
+    }
+
+    /// Claim the wheel for a horizontally scrolling region, but only for a
+    /// horizontal gesture.
+    ///
+    /// Code blocks, tables, and diffs scroll sideways inside surfaces that
+    /// scroll down. Paired with `restrict_scroll_to_axis`, this keeps a
+    /// vertical wheel over one of them scrolling the surface behind it rather
+    /// than being swallowed or, worse, turned into sideways movement.
+    fn claim_horizontal_scroll(event: &gpui::ScrollWheelEvent, window: &mut Window, cx: &mut App) {
+        let delta = event.delta.pixel_delta(window.line_height());
+        if delta.x != px(0.0) && delta.x.abs() > delta.y.abs() {
+            cx.stop_propagation();
+        }
+    }
+
     /// A bounded, scrollable block of detail inside a tool entry.
     ///
     /// Commands, diffs, and output are frequently taller than any sensible
@@ -6219,6 +7782,7 @@ impl SessionMvpView {
         }
 
         let group = SharedString::from(format!("scroll-{id}"));
+        let claim_scroll = self.claim_scroll_when_moved(id, &handle, cx);
         let scrollbar = Self::scrollbar(id, &handle, group.clone(), cx);
 
         div()
@@ -6239,7 +7803,10 @@ impl SessionMvpView {
                     .overflow_y_scroll()
                     // Without this the transcript scrolls too, so reading a
                     // command's output dragged the whole conversation along.
-                    .on_scroll_wheel(|_, _, cx| cx.stop_propagation())
+                    // Claiming it outright was its own bug: a block short
+                    // enough to need no scrolling, or already at its end, left
+                    // the transcript stuck under the pointer.
+                    .on_scroll_wheel(claim_scroll)
                     .px_2()
                     .py_1()
                     .rounded_md()
@@ -6251,29 +7818,225 @@ impl SessionMvpView {
             .children(scrollbar)
     }
 
-    /// A tool call in the timeline, with its nested subagent work.
-    ///
-    /// This is what makes a session observable: without it the transcript
-    /// shows what the agent said while the reads, searches, edits, and
-    /// commands it actually ran stay invisible.
-    #[allow(clippy::too_many_lines)]
+    fn tool_expanded(&self, call_id: &str) -> bool {
+        self.selected_session.as_ref().is_some_and(|session_id| {
+            self.expanded_tools
+                .get(session_id)
+                .is_some_and(|expanded| expanded.contains(call_id))
+        })
+    }
+
+    fn toggle_tool(&mut self, call_id: &str) {
+        let Some(session_id) = self.selected_session.clone() else {
+            return;
+        };
+        let expanded = self.expanded_tools.entry(session_id).or_default();
+        if !expanded.remove(call_id) {
+            expanded.insert(call_id.to_owned());
+        }
+    }
+
+    fn terminal_is_running(&self, invocation: &app_model::ToolInvocation) -> bool {
+        if invocation.class != app_model::ToolClass::Shell {
+            return false;
+        }
+        invocation
+            .shell_id
+            .as_deref()
+            .and_then(|shell_id| self.selected()?.snapshot.tool_activity.terminal(shell_id))
+            .map_or(
+                invocation.state == app_model::InvocationState::Running,
+                app_model::TerminalSession::is_active,
+            )
+    }
+
+    fn tool_icon(class: app_model::ToolClass) -> &'static str {
+        match class {
+            app_model::ToolClass::FileRead => "◇",
+            app_model::ToolClass::FileWrite | app_model::ToolClass::FileEditor => "±",
+            app_model::ToolClass::Search => "⌕",
+            app_model::ToolClass::Shell | app_model::ToolClass::ShellControl => ">_",
+            app_model::ToolClass::Web => "↗",
+            app_model::ToolClass::Delegation => "◎",
+            app_model::ToolClass::Data => "▤",
+            app_model::ToolClass::Skill => "◆",
+            app_model::ToolClass::Interaction => "?",
+            app_model::ToolClass::Other => "•",
+        }
+    }
+
+    fn tool_argument_detail(
+        invocation: &app_model::ToolInvocation,
+    ) -> Option<(&'static str, String)> {
+        let named = match invocation.class {
+            app_model::ToolClass::FileRead
+            | app_model::ToolClass::FileWrite
+            | app_model::ToolClass::FileEditor => invocation
+                .string_argument("path")
+                .map(|value| ("Path", value)),
+            app_model::ToolClass::Search => invocation
+                .string_argument("pattern")
+                .or_else(|| invocation.string_argument("query"))
+                .map(|value| ("Pattern", value)),
+            app_model::ToolClass::Shell | app_model::ToolClass::ShellControl => invocation
+                .string_argument("command")
+                .or_else(|| invocation.display_command.clone())
+                .map(|value| ("Command", value)),
+            app_model::ToolClass::Web => invocation
+                .string_argument("url")
+                .or_else(|| invocation.string_argument("query"))
+                .map(|value| ("Request", value)),
+            app_model::ToolClass::Delegation
+            | app_model::ToolClass::Skill
+            | app_model::ToolClass::Interaction => invocation
+                .string_argument("description")
+                .or_else(|| invocation.string_argument("prompt"))
+                .map(|value| ("Prompt", value)),
+            app_model::ToolClass::Data | app_model::ToolClass::Other => None,
+        };
+        named.or_else(|| {
+            (!invocation.arguments.is_null()
+                && invocation
+                    .arguments
+                    .as_object()
+                    .is_none_or(|arguments| !arguments.is_empty()))
+            .then(|| {
+                (
+                    "Arguments",
+                    serde_json::to_string_pretty(&invocation.arguments)
+                        .unwrap_or_else(|_| invocation.arguments.to_string()),
+                )
+            })
+        })
+    }
+
+    fn tool_diff_counts(diff: &str) -> (usize, usize) {
+        diff.lines().fold((0, 0), |(insertions, deletions), line| {
+            if line.starts_with('+') && !line.starts_with("+++") {
+                (insertions + 1, deletions)
+            } else if line.starts_with('-') && !line.starts_with("---") {
+                (insertions, deletions + 1)
+            } else {
+                (insertions, deletions)
+            }
+        })
+    }
+
+    fn reported_match_count(output: &str) -> Option<usize> {
+        let lowercase = output.to_ascii_lowercase();
+        if ["no matches", "no results", "no files matched"]
+            .iter()
+            .any(|marker| lowercase.contains(marker))
+        {
+            return Some(0);
+        }
+        let prefix = output.split_once(" match")?.0;
+        prefix
+            .split(|character: char| !character.is_ascii_digit())
+            .rfind(|part| !part.is_empty())?
+            .parse()
+            .ok()
+    }
+
+    fn tool_brief(invocation: &app_model::ToolInvocation, has_diff: bool) -> Option<String> {
+        match invocation.state {
+            app_model::InvocationState::Running => return Some("Working".to_owned()),
+            app_model::InvocationState::Failed => return Some("Failed".to_owned()),
+            app_model::InvocationState::Cancelled => return Some("Cancelled".to_owned()),
+            app_model::InvocationState::Succeeded => {}
+        }
+        if has_diff {
+            return None;
+        }
+        if !invocation.output.is_empty() {
+            let count = if invocation.class == app_model::ToolClass::Search {
+                Self::reported_match_count(&invocation.output)
+                    .unwrap_or_else(|| invocation.output.lines().count())
+            } else {
+                invocation.output.lines().count()
+            };
+            let noun = if invocation.class == app_model::ToolClass::Search {
+                if count == 1 { "result" } else { "results" }
+            } else if count == 1 {
+                "line"
+            } else {
+                "lines"
+            };
+            return Some(format!("{count} {noun}"));
+        }
+        tool_duration(invocation)
+            .map(|duration| format!("Worked for {}", format_activity_duration(duration)))
+    }
+
+    /// A tool call in the timeline, followed by independently expandable
+    /// activity rows for work delegated to a subagent.
     fn tool_entry(
         &self,
         invocation: &app_model::ToolInvocation,
         children: &[&app_model::ToolInvocation],
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
+        let nested = children
+            .iter()
+            .map(|child| self.tool_activity_entry(child, true, cx))
+            .collect::<Vec<_>>();
+        div()
+            .id(SharedString::from(format!("tool-{}", invocation.call_id)))
+            .debug_selector(|| "tool-entry".to_owned())
+            .accessibility_id(invocation.call_id.clone())
+            .role(Role::ListItem)
+            .aria_label(format!(
+                "{} {}",
+                invocation.verb(),
+                invocation.summary_line()
+            ))
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .child(self.tool_activity_entry(invocation, false, cx))
+            .when(!nested.is_empty(), |entry| {
+                entry.child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .gap_1()
+                        .border_l_1()
+                        .border_color(rgb(BORDER))
+                        .children(nested),
+                )
+            })
+            .into_any_element()
+    }
+
+    /// One compact activity row and its optional GCABB detail card.
+    #[allow(clippy::too_many_lines)]
+    fn tool_activity_entry(
+        &self,
+        invocation: &app_model::ToolInvocation,
+        nested: bool,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let (status, status_color) = match invocation.state {
             app_model::InvocationState::Running => ("running", GREEN),
             app_model::InvocationState::Succeeded => ("done", MUTED),
             app_model::InvocationState::Failed => ("failed", RED),
             app_model::InvocationState::Cancelled => ("cancelled", MUTED),
         };
-        let summary = invocation.summary_line();
-        let detail = invocation.multiline_summary();
+        let full_summary = invocation.file_path().map_or_else(
+            || invocation.summary(),
+            |path| self.display_worktree_path(Path::new(path)),
+        );
+        let summary = summary_line(&full_summary);
         let verb = invocation.verb();
         let label = format!("{verb} {summary}");
         let diff = invocation.diff().map(str::to_owned);
+        let diff_counts = diff.as_deref().map(Self::tool_diff_counts);
+        let brief = Self::tool_brief(invocation, diff.is_some());
+        let accessible_brief = diff_counts.map_or_else(
+            || brief.clone().unwrap_or_default(),
+            |(insertions, deletions)| format!("{insertions} additions, {deletions} deletions"),
+        );
         let error = invocation.error_message.clone();
         let output_error = invocation
             .output_load_error
@@ -6281,10 +8044,7 @@ impl SessionMvpView {
             .or_else(|| invocation.output_error.clone());
         // Restored command output is already a bounded chunk window. When the
         // user explicitly prepends older windows, keep them reachable here.
-        let has_output = matches!(
-            invocation.class,
-            app_model::ToolClass::Shell | app_model::ToolClass::ShellControl
-        ) && !invocation.output.is_empty();
+        let has_output = !invocation.output.is_empty() && diff.is_none();
         let output_is_large = has_output && output_needs_preview(&invocation.output);
         let output_is_expanded = invocation.state != app_model::InvocationState::Running
             && self.expanded_tool_outputs.contains(&invocation.call_id);
@@ -6311,227 +8071,292 @@ impl SessionMvpView {
             .exit_code
             .filter(|code| *code != 0)
             .map(|code| format!("exit {code}"));
-        let nested: Vec<_> = children
-            .iter()
-            .map(|child| {
-                let child_status = match child.state {
-                    app_model::InvocationState::Running => GREEN,
-                    app_model::InvocationState::Succeeded
-                    | app_model::InvocationState::Cancelled => MUTED,
-                    app_model::InvocationState::Failed => RED,
-                };
+        let argument_detail = Self::tool_argument_detail(invocation);
+        let terminal_running = self.terminal_is_running(invocation);
+        let expanded = terminal_running || self.tool_expanded(&invocation.call_id);
+        let call_id = invocation.call_id.clone();
+        let selector_call_id = invocation.call_id.clone();
+        let disclosure_label = if terminal_running {
+            format!("Details for {label}, expanded while terminal is running")
+        } else if expanded {
+            format!("Collapse details for {label}")
+        } else {
+            format!("Expand details for {label}")
+        };
+        let started = format_activity_timestamp(&invocation.started_at);
+        let duration = tool_duration(invocation).map(format_activity_duration);
+        let output_metadata = has_output.then(|| {
+            let lines = invocation.output.lines().count();
+            format!(
+                "{} {} · {}",
+                lines,
+                if lines == 1 { "line" } else { "lines" },
+                format_byte_count(invocation.output_metadata.byte_count)
+            )
+        });
+        let detail_card = div()
+            .debug_selector(|| "tool-expanded-card".to_owned())
+            .min_w_0()
+            .flex()
+            .flex_col()
+            .gap_1()
+            .mt_1()
+            .px_3()
+            .py_2()
+            .rounded_md()
+            .bg(rgb(SUBTLE))
+            .overflow_hidden()
+            .border_1()
+            .border_color(rgb(
+                if invocation.state == app_model::InvocationState::Failed {
+                    RED
+                } else {
+                    BORDER
+                },
+            ))
+            .when_some(exit, |entry, exit| {
+                entry.child(div().text_xs().text_color(rgb(RED)).child(exit))
+            })
+            .when_some(error, |entry, error| {
+                entry.child(div().text_xs().text_color(rgb(RED)).child(error))
+            })
+            .when_some(output_error, |entry, error| {
+                entry.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "tool-output-error-{}",
+                            invocation.call_id
+                        )))
+                        .role(Role::Alert)
+                        .text_xs()
+                        .text_color(rgb(RED))
+                        .child(format!("Output unavailable: {error}")),
+                )
+            })
+            .when_some(argument_detail, |entry, (argument_label, detail)| {
+                entry
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(argument_label))
+                    .child(self.detail_block(
+                        &format!("tool-argument-{}", invocation.call_id),
+                        detail,
+                        COMMAND_BLOCK_HEIGHT,
+                        cx,
+                    ))
+            })
+            .when_some(diff, |entry, diff| {
+                entry.child(self.detail_block(
+                    &format!("tool-diff-{}", invocation.call_id),
+                    diff,
+                    ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
+                    cx,
+                ))
+            })
+            .when_some(
+                earlier_output,
+                |entry, (session_id, identity, before_chunk)| {
+                    entry.child(
+                        div()
+                            .id(SharedString::from(format!(
+                                "load-output-{}",
+                                invocation.call_id
+                            )))
+                            .role(Role::Button)
+                            .aria_label("Load earlier retained output")
+                            .focusable()
+                            .tab_stop(true)
+                            .mt_1()
+                            .px_2()
+                            .py_1()
+                            .rounded_sm()
+                            .text_xs()
+                            .text_color(rgb(BLUE))
+                            .child(format!(
+                                "Load earlier output ({before_chunk} chunks retained)"
+                            ))
+                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                            .on_click(cx.listener(move |view, _, _, cx| {
+                                let _ = view.commands.send(ServiceCommand::LoadEarlierOutput {
+                                    app_session_id: session_id.clone(),
+                                    identity: identity.clone(),
+                                    before_chunk,
+                                });
+                                cx.notify();
+                            })),
+                    )
+                },
+            )
+            .when_some(output, |entry, output| {
+                entry.child(self.detail_block(
+                    &format!("tool-output-{}", invocation.call_id),
+                    output,
+                    ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
+                    cx,
+                ))
+            })
+            .when_some(output_toggle, |entry, (call_id, expanded)| {
+                entry.child(
+                    div()
+                        .id(SharedString::from(format!("toggle-output-{call_id}")))
+                        .debug_selector(|| "toggle-tool-output".to_owned())
+                        .role(Role::Button)
+                        .aria_label(if expanded {
+                            "Show latest output"
+                        } else {
+                            "Show complete output"
+                        })
+                        .focusable()
+                        .tab_stop(true)
+                        .mt_1()
+                        .px_2()
+                        .py_1()
+                        .rounded_sm()
+                        .text_xs()
+                        .text_color(rgb(BLUE))
+                        .child(if expanded {
+                            "Show latest output".to_owned()
+                        } else {
+                            format!(
+                                "Show complete output ({} bytes)",
+                                invocation.output_metadata.byte_count
+                            )
+                        })
+                        .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                        .on_click(cx.listener(move |view, _, _, cx| {
+                            if expanded {
+                                view.expanded_tool_outputs.remove(&call_id);
+                            } else {
+                                view.expanded_tool_outputs.insert(call_id.clone());
+                            }
+                            cx.notify();
+                        })),
+                )
+            })
+            .child(
                 div()
-                    .id(SharedString::from(format!("nested-{}", child.call_id)))
-                    .role(Role::ListItem)
-                    .aria_label(format!("{} {}", child.verb(), child.summary()))
+                    .mt_2()
+                    .pt_2()
+                    .border_t_1()
+                    .border_color(rgb(BORDER))
+                    .flex()
+                    .flex_wrap()
+                    .gap_3()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!("Started {started}"))
+                    .when_some(duration, |metadata, duration| {
+                        metadata.child(format!("Duration {duration}"))
+                    })
+                    .when_some(output_metadata, |metadata, output| {
+                        metadata.child(format!("Output {output}"))
+                    }),
+            );
+
+        div()
+            .id(SharedString::from(format!(
+                "tool-activity-{}",
+                invocation.call_id
+            )))
+            .debug_selector(move || format!("tool-toggle-{selector_call_id}"))
+            .flex()
+            .flex_col()
+            .w_full()
+            .min_w_0()
+            .child(
+                div()
+                    .id(SharedString::from(format!(
+                        "tool-toggle-{}",
+                        invocation.call_id
+                    )))
+                    .debug_selector(|| "tool-card".to_owned())
+                    .role(Role::Button)
+                    .aria_label(if accessible_brief.is_empty() {
+                        format!("{disclosure_label} ({status})")
+                    } else {
+                        format!("{disclosure_label} ({status}), {accessible_brief}")
+                    })
+                    .aria_expanded(expanded)
+                    .focusable()
+                    .tab_stop(true)
+                    .focus_visible(|style| style.rounded_sm().border_1().border_color(rgb(BLUE)))
+                    .w_full()
+                    .min_w_0()
                     .flex()
                     .items_center()
                     .gap_2()
+                    .pl(px(if nested { 24.0 } else { 0.0 }))
+                    .py_1()
+                    .rounded_sm()
                     .child(
                         div()
-                            .w(px(5.0))
-                            .h(px(5.0))
-                            .rounded_full()
-                            .bg(rgb(child_status)),
+                            .w(px(20.0))
+                            .flex_none()
+                            .when(invocation.class == app_model::ToolClass::Search, |icon| {
+                                icon.text_lg()
+                            })
+                            .when(invocation.class != app_model::ToolClass::Search, |icon| {
+                                icon.text_xs()
+                            })
+                            .text_color(rgb(status_color))
+                            .child(Self::tool_icon(invocation.class)),
+                    )
+                    .child(
+                        div()
+                            .flex_none()
+                            .text_sm()
+                            .text_color(rgb(BLUE))
+                            .child(verb.to_owned()),
                     )
                     .child(
                         div()
                             .flex_1()
                             .min_w_0()
                             .overflow_hidden()
-                            .text_xs()
+                            .text_sm()
                             .text_color(rgb(MUTED))
-                            .child(format!("{} {}", child.verb(), child.summary())),
+                            .child(summary),
                     )
-            })
-            .collect();
-
-        div()
-            .id(SharedString::from(format!("tool-{}", invocation.call_id)))
-            .debug_selector(|| "tool-entry".to_owned())
-            .accessibility_id(invocation.call_id.clone())
-            .role(Role::ListItem)
-            .aria_label(format!("{label} ({status})"))
-            .flex()
-            .w_full()
-            .justify_start()
-            .child(
-                div()
-                    .debug_selector(|| "tool-card".to_owned())
-                    .w_full()
-                    .min_w_0()
-                    .flex()
-                    .flex_col()
-                    .gap_1()
-                    .px_3()
-                    .py_2()
-                    .rounded_md()
-                    .bg(rgb(SUBTLE))
-                    .overflow_hidden()
-                    .border_1()
-                    .border_color(rgb(
-                        if invocation.state == app_model::InvocationState::Failed {
-                            RED
-                        } else {
-                            BORDER
-                        },
-                    ))
-                    .child(
-                        div()
-                            .flex()
-                            // Top aligned: a multi-line target must not push
-                            // the label to the vertical middle of the block.
-                            .items_start()
-                            .gap_2()
-                            .child(
-                                div()
-                                    .mt(px(5.0))
-                                    .w(px(6.0))
-                                    .h(px(6.0))
-                                    .rounded_full()
-                                    .bg(rgb(status_color)),
-                            )
-                            .child(div().text_xs().text_color(rgb(BLUE)).child(verb.to_owned()))
-                            .child(
-                                div()
-                                    .flex_1()
-                                    .min_w_0()
-                                    .overflow_hidden()
-                                    .text_xs()
-                                    .text_color(rgb(PRIMARY))
-                                    .child(summary),
-                            )
-                            .when_some(exit, |row, exit| {
-                                row.child(div().text_xs().text_color(rgb(RED)).child(exit))
-                            }),
-                    )
-                    .when_some(error, |entry, error| {
-                        entry.child(div().text_xs().text_color(rgb(RED)).child(error))
-                    })
-                    .when_some(output_error, |entry, error| {
-                        entry.child(
+                    .when_some(diff_counts, |row, (insertions, deletions)| {
+                        row.child(
                             div()
-                                .id(SharedString::from(format!(
-                                    "tool-output-error-{}",
-                                    invocation.call_id
-                                )))
-                                .role(Role::Alert)
-                                .text_xs()
+                                .flex_none()
+                                .text_sm()
+                                .text_color(rgb(GREEN))
+                                .child(format!("+{insertions}")),
+                        )
+                        .child(
+                            div()
+                                .flex_none()
+                                .text_sm()
                                 .text_color(rgb(RED))
-                                .child(format!("Output unavailable: {error}")),
+                                .child(format!("-{deletions}")),
                         )
                     })
-                    .when_some(detail, |entry, detail| {
-                        entry.child(self.detail_block(
-                            &format!("tool-detail-{}", invocation.call_id),
-                            detail,
-                            COMMAND_BLOCK_HEIGHT,
-                            cx,
-                        ))
-                    })
-                    .when_some(diff, |entry, diff| {
-                        entry.child(self.detail_block(
-                            &format!("tool-diff-{}", invocation.call_id),
-                            diff,
-                            ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
-                            cx,
-                        ))
-                    })
-                    .when_some(
-                        earlier_output,
-                        |entry, (session_id, identity, before_chunk)| {
-                            entry.child(
-                                div()
-                                    .id(SharedString::from(format!(
-                                        "load-output-{}",
-                                        invocation.call_id
-                                    )))
-                                    .role(Role::Button)
-                                    .aria_label("Load earlier retained output")
-                                    .focusable()
-                                    .tab_stop(true)
-                                    .mt_1()
-                                    .px_2()
-                                    .py_1()
-                                    .rounded_sm()
-                                    .text_xs()
-                                    .text_color(rgb(BLUE))
-                                    .child(format!(
-                                        "Load earlier output ({before_chunk} chunks retained)"
-                                    ))
-                                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                                    .on_click(cx.listener(move |view, _, _, cx| {
-                                        let _ =
-                                            view.commands.send(ServiceCommand::LoadEarlierOutput {
-                                                app_session_id: session_id.clone(),
-                                                identity: identity.clone(),
-                                                before_chunk,
-                                            });
-                                        cx.notify();
-                                    })),
-                            )
-                        },
-                    )
-                    .when_some(output, |entry, output| {
-                        entry.child(self.detail_block(
-                            &format!("tool-output-{}", invocation.call_id),
-                            output,
-                            ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
-                            cx,
-                        ))
-                    })
-                    .when_some(output_toggle, |entry, (call_id, expanded)| {
-                        entry.child(
+                    .when_some(brief, |row, brief| {
+                        row.child(
                             div()
-                                .id(SharedString::from(format!("toggle-output-{call_id}")))
-                                .debug_selector(|| "toggle-tool-output".to_owned())
-                                .role(Role::Button)
-                                .aria_label(if expanded {
-                                    "Show latest output"
-                                } else {
-                                    "Show complete output"
-                                })
-                                .focusable()
-                                .tab_stop(true)
-                                .mt_1()
-                                .px_2()
-                                .py_1()
-                                .rounded_sm()
-                                .text_xs()
-                                .text_color(rgb(BLUE))
-                                .child(if expanded {
-                                    "Show latest output".to_owned()
-                                } else {
-                                    format!(
-                                        "Show complete output ({} bytes)",
-                                        invocation.output_metadata.byte_count
-                                    )
-                                })
-                                .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                                .on_click(cx.listener(move |view, _, _, cx| {
-                                    if expanded {
-                                        view.expanded_tool_outputs.remove(&call_id);
-                                    } else {
-                                        view.expanded_tool_outputs.insert(call_id.clone());
-                                    }
-                                    cx.notify();
-                                })),
+                                .flex_none()
+                                .text_sm()
+                                .text_color(rgb(MUTED))
+                                .child(brief),
                         )
                     })
-                    .when(!nested.is_empty(), |entry| {
-                        entry.child(
-                            div()
-                                .mt_1()
-                                .pl_3()
-                                .flex()
-                                .flex_col()
-                                .gap_1()
-                                .border_l_1()
-                                .border_color(rgb(BORDER))
-                                .children(nested),
-                        )
-                    }),
+                    .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        if !terminal_running {
+                            view.toggle_tool(&call_id);
+                        }
+                        cx.notify();
+                    })),
             )
+            .when(expanded, |entry| {
+                entry.child(
+                    div()
+                        .w_full()
+                        .pl(px(if nested { 52.0 } else { 28.0 }))
+                        .child(detail_card),
+                )
+            })
+            .into_any_element()
     }
 
     /// One conversation message.
@@ -6655,39 +8480,36 @@ impl SessionMvpView {
         nodes: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
-        _cx: &mut Context<Self>,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
     ) -> gpui::AnyElement {
         let content = Self::markdown_inline_content(nodes);
-        let links = content.links;
-        let clickable_ranges = links
-            .iter()
-            .map(|(range, _)| range.clone())
-            .collect::<Vec<_>>();
-        let targets = links
-            .into_iter()
-            .map(|(_, target)| target)
-            .collect::<Vec<_>>();
-        let text = StyledText::new(content.text)
-            .with_highlights(content.highlights)
-            .with_font_family_overrides(content.font_family_overrides);
-        let text = if clickable_ranges.is_empty() {
-            text.into_any_element()
-        } else {
-            let inline_index = *element_index;
-            *element_index += 1;
-            InteractiveText::new(
-                SharedString::from(format!("markdown-{message_id}-{inline_index}")),
-                text,
-            )
-            .on_click(clickable_ranges, move |index, _, cx| {
-                cx.open_url(&targets[index]);
-            })
-            .into_any_element()
-        };
+        let inline_index = *element_index;
+        *element_index += 1;
+        let message_order = selection
+            .borrow()
+            .message_orders
+            .get(message_id)
+            .copied()
+            .unwrap_or_default();
+        let text = SelectableTranscriptText::new(
+            format!("markdown-{message_id}-{inline_index}"),
+            (message_order, inline_index),
+            content,
+            selection.clone(),
+            selection_focus.clone(),
+        );
+        let selector = format!("markdown-inline-{message_id}-{inline_index}");
         div()
-            .debug_selector(|| "markdown-inline".to_owned())
+            .debug_selector(move || selector.clone())
+            .cursor(CursorStyle::IBeam)
             .min_w_0()
-            .child(text)
+            .child(
+                div()
+                    .debug_selector(|| "markdown-inline".to_owned())
+                    .min_w_0()
+                    .child(text),
+            )
             .into_any_element()
     }
 
@@ -6696,7 +8518,8 @@ impl SessionMvpView {
         header: bool,
         message_id: &str,
         element_index: &mut usize,
-        cx: &mut Context<Self>,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
     ) -> Vec<gpui::AnyElement> {
         if header
             && nodes
@@ -6708,7 +8531,8 @@ impl SessionMvpView {
                 true,
                 message_id,
                 element_index,
-                cx,
+                selection,
+                selection_focus,
             )];
         }
 
@@ -6723,7 +8547,8 @@ impl SessionMvpView {
                     header,
                     message_id,
                     element_index,
-                    cx,
+                    selection,
+                    selection_focus,
                 ))
             })
             .collect()
@@ -6734,7 +8559,8 @@ impl SessionMvpView {
         header: bool,
         message_id: &str,
         element_index: &mut usize,
-        cx: &mut Context<Self>,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
     ) -> gpui::AnyElement {
         div()
             .flex()
@@ -6758,7 +8584,8 @@ impl SessionMvpView {
                             content,
                             message_id,
                             element_index,
-                            cx,
+                            selection,
+                            selection_focus,
                         )),
                 )
             }))
@@ -6770,7 +8597,8 @@ impl SessionMvpView {
         children: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
-        cx: &mut Context<Self>,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
     ) -> gpui::AnyElement {
         div()
             .mt_1()
@@ -6787,7 +8615,8 @@ impl SessionMvpView {
                 children,
                 message_id,
                 element_index,
-                cx,
+                selection,
+                selection_focus,
             ))
             .into_any_element()
     }
@@ -6796,6 +8625,8 @@ impl SessionMvpView {
         children: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         div()
@@ -6810,6 +8641,8 @@ impl SessionMvpView {
                 children,
                 message_id,
                 element_index,
+                selection,
+                selection_focus,
                 cx,
             ))
             .into_any_element()
@@ -6820,12 +8653,33 @@ impl SessionMvpView {
         children: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let code = markdown::plain_text(children);
         let copy = code.clone();
         let block_index = *element_index;
         *element_index += 1;
+        let message_order = selection
+            .borrow()
+            .message_orders
+            .get(message_id)
+            .copied()
+            .unwrap_or_default();
+        let code_len = code.len();
+        let selectable_code = SelectableTranscriptText::new(
+            format!("markdown-code-{message_id}-{block_index}"),
+            (message_order, block_index),
+            MarkdownInlineContent {
+                text: code,
+                highlights: Vec::new(),
+                font_family_overrides: vec![(0..code_len, ".ZedMono".into())],
+                links: Vec::new(),
+            },
+            selection.clone(),
+            selection_focus.clone(),
+        );
         div()
             .rounded_md()
             .border_1()
@@ -6872,10 +8726,12 @@ impl SessionMvpView {
                     .debug_selector(|| "markdown-code".to_owned())
                     .p_3()
                     .overflow_x_scroll()
+                    .restrict_scroll_to_axis()
+                    .on_scroll_wheel(Self::claim_horizontal_scroll)
                     .whitespace_nowrap()
                     .font_family(".ZedMono")
                     .text_sm()
-                    .child(code),
+                    .child(selectable_code),
             )
             .into_any_element()
     }
@@ -6885,6 +8741,8 @@ impl SessionMvpView {
         children: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let first = start.unwrap_or(1);
@@ -6914,7 +8772,14 @@ impl SessionMvpView {
                             .child(marker),
                     )
                     .child(div().min_w_0().flex_1().flex().flex_col().gap_1().children(
-                        Self::markdown_blocks(content, message_id, element_index, cx),
+                        Self::markdown_blocks(
+                            content,
+                            message_id,
+                            element_index,
+                            selection,
+                            selection_focus,
+                            cx,
+                        ),
                     ))
             }))
             .into_any_element()
@@ -6924,7 +8789,8 @@ impl SessionMvpView {
         children: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
-        cx: &mut Context<Self>,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
     ) -> gpui::AnyElement {
         let table_index = *element_index;
         *element_index += 1;
@@ -6937,7 +8803,8 @@ impl SessionMvpView {
                         true,
                         message_id,
                         element_index,
-                        cx,
+                        selection,
+                        selection_focus,
                     ));
                 }
                 MarkdownNode::Container(MarkdownTag::TableRow, _) => {
@@ -6946,7 +8813,8 @@ impl SessionMvpView {
                         false,
                         message_id,
                         element_index,
-                        cx,
+                        selection,
+                        selection_focus,
                     ));
                 }
                 _ => {}
@@ -6958,6 +8826,8 @@ impl SessionMvpView {
             )))
             .debug_selector(|| "markdown-table".to_owned())
             .overflow_x_scroll()
+            .restrict_scroll_to_axis()
+            .on_scroll_wheel(Self::claim_horizontal_scroll)
             .rounded_md()
             .border_1()
             .border_color(rgb(BORDER))
@@ -6969,33 +8839,65 @@ impl SessionMvpView {
         node: &MarkdownNode,
         message_id: &str,
         element_index: &mut usize,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         match node {
             MarkdownNode::Container(MarkdownTag::Paragraph, children) => {
-                Self::markdown_inline_block(children, message_id, element_index, cx)
+                Self::markdown_inline_block(
+                    children,
+                    message_id,
+                    element_index,
+                    selection,
+                    selection_focus,
+                )
             }
             MarkdownNode::Container(MarkdownTag::Heading(level), children) => {
-                Self::markdown_heading(*level, children, message_id, element_index, cx)
+                Self::markdown_heading(
+                    *level,
+                    children,
+                    message_id,
+                    element_index,
+                    selection,
+                    selection_focus,
+                )
             }
-            MarkdownNode::Container(MarkdownTag::BlockQuote, children) => {
-                Self::markdown_quote(children, message_id, element_index, cx)
-            }
+            MarkdownNode::Container(MarkdownTag::BlockQuote, children) => Self::markdown_quote(
+                children,
+                message_id,
+                element_index,
+                selection,
+                selection_focus,
+                cx,
+            ),
             MarkdownNode::Container(MarkdownTag::CodeBlock(language), children) => {
                 Self::markdown_code_block(
                     language.as_ref(),
                     children,
                     message_id,
                     element_index,
+                    selection,
+                    selection_focus,
                     cx,
                 )
             }
-            MarkdownNode::Container(MarkdownTag::List(start), children) => {
-                Self::markdown_list(*start, children, message_id, element_index, cx)
-            }
-            MarkdownNode::Container(MarkdownTag::Table, children) => {
-                Self::markdown_table(children, message_id, element_index, cx)
-            }
+            MarkdownNode::Container(MarkdownTag::List(start), children) => Self::markdown_list(
+                *start,
+                children,
+                message_id,
+                element_index,
+                selection,
+                selection_focus,
+                cx,
+            ),
+            MarkdownNode::Container(MarkdownTag::Table, children) => Self::markdown_table(
+                children,
+                message_id,
+                element_index,
+                selection,
+                selection_focus,
+            ),
             MarkdownNode::Rule => div()
                 .w_full()
                 .h(px(1.))
@@ -7010,6 +8912,8 @@ impl SessionMvpView {
                     children,
                     message_id,
                     element_index,
+                    selection,
+                    selection_focus,
                     cx,
                 ))
                 .into_any_element(),
@@ -7017,7 +8921,8 @@ impl SessionMvpView {
                 std::slice::from_ref(node),
                 message_id,
                 element_index,
-                cx,
+                selection,
+                selection_focus,
             ),
         }
     }
@@ -7076,17 +8981,28 @@ impl SessionMvpView {
         nodes: &[MarkdownNode],
         message_id: &str,
         element_index: &mut usize,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
         cx: &mut Context<Self>,
     ) -> Vec<gpui::AnyElement> {
         Self::markdown_runs(nodes)
             .into_iter()
             .map(|run| match run {
-                MarkdownRun::Inline(range) => {
-                    Self::markdown_inline_block(&nodes[range], message_id, element_index, cx)
-                }
-                MarkdownRun::Block(index) => {
-                    Self::markdown_block(&nodes[index], message_id, element_index, cx)
-                }
+                MarkdownRun::Inline(range) => Self::markdown_inline_block(
+                    &nodes[range],
+                    message_id,
+                    element_index,
+                    selection,
+                    selection_focus,
+                ),
+                MarkdownRun::Block(index) => Self::markdown_block(
+                    &nodes[index],
+                    message_id,
+                    element_index,
+                    selection,
+                    selection_focus,
+                    cx,
+                ),
             })
             .collect()
     }
@@ -7094,6 +9010,8 @@ impl SessionMvpView {
     fn markdown_content(
         message_id: &str,
         document: &MarkdownDocument,
+        selection: &Rc<RefCell<TranscriptTextSelection>>,
+        selection_focus: &FocusHandle,
         cx: &mut Context<Self>,
     ) -> gpui::AnyElement {
         let mut element_index = 0;
@@ -7107,6 +9025,8 @@ impl SessionMvpView {
                 &document.children,
                 message_id,
                 &mut element_index,
+                selection,
+                selection_focus,
                 cx,
             ))
             .into_any_element()
@@ -7155,49 +9075,76 @@ impl SessionMvpView {
         format!("{speaker}{pending}: {}", message.content)
     }
 
-    fn transcript_message_header(
+    fn copy_icon(surface: u32) -> impl IntoElement {
+        div()
+            .relative()
+            .w(px(16.0))
+            .h(px(16.0))
+            .child(
+                div()
+                    .absolute()
+                    .top_0()
+                    .left_0()
+                    .w(px(10.0))
+                    .h(px(10.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(MUTED)),
+            )
+            .child(
+                div()
+                    .absolute()
+                    .top(px(4.0))
+                    .left(px(4.0))
+                    .w(px(10.0))
+                    .h(px(10.0))
+                    .rounded_sm()
+                    .border_1()
+                    .border_color(rgb(MUTED))
+                    .bg(rgb(surface)),
+            )
+    }
+
+    fn transcript_copy_button(
         message: &app_model::TranscriptMessage,
         is_user: bool,
         markdown_source: String,
+        group: SharedString,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
+        let surface = if is_user { ELEVATED } else { BACKGROUND };
         div()
+            .id(SharedString::from(format!("copy-markdown-{}", message.id)))
+            .debug_selector(|| "copy-markdown".to_owned())
+            .role(Role::Button)
+            .aria_label(if is_user {
+                "Copy your message"
+            } else {
+                "Copy Copilot message"
+            })
+            .focusable()
+            .tab_stop(true)
+            .focus_visible(|style| style.opacity(1.0).border_color(rgb(BLUE)))
+            .absolute()
+            .top(px(if is_user { 8.0 } else { 0.0 }))
+            .right(px(if is_user { 8.0 } else { 0.0 }))
+            .w(px(28.0))
+            .h(px(28.0))
             .flex()
             .items_center()
-            .justify_between()
-            .child(
-                div()
-                    .text_xs()
-                    .text_color(if is_user { rgb(BLUE) } else { rgb(GREEN) })
-                    .child(if is_user { "You" } else { "Copilot" }),
-            )
-            .when(!message.content.is_empty(), |header| {
-                header.child(
-                    div()
-                        .id(SharedString::from(format!("copy-markdown-{}", message.id)))
-                        .debug_selector(|| "copy-markdown".to_owned())
-                        .role(Role::Button)
-                        .aria_label("Copy original markdown")
-                        .focusable()
-                        .tab_stop(true)
-                        .px_1()
-                        .rounded_sm()
-                        .text_xs()
-                        .text_color(rgb(MUTED))
-                        .child("Copy")
-                        .hover(|style| {
-                            style
-                                .bg(rgb(SUBTLE))
-                                .text_color(rgb(PRIMARY))
-                                .cursor_pointer()
-                        })
-                        .on_click(cx.listener(move |_, _, _, cx| {
-                            cx.write_to_clipboard(gpui::ClipboardItem::new_string(
-                                markdown_source.clone(),
-                            ));
-                        })),
-                )
-            })
+            .justify_center()
+            .rounded_md()
+            .border_1()
+            .border_color(rgb(surface))
+            .bg(rgb(surface))
+            .opacity(0.0)
+            .group_hover(group, |style| style.opacity(1.0))
+            .child(Self::copy_icon(surface))
+            .hover(|style| style.border_color(rgb(BORDER)).cursor_pointer())
+            .on_click(cx.listener(move |_, _, _, cx| {
+                cx.write_to_clipboard(gpui::ClipboardItem::new_string(markdown_source.clone()));
+            }))
+            .into_any_element()
     }
 
     fn transcript_message(
@@ -7209,8 +9156,20 @@ impl SessionMvpView {
         let attachments = Self::message_attachment_chips(message, cx);
         let markdown_source = message.content.clone();
         let document = self.message_markdown(message);
-        let markdown = Self::markdown_content(&message.id, &document, cx);
-        let header = Self::transcript_message_header(message, is_user, markdown_source, cx);
+        self.transcript_selection
+            .borrow_mut()
+            .message_orders
+            .insert(message.id.clone(), message.sequence);
+        let markdown = Self::markdown_content(
+            &message.id,
+            &document,
+            &self.transcript_selection,
+            &self.transcript_selection_focus,
+            cx,
+        );
+        let group = SharedString::from(format!("message-hover-{}", message.id));
+        let copy =
+            Self::transcript_copy_button(message, is_user, markdown_source, group.clone(), cx);
         div()
             .id(SharedString::from(format!("message-{}", message.id)))
             .accessibility_id(message.id.clone())
@@ -7223,6 +9182,8 @@ impl SessionMvpView {
             .child(
                 div()
                     .debug_selector(|| "transcript-message".to_owned())
+                    .group(group)
+                    .relative()
                     .when(message.state == TranscriptState::Pending, |bubble| {
                         bubble
                             .debug_selector(|| "pending-steering-message".to_owned())
@@ -7235,18 +9196,28 @@ impl SessionMvpView {
                         // easy to spot while scrolling back through the
                         // transcript, while staying right-aligned with the
                         // agent's output below.
-                        bubble.max_w(relative(0.85))
+                        bubble
+                            .max_w(relative(0.85))
+                            .p_3()
+                            .rounded_lg()
+                            .bg(rgb(ELEVATED))
+                            .border_1()
+                            .border_color(rgb(BORDER))
                     })
-                    .when(!is_user, gpui::Styled::w_full)
+                    .when(!is_user, |message| message.w_full().py_2())
                     .min_w_0()
-                    .p_3()
-                    .rounded_lg()
-                    .bg(if is_user { rgb(ELEVATED) } else { rgb(PANEL) })
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .child(header)
+                    .when(is_user, |bubble| {
+                        bubble.child(div().text_xs().text_color(rgb(BLUE)).child("You"))
+                    })
+                    .when(!message.content.is_empty(), |bubble| bubble.child(copy))
                     .when(!message.content.is_empty(), |bubble| {
-                        bubble.child(div().mt_2().text_color(rgb(PRIMARY)).child(markdown))
+                        bubble.child(
+                            div()
+                                .when(is_user, gpui::Styled::mt_2)
+                                .pr_8()
+                                .text_color(rgb(PRIMARY))
+                                .child(markdown),
+                        )
                     })
                     .when(!attachments.is_empty(), |bubble| {
                         bubble.child(
@@ -7281,6 +9252,154 @@ impl SessionMvpView {
             )
     }
 
+    #[allow(clippy::too_many_lines)]
+    fn permission_entry(
+        &self,
+        interaction_index: usize,
+        record: &app_model::InteractionRecord,
+        snapshot: &SessionSnapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let request = &record.request;
+        let details = (!request.details.is_null()).then(|| {
+            serde_json::to_string_pretty(&request.details)
+                .unwrap_or_else(|_| request.details.to_string())
+        });
+        let status = record.response.as_ref().map(|response| match response {
+            InteractionResponse::Approve
+            | InteractionResponse::ApproveForSession
+            | InteractionResponse::ApproveForLocation
+            | InteractionResponse::ApprovePermanently => "Allowed",
+            InteractionResponse::Reject { .. } => "Denied",
+            InteractionResponse::Cancel => "Cancelled",
+            InteractionResponse::Submit { .. } => "Answered",
+        });
+        let turn = snapshot
+            .transcript
+            .iter()
+            .filter(|message| {
+                message.role == TranscriptRole::User && message.sequence <= record.sequence
+            })
+            .count();
+        let context = if turn == 0 {
+            format!("Session: {}", snapshot.metadata.title)
+        } else {
+            format!("Session: {} · Turn {turn}", snapshot.metadata.title)
+        };
+        let choices = request.choices.iter().enumerate().map(|(index, choice)| {
+            let choice = choice.clone();
+            let response_choice = choice.clone();
+            let session_id = snapshot.metadata.id.clone();
+            let interaction_id = request.id.clone();
+            let description = permission_scope_description(&choice);
+            let selector = format!("permission-scope-{index}");
+            div()
+                .id(("permission-scope", index))
+                .debug_selector({
+                    let selector = selector.clone();
+                    move || selector.clone()
+                })
+                .accessibility_id(selector)
+                .role(Role::Button)
+                .aria_label(format!("{choice}. {description}"))
+                .focusable()
+                .tab_stop(true)
+                .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                .flex()
+                .items_center()
+                .gap_2()
+                .px_3()
+                .py_2()
+                .rounded_md()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .child(div().flex_1().child(choice))
+                .child(div().text_xs().text_color(rgb(MUTED)).child(description))
+                .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                .on_click(cx.listener(move |view, _, _, _| {
+                    let _ = view.commands.send(ServiceCommand::Respond {
+                        app_session_id: session_id.clone(),
+                        interaction_id: interaction_id.clone(),
+                        response: choice_response(InteractionKind::Permission, &response_choice),
+                    });
+                }))
+        });
+
+        div()
+            .id(SharedString::from(format!(
+                "permission-{interaction_index}-{}",
+                request.id
+            )))
+            .debug_selector(|| "permission-entry".to_owned())
+            .accessibility_id(format!("permission-{interaction_index}-{}", request.id))
+            .role(Role::ListItem)
+            .aria_label(format!("Permission required: {}", request.message))
+            .w_full()
+            .p_4()
+            .rounded_lg()
+            .bg(rgb(PANEL))
+            .border_1()
+            .border_color(rgb(AMBER))
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .text_sm()
+                            .font_weight(gpui::FontWeight::BOLD)
+                            .text_color(rgb(AMBER))
+                            .child(request.title.clone()),
+                    )
+                    .when_some(status, |heading, status| {
+                        heading.child(div().text_xs().text_color(rgb(MUTED)).child(status))
+                    }),
+            )
+            .child(div().mt_1().text_xs().text_color(rgb(MUTED)).child(context))
+            .child(
+                div()
+                    .mt_3()
+                    .text_color(rgb(PRIMARY))
+                    .child(request.message.clone()),
+            )
+            .when_some(details, |card, details| {
+                let scroll_id = format!("permission-detail-{}-{}", interaction_index, request.id);
+                let handle = self
+                    .detail_scrolls
+                    .borrow_mut()
+                    .entry(scroll_id.clone())
+                    .or_default()
+                    .clone();
+                card.child(
+                    div()
+                        .id(SharedString::from(scroll_id.clone()))
+                        .debug_selector({
+                            let scroll_id = scroll_id.clone();
+                            move || scroll_id.clone()
+                        })
+                        .accessibility_id(scroll_id.clone())
+                        .role(Role::Document)
+                        .aria_label("Requested action detail")
+                        .mt_3()
+                        .max_h(self.permission_detail_max_height())
+                        .track_scroll(&handle)
+                        .overflow_y_scroll()
+                        .on_scroll_wheel(self.claim_scroll_when_moved(&scroll_id, &handle, cx))
+                        .p_3()
+                        .rounded_md()
+                        .bg(rgb(SUBTLE))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .text_sm()
+                        .child(details),
+                )
+            })
+            .when(record.response.is_none(), |card| {
+                card.child(div().mt_3().flex().flex_col().gap_2().children(choices))
+            })
+    }
+
     fn render_timeline_row(&mut self, index: usize, cx: &mut Context<Self>) -> gpui::AnyElement {
         let Some(item) = self.timeline.items.get(index).cloned() else {
             return div().into_any_element();
@@ -7289,7 +9408,16 @@ impl SessionMvpView {
             return div().into_any_element();
         };
         self.transcript_rows_rendered += 1;
+        let bottom_padding = match item.kind {
+            TimelineItemKind::SessionStart(_) => 0.0,
+            TimelineItemKind::Tool(_) => 4.0,
+            TimelineItemKind::Message(_) | TimelineItemKind::Interaction(_) => 12.0,
+        };
         let content = match item.kind {
+            TimelineItemKind::SessionStart(item) => Some(
+                self.session_start_row(item, &snapshot.metadata)
+                    .into_any_element(),
+            ),
             TimelineItemKind::Message(message_index) => snapshot
                 .transcript
                 .get(message_index)
@@ -7310,13 +9438,20 @@ impl SessionMvpView {
                     self.tool_entry(invocation, &children, cx)
                         .into_any_element()
                 }),
+            TimelineItemKind::Interaction(interaction_index) => snapshot
+                .interaction_history
+                .get(interaction_index)
+                .map(|record| {
+                    self.permission_entry(interaction_index, record, &snapshot, cx)
+                        .into_any_element()
+                }),
         };
         div()
             .id(SharedString::from(format!("timeline-{}", item.id)))
             .w_full()
             .min_w_0()
             .px_5()
-            .pb_3()
+            .pb(px(bottom_padding))
             .child(
                 div()
                     .debug_selector(|| "transcript-content".to_owned())
@@ -7327,6 +9462,89 @@ impl SessionMvpView {
                     .children(content),
             )
             .into_any_element()
+    }
+
+    fn session_start_row(
+        &self,
+        item: SessionStartItem,
+        metadata: &SessionMetadata,
+    ) -> impl IntoElement {
+        let (id, label, detail) = match item {
+            SessionStartItem::CreatingWorktree => ("creating-worktree", "Creating worktree", None),
+            SessionStartItem::WorktreeReady => (
+                "worktree-ready",
+                "Worktree ready",
+                Some(self.display_worktree_path(Path::new(&metadata.project_path))),
+            ),
+            SessionStartItem::CopilotSessionStarted => {
+                ("copilot-session-started", "Copilot session started", None)
+            }
+        };
+        let aria_label = detail
+            .as_ref()
+            .map_or_else(|| label.to_owned(), |detail| format!("{label}: {detail}"));
+        // Recorded as history: these are milestones from the session's actual
+        // creation, not a decoration re-rendered ahead of the transcript, so
+        // they carry the same timestamp as everything else that happened then.
+        let timestamp = format_session_created_at(&metadata.created_at);
+        div()
+            .id(SharedString::from(format!("session-start-{id}")))
+            .debug_selector(move || format!("session-start-{id}"))
+            .role(Role::Status)
+            .aria_label(format!("{aria_label} — {timestamp}"))
+            .flex()
+            .items_center()
+            .gap_3()
+            .py_1()
+            .text_sm()
+            .text_color(rgb(MUTED))
+            .child(div().w(px(18.0)).text_color(rgb(GREEN)).child("✓"))
+            .child(label)
+            .when_some(detail, |row, detail| {
+                row.child(
+                    div()
+                        .min_w_0()
+                        .overflow_hidden()
+                        .text_color(rgb(MUTED))
+                        .child(detail),
+                )
+            })
+            .child(div().flex_1())
+            .child(div().text_xs().text_color(rgb(MUTED)).child(timestamp))
+    }
+
+    fn copy_transcript_selection(
+        &mut self,
+        _: &CopyTranscript,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        let selection = self.transcript_selection.borrow();
+        let Some(text) = selection.selected_text() else {
+            return;
+        };
+        cx.write_to_clipboard(gpui::ClipboardItem::new_string(text));
+    }
+
+    fn resuming_session_placeholder() -> gpui::Stateful<gpui::Div> {
+        div()
+            .id("resuming-session")
+            .debug_selector(|| "resuming-session".to_owned())
+            .role(Role::Status)
+            .aria_label("Resuming session")
+            .flex()
+            .flex_1()
+            .items_center()
+            .justify_center()
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .text_color(rgb(MUTED))
+                    .child(progress_spinner("resuming-session-spinner".into()))
+                    .child("Resuming session…"),
+            )
     }
 
     fn transcript(&mut self, cx: &mut Context<Self>) -> impl IntoElement {
@@ -7362,13 +9580,16 @@ impl SessionMvpView {
                         ),
                 );
         };
-        let _ = session;
+        if session.snapshot.status == SessionStatus::Recovering {
+            return Self::resuming_session_placeholder();
+        }
         self.transcript_rows_rendered = 0;
         let group = SharedString::from("scroll-transcript");
         let view = cx.entity();
         let list_state = self.transcript_list.clone();
         let running_indicator = self.running_indicator();
         let scrollbar = self.transcript_scrollbar(group.clone(), cx);
+        let away_from_tail = self.transcript_is_away_from_tail();
         let transcript = list(list_state, move |index, _, cx| {
             view.update(cx, |view, cx| view.render_timeline_row(index, cx))
         })
@@ -7376,14 +9597,36 @@ impl SessionMvpView {
         .min_h_0()
         .py_5();
 
+        // The fade and the button ride with the rows rather than the whole
+        // frame, so the running indicator below stays legible.
+        let rows = div()
+            .relative()
+            .flex()
+            .flex_col()
+            .flex_1()
+            .min_h_0()
+            .child(transcript)
+            .when(away_from_tail, |rows| {
+                rows.child(Self::transcript_tail_fade())
+                    .child(Self::scroll_to_bottom_button(cx))
+            });
+
         div()
             .id("transcript-frame")
+            .key_context("TranscriptSelection")
+            .track_focus(&self.transcript_selection_focus)
+            .on_action(cx.listener(Self::copy_transcript_selection))
             .group(group)
             .relative()
             .flex()
             .flex_col()
             .flex_1()
             .min_h_0()
+            // A glide is a request for one destination; steering by hand
+            // replaces it, so the two never fight over the scroll position.
+            .on_scroll_wheel(cx.listener(|view, _: &gpui::ScrollWheelEvent, _, _| {
+                view.cancel_scroll_to_bottom();
+            }))
             .child(
                 div()
                     .id("transcript")
@@ -7400,29 +9643,115 @@ impl SessionMvpView {
                             .flex_col()
                             .flex_1()
                             .min_h_0()
-                            .child(transcript)
+                            .child(rows)
                             .children(running_indicator),
                     ),
             )
             .children(scrollbar)
     }
 
+    /// Dims the conversation tail while the transcript is parked above it.
+    ///
+    /// The unread bottom edge fading into the background is what makes "there
+    /// is more below" legible at a glance, before the button is even noticed.
+    fn transcript_tail_fade() -> impl IntoElement {
+        div()
+            .id("transcript-tail-fade")
+            .debug_selector(|| "transcript-tail-fade".to_owned())
+            .absolute()
+            .bottom_0()
+            .left_0()
+            .right_0()
+            .h(px(TRANSCRIPT_TAIL_FADE))
+            // `BACKGROUND` carries no alpha channel, so shift it into place and
+            // fade from fully transparent to the surface behind the transcript.
+            .bg(gpui::linear_gradient(
+                180.0,
+                gpui::linear_color_stop(gpui::rgba(BACKGROUND << 8), 0.0),
+                gpui::linear_color_stop(gpui::rgba((BACKGROUND << 8) | 0xff), 0.85),
+            ))
+    }
+
+    /// The affordance that returns the transcript to the newest output.
+    fn scroll_to_bottom_button(cx: &mut Context<Self>) -> impl IntoElement + use<> {
+        div()
+            .absolute()
+            .bottom(px(12.0))
+            .left_0()
+            .right_0()
+            .flex()
+            .justify_center()
+            .child(
+                div()
+                    .id("scroll-to-bottom")
+                    .debug_selector(|| "scroll-to-bottom".to_owned())
+                    .accessibility_id("scroll-to-bottom")
+                    .role(Role::Button)
+                    .aria_label("Scroll to newest output")
+                    .focusable()
+                    .tab_stop(true)
+                    .focus_visible(|style| style.border_color(rgb(BLUE)))
+                    .w(px(32.0))
+                    .h(px(32.0))
+                    .flex()
+                    .items_center()
+                    .justify_center()
+                    .rounded_full()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .bg(rgb(ELEVATED))
+                    .text_color(rgb(MUTED))
+                    .child("↓")
+                    .hover(|style| {
+                        style
+                            .bg(rgb(BORDER))
+                            .text_color(rgb(PRIMARY))
+                            .cursor_pointer()
+                    })
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.scroll_transcript_to_bottom(cx);
+                    })),
+            )
+    }
+
     /// Running state at the conversation tail, where the user is already
     /// watching for the next activity.
+    ///
+    /// One row carries everything about the running turn: the spinner, the
+    /// elapsed time, and what the agent is currently doing.
     fn running_indicator(&self) -> Option<impl IntoElement + use<>> {
         let session = self.selected()?;
-        let running_since = session.running_since?;
-        if !session_is_running(session.snapshot.status) {
+        if !matches!(
+            session.snapshot.status,
+            SessionStatus::Running | SessionStatus::Starting
+        ) {
             return None;
         }
-        let elapsed = running_since.elapsed().as_secs();
+        let elapsed = session
+            .snapshot
+            .diagnostics
+            .turn_started_at
+            .as_deref()
+            .and_then(elapsed_since_timestamp)
+            .or_else(|| self.running_since.get(session.id()).map(Instant::elapsed))
+            .or_else(|| session.running_since.map(|since| since.elapsed()))
+            .unwrap_or_default();
+        let diagnostics = &session.snapshot.diagnostics;
+        let label = diagnostics
+            .latest_intent
+            .as_ref()
+            .or(diagnostics.activity.as_ref())
+            .map_or("Agent is working", String::as_str)
+            .to_owned();
+        let elapsed_label = format_elapsed(elapsed);
+
         Some(
             div()
-                .id("running-indicator")
-                .debug_selector(|| "running-indicator".to_owned())
+                .id("running-activity")
+                .debug_selector(|| "running-activity".to_owned())
                 .accessibility_id("running-indicator")
                 .role(Role::Status)
-                .aria_label(format!("Agent running, {elapsed} seconds"))
+                .aria_label(format!("{label}, {elapsed_label}"))
                 .mx_auto()
                 .w_full()
                 .max_w(px(CONVERSATION_COLUMN_WIDTH))
@@ -7433,8 +9762,27 @@ impl SessionMvpView {
                 .pb_3()
                 .text_xs()
                 .text_color(rgb(MUTED))
-                .child(progress_spinner("running-indicator-spinner".into()))
-                .child(format!("{elapsed}s")),
+                .child(
+                    div()
+                        .id("running-indicator")
+                        .debug_selector(|| "running-indicator".to_owned())
+                        .flex()
+                        .items_center()
+                        .child(progress_spinner("running-indicator-spinner".into())),
+                )
+                .child(
+                    div()
+                        .id("running-elapsed")
+                        .debug_selector(|| "running-elapsed".to_owned())
+                        .text_color(rgb(GREEN))
+                        .child(elapsed_label),
+                )
+                .child(
+                    div()
+                        .id("running-intent")
+                        .debug_selector(|| "running-intent".to_owned())
+                        .child(label),
+                ),
         )
     }
 
@@ -7467,6 +9815,11 @@ impl SessionMvpView {
                 .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
                 .on_click(cx.listener(move |view, _, _, cx| {
                     view.active_panel = panel;
+                    if panel == SessionPanel::Changes {
+                        view.refresh_selected_changes(false, cx);
+                    } else {
+                        view.base_menu_visibility = SettingsVisibility::Closed;
+                    }
                     cx.notify();
                 }))
         });
@@ -7518,33 +9871,208 @@ impl SessionMvpView {
     }
 
     #[allow(clippy::too_many_lines)]
+    fn changes_base_controls(
+        &self,
+        snapshot: &SessionSnapshot,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let selected = snapshot.metadata.base_ref.as_deref().unwrap_or("HEAD");
+        let resolved = snapshot.changes.tracking_ref.as_deref().unwrap_or(selected);
+        let commit = snapshot
+            .changes
+            .base
+            .as_deref()
+            .map_or("unresolved", |commit| &commit[..commit.len().min(8)]);
+        let default = self.base_default_ref.clone();
+        let options = self
+            .base_ref_options
+            .iter()
+            .enumerate()
+            .map(|(index, reference)| {
+                let value = reference.clone();
+                let is_selected = reference == selected;
+                div()
+                    .id(("changes-base-option", index))
+                    .debug_selector({
+                        let selector = format!("changes-base-option-{index}");
+                        move || selector.clone()
+                    })
+                    .accessibility_id(format!("changes-base-option-{index}"))
+                    .role(Role::Button)
+                    .aria_label(reference.clone())
+                    .aria_selected(is_selected)
+                    .focusable()
+                    .tab_stop(true)
+                    .px_3()
+                    .py_2()
+                    .rounded_md()
+                    .w_full()
+                    .min_w_0()
+                    .truncate()
+                    .when(is_selected, |row| row.bg(rgb(ELEVATED)))
+                    .child(reference.clone())
+                    .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                    .on_click(cx.listener(move |view, _, _, cx| {
+                        view.set_changes_base(value.clone(), cx);
+                    }))
+            });
+
+        div()
+            .id("changes-base-controls")
+            .relative()
+            .flex()
+            .items_center()
+            .gap_2()
+            .child(
+                div()
+                    .id("changes-base")
+                    .debug_selector(|| "changes-base".to_owned())
+                    .accessibility_id("changes-base")
+                    .role(Role::ComboBox)
+                    .aria_label("Change comparison base")
+                    .aria_value(selected)
+                    .aria_expanded(self.base_menu_visibility == SettingsVisibility::Open)
+                    .focusable()
+                    .tab_stop(true)
+                    .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .child("Base")
+                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                    .on_click(cx.listener(|view, _, _, cx| view.toggle_base_menu(cx))),
+            )
+            .child(
+                div()
+                    .id("changes-refresh")
+                    .debug_selector(|| "changes-refresh".to_owned())
+                    .accessibility_id("changes-refresh")
+                    .role(Role::Button)
+                    .aria_label("Refresh changes and base branch")
+                    .focusable()
+                    .tab_stop(true)
+                    .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                    .px_2()
+                    .py_1()
+                    .rounded_md()
+                    .child("\u{21bb}")
+                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.refresh_selected_changes(true, cx);
+                    })),
+            )
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child(format!("{selected} \u{2192} {resolved} @ {commit}")),
+            )
+            .when(
+                self.base_menu_visibility == SettingsVisibility::Open,
+                |controls| {
+                    controls.child(
+                        deferred(
+                            div()
+                                .id("changes-base-menu")
+                                .accessibility_id("changes-base-menu")
+                                .role(Role::ListBox)
+                                .aria_label("Comparison base branches")
+                                .occlude()
+                                .absolute()
+                                .top(px(34.0))
+                                .left_0()
+                                .w(px(320.0))
+                                .max_h(px(360.0))
+                                .overflow_y_scroll()
+                                .flex()
+                                .flex_col()
+                                .gap_1()
+                                .p_2()
+                                .rounded_lg()
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .bg(rgb(PANEL))
+                                .shadow_lg()
+                                .when_some(default, |menu, default| {
+                                    let value = default.clone();
+                                    menu.child(
+                                        div()
+                                            .id("changes-base-reset")
+                                            .debug_selector(|| "changes-base-reset".to_owned())
+                                            .accessibility_id("changes-base-reset")
+                                            .role(Role::Button)
+                                            .aria_label(format!("Reset to default base {default}"))
+                                            .focusable()
+                                            .tab_stop(true)
+                                            .w_full()
+                                            .min_w_0()
+                                            .px_3()
+                                            .py_2()
+                                            .rounded_md()
+                                            .truncate()
+                                            .text_color(rgb(BLUE))
+                                            .child(format!("Reset to default ({default})"))
+                                            .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
+                                            .on_click(cx.listener(move |view, _, _, cx| {
+                                                view.set_changes_base(value.clone(), cx);
+                                            })),
+                                    )
+                                })
+                                .children(options),
+                        )
+                        .with_priority(1),
+                    )
+                },
+            )
+    }
+
+    #[allow(clippy::too_many_lines)]
     fn changes_panel(
         &self,
         snapshot: &SessionSnapshot,
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let changes = &snapshot.changes;
+        let controls = self.changes_base_controls(snapshot, cx).into_any_element();
         if let Some(error) = &changes.error {
             return div()
-                .id("changes-error")
-                .role(Role::Alert)
-                .aria_label(error.clone())
-                .text_sm()
-                .text_color(rgb(RED))
-                .child(error.clone())
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(controls)
+                .child(
+                    div()
+                        .id("changes-error")
+                        .role(Role::Alert)
+                        .aria_label(error.clone())
+                        .text_sm()
+                        .text_color(rgb(RED))
+                        .child(error.clone()),
+                )
                 .into_any_element();
         }
         if changes.is_empty() {
             return div()
-                .id("changes-empty")
-                .role(Role::Status)
-                .aria_label("No changes")
-                .text_sm()
-                .text_color(rgb(MUTED))
-                .child(format!(
-                    "No changes against {}.",
-                    changes.base_label.as_deref().unwrap_or("base")
-                ))
+                .flex()
+                .flex_col()
+                .gap_2()
+                .child(controls)
+                .child(
+                    div()
+                        .id("changes-empty")
+                        .role(Role::Status)
+                        .aria_label("No changes")
+                        .text_sm()
+                        .text_color(rgb(MUTED))
+                        .child(format!(
+                            "No changes against {}.",
+                            changes.base_label.as_deref().unwrap_or("base")
+                        )),
+                )
                 .into_any_element();
         }
 
@@ -7557,6 +10085,7 @@ impl SessionMvpView {
             .or_default()
             .clone();
         let group = SharedString::from("scroll-changes");
+        let claim_scroll = self.claim_scroll_when_moved(CHANGES_SCROLL_ID, &handle, cx);
         let mut entries = Vec::with_capacity(changes.files.len());
         for file in &changes.files {
             entries.push(self.change_entry(&session_id, file, cx).into_any_element());
@@ -7569,6 +10098,7 @@ impl SessionMvpView {
             .flex_1()
             .min_h_0()
             .gap_2()
+            .child(controls)
             .child(
                 div()
                     .id("changes-summary")
@@ -7615,6 +10145,7 @@ impl SessionMvpView {
                             .gap_1()
                             .pr_2()
                             .overflow_y_scroll()
+                            .on_scroll_wheel(claim_scroll)
                             .children(entries),
                     )
                     .children(scrollbar),
@@ -7691,6 +10222,15 @@ impl SessionMvpView {
             .clone()
     }
 
+    const fn change_status_color(status: ChangeStatus) -> u32 {
+        match status {
+            ChangeStatus::Added | ChangeStatus::Untracked => GREEN,
+            ChangeStatus::Deleted => RED,
+            ChangeStatus::Renamed => BLUE,
+            ChangeStatus::Modified => MUTED,
+        }
+    }
+
     /// A changed file row plus, when expanded, its complete diff in flow.
     fn change_entry(
         &self,
@@ -7713,12 +10253,7 @@ impl SessionMvpView {
             format!("Expand diff for {path}")
         };
         let selector_path = path.clone();
-        let status_color = match file.status {
-            ChangeStatus::Added | ChangeStatus::Untracked => rgb(GREEN),
-            ChangeStatus::Deleted => rgb(RED),
-            ChangeStatus::Renamed => rgb(BLUE),
-            ChangeStatus::Modified => rgb(MUTED),
-        };
+        let status_color = rgb(Self::change_status_color(file.status));
 
         div()
             .id(SharedString::from(format!("change-entry-{path}")))
@@ -7800,16 +10335,73 @@ impl SessionMvpView {
                         cx.notify();
                     })),
             )
-            .when(expanded, |entry| entry.child(Self::change_diff(file)))
+            .when(expanded, |entry| {
+                entry.child(self.change_diff(session_id, file))
+            })
+    }
+
+    fn change_diff_document(&self, session_id: &str, file: &ChangedFile) -> Arc<DiffDocument> {
+        let key = format!("{session_id}\u{1f}{}", file.path);
+        let (body, muted) = Self::change_diff_text(file);
+        let mut cache = self.diff_cache.borrow_mut();
+
+        if let Some(document) = cache.documents.get(&key)
+            && document.source.as_ref() == body
+            && document.muted == muted
+        {
+            return Arc::clone(document);
+        }
+
+        let highlights = if muted {
+            Vec::new()
+        } else {
+            syntax::diff_highlights(Path::new(&file.path), &body).unwrap_or_else(|error| {
+                tracing::warn!(
+                    path = %file.path,
+                    %error,
+                    "failed to syntax-highlight diff"
+                );
+                Vec::new()
+            })
+        };
+        let lines = diff_lines(&body, &highlights);
+        let document = Arc::new(DiffDocument {
+            source: body.into(),
+            lines,
+            muted,
+        });
+
+        if !cache.documents.contains_key(&key) {
+            if cache.documents.len() == DIFF_CACHE_CAPACITY
+                && let Some(evicted) = cache.order.pop_front()
+            {
+                cache.documents.remove(&evicted);
+            }
+            cache.order.push_back(key.clone());
+        }
+        cache.documents.insert(key, Arc::clone(&document));
+        document
     }
 
     /// A file's complete diff, laid out in the panel's own scroll flow.
     ///
     /// Only the horizontal axis scrolls here: a vertical scroller would trap
     /// the wheel and give the panel a second competing scrollbar.
-    fn change_diff(file: &ChangedFile) -> impl IntoElement {
+    fn change_diff(&self, session_id: &str, file: &ChangedFile) -> impl IntoElement {
         let path = file.path.clone();
-        let (body, muted) = Self::change_diff_text(file);
+        let document = self.change_diff_document(session_id, file);
+        let body = div()
+            .flex()
+            .flex_col()
+            .min_w_full()
+            .children(document.lines.iter().map(|line| {
+                let text =
+                    StyledText::new(line.source.clone()).with_highlights(line.highlights.clone());
+                div()
+                    .min_w_full()
+                    .when_some(line.background, |row, color| row.bg(gpui::rgba(color)))
+                    .child(text)
+            }));
 
         div()
             .id(SharedString::from(format!("change-diff-{path}")))
@@ -7835,7 +10427,12 @@ impl SessionMvpView {
             // Without this a vertical wheel over a diff is remapped onto the
             // horizontal axis instead of scrolling the panel.
             .restrict_scroll_to_axis()
-            .text_color(if muted { rgb(MUTED) } else { rgb(PRIMARY) })
+            .on_scroll_wheel(Self::claim_horizontal_scroll)
+            .text_color(if document.muted {
+                rgb(MUTED)
+            } else {
+                rgb(PRIMARY)
+            })
             .child(body)
     }
 
@@ -8045,7 +10642,320 @@ impl SessionMvpView {
     }
 
     #[allow(clippy::too_many_lines)]
-    fn session_composer(&self, cx: &mut Context<Self>) -> impl IntoElement {
+    fn diagnostics_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        if self.diagnostics_visibility != SettingsVisibility::Open {
+            return None;
+        }
+        let session = self.selected()?;
+        let snapshot = &session.snapshot;
+        let diagnostics = &snapshot.diagnostics;
+        let elapsed = self
+            .selected()
+            .and_then(|session| {
+                session
+                    .snapshot
+                    .diagnostics
+                    .turn_started_at
+                    .as_deref()
+                    .and_then(elapsed_since_timestamp)
+            })
+            .or_else(|| self.running_since.get(session.id()).map(Instant::elapsed))
+            .unwrap_or_default();
+        let silence = diagnostics
+            .last_event_at
+            .as_deref()
+            .and_then(elapsed_since_timestamp)
+            .or_else(|| {
+                self.last_event_seen
+                    .get(session.id())
+                    .map(|(_, seen_at)| seen_at.elapsed())
+            })
+            .unwrap_or_default();
+        let active_tools: Vec<_> = snapshot
+            .tool_activity
+            .invocations
+            .iter()
+            .filter(|invocation| invocation.state == app_model::InvocationState::Running)
+            .map(|invocation| {
+                diagnostic_field(
+                    invocation.tool_name.clone(),
+                    format!("{} · running", invocation.summary_line()),
+                )
+            })
+            .collect();
+        let event_counts: Vec<_> = diagnostics
+            .event_counts
+            .iter()
+            .map(|(event_type, count)| diagnostic_field(event_type.clone(), count.to_string()))
+            .collect();
+        let recent_events: Vec<_> = diagnostics
+            .recent_events
+            .iter()
+            .rev()
+            .map(|event| {
+                diagnostic_field(
+                    format!("#{} {}", event.sequence, event.event_type),
+                    event.summary.clone(),
+                )
+            })
+            .collect();
+        let usage = diagnostics.last_usage.as_ref().map(|usage| {
+            format!(
+                "{} · {} ms · {} input / {} output tokens · {} cached",
+                usage.model.as_deref().unwrap_or("unknown model"),
+                usage.duration_ms.unwrap_or_default(),
+                usage.input_tokens.unwrap_or_default(),
+                usage.output_tokens.unwrap_or_default(),
+                usage.cache_read_tokens.unwrap_or_default(),
+            )
+        });
+        let compaction = diagnostics.compaction.as_ref().map(|compaction| {
+            format!(
+                "{} / {} tokens · trigger {}",
+                compaction.current_tokens.unwrap_or_default(),
+                compaction.token_limit.unwrap_or_default(),
+                compaction.trigger.as_deref().unwrap_or("unknown"),
+            )
+        });
+
+        let (provider_status, provider_color) = self.provider_status();
+
+        Some(
+            div()
+                .id("diagnostics-dialog")
+                .debug_selector(|| "diagnostics-dialog".to_owned())
+                .accessibility_id("diagnostics-dialog")
+                .role(Role::Dialog)
+                .aria_label("Agent diagnostics")
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0000_00a8))
+                .child(
+                    div()
+                        .id("diagnostics-panel")
+                        .w(px(720.0))
+                        .max_h(px(720.0))
+                        .overflow_hidden()
+                        .flex()
+                        .flex_col()
+                        .rounded_lg()
+                        .bg(rgb(PANEL))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .flex()
+                                .items_center()
+                                .justify_between()
+                                .p_5()
+                                .border_b_1()
+                                .border_color(rgb(BORDER))
+                                .child(
+                                    div()
+                                        .id("diagnostics-heading")
+                                        .role(Role::Heading)
+                                        .aria_level(2)
+                                        .text_xl()
+                                        .font_weight(gpui::FontWeight::BOLD)
+                                        .child("Agent diagnostics"),
+                                )
+                                .child(
+                                    div()
+                                        .id("diagnostics-close")
+                                        .debug_selector(|| "diagnostics-close".to_owned())
+                                        .accessibility_id("diagnostics-close")
+                                        .role(Role::Button)
+                                        .aria_label("Close agent diagnostics")
+                                        .focusable()
+                                        .tab_stop(true)
+                                        .px_3()
+                                        .py_1()
+                                        .rounded_md()
+                                        .bg(rgb(ELEVATED))
+                                        .child("Close")
+                                        .hover(|style| style.opacity(0.85).cursor_pointer())
+                                        .on_click(cx.listener(|view, _, _, cx| {
+                                            view.diagnostics_visibility =
+                                                SettingsVisibility::Closed;
+                                            cx.notify();
+                                        })),
+                                ),
+                        )
+                        .child(
+                            div()
+                                .id("diagnostics-content")
+                                .p_5()
+                                .flex()
+                                .flex_1()
+                                .flex_col()
+                                .min_h_0()
+                                .gap_4()
+                                .overflow_y_scroll()
+                                .child(diagnostic_section(
+                                    "Connection",
+                                    vec![
+                                        div()
+                                            .id("provider-status")
+                                            .role(Role::Status)
+                                            .aria_label(provider_status.clone())
+                                            .text_color(rgb(provider_color))
+                                            .child(provider_status)
+                                            .into_any_element(),
+                                    ],
+                                ))
+                                .child(diagnostic_section(
+                                    "Current activity",
+                                    vec![
+                                        diagnostic_field(
+                                            "Status",
+                                            format!("{:?}", snapshot.status),
+                                        ),
+                                        diagnostic_field("Elapsed", format_elapsed(elapsed)),
+                                        diagnostic_field(
+                                            "Current activity",
+                                            diagnostics.activity.clone().unwrap_or_else(|| {
+                                                "No active SDK phase".to_owned()
+                                            }),
+                                        ),
+                                        diagnostic_field(
+                                            "Assistant intent",
+                                            diagnostics
+                                                .latest_intent
+                                                .clone()
+                                                .unwrap_or_else(|| "Not reported".to_owned()),
+                                        ),
+                                        diagnostic_field(
+                                            "Model / turn",
+                                            format!(
+                                                "{} / {}",
+                                                diagnostics.model.as_deref().unwrap_or("unknown"),
+                                                diagnostics.turn_id.as_deref().unwrap_or("unknown")
+                                            ),
+                                        ),
+                                        diagnostic_field(
+                                            "Last SDK event",
+                                            format!(
+                                                "{} · {} ago",
+                                                diagnostics
+                                                    .last_event_type
+                                                    .as_deref()
+                                                    .unwrap_or("none"),
+                                                format_elapsed(silence)
+                                            ),
+                                        ),
+                                        diagnostic_field(
+                                            "Response stream",
+                                            diagnostics.response_bytes.map_or_else(
+                                                || "No byte count reported".to_owned(),
+                                                |bytes| format!("{bytes} bytes received"),
+                                            ),
+                                        ),
+                                    ],
+                                ))
+                                .when_some(compaction, |content, value| {
+                                    content.child(diagnostic_section(
+                                        "Context compaction",
+                                        vec![diagnostic_field("In progress", value)],
+                                    ))
+                                })
+                                .when_some(usage, |content, value| {
+                                    content.child(diagnostic_section(
+                                        "Latest model call",
+                                        vec![diagnostic_field("Usage", value)],
+                                    ))
+                                })
+                                .when(!active_tools.is_empty(), |content| {
+                                    content.child(diagnostic_section("Active tools", active_tools))
+                                })
+                                .child(diagnostic_section("SDK event counts", event_counts))
+                                .child(diagnostic_section(
+                                    "Recent progress signals",
+                                    recent_events,
+                                )),
+                        ),
+                ),
+        )
+    }
+
+    fn unavailable_session_notice(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        let session = self.selected().expect("selected session");
+        let app_session_id = session.id().to_owned();
+        let locate_id = app_session_id.clone();
+        let delete_id = app_session_id.clone();
+        let retry_id = app_session_id.clone();
+        let working_directory = PathBuf::from(&session.snapshot.metadata.project_path);
+        let worktrees_root = self
+            .worktree_configuration
+            .settings
+            .owning_root_for_worktree(
+                &working_directory,
+                &self.worktree_configuration.default_root,
+            );
+        let can_recreate = worktrees_root.is_some() && session.snapshot.changes.branch.is_some();
+
+        div()
+            .id("session-unavailable")
+            .debug_selector(|| "session-unavailable".to_owned())
+            .accessibility_id("session-unavailable")
+            .role(Role::Status)
+            .aria_label("Session working directory unavailable")
+            .mx_auto()
+            .mb_4()
+            .w_full()
+            .max_w(px(CONVERSATION_COLUMN_WIDTH))
+            .flex()
+            .items_center()
+            .gap_3()
+            .p_3()
+            .rounded_lg()
+            .border_1()
+            .border_color(rgb(BORDER))
+            .bg(rgb(PANEL))
+            .child(
+                div()
+                    .flex_1()
+                    .min_w_0()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child("Worktree unavailable")
+                    .child(
+                        div()
+                            .text_xs()
+                            .text_color(rgb(MUTED))
+                            .child("Stored history is available read-only."),
+                    ),
+            )
+            .when(can_recreate, |notice| {
+                notice.child(action_button("Recreate", GREEN, cx, move |view, _| {
+                    view.action_error = None;
+                    let _ = view.commands.send(ServiceCommand::Resume {
+                        app_session_id: retry_id.clone(),
+                        worktrees_root: worktrees_root.clone(),
+                    });
+                }))
+            })
+            .child(action_button("Locate folder", BLUE, cx, move |view, cx| {
+                view.locate_session(locate_id.clone(), cx);
+            }))
+            .child(action_button("Delete session", RED, cx, move |view, cx| {
+                view.delete_session(delete_id.clone(), cx);
+            }))
+            .into_any_element()
+    }
+
+    #[allow(clippy::too_many_lines)]
+    fn session_composer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
+        if self
+            .selected()
+            .is_some_and(|session| session.snapshot.status == SessionStatus::Unavailable)
+        {
+            return self.unavailable_session_notice(cx);
+        }
         let mode = title_case(&self.draft_mode);
         let effort = effort_label(&self.draft_effort);
         let model = self.draft_model_label();
@@ -8053,12 +10963,7 @@ impl SessionMvpView {
         let supports_reasoning = !self.effort_options().is_empty();
         let context_control = self.context_control(cx);
         let selected = self.selected();
-        let running = selected.is_some_and(|session| {
-            matches!(
-                session.snapshot.status,
-                SessionStatus::Running | SessionStatus::Starting
-            )
-        });
+        let running = selected.is_some_and(|session| session.snapshot.status.is_busy());
         let has_draft =
             !self.composer.read(cx).value().trim().is_empty() || !self.draft_attachments.is_empty();
         let stops_running_session = running && !has_draft;
@@ -8159,6 +11064,36 @@ impl SessionMvpView {
                     .child(div().flex_1())
                     .child(
                         div()
+                            .id("open-diagnostics")
+                            .debug_selector(|| "open-diagnostics".to_owned())
+                            .accessibility_id("open-diagnostics")
+                            .role(Role::Button)
+                            .aria_label("Open agent diagnostics")
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                            .w(px(32.0))
+                            .h(px(32.0))
+                            .flex()
+                            .items_center()
+                            .justify_center()
+                            .rounded_full()
+                            .bg(rgb(ELEVATED))
+                            .text_color(rgb(MUTED))
+                            .child("?")
+                            .hover(|style| {
+                                style
+                                    .bg(rgb(BORDER))
+                                    .text_color(rgb(PRIMARY))
+                                    .cursor_pointer()
+                            })
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.diagnostics_visibility = SettingsVisibility::Open;
+                                cx.notify();
+                            })),
+                    )
+                    .child(
+                        div()
                             .id(action_id)
                             .debug_selector(move || action_id.to_owned())
                             .accessibility_id(action_id)
@@ -8219,12 +11154,14 @@ impl SessionMvpView {
                                     .on_click(cx.listener(move |view, _, _, _| {
                                         let _ = view.commands.send(ServiceCommand::Resume {
                                             app_session_id: id.clone(),
+                                            worktrees_root: None,
                                         });
                                     })),
                             )
                         })
                     }),
             )
+            .into_any_element()
     }
 
     #[allow(clippy::too_many_lines)]
@@ -8424,7 +11361,41 @@ impl SessionMvpView {
                                         cx.notify();
                                     })),
                             )
-                            .child(format!("⌁ {branch}"))
+                            .when(
+                                self.draft_location == SessionLocation::NewWorktree,
+                                |strip| {
+                                    strip.child(
+                                        div()
+                                            .id("base-branch-pill")
+                                            .debug_selector(|| "base-branch-pill".to_owned())
+                                            .accessibility_id("base-branch-pill")
+                                            .role(Role::ComboBox)
+                                            .aria_label("Base branch")
+                                            .aria_value(branch.clone())
+                                            .aria_expanded(
+                                                self.open_control_menu == Some(ControlMenu::Base),
+                                            )
+                                            .focusable()
+                                            .tab_stop(true)
+                                            .focus_visible(|style| {
+                                                style.border_1().border_color(rgb(BLUE))
+                                            })
+                                            .px_2()
+                                            .py_1()
+                                            .rounded_md()
+                                            .child(format!("⌁ {branch}"))
+                                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                                            .on_click(cx.listener(|view, _, _, cx| {
+                                                view.toggle_control_menu(ControlMenu::Base);
+                                                cx.notify();
+                                            })),
+                                    )
+                                },
+                            )
+                            .when(
+                                self.draft_location != SessionLocation::NewWorktree,
+                                |strip| strip.child(format!("⌁ {branch}")),
+                            )
                     })
                     .child(div().flex_1())
                     .child(
@@ -8453,9 +11424,75 @@ impl SessionMvpView {
             )
     }
 
+    fn session_launch_progress(&self, progress: SessionLaunchProgress) -> impl IntoElement {
+        let ready_path = match progress {
+            SessionLaunchProgress::CreatingWorktree => None,
+            SessionLaunchProgress::WorktreeReady(path) => Some(self.display_worktree_path(&path)),
+        };
+        div()
+            .id("session-launch-progress")
+            .role(Role::Status)
+            .aria_label(if ready_path.is_some() {
+                "Worktree created; starting Copilot session"
+            } else {
+                "Creating worktree"
+            })
+            .w_full()
+            .max_w(px(CONVERSATION_COLUMN_WIDTH))
+            .flex()
+            .flex_col()
+            .gap_3()
+            .child(
+                div()
+                    .id("launch-creating-worktree")
+                    .debug_selector(|| "launch-creating-worktree".to_owned())
+                    .flex()
+                    .items_center()
+                    .gap_3()
+                    .text_color(rgb(MUTED))
+                    .child(if ready_path.is_some() {
+                        div()
+                            .w(px(18.0))
+                            .text_color(rgb(GREEN))
+                            .child("✓")
+                            .into_any_element()
+                    } else {
+                        progress_spinner("launch-worktree-spinner".into()).into_any_element()
+                    })
+                    .child("Creating worktree..."),
+            )
+            .when_some(ready_path, |column, path| {
+                column
+                    .child(
+                        div()
+                            .id("launch-worktree-ready")
+                            .debug_selector(|| "launch-worktree-ready".to_owned())
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .text_color(rgb(MUTED))
+                            .child(div().w(px(18.0)).text_color(rgb(GREEN)).child("✓"))
+                            .child("Worktree ready")
+                            .child(div().min_w_0().overflow_hidden().child(path)),
+                    )
+                    .child(
+                        div()
+                            .id("launch-copilot-session")
+                            .debug_selector(|| "launch-copilot-session".to_owned())
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .text_color(rgb(MUTED))
+                            .child(progress_spinner("launch-session-spinner".into()))
+                            .child("Starting Copilot session..."),
+                    )
+            })
+    }
+
     #[allow(clippy::too_many_lines)]
     fn home(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
-        let (provider_status, provider_color) = self.provider_status();
+        let launch = self.session_launch.clone();
+        let launching = launch.is_some();
 
         div()
             .id("home")
@@ -8470,47 +11507,45 @@ impl SessionMvpView {
             .pb_6()
             .child(
                 div()
-                    .id("provider-status")
-                    .role(Role::Status)
-                    .aria_label(provider_status.clone())
-                    .absolute()
-                    .top(px(20.0))
-                    .right(px(24.0))
-                    .text_xs()
-                    .text_color(rgb(provider_color))
-                    .child(provider_status),
-            )
-            .child(
-                div()
                     .flex()
                     .flex_col()
                     .items_center()
                     .w_full()
                     .pt(if compact { px(92.0) } else { px(118.0) })
-                    .child(
-                        div()
-                            .id("gcabb-mark")
-                            .w(px(72.0))
-                            .h(px(72.0))
-                            .mb_10()
-                            .rounded_full()
-                            .flex()
-                            .items_center()
-                            .justify_center()
-                            .bg(rgb(MUTED))
-                            .text_color(rgb(BACKGROUND))
-                            .text_xl()
-                            .font_weight(gpui::FontWeight::BOLD)
-                            .child("GC"),
-                    )
-                    .child(self.home_composer(cx)),
+                    .when(!launching, |column| {
+                        column.child(
+                            div()
+                                .id("gcabb-mark")
+                                .w(px(72.0))
+                                .h(px(72.0))
+                                .mb_10()
+                                .rounded_full()
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .bg(rgb(MUTED))
+                                .text_color(rgb(BACKGROUND))
+                                .text_xl()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child("GC"),
+                        )
+                    })
+                    .when_some(launch, |column, launch| {
+                        column.child(self.session_launch_progress(launch))
+                    })
+                    .when(!launching, |column| column.child(self.home_composer(cx))),
             )
     }
 
     #[allow(clippy::too_many_lines)]
-    fn interaction_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+    fn interaction_prompt(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let session = self.selected()?;
-        let interaction = session.snapshot.pending_interactions.first()?.clone();
+        let interaction = session
+            .snapshot
+            .pending_interactions
+            .iter()
+            .find(|interaction| interaction.kind != InteractionKind::Permission)?
+            .clone();
         let app_session_id = session.id().to_owned();
         let interaction_id = interaction.id.clone();
         let reject = interaction_id.clone();
@@ -8525,20 +11560,33 @@ impl SessionMvpView {
                 let kind = interaction.kind;
                 let id = interaction_id.clone();
                 let session_id = app_session_id.clone();
+                let selector = format!("interaction-choice-{index}");
                 div()
                     .id(("interaction-choice", index))
-                    .accessibility_id(format!("interaction-choice-{index}"))
+                    .debug_selector({
+                        let selector = selector.clone();
+                        move || selector.clone()
+                    })
+                    .accessibility_id(selector)
                     .role(Role::Button)
                     .aria_label(choice.clone())
                     .focusable()
                     .tab_stop(true)
                     .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                    .flex()
+                    .items_center()
+                    .gap_2()
                     .px_3()
                     .py_2()
                     .rounded_md()
-                    .border_1()
-                    .border_color(rgb(BORDER))
-                    .child(choice.clone())
+                    .when(index == 0, |row| row.bg(rgb(SUBTLE)))
+                    .child(
+                        div()
+                            .w(px(28.0))
+                            .text_color(rgb(MUTED))
+                            .child(format!("{}.", index + 1)),
+                    )
+                    .child(div().flex_1().child(choice.clone()))
                     .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                     .on_click(cx.listener(move |view, _, _, _| {
                         let _ = view.commands.send(ServiceCommand::Respond {
@@ -8556,40 +11604,45 @@ impl SessionMvpView {
             .collect::<Vec<_>>();
         Some(
             div()
-                .id("interaction-dialog")
-                .accessibility_id("interaction-dialog")
-                .role(Role::Dialog)
+                .id("interaction-prompt")
+                .debug_selector(|| "interaction-prompt".to_owned())
+                .accessibility_id("interaction-prompt")
+                .role(Role::Group)
                 .aria_label(interaction.title.clone())
-                .absolute()
-                .inset_0()
-                .flex()
-                .items_center()
-                .justify_center()
-                .bg(gpui::rgba(0x0000_00a8))
+                .w_full()
+                .px_5()
+                .pb_3()
                 .child(
                     div()
                         .id("interaction-panel")
-                        .w(px(560.0))
+                        .mx_auto()
+                        .w_full()
+                        .max_w(px(CONVERSATION_COLUMN_WIDTH))
                         .flex()
                         .flex_col()
                         .gap_3()
-                        .p_5()
+                        .p_4()
                         .rounded_lg()
                         .bg(rgb(PANEL))
                         .border_1()
                         .border_color(rgb(BORDER))
-                        .shadow_lg()
                         .child(
                             div()
                                 .id("interaction-heading")
                                 .role(Role::Heading)
                                 .aria_level(2)
                                 .aria_label(interaction.title.clone())
-                                .text_xl()
-                                .font_weight(gpui::FontWeight::BOLD)
+                                .text_lg()
+                                .font_weight(gpui::FontWeight::SEMIBOLD)
                                 .child(interaction.title),
                         )
                         .when(interaction.kind == InteractionKind::Permission, |dialog| {
+                            let handle = self
+                                .detail_scrolls
+                                .borrow_mut()
+                                .entry(PERMISSION_DETAIL_SCROLL_ID.to_owned())
+                                .or_default()
+                                .clone();
                             dialog.child(
                                 div()
                                     .flex()
@@ -8603,6 +11656,19 @@ impl SessionMvpView {
                                     )
                                     .child(
                                         div()
+                                            .id("permission-detail")
+                                            .debug_selector(|| "permission-detail".to_owned())
+                                            .accessibility_id("permission-detail")
+                                            .role(Role::Document)
+                                            .aria_label("Requested action detail")
+                                            .max_h(self.permission_detail_max_height())
+                                            .track_scroll(&handle)
+                                            .overflow_y_scroll()
+                                            .on_scroll_wheel(self.claim_scroll_when_moved(
+                                                PERMISSION_DETAIL_SCROLL_ID,
+                                                &handle,
+                                                cx,
+                                            ))
                                             .p_3()
                                             .rounded_md()
                                             .border_1()
@@ -8615,6 +11681,11 @@ impl SessionMvpView {
                         .when(interaction.kind != InteractionKind::Permission, |dialog| {
                             dialog.child(div().text_color(rgb(MUTED)).child(interaction.message))
                         })
+                        .when(
+                            interaction.kind != InteractionKind::Permission
+                                && !interaction.choices.is_empty(),
+                            |dialog| dialog.child(div().h(px(1.0)).bg(rgb(BORDER)).mx(px(-16.0))),
+                        )
                         .children(choices)
                         .when(interaction.allow_freeform, |dialog| {
                             dialog.child(
@@ -8637,9 +11708,14 @@ impl SessionMvpView {
                                         let response_choice = choice.clone();
                                         let response_session = app_session_id.clone();
                                         let response_id = interaction_id.clone();
+                                        let selector = format!("permission-scope-{index}");
                                         div()
                                             .id(("permission-scope", index))
-                                            .accessibility_id(format!("permission-scope-{index}"))
+                                            .debug_selector({
+                                                let selector = selector.clone();
+                                                move || selector.clone()
+                                            })
+                                            .accessibility_id(selector)
                                             .role(Role::Button)
                                             .aria_label(format!("{choice}. {description}"))
                                             .focusable()
@@ -8649,17 +11725,22 @@ impl SessionMvpView {
                                             })
                                             .flex()
                                             .items_center()
-                                            .justify_between()
-                                            .gap_4()
+                                            .gap_2()
                                             .px_3()
                                             .py_3()
                                             .rounded_md()
-                                            .border_1()
-                                            .border_color(rgb(BORDER))
+                                            .when(index == 0, |row| row.bg(rgb(SUBTLE)))
+                                            .child(
+                                                div()
+                                                    .w(px(28.0))
+                                                    .text_color(rgb(MUTED))
+                                                    .child(format!("{}.", index + 1)),
+                                            )
                                             .child(
                                                 div()
                                                     .flex()
                                                     .flex_col()
+                                                    .flex_1()
                                                     .gap_1()
                                                     .child(
                                                         div()
@@ -8710,7 +11791,7 @@ impl SessionMvpView {
                                         .child(div().text_xs().text_color(rgb(MUTED)).child(
                                             "Project rules can be changed in Copilot settings.",
                                         ))
-                                        .child(action_button("Deny", RED, cx, move |view| {
+                                        .child(action_button("Deny", RED, cx, move |view, _| {
                                             let _ = view.commands.send(ServiceCommand::Respond {
                                                 app_session_id: session_id.clone(),
                                                 interaction_id: reject.clone(),
@@ -8726,7 +11807,7 @@ impl SessionMvpView {
                                 "Cancel",
                                 RED,
                                 cx,
-                                move |view| {
+                                move |view, _| {
                                     let _ = view.commands.send(ServiceCommand::Respond {
                                         app_session_id: cancel_session.clone(),
                                         interaction_id: interaction_id.clone(),
@@ -8744,7 +11825,7 @@ impl Render for SessionMvpView {
     #[allow(clippy::too_many_lines)]
     fn render(&mut self, window: &mut Window, cx: &mut Context<Self>) -> impl IntoElement {
         self.sync_transcript();
-        let (provider_status, provider_color) = self.provider_status();
+        self.viewport_height = window.viewport_size().height;
         let compact = compact_layout(f32::from(window.viewport_size().width));
         let show_sidebar = self.sidebar_open;
         let content_left = if show_sidebar {
@@ -8754,6 +11835,9 @@ impl Render for SessionMvpView {
         };
         let control_menu_left = self.open_control_menu.map_or(0, control_menu_offset);
         let session_selected = self.selected_session.is_some();
+        let session_unavailable = self
+            .selected()
+            .is_some_and(|session| session.snapshot.status == SessionStatus::Unavailable);
         let title = self.selected().map_or_else(
             || "New session".to_owned(),
             |session| session.snapshot.metadata.title.clone(),
@@ -8795,6 +11879,7 @@ impl Render for SessionMvpView {
                 view.dismiss_control_menu(cx);
                 view.dismiss_session_menu(cx);
                 view.dismiss_image_preview(cx);
+                view.diagnostics_visibility = SettingsVisibility::Closed;
                 view.settings_visibility = SettingsVisibility::Closed;
                 view.automations_open = false;
                 view.open_automation_menu = None;
@@ -8806,6 +11891,7 @@ impl Render for SessionMvpView {
             .flex()
             .size_full()
             .bg(rgb(BACKGROUND))
+            .text_sm()
             .text_color(rgb(PRIMARY))
             // Scrollbar drags are tracked at the window so the thumb keeps
             // following the pointer once it leaves the narrow track.
@@ -8898,6 +11984,24 @@ impl Render for SessionMvpView {
                                         .flex()
                                         .items_center()
                                         .gap_3()
+                                        .when(session_unavailable, |status| {
+                                            status.child(
+                                                div()
+                                                    .id("worktree-unavailable-badge")
+                                                    .debug_selector(|| {
+                                                        "worktree-unavailable-badge".to_owned()
+                                                    })
+                                                    .role(Role::Status)
+                                                    .aria_label("Worktree unavailable")
+                                                    .px_2()
+                                                    .py_1()
+                                                    .rounded_md()
+                                                    .text_xs()
+                                                    .text_color(rgb(AMBER))
+                                                    .bg(rgb(SUBTLE))
+                                                    .child("Worktree unavailable"),
+                                            )
+                                        })
                                         .child(
                                             div()
                                                 .id("panel-toggle")
@@ -8923,15 +12027,6 @@ impl Render for SessionMvpView {
                                                     view.panel_open = !view.panel_open;
                                                     cx.notify();
                                                 })),
-                                        )
-                                        .child(
-                                            div()
-                                                .id("provider-status")
-                                                .role(Role::Status)
-                                                .aria_label(provider_status.clone())
-                                                .text_xs()
-                                                .text_color(rgb(provider_color))
-                                                .child(provider_status),
                                         ),
                                 ),
                         )
@@ -8977,8 +12072,21 @@ impl Render for SessionMvpView {
                                                     .child(error),
                                             )
                                         })
-                                        .child(
-                                            div().w_full().px_5().child(self.session_composer(cx)),
+                                        .when_some(self.interaction_prompt(cx), |column, prompt| {
+                                            column.child(prompt)
+                                        })
+                                        .when(
+                                            self.selected().is_some_and(|session| {
+                                                session.snapshot.pending_interactions.is_empty()
+                                            }),
+                                            |column| {
+                                                column.child(
+                                                    div()
+                                                        .w_full()
+                                                        .px_5()
+                                                        .child(self.session_composer(cx)),
+                                                )
+                                            },
                                         ),
                                 )
                                 .when_some(
@@ -9053,11 +12161,163 @@ impl Render for SessionMvpView {
             .when_some(self.rename_dialog(cx), gpui::ParentElement::child)
             .when_some(self.settings_dialog(cx), gpui::ParentElement::child)
             .when_some(self.automations_dialog(cx), gpui::ParentElement::child)
+            .when_some(self.diagnostics_dialog(cx), gpui::ParentElement::child)
             .when_some(self.image_preview_overlay(cx), gpui::ParentElement::child)
-            .when_some(self.interaction_dialog(cx), |root, dialog| {
-                root.child(dialog)
-            })
     }
+}
+
+fn format_elapsed(elapsed: Duration) -> String {
+    let seconds = elapsed.as_secs();
+    let hours = seconds / 3600;
+    let minutes = seconds / 60;
+    let minutes = minutes % 60;
+    let seconds = seconds % 60;
+    if hours > 0 {
+        format!("{hours}:{minutes:02}:{seconds:02}")
+    } else if minutes > 0 {
+        format!("{minutes}:{seconds:02}")
+    } else {
+        format!("{seconds}s")
+    }
+}
+
+fn timestamp_millis(timestamp: &str) -> Option<u128> {
+    timestamp.parse::<u128>().ok().or_else(|| {
+        DateTime::parse_from_rfc3339(timestamp)
+            .ok()
+            .and_then(|timestamp| u128::try_from(timestamp.timestamp_millis()).ok())
+    })
+}
+
+fn format_activity_timestamp(timestamp: &str) -> String {
+    DateTime::parse_from_rfc3339(timestamp).map_or_else(
+        |_| timestamp.to_owned(),
+        |timestamp| {
+            timestamp
+                .with_timezone(&chrono::Local)
+                .format("%b %-d, %Y · %-I:%M %p")
+                .to_string()
+        },
+    )
+}
+
+/// `metadata.created_at`/`updated_at` are always epoch-millis strings (see
+/// `session-manager`'s `timestamp()`), unlike SDK-sourced event timestamps
+/// which are RFC3339. Format directly rather than routing through the
+/// RFC3339-only `format_activity_timestamp`.
+fn format_session_created_at(created_at: &str) -> String {
+    created_at
+        .parse::<i64>()
+        .ok()
+        .and_then(chrono::DateTime::from_timestamp_millis)
+        .map_or_else(
+            || created_at.to_owned(),
+            |timestamp| {
+                timestamp
+                    .with_timezone(&chrono::Local)
+                    .format("%b %-d, %Y · %-I:%M %p")
+                    .to_string()
+            },
+        )
+}
+
+fn tool_duration(invocation: &app_model::ToolInvocation) -> Option<Duration> {
+    let started = timestamp_millis(&invocation.started_at)?;
+    let elapsed = invocation.completed_at.as_deref().map_or_else(
+        || elapsed_since_timestamp(&invocation.started_at),
+        |completed| {
+            let completed = timestamp_millis(completed)?;
+            Some(Duration::from_millis(
+                u64::try_from(completed.saturating_sub(started)).unwrap_or(u64::MAX),
+            ))
+        },
+    )?;
+    Some(elapsed)
+}
+
+fn format_activity_duration(duration: Duration) -> String {
+    if duration < Duration::from_secs(1) {
+        format!("{}ms", duration.as_millis())
+    } else {
+        format_elapsed(duration)
+    }
+}
+
+fn format_byte_count(bytes: u64) -> String {
+    const KIB: u64 = 1024;
+    const MIB: u64 = KIB * 1024;
+    let (unit, suffix) = if bytes >= MIB {
+        (MIB, "MB")
+    } else if bytes >= KIB {
+        (KIB, "KB")
+    } else {
+        return format!("{bytes} B");
+    };
+    let whole = bytes / unit;
+    let tenths = ((bytes % unit) * 10 + unit / 2) / unit;
+    if tenths == 10 {
+        format!("{}.0 {suffix}", whole + 1)
+    } else {
+        format!("{whole}.{tenths} {suffix}")
+    }
+}
+
+fn elapsed_since_timestamp(timestamp: &str) -> Option<Duration> {
+    let event_millis = timestamp_millis(timestamp)?;
+    let now_millis = SystemTime::now()
+        .duration_since(UNIX_EPOCH)
+        .ok()?
+        .as_millis();
+    Some(Duration::from_millis(
+        u64::try_from(now_millis.saturating_sub(event_millis)).unwrap_or(u64::MAX),
+    ))
+}
+
+fn diagnostic_field(label: impl Into<String>, value: impl Into<String>) -> gpui::AnyElement {
+    div()
+        .flex()
+        .items_start()
+        .gap_3()
+        .child(
+            div()
+                .w(px(170.0))
+                .flex_none()
+                .text_xs()
+                .text_color(rgb(MUTED))
+                .child(label.into()),
+        )
+        .child(
+            div()
+                .flex_1()
+                .min_w_0()
+                .text_xs()
+                .text_color(rgb(PRIMARY))
+                .child(value.into()),
+        )
+        .into_any_element()
+}
+
+fn diagnostic_section(title: &str, rows: Vec<gpui::AnyElement>) -> gpui::AnyElement {
+    div()
+        .flex()
+        .flex_col()
+        .gap_2()
+        .child(
+            div()
+                .text_sm()
+                .font_weight(gpui::FontWeight::BOLD)
+                .child(title.to_owned()),
+        )
+        .when(rows.is_empty(), |section| {
+            section.child(
+                div()
+                    .text_xs()
+                    .text_color(rgb(MUTED))
+                    .child("No data reported"),
+            )
+        })
+        .children(rows)
+        .into_any_element()
 }
 
 /// Trailing slice of terminal output displayed until transcript virtualization.
@@ -9188,6 +12448,7 @@ fn control_pill(
     let label = match menu {
         ControlMenu::Project => "Project",
         ControlMenu::Location => "Where to run this session",
+        ControlMenu::Base => "Base branch",
         ControlMenu::Mode => "Mode",
         ControlMenu::Agent => "Agent",
         ControlMenu::Model => "Model",
@@ -9236,6 +12497,7 @@ fn control_menu_id(menu: ControlMenu) -> &'static str {
     match menu {
         ControlMenu::Project => "project",
         ControlMenu::Location => "location",
+        ControlMenu::Base => "base",
         ControlMenu::Mode => "mode",
         ControlMenu::Agent => "agent",
         ControlMenu::Model => "model",
@@ -9269,10 +12531,11 @@ fn compact_layout(width: f32) -> bool {
 
 fn control_menu_offset(menu: ControlMenu) -> u16 {
     match menu {
-        // The project and location pills sit in the checkout strip below the
-        // composer, left to right.
+        // The project, location, and base pills sit in the checkout strip
+        // below the composer, left to right.
         ControlMenu::Project => 0,
         ControlMenu::Location => 96,
+        ControlMenu::Base => 176,
         ControlMenu::Mode => 40,
         ControlMenu::Agent => 128,
         ControlMenu::Model => 216,
@@ -9462,7 +12725,7 @@ fn action_button(
     label: &'static str,
     color: u32,
     cx: &mut Context<SessionMvpView>,
-    action: impl Fn(&mut SessionMvpView) + 'static,
+    action: impl Fn(&mut SessionMvpView, &mut Context<SessionMvpView>) + 'static,
 ) -> impl IntoElement {
     div()
         .id(label)
@@ -9481,7 +12744,7 @@ fn action_button(
         .child(label)
         .hover(|style| style.opacity(0.85).cursor_pointer())
         .on_click(cx.listener(move |view, _, _, cx| {
-            action(view);
+            action(view, cx);
             cx.notify();
         }))
 }
@@ -9491,7 +12754,10 @@ fn status_color(status: SessionStatus) -> gpui::Rgba {
         SessionStatus::Running | SessionStatus::Starting => rgb(GREEN),
         SessionStatus::Waiting => rgb(AMBER),
         SessionStatus::Failed | SessionStatus::Cancelled => rgb(RED),
-        SessionStatus::Idle | SessionStatus::Recovering | SessionStatus::Disconnected => rgb(MUTED),
+        SessionStatus::Idle
+        | SessionStatus::Recovering
+        | SessionStatus::Disconnected
+        | SessionStatus::Unavailable => rgb(MUTED),
     }
 }
 
@@ -9843,6 +13109,7 @@ fn elapsed_millis(started: Instant) -> u64 {
 fn bind_app_keys(cx: &mut App) {
     bind_text_input_keys(cx);
     cx.bind_keys([
+        KeyBinding::new("secondary-c", CopyTranscript, Some("TranscriptSelection")),
         KeyBinding::new("escape", DismissPopup, None),
         KeyBinding::new("tab", FocusNext, None),
         KeyBinding::new("shift-tab", FocusPrevious, None),
@@ -9947,7 +13214,12 @@ fn main() {
     let window_title = format!("GCABB {}", build.display());
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let branch = git_branch(&project_root);
-    let service = match data_dir.and_then(|path| database_path(&path)) {
+    let worktree_configuration = WorktreeConfiguration::load(&data_dir);
+    let service = match data_dir
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|path| database_path(path))
+    {
         Ok(path) => AppService::start(project_root.clone(), &path),
         Err(error) => AppService::failed(error),
     };
@@ -9966,6 +13238,7 @@ fn main() {
         let project_root = project_root.clone();
         let branch = branch.clone();
         let chats_workspace = chats_workspace.clone();
+        let worktree_configuration = worktree_configuration.clone();
         let window = cx
             .open_window(
                 WindowOptions {
@@ -9986,6 +13259,7 @@ fn main() {
                             branch,
                             chats_workspace,
                             attachments_directory(),
+                            worktree_configuration,
                             cx,
                         )
                     })
@@ -10199,6 +13473,20 @@ mod tests {
     }
 
     #[test]
+    fn search_briefs_report_zero_and_parsed_match_counts() {
+        assert_eq!(
+            super::SessionMvpView::reported_match_count("No matches found."),
+            Some(0)
+        );
+        assert_eq!(
+            super::SessionMvpView::reported_match_count(
+                "[grep content: 76 matches across 1 file(s)]"
+            ),
+            Some(76)
+        );
+    }
+
+    #[test]
     fn permission_scope_copy_explains_how_long_each_approval_lasts() {
         assert!(permission_scope_description("Allow once").contains("Only this request"));
         assert!(permission_scope_description("Allow for this session").contains("session ends"));
@@ -10208,6 +13496,17 @@ mod tests {
         assert!(
             permission_scope_description("Always allow this domain").contains("across sessions")
         );
+    }
+
+    #[test]
+    fn transcript_selection_clamps_when_streaming_rewrites_a_block() {
+        let mut selection = super::TranscriptTextSelection::default();
+        let original = gpui::SharedString::from("?");
+        selection.begin("block".to_owned(), (1, 0), &original, 0);
+        selection.extend("block".to_owned(), (1, 0), &original, "?".len());
+        selection.register_block("block", (1, 0), "x".into(), Vec::new());
+
+        assert_eq!(selection.selected_text().as_deref(), Some("x"));
     }
 
     /// Adding a worktree folder must resolve to its repository, so adding a
@@ -10327,170 +13626,6 @@ mod tests {
         );
     }
 
-    #[test]
-    fn branch_slugs_are_git_safe() {
-        assert_eq!(super::slugify("Fix the login bug!"), "fix-the-login-bug");
-        assert_eq!(
-            super::slugify("[Auth] Fix login/session handling"),
-            "auth-fix-login-session-handling"
-        );
-        assert_eq!(super::slugify("   "), "session");
-        assert_eq!(super::slugify(&"x".repeat(200)).len(), 50);
-    }
-
-    #[test]
-    fn fallback_session_titles_handle_low_information_prompts() {
-        assert_eq!(super::session_title(""), "New session");
-        assert_eq!(super::session_title("Help"), "Help");
-    }
-
-    /// A worktree session gets its own checkout on its own branch.
-    #[test]
-    fn new_worktree_location_creates_a_separate_checkout() {
-        let (_guard, main, _worktree) = repo_with_worktree();
-        let roots = tempfile::tempdir().expect("tempdir");
-        let title = "Add a feature";
-        let resolved = super::resolve_session_workspace(
-            SessionLocation::NewWorktree,
-            app_model::SessionKind::Project,
-            &main,
-            Some(&main.to_string_lossy()),
-            Some("main"),
-            title,
-            roots.path(),
-        )
-        .expect("worktree resolved");
-
-        assert_ne!(resolved, main, "the session must not run in the checkout");
-        assert!(resolved.join("a.txt").exists(), "checkout is populated");
-        let service = git_service::GitService::new(&resolved);
-        assert_eq!(service.current_branch().unwrap(), "gcabb/add-a-feature");
-        // The developer's checkout is untouched.
-        assert_eq!(
-            git_service::GitService::new(&main)
-                .current_branch()
-                .unwrap(),
-            "main"
-        );
-    }
-
-    /// Local repository runs in place, which is the shared-checkout option.
-    #[test]
-    fn local_repository_location_runs_in_the_project_directory() {
-        let (_guard, main, _worktree) = repo_with_worktree();
-        let roots = tempfile::tempdir().expect("tempdir");
-        let resolved = super::resolve_session_workspace(
-            SessionLocation::LocalRepository,
-            app_model::SessionKind::Project,
-            &main,
-            Some(&main.to_string_lossy()),
-            Some("main"),
-            "Anything",
-            roots.path(),
-        )
-        .expect("resolved");
-        assert_eq!(resolved, main);
-    }
-
-    /// Chats have no repository, so they never get a worktree.
-    #[test]
-    fn chats_never_get_a_worktree() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let roots = tempfile::tempdir().expect("tempdir");
-        let resolved = super::resolve_session_workspace(
-            SessionLocation::NewWorktree,
-            app_model::SessionKind::Chat,
-            dir.path(),
-            None,
-            None,
-            "A chat",
-            roots.path(),
-        )
-        .expect("resolved");
-        assert_eq!(resolved, dir.path());
-    }
-
-    /// A folder that is not a repository cannot host a worktree, so it runs
-    /// in place rather than failing.
-    #[test]
-    fn non_repository_projects_run_in_place() {
-        let dir = tempfile::tempdir().expect("tempdir");
-        let roots = tempfile::tempdir().expect("tempdir");
-        let resolved = super::resolve_session_workspace(
-            SessionLocation::NewWorktree,
-            app_model::SessionKind::Project,
-            dir.path(),
-            Some(&dir.path().to_string_lossy()),
-            None,
-            "Anything",
-            roots.path(),
-        )
-        .expect("resolved");
-        assert_eq!(resolved, dir.path());
-    }
-
-    /// Two sessions with the same title must not collide on a branch name.
-    #[test]
-    fn repeated_titles_get_distinct_branches() {
-        let (_guard, main, _worktree) = repo_with_worktree();
-        let roots = tempfile::tempdir().expect("tempdir");
-        let first = super::resolve_session_workspace(
-            SessionLocation::NewWorktree,
-            app_model::SessionKind::Project,
-            &main,
-            Some(&main.to_string_lossy()),
-            Some("main"),
-            "Same title",
-            roots.path(),
-        )
-        .expect("first worktree");
-        let second = super::resolve_session_workspace(
-            SessionLocation::NewWorktree,
-            app_model::SessionKind::Project,
-            &main,
-            Some(&main.to_string_lossy()),
-            Some("main"),
-            "Same title",
-            roots.path(),
-        )
-        .expect("second worktree");
-
-        assert_ne!(first, second);
-        assert_eq!(
-            git_service::GitService::new(&second)
-                .current_branch()
-                .unwrap(),
-            "gcabb/same-title-2"
-        );
-    }
-
-    /// A stale managed directory must not make an otherwise valid task fail.
-    #[test]
-    fn stale_worktree_directories_get_a_predictable_collision_suffix() {
-        let (_guard, main, _worktree) = repo_with_worktree();
-        let roots = tempfile::tempdir().expect("tempdir");
-        let stale = roots.path().join("main").join("gcabb-fix-auth-flow");
-        std::fs::create_dir_all(stale).expect("stale worktree directory");
-
-        let resolved = super::resolve_session_workspace(
-            SessionLocation::NewWorktree,
-            app_model::SessionKind::Project,
-            &main,
-            Some(&main.to_string_lossy()),
-            Some("main"),
-            "Fix auth flow",
-            roots.path(),
-        )
-        .expect("worktree resolved");
-
-        assert_eq!(
-            git_service::GitService::new(resolved)
-                .current_branch()
-                .unwrap(),
-            "gcabb/fix-auth-flow-2"
-        );
-    }
-
     fn window(tier: &str, max_tokens: Option<u64>) -> ContextWindowOption {
         ContextWindowOption {
             tier: tier.to_owned(),
@@ -10526,6 +13661,7 @@ mod tests {
         assert_eq!(control_menu_offset(ControlMenu::Agent), 128);
         assert_eq!(control_menu_offset(ControlMenu::Model), 216);
         assert_eq!(control_menu_offset(ControlMenu::Effort), 304);
+        assert_eq!(control_menu_offset(ControlMenu::Base), 176);
     }
 
     #[test]
@@ -10534,6 +13670,7 @@ mod tests {
         assert_eq!(control_menu_id(ControlMenu::Agent), "agent");
         assert_eq!(control_menu_id(ControlMenu::Model), "model");
         assert_eq!(control_menu_id(ControlMenu::Effort), "effort");
+        assert_eq!(control_menu_id(ControlMenu::Base), "base");
     }
 
     #[test]
@@ -10759,14 +13896,16 @@ mod tests {
 
     mod interaction {
         use app_model::{
-            SessionKind, SessionMetadata, SessionSnapshot, SessionStatus, TitleSource,
+            InteractionKind, InteractionRequest, InteractionResponse, SessionKind, SessionMetadata,
+            SessionSnapshot, SessionStatus, TitleSource,
         };
-        use gpui::{Modifiers, MouseButton, TestAppContext, VisualTestContext};
+        use gpui::{FollowMode, Modifiers, MouseButton, TestAppContext, VisualTestContext};
         use session_manager::SessionHandle;
         use std::sync::Arc;
 
         use crate::{
-            AppService, ServiceCommand, ServiceUpdate, SessionMvpView, SessionProjection, UpdateUi,
+            AppService, PERMISSION_DETAIL_MAX_HEIGHT, SCROLL_TO_BOTTOM_DURATION, ServiceCommand,
+            ServiceUpdate, SessionLaunchProgress, SessionMvpView, SessionProjection, UpdateUi,
         };
 
         fn snapshot(id: &str, title: &str) -> SessionSnapshot {
@@ -10788,6 +13927,25 @@ mod tests {
             state
         }
 
+        fn interaction(
+            kind: InteractionKind,
+            title: &str,
+            message: &str,
+            choices: &[&str],
+            allow_freeform: bool,
+        ) -> InteractionRequest {
+            InteractionRequest {
+                id: "interaction-1".to_owned(),
+                session_id: "sdk-session-1".to_owned(),
+                kind,
+                title: title.to_owned(),
+                message: message.to_owned(),
+                choices: choices.iter().map(|choice| (*choice).to_owned()).collect(),
+                allow_freeform,
+                details: serde_json::Value::Null,
+            }
+        }
+
         /// Build the real view with one session row rendered.
         fn setup(
             cx: &mut TestAppContext,
@@ -10798,6 +13956,12 @@ mod tests {
         ) {
             let (view, cx, commands, _) = setup_with_attachments(cx);
             (view, cx, commands)
+        }
+
+        fn expand_first_tool(cx: &mut VisualTestContext) {
+            let row = cx.debug_bounds("tool-card").expect("tool row rendered");
+            cx.simulate_click(row.center(), Modifiers::none());
+            cx.run_until_parked();
         }
 
         fn setup_for_bootstrap(
@@ -10817,6 +13981,11 @@ mod tests {
                     "main".to_owned(),
                     std::path::PathBuf::from("/tmp/chats"),
                     None,
+                    crate::WorktreeConfiguration {
+                        data_dir: None,
+                        settings: crate::AppSettings::default(),
+                        default_root: std::path::PathBuf::from("/tmp/worktrees"),
+                    },
                     cx,
                 )
             });
@@ -10844,6 +14013,11 @@ mod tests {
                     "main".to_owned(),
                     std::path::PathBuf::from("/tmp/chats"),
                     Some(attachments_root),
+                    crate::WorktreeConfiguration {
+                        data_dir: None,
+                        settings: crate::AppSettings::default(),
+                        default_root: std::path::PathBuf::from("/tmp/worktrees"),
+                    },
                     cx,
                 );
                 view.selected_project = std::path::PathBuf::from("/tmp/project");
@@ -11049,6 +14223,122 @@ mod tests {
         }
 
         #[gpui::test]
+        fn configured_worktree_location_is_sent_with_new_sessions(cx: &mut TestAppContext) {
+            let repository = tempfile::tempdir().expect("repository");
+            super::git(repository.path(), &["init", "-q"]);
+            let custom = repository.path().join("custom-worktrees");
+            let (view, cx, commands, _) = setup_for_bootstrap(cx);
+            view.update(cx, |view, _| {
+                let configuration = &mut view.worktree_configuration;
+                configuration
+                    .settings
+                    .set_worktrees_root(custom.clone(), &configuration.default_root);
+                view.composing_chat = false;
+                view.selected_project = repository.path().to_owned();
+                view.workspace_root = repository.path().to_owned();
+                view.submit_prompt("Start a session".to_owned());
+            });
+
+            let root = commands
+                .try_iter()
+                .find_map(|command| match command {
+                    ServiceCommand::Submit { worktrees_root, .. } => Some(worktrees_root),
+                    _ => None,
+                })
+                .expect("a submit command was sent");
+            assert_eq!(root, custom);
+        }
+
+        #[gpui::test]
+        fn worktree_launch_shows_creation_before_ready(cx: &mut TestAppContext) {
+            let repository = tempfile::tempdir().expect("repository");
+            super::git(repository.path(), &["init", "-q"]);
+            let (view, cx, _commands, updates) = setup_for_bootstrap(cx);
+            view.update(cx, |view, cx| {
+                view.composing_chat = false;
+                view.selected_project = repository.path().to_owned();
+                view.workspace_root = repository.path().to_owned();
+                view.submit_prompt("Start a session".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("launch-creating-worktree").is_some());
+            assert!(cx.debug_bounds("launch-worktree-ready").is_none());
+
+            updates
+                .send(ServiceUpdate::SessionLaunchProgress(
+                    SessionLaunchProgress::WorktreeReady(std::path::PathBuf::from(
+                        "/tmp/worktrees/session",
+                    )),
+                ))
+                .unwrap();
+            view.update(cx, |view, cx| {
+                view.apply_service_updates(cx);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let creating = cx
+                .debug_bounds("launch-creating-worktree")
+                .expect("creation status rendered");
+            let ready = cx
+                .debug_bounds("launch-worktree-ready")
+                .expect("ready status rendered");
+            assert!(
+                creating.origin.y < ready.origin.y,
+                "creation status must precede worktree ready"
+            );
+            assert!(cx.debug_bounds("launch-copilot-session").is_some());
+        }
+
+        #[gpui::test]
+        fn completed_worktree_start_steps_precede_the_prompt(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.metadata.project_path = "/tmp/worktrees/session".to_owned();
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "prompt".to_owned(),
+                    role: app_model::TranscriptRole::User,
+                    content: "Start a session".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let creating = cx
+                .debug_bounds("session-start-creating-worktree")
+                .expect("creation status rendered");
+            let ready = cx
+                .debug_bounds("session-start-worktree-ready")
+                .expect("ready status rendered");
+            let started = cx
+                .debug_bounds("session-start-copilot-session-started")
+                .expect("session status rendered");
+            let prompt = cx
+                .debug_bounds("transcript-message")
+                .expect("submitted prompt rendered");
+            assert!(creating.origin.y < ready.origin.y);
+            assert!(ready.origin.y < started.origin.y);
+            assert!(started.origin.y < prompt.origin.y);
+            assert!(
+                ready.origin.y - creating.bottom() <= gpui::px(1.0),
+                "startup rows should not have extra space between them"
+            );
+            assert!(
+                started.origin.y - ready.bottom() <= gpui::px(1.0),
+                "startup rows should form one compact activity group"
+            );
+        }
+
+        #[gpui::test]
         fn bootstrap_selects_the_stored_session_before_hydration(cx: &mut TestAppContext) {
             let (mut service, _commands) = AppService::for_test();
             let first = snapshot("session-1", "First session").metadata;
@@ -11056,6 +14346,7 @@ mod tests {
             service.bootstrap = Some(super::super::BootstrapState {
                 projects: Vec::new(),
                 sessions: vec![first, second],
+                archived: Vec::new(),
                 selected_session: Some("session-2".to_owned()),
                 automations: Vec::new(),
                 automation_runs: Vec::new(),
@@ -11068,6 +14359,11 @@ mod tests {
                     "main".to_owned(),
                     std::path::PathBuf::from("/tmp/chats"),
                     None,
+                    crate::WorktreeConfiguration {
+                        data_dir: None,
+                        settings: crate::AppSettings::default(),
+                        default_root: std::path::PathBuf::from("/tmp/worktrees"),
+                    },
                     cx,
                 )
             });
@@ -11083,6 +14379,58 @@ mod tests {
         }
 
         #[gpui::test]
+        fn recovering_session_shows_resuming_spinner_until_hydrated(cx: &mut TestAppContext) {
+            let (mut service, _commands, updates) = AppService::for_test_with_updates();
+            let metadata = snapshot("session-1", "First session").metadata;
+            service.bootstrap = Some(super::super::BootstrapState {
+                projects: Vec::new(),
+                sessions: vec![metadata],
+                archived: Vec::new(),
+                selected_session: Some("session-1".to_owned()),
+                automations: Vec::new(),
+                automation_runs: Vec::new(),
+            });
+            cx.update(super::super::bind_app_keys);
+            let (view, cx) = cx.add_window_view(|_, cx| {
+                SessionMvpView::new(
+                    service,
+                    std::path::PathBuf::from("/tmp/project"),
+                    "main".to_owned(),
+                    std::path::PathBuf::from("/tmp/chats"),
+                    None,
+                    crate::WorktreeConfiguration {
+                        data_dir: None,
+                        settings: crate::AppSettings::default(),
+                        default_root: std::path::PathBuf::from("/tmp/worktrees"),
+                    },
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("resuming-session").is_some(),
+                "resuming spinner should render while session is still hydrating"
+            );
+
+            updates
+                .send(ServiceUpdate::SessionAdded(SessionHandle::for_test(
+                    snapshot("session-1", "First session"),
+                )))
+                .unwrap();
+            view.update(cx, |view, cx| {
+                view.apply_service_updates(cx);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("resuming-session").is_none(),
+                "resuming spinner should disappear once the session is hydrated"
+            );
+        }
+
+        #[gpui::test]
         fn navigation_before_bootstrap_is_never_overwritten(cx: &mut TestAppContext) {
             let (view, cx, _commands, _updates) = setup_for_bootstrap(cx);
             view.update_in(cx, SessionMvpView::new_session);
@@ -11090,6 +14438,7 @@ mod tests {
                 view.apply_bootstrap(super::super::BootstrapState {
                     projects: Vec::new(),
                     sessions: vec![snapshot("session-1", "First session").metadata],
+                    archived: Vec::new(),
                     selected_session: Some("session-1".to_owned()),
                     automations: Vec::new(),
                     automation_runs: Vec::new(),
@@ -11109,6 +14458,7 @@ mod tests {
                 view.apply_bootstrap(super::super::BootstrapState {
                     projects: Vec::new(),
                     sessions: vec![snapshot("session-1", "First session").metadata],
+                    archived: Vec::new(),
                     selected_session: Some("session-1".to_owned()),
                     automations: Vec::new(),
                     automation_runs: Vec::new(),
@@ -11147,6 +14497,76 @@ mod tests {
         }
 
         #[gpui::test]
+        fn unavailable_hydration_is_not_selected_automatically(cx: &mut TestAppContext) {
+            let (view, cx, _commands, updates) = setup_for_bootstrap(cx);
+            let mut unavailable = snapshot("session-1", "Archived session");
+            unavailable.status = SessionStatus::Unavailable;
+            updates
+                .send(ServiceUpdate::SessionHydrated(SessionHandle::for_test(
+                    unavailable,
+                )))
+                .unwrap();
+
+            view.update(cx, SessionMvpView::apply_service_updates);
+
+            view.read_with(cx, |view, _| {
+                assert!(view.selected_session.is_none());
+                assert_eq!(view.sessions[0].snapshot.status, SessionStatus::Unavailable);
+            });
+        }
+
+        #[gpui::test]
+        fn unavailable_session_is_read_only_and_offers_recovery(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut unavailable = snapshot("session-1", "Archived session");
+                unavailable.status = SessionStatus::Unavailable;
+                unavailable.metadata.project_path = view
+                    .worktree_configuration
+                    .default_root
+                    .join("project")
+                    .join("gcabb-archived")
+                    .to_string_lossy()
+                    .into_owned();
+                unavailable.changes.branch = Some("gcabb/archived".to_owned());
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
+                    unavailable,
+                ))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("worktree-unavailable-badge").is_some());
+            assert!(cx.debug_bounds("session-unavailable").is_some());
+            assert!(cx.debug_bounds("composer-input").is_none());
+            assert!(cx.debug_bounds("Recreate").is_some());
+            assert!(cx.debug_bounds("Locate folder").is_some());
+            assert!(cx.debug_bounds("Delete session").is_some());
+
+            let recreate = cx.debug_bounds("Recreate").expect("recreate button");
+            cx.simulate_click(recreate.center(), Modifiers::none());
+            assert!(matches!(
+                commands.recv().expect("resume command"),
+                ServiceCommand::Resume {
+                    app_session_id,
+                    worktrees_root: Some(worktrees_root),
+                } if app_session_id == "session-1"
+                    && worktrees_root == std::path::Path::new("/tmp/worktrees")
+            ));
+
+            let delete = cx
+                .debug_bounds("Delete session")
+                .expect("delete session button");
+            cx.simulate_click(delete.center(), Modifiers::none());
+            assert!(matches!(
+                commands.recv().expect("delete command"),
+                ServiceCommand::DeleteSession { app_session_id, .. }
+                    if app_session_id == "session-1"
+            ));
+        }
+
+        #[gpui::test]
         fn hydration_refreshes_repository_grouping_after_metadata_adoption(
             cx: &mut TestAppContext,
         ) {
@@ -11158,6 +14578,7 @@ mod tests {
                 view.apply_bootstrap(super::super::BootstrapState {
                     projects: Vec::new(),
                     sessions: vec![legacy],
+                    archived: Vec::new(),
                     selected_session: Some("session-1".to_owned()),
                     automations: Vec::new(),
                     automation_runs: Vec::new(),
@@ -11195,6 +14616,7 @@ mod tests {
                 view.apply_bootstrap(super::super::BootstrapState {
                     projects: Vec::new(),
                     sessions: vec![snapshot("session-1", "First session").metadata],
+                    archived: Vec::new(),
                     selected_session: Some("session-1".to_owned()),
                     automations: Vec::new(),
                     automation_runs: Vec::new(),
@@ -11405,6 +14827,233 @@ mod tests {
         }
 
         #[gpui::test]
+        fn session_waiting_on_a_request_can_still_be_stopped(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                let mut snapshot = (*view.sessions[0].snapshot).clone();
+                snapshot.status = SessionStatus::Waiting;
+                view.sessions[0].set_snapshot(Arc::new(snapshot));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let stop = cx
+                .debug_bounds("stop-session")
+                .expect("stop action rendered while waiting");
+            cx.simulate_click(stop.center(), Modifiers::none());
+
+            match commands.try_recv().expect("a command was sent") {
+                ServiceCommand::Cancel { app_session_id } => {
+                    assert_eq!(app_session_id, "session-1");
+                }
+                _ => panic!("expected a Cancel command"),
+            }
+        }
+
+        #[gpui::test]
+        fn running_session_shows_elapsed_activity_and_intent(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                let mut snapshot = (*view.sessions[0].snapshot).clone();
+                snapshot.status = SessionStatus::Running;
+                snapshot.diagnostics.latest_intent = Some("Reviewing repository state".to_owned());
+                snapshot.diagnostics.activity = Some("Waiting for model response".to_owned());
+                view.sessions[0].snapshot = Arc::new(snapshot);
+                view.sync_activity_timers();
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("running-activity").is_some());
+            assert!(cx.debug_bounds("running-elapsed").is_some());
+            assert!(cx.debug_bounds("running-intent").is_some());
+        }
+
+        #[gpui::test]
+        fn diagnostics_button_opens_and_closes_dialog(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            let button = cx
+                .debug_bounds("open-diagnostics")
+                .expect("diagnostics button rendered");
+            cx.simulate_click(button.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("diagnostics-dialog").is_some());
+            let close = cx
+                .debug_bounds("diagnostics-close")
+                .expect("diagnostics close rendered");
+            cx.simulate_click(close.center(), Modifiers::none());
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("diagnostics-dialog").is_none());
+        }
+
+        #[gpui::test]
+        fn pending_question_is_inline_and_replaces_the_composer(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                Arc::make_mut(&mut view.sessions[0].snapshot)
+                    .pending_interactions
+                    .push(interaction(
+                        InteractionKind::UserInput,
+                        "Choose a direction",
+                        "Which approach should I take?",
+                        &["Keep it simple", "Add configuration"],
+                        true,
+                    ));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let transcript = cx.debug_bounds("transcript").expect("transcript rendered");
+            let prompt = cx
+                .debug_bounds("interaction-prompt")
+                .expect("inline interaction rendered");
+            assert!(
+                prompt.origin.y >= transcript.origin.y + transcript.size.height,
+                "interaction should follow the transcript instead of covering it"
+            );
+            assert!(
+                cx.debug_bounds("composer").is_none(),
+                "the regular composer should not compete with a pending question"
+            );
+
+            let choice = cx
+                .debug_bounds("interaction-choice-0")
+                .expect("question choice rendered");
+            cx.simulate_click(choice.center(), Modifiers::none());
+            match commands.try_recv().expect("a response was sent") {
+                ServiceCommand::Respond {
+                    app_session_id,
+                    interaction_id,
+                    response,
+                } => {
+                    assert_eq!(app_session_id, "session-1");
+                    assert_eq!(interaction_id, "interaction-1");
+                    assert_eq!(
+                        response,
+                        InteractionResponse::Submit {
+                            value: "Keep it simple".into(),
+                            freeform: false,
+                        }
+                    );
+                }
+                _ => panic!("expected an interaction response"),
+            }
+        }
+
+        #[gpui::test]
+        fn pending_permission_is_inline_and_keeps_scope_actions(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                let mut request = interaction(
+                    InteractionKind::Permission,
+                    "Permission required",
+                    "Run cargo test",
+                    &["Allow once", "Allow for this session", "Deny"],
+                    false,
+                );
+                request.details = serde_json::json!({
+                    "command": "cargo test",
+                    "arguments": ["--workspace"],
+                    "path": "/tmp/project"
+                });
+                Arc::make_mut(&mut view.sessions[0].snapshot).add_interaction(request);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("permission-entry").is_some());
+            assert!(cx.debug_bounds("interaction-prompt").is_none());
+            assert!(cx.debug_bounds("composer").is_none());
+            let scope = cx
+                .debug_bounds("permission-scope-1")
+                .expect("session permission rendered");
+            cx.simulate_click(scope.center(), Modifiers::none());
+            match commands.try_recv().expect("a response was sent") {
+                ServiceCommand::Respond {
+                    app_session_id,
+                    interaction_id,
+                    response,
+                } => {
+                    assert_eq!(app_session_id, "session-1");
+                    assert_eq!(interaction_id, "interaction-1");
+                    assert_eq!(response, InteractionResponse::ApproveForSession);
+                }
+                _ => panic!("expected an interaction response"),
+            }
+
+            view.update(cx, |view, cx| {
+                let snapshot = Arc::make_mut(&mut view.sessions[0].snapshot);
+                snapshot.record_interaction_response(
+                    "interaction-1",
+                    InteractionResponse::ApproveForSession,
+                );
+                snapshot.remove_interaction("interaction-1");
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("permission-entry").is_some());
+            assert!(cx.debug_bounds("permission-scope-1").is_none());
+        }
+
+        /// Regression: a permission's requested-action detail could run to
+        /// many pages of JSON for large tool-call payloads, pushing both the
+        /// scope choices and the top of the request off screen. The detail
+        /// now sits in its own scrollable panel capped to a fixed height.
+        #[gpui::test]
+        fn permission_detail_is_capped_and_scrollable(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                let mut request = interaction(
+                    InteractionKind::Permission,
+                    "Permission required",
+                    "Read a very large file",
+                    &["Allow once", "Allow for this session", "Deny"],
+                    false,
+                );
+                // A payload large enough that, unbounded, it would run to
+                // many pages on screen.
+                let large_paths: Vec<String> = (0..500)
+                    .map(|index| format!("/tmp/file-{index}.rs"))
+                    .collect();
+                request.details = serde_json::json!({ "paths": large_paths });
+                Arc::make_mut(&mut view.sessions[0].snapshot).add_interaction(request);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let entry = cx
+                .debug_bounds("permission-entry")
+                .expect("permission entry rendered");
+            let detail = cx
+                .debug_bounds("permission-detail-0-interaction-1")
+                .expect("requested-action detail rendered");
+            assert!(
+                f32::from(detail.size.height) <= PERMISSION_DETAIL_MAX_HEIGHT,
+                "the detail panel should be capped to a rational height instead \
+                 of growing with the payload, got {:?}",
+                detail.size.height
+            );
+            assert!(
+                f32::from(entry.size.height) < 2000.0,
+                "the whole permission card should stay compact even for a huge \
+                 payload, got {:?}",
+                entry.size.height
+            );
+        }
+
+        #[gpui::test]
         fn typing_during_active_work_turns_stop_into_steering_send(cx: &mut TestAppContext) {
             let (view, cx, commands) = setup(cx);
             view.update(cx, |view, cx| {
@@ -11516,6 +15165,40 @@ mod tests {
             });
         }
 
+        /// The reveal item is offered for every session, and a working
+        /// directory that vanished is reported instead of silently ignored.
+        #[gpui::test]
+        fn clicking_show_in_file_manager_reports_a_missing_folder(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut snapshot = (*view.sessions[0].snapshot).clone();
+                snapshot.metadata.project_path = "/gcabb-does-not-exist/session-1".to_owned();
+                view.sessions[0].set_snapshot(Arc::new(snapshot));
+                cx.notify();
+            });
+            let row = cx
+                .debug_bounds("session-row")
+                .expect("session row rendered");
+            cx.simulate_mouse_down(row.center(), MouseButton::Right, Modifiers::none());
+            cx.simulate_mouse_up(row.center(), MouseButton::Right, Modifiers::none());
+            cx.run_until_parked();
+
+            let item = cx
+                .debug_bounds("session-menu-reveal")
+                .expect("reveal item rendered");
+            cx.simulate_click(item.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(view.session_menu.is_none(), "menu closes after choosing");
+                let error = view.action_error.as_deref().expect("an error is shown");
+                assert!(
+                    error.contains("/gcabb-does-not-exist/session-1"),
+                    "error names the missing folder: {error}"
+                );
+            });
+        }
+
         #[gpui::test]
         fn clicking_delete_sends_a_delete_command(cx: &mut TestAppContext) {
             let (view, cx, commands) = setup(cx);
@@ -11541,10 +15224,78 @@ mod tests {
             });
             let command = commands.try_recv().expect("a command was sent");
             match command {
-                ServiceCommand::DeleteSession { app_session_id } => {
+                ServiceCommand::DeleteSession { app_session_id, .. } => {
                     assert_eq!(app_session_id, "session-1");
                 }
                 _ => panic!("expected a DeleteSession command"),
+            }
+        }
+
+        #[gpui::test]
+        fn clicking_archive_sends_an_archive_command(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            let row = cx
+                .debug_bounds("session-row")
+                .expect("session row rendered");
+            cx.simulate_mouse_down(row.center(), MouseButton::Right, Modifiers::none());
+            cx.simulate_mouse_up(row.center(), MouseButton::Right, Modifiers::none());
+            cx.run_until_parked();
+
+            let item = cx
+                .debug_bounds("session-menu-archive")
+                .expect("archive item rendered");
+            cx.simulate_click(item.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(view.session_menu.is_none());
+                assert!(view.archiving_sessions.contains("session-1"));
+            });
+            let command = commands.try_recv().expect("a command was sent");
+            match command {
+                ServiceCommand::ArchiveSession { app_session_id, .. } => {
+                    assert_eq!(app_session_id, "session-1");
+                }
+                _ => panic!("expected an ArchiveSession command"),
+            }
+        }
+
+        /// An archived session leaves the sidebar and turns up in settings,
+        /// which is the only place it can be brought back from.
+        #[gpui::test]
+        fn settings_offers_to_unarchive_an_archived_session(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+
+            view.update(cx, |view, cx| {
+                view.forget_session("session-1", cx);
+                view.archived_sessions = vec![crate::ArchivedSessionRow {
+                    id: "session-1".to_owned(),
+                    title: "First session".to_owned(),
+                    archived_at: "2026-01-01T00:00:00Z".to_owned(),
+                }];
+                view.settings_visibility = crate::SettingsVisibility::Open;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(
+                    view.sessions.is_empty(),
+                    "an archived session stayed in the sidebar"
+                );
+            });
+            let unarchive = cx
+                .debug_bounds("settings-unarchive-session-1")
+                .expect("unarchive button rendered");
+            cx.simulate_click(unarchive.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            let command = commands.try_recv().expect("a command was sent");
+            match command {
+                ServiceCommand::UnarchiveSession { app_session_id } => {
+                    assert_eq!(app_session_id, "session-1");
+                }
+                _ => panic!("expected an UnarchiveSession command"),
             }
         }
 
@@ -12061,6 +15812,57 @@ mod tests {
             assert_eq!(
                 cx.read_from_clipboard().and_then(|item| item.text()),
                 Some(source.to_owned())
+            );
+        }
+
+        #[gpui::test]
+        fn transcript_text_can_be_selected_and_copied(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "selectable-message".to_owned(),
+                    role: app_model::TranscriptRole::Assistant,
+                    content: "Selectable first paragraph.\n\nAnd a second paragraph.".to_owned(),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let first = cx
+                .debug_bounds("markdown-inline-selectable-message-0")
+                .expect("first selectable paragraph rendered");
+            let second = cx
+                .debug_bounds("markdown-inline-selectable-message-1")
+                .expect("second selectable paragraph rendered");
+            let start = gpui::point(first.origin.x + gpui::px(2.0), first.center().y);
+            let end = gpui::point(second.right() - gpui::px(2.0), second.center().y);
+            cx.simulate_mouse_down(start, MouseButton::Left, Modifiers::none());
+            cx.simulate_event(gpui::MouseMoveEvent {
+                position: end,
+                pressed_button: Some(MouseButton::Left),
+                modifiers: Modifiers::none(),
+            });
+            cx.simulate_mouse_up(end, MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+
+            let selected = view.read_with(cx, |view, _| {
+                let selection = view.transcript_selection.borrow();
+                selection.selected_text().expect("selected transcript text")
+            });
+            assert!(selected.contains("first paragraph"));
+            assert!(selected.contains("second paragraph"));
+            cx.simulate_keystrokes("secondary-c");
+            cx.run_until_parked();
+            assert_eq!(
+                cx.read_from_clipboard().and_then(|item| item.text()),
+                Some(selected)
             );
         }
 
@@ -12665,11 +16467,166 @@ mod tests {
                 cx.debug_bounds("tool-entry").is_some(),
                 "the edit should be visible in the transcript"
             );
+            assert!(
+                cx.debug_bounds("tool-expanded-card").is_none(),
+                "tool details should start collapsed"
+            );
+            expand_first_tool(cx);
+            assert!(
+                cx.debug_bounds("tool-expanded-card").is_some(),
+                "clicking the row should reveal the detail card"
+            );
             view.read_with(cx, |view, _| {
                 let snapshot = &view.selected().unwrap().snapshot;
                 let timeline = snapshot.timeline();
                 assert_eq!(timeline.len(), 2, "one message and one tool call");
+                assert!(view.tool_expanded("c1"));
             });
+        }
+
+        #[gpui::test]
+        fn nested_tool_rows_expand_independently(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for (sequence, raw) in [
+                    serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"task-1","toolName":"task",
+                                "arguments":{"description":"Survey the UI"}}}),
+                    serde_json::json!({"id":"sa","type":"subagent.started",
+                        "data":{"agentId":"agent-7","parentToolCallId":"task-1"}}),
+                    serde_json::json!({"id":"n","type":"tool.execution_start","agentId":"agent-7",
+                        "data":{"toolCallId":"nested-1","toolName":"grep",
+                                "arguments":{"pattern":"tool_entry"}}}),
+                ]
+                .into_iter()
+                .enumerate()
+                {
+                    state.apply(app_model::DomainEvent::from_sdk_event_for(
+                        "session-1",
+                        u64::try_from(sequence).unwrap_or(0) + 1,
+                        &raw,
+                    ));
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("tool-toggle-task-1").is_some());
+            let nested = cx
+                .debug_bounds("tool-toggle-nested-1")
+                .expect("nested activity row rendered");
+            cx.simulate_click(nested.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(!view.tool_expanded("task-1"));
+                assert!(view.tool_expanded("nested-1"));
+            });
+        }
+
+        #[gpui::test]
+        fn expanded_shell_details_use_the_actual_command(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.apply(app_model::DomainEvent::from_sdk_event_for(
+                    "session-1",
+                    1,
+                    &serde_json::json!({"id":"t","type":"tool.execution_start",
+                    "data":{"toolCallId":"c1","toolName":"bash",
+                            "arguments":{
+                                "description":"Validate first 20 Fibonacci numbers",
+                                "command":"python3 - <<'PY'\nprint('validation')\nPY"
+                            },
+                            "shellToolInfo":{
+                                "displayCommand":"python3 - <<'PY'\nprint('validation')\nPY",
+                                "hasWriteFileRedirection":false,
+                                "possiblePaths":[]
+                            }}}),
+                ));
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                let invocation = &view.selected().unwrap().snapshot.tool_activity.invocations[0];
+                assert_eq!(
+                    SessionMvpView::tool_argument_detail(invocation),
+                    Some((
+                        "Command",
+                        "python3 - <<'PY'\nprint('validation')\nPY".to_owned()
+                    ))
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn running_terminals_expand_until_they_exit(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let running = |completed: bool| {
+                let mut state = snapshot("session-1", "First session");
+                state.apply(app_model::DomainEvent::from_sdk_event_for(
+                    "session-1",
+                    1,
+                    &serde_json::json!({"id":"t","type":"tool.execution_start",
+                        "data":{"toolCallId":"c1","toolName":"bash",
+                                "arguments":{"command":"sleep 1","shellId":"shell-1"}}}),
+                ));
+                if completed {
+                    state.apply(app_model::DomainEvent::from_sdk_event_for(
+                        "session-1",
+                        2,
+                        &serde_json::json!({"id":"d","type":"tool.execution_complete",
+                        "data":{"toolCallId":"c1","toolName":"bash","success":true,
+                                "result":{"contents":[
+                                    {"type":"shell_exit","shellId":"shell-1","exitCode":0}
+                                ]}}}),
+                    ));
+                }
+                state
+            };
+            view.update(cx, |view, cx| {
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
+                    running(false),
+                ))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("tool-expanded-card").is_some(),
+                "a running terminal should reveal its details automatically"
+            );
+            view.read_with(cx, |view, _| {
+                assert!(
+                    !view.tool_expanded("c1"),
+                    "automatic expansion must not become a manual preference"
+                );
+            });
+
+            view.update(cx, |view, cx| {
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
+                    running(true),
+                ))];
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("tool-expanded-card").is_none(),
+                "the terminal should collapse after exit"
+            );
+            expand_first_tool(cx);
+            assert!(
+                cx.debug_bounds("tool-expanded-card").is_some(),
+                "an exited terminal can still be opened manually"
+            );
         }
 
         #[gpui::test]
@@ -12728,6 +16685,7 @@ mod tests {
                 cx.notify();
             });
             cx.run_until_parked();
+            expand_first_tool(cx);
 
             let column = cx
                 .debug_bounds("transcript-content")
@@ -12771,6 +16729,7 @@ mod tests {
                 cx.notify();
             });
             cx.run_until_parked();
+            expand_first_tool(cx);
 
             let toggle = cx
                 .debug_bounds("toggle-tool-output")
@@ -12969,6 +16928,7 @@ mod tests {
                 cx.notify();
             });
             cx.run_until_parked();
+            expand_first_tool(cx);
 
             let wheel = |position, cx: &mut VisualTestContext| {
                 cx.simulate_event(gpui::ScrollWheelEvent {
@@ -13013,6 +16973,111 @@ mod tests {
             );
         }
 
+        /// Regression: every transcript block registers a mouse-up handler on
+        /// the shared selection, and bubble-phase handlers run in reverse paint
+        /// order, so the last block always cleared the drag first and links in
+        /// any other message did nothing.
+        #[gpui::test]
+        fn clicking_a_transcript_link_opens_it(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let target = "https://example.com/docs";
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                let mut push = |index: usize, content: String| {
+                    state.transcript.push(app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content,
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
+                    });
+                };
+                push(0, format!("See {target} for details."));
+                // Later messages paint after the link, so their handlers get the
+                // release first.
+                for index in 1..4 {
+                    push(index, format!("a follow-up message {index}"));
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            let position = view.read_with(cx, |view, _| {
+                let selection = view.transcript_selection.borrow();
+                selection.blocks.values().find_map(|block| {
+                    let start = block.content.find(target)?;
+                    let layout = block.layout.as_ref()?;
+                    let left = layout.position_for_index(start)?;
+                    let right = layout.position_for_index(start + target.len())?;
+                    Some(gpui::point(
+                        (left.x + right.x) / 2.0,
+                        left.y + gpui::px(4.0),
+                    ))
+                })
+            });
+            let position = position.expect("the transcript rendered a link");
+
+            cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+            cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+
+            assert_eq!(cx.opened_url().as_deref(), Some(target));
+        }
+
+        /// Clicking past the end of a line must not open the link that happens
+        /// to sit at that text index.
+        #[gpui::test]
+        fn clicking_beside_a_link_opens_nothing(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let target = "https://example.com/docs";
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: "m1".to_owned(),
+                    role: app_model::TranscriptRole::Assistant,
+                    content: format!("See {target}"),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: 1,
+                    attachments: Vec::new(),
+                });
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.update(cx, |_, cx| cx.notify());
+            cx.run_until_parked();
+
+            let position = view.read_with(cx, |view, _| {
+                let selection = view.transcript_selection.borrow();
+                selection.blocks.values().find_map(|block| {
+                    let end = block.content.find(target)? + target.len();
+                    let bounds = block.bounds?;
+                    let after = block.layout.as_ref()?.position_for_index(end)?;
+                    Some(gpui::point(
+                        after.x + (bounds.right() - after.x) / 2.0,
+                        after.y + gpui::px(4.0),
+                    ))
+                })
+            });
+            let position = position.expect("the transcript rendered a link");
+
+            cx.simulate_mouse_down(position, MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+            cx.simulate_mouse_up(position, MouseButton::Left, Modifiers::none());
+            cx.run_until_parked();
+
+            assert_eq!(cx.opened_url(), None);
+        }
+
         /// Regression: the thumb was drawn but inert, so the wheel was the only
         /// way to move a scrollable region.
         #[gpui::test]
@@ -13040,17 +17105,30 @@ mod tests {
             // follow-up frame the extent change requests.
             view.update(cx, |_, cx| cx.notify());
             cx.run_until_parked();
+            view.update(cx, |view, cx| {
+                let max = view.transcript_list.max_offset_for_scrollbar().y;
+                view.transcript_list.set_follow_mode(FollowMode::Normal);
+                view.transcript_list
+                    .set_offset_from_scrollbar(gpui::point(gpui::px(0.0), -max));
+                cx.notify();
+            });
+            cx.run_until_parked();
 
-            // Auto-follow leaves the view at the bottom.
+            // Start at the bottom without auto-follow changing the offset while
+            // the press is being measured.
             let bottom = view.read_with(cx, |view, _| {
                 view.transcript_list.scroll_px_offset_for_scrollbar().y
             });
             assert!(bottom < gpui::px(0.0));
 
-            // Press near the top of the track: the content should jump up.
+            // Press near the top of the track: the content should move and the
+            // drag should become active.
             let track = cx.debug_bounds("scrollbar").expect("scrollbar rendered");
+            let geometry = view.read_with(cx, |view, _| {
+                view.drawn_transcript_scrollbar.expect("scrollbar geometry")
+            });
             let track_x = track.center().x;
-            let near_top = track.origin.y + gpui::px(10.0);
+            let near_top = geometry.track_top + gpui::px((geometry.thumb_top / 2.0).max(1.0));
             cx.simulate_mouse_down(
                 gpui::point(track_x, near_top),
                 MouseButton::Left,
@@ -13062,7 +17140,7 @@ mod tests {
                 view.transcript_list.scroll_px_offset_for_scrollbar().y
             });
             assert!(
-                after > bottom,
+                after != bottom,
                 "dragging the scrollbar must scroll: {bottom:?} -> {after:?}"
             );
             view.read_with(cx, |view, _| {
@@ -13319,6 +17397,7 @@ mod tests {
                 cx.notify();
             });
             cx.run_until_parked();
+            expand_first_tool(cx);
 
             let bounds = cx
                 .debug_bounds("tool-detail")
@@ -13361,6 +17440,7 @@ mod tests {
                 cx.notify();
             });
             cx.run_until_parked();
+            expand_first_tool(cx);
 
             assert!(
                 cx.debug_bounds("tool-detail").is_some(),
@@ -13396,6 +17476,11 @@ mod tests {
                 cx.notify();
             });
             cx.run_until_parked();
+            view.update(cx, |view, cx| {
+                view.transcript_list.set_follow_mode(FollowMode::Normal);
+                cx.notify();
+            });
+            cx.run_until_parked();
 
             // Auto-follow leaves the view at the tail, so scroll back up.
             let before = view.read_with(cx, |view, _| {
@@ -13419,7 +17504,7 @@ mod tests {
                 view.transcript_list.scroll_px_offset_for_scrollbar().y
             });
             assert!(
-                after > before,
+                after != before,
                 "scrolling up must move the transcript: {before:?} -> {after:?}"
             );
 
@@ -13427,6 +17512,163 @@ mod tests {
             // instantiated.
             view.read_with(cx, |view, _| {
                 assert_eq!(view.selected().unwrap().snapshot.transcript.len(), 80);
+            });
+        }
+
+        /// Fills the selected session with enough output to scroll, then parks
+        /// the transcript above the tail.
+        fn scroll_transcript_away_from_tail(
+            view: &gpui::Entity<SessionMvpView>,
+            cx: &mut gpui::VisualTestContext,
+        ) {
+            view.update(cx, |view, cx| {
+                let mut state = snapshot("session-1", "First session");
+                for index in 0..80 {
+                    state.transcript.push(app_model::TranscriptMessage {
+                        id: format!("m{index}"),
+                        role: app_model::TranscriptRole::Assistant,
+                        content: format!("message {index} with enough text to take a line"),
+                        state: app_model::TranscriptState::Complete,
+                        timestamp: "1".to_owned(),
+                        sequence: u64::try_from(index).unwrap_or(0) + 1,
+                        attachments: Vec::new(),
+                    });
+                }
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let bounds = cx.debug_bounds("transcript").expect("transcript rendered");
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: bounds.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(400.0))),
+                modifiers: Modifiers::none(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+
+        /// Reaching the newest output should never require a hunt for the
+        /// scrollbar, and the dimmed tail is what makes the gap obvious before
+        /// the button is even noticed. Neither belongs on screen while the
+        /// transcript already sits at the bottom.
+        #[gpui::test]
+        fn jumping_to_the_tail_is_offered_only_while_scrolled_away(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            scroll_transcript_away_from_tail(&view, cx);
+
+            assert!(
+                cx.debug_bounds("scroll-to-bottom").is_some(),
+                "scrolling up should offer a way back to the newest output"
+            );
+            assert!(
+                cx.debug_bounds("transcript-tail-fade").is_some(),
+                "the conversation tail should dim while it is scrolled past"
+            );
+
+            view.update(cx, |view, cx| {
+                view.transcript_list.set_follow_mode(FollowMode::Tail);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("scroll-to-bottom").is_none(),
+                "the affordance should retire once the transcript is at the tail"
+            );
+            assert!(
+                cx.debug_bounds("transcript-tail-fade").is_none(),
+                "nothing is being scrolled past, so nothing should be dimmed"
+            );
+        }
+
+        /// The jump glides rather than cutting: the intervening content flying
+        /// past is what tells the reader how far the view moved. A snap would
+        /// leave them re-orienting at the tail.
+        #[gpui::test]
+        fn jumping_to_the_tail_glides_instead_of_snapping(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            scroll_transcript_away_from_tail(&view, cx);
+
+            let parked = view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
+            let button = cx
+                .debug_bounds("scroll-to-bottom")
+                .expect("the jump affordance should be rendered");
+            cx.simulate_click(button.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            let started = view
+                .read_with(cx, |view, _| view.scroll_to_bottom)
+                .expect("pressing the affordance should start a glide")
+                .started;
+
+            // Halfway through, the transcript has left where it was parked but
+            // has not yet reached the tail.
+            let midpoint = view.update(cx, |view, _| {
+                let still_gliding =
+                    view.step_scroll_to_bottom(started + SCROLL_TO_BOTTOM_DURATION / 2);
+                assert!(still_gliding, "the glide should still be running midway");
+                assert!(
+                    !view.transcript_list.is_following_tail(),
+                    "the glide should not arrive early"
+                );
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            });
+            assert!(
+                midpoint < parked,
+                "the glide should be travelling toward the tail: {parked:?} -> {midpoint:?}"
+            );
+
+            view.update(cx, |view, _| {
+                let still_gliding = view.step_scroll_to_bottom(started + SCROLL_TO_BOTTOM_DURATION);
+                assert!(!still_gliding, "the glide should end at its full duration");
+                assert!(
+                    view.transcript_list.is_following_tail(),
+                    "landing at the tail should resume following new output"
+                );
+                assert!(
+                    view.scroll_to_bottom.is_none(),
+                    "a landed glide should leave no state behind"
+                );
+            });
+        }
+
+        /// Steering by hand mid-glide means the reader wants somewhere else.
+        /// Continuing to drag them to the tail would be a fight they did not
+        /// ask for.
+        #[gpui::test]
+        fn scrolling_by_hand_abandons_the_glide(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            scroll_transcript_away_from_tail(&view, cx);
+
+            let button = cx
+                .debug_bounds("scroll-to-bottom")
+                .expect("the jump affordance should be rendered");
+            cx.simulate_click(button.center(), Modifiers::none());
+            cx.run_until_parked();
+            assert!(
+                view.read_with(cx, |view, _| view.scroll_to_bottom.is_some()),
+                "the glide should be running before the manual scroll"
+            );
+
+            let bounds = cx.debug_bounds("transcript").expect("transcript rendered");
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: bounds.center(),
+                delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(0.0), gpui::px(200.0))),
+                modifiers: Modifiers::none(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(
+                    view.scroll_to_bottom.is_none(),
+                    "scrolling by hand should abandon the glide"
+                );
             });
         }
 
@@ -13763,6 +18005,81 @@ mod tests {
             });
         }
 
+        /// Choosing a base branch overrides the project default for the new
+        /// worktree, both in the composer label and the submitted request.
+        #[gpui::test]
+        fn base_branch_pill_overrides_the_project_default(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.projects = vec![app_model::ProjectMetadata {
+                    id: "/tmp/project".to_owned(),
+                    path: "/tmp/project".to_owned(),
+                    name: "project".to_owned(),
+                    default_branch: Some("main".to_owned()),
+                    last_opened_at: "1".to_owned(),
+                }];
+                view.selected_project = std::path::PathBuf::from("/tmp/project");
+                view.selected_session = None;
+                view.composing_chat = false;
+                cx.notify();
+            });
+
+            // Nothing chosen yet, so the project default shows through.
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.composer_branch_label(), "main");
+            });
+
+            view.update(cx, |view, cx| {
+                view.choose_control(
+                    super::super::ControlMenu::Base,
+                    "release/next".to_owned(),
+                    cx,
+                );
+            });
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.draft_base_ref.as_deref(), Some("release/next"));
+                assert_eq!(view.composer_branch_label(), "release/next");
+            });
+
+            view.update(cx, |view, _cx| {
+                view.submit_prompt("hello".to_owned());
+            });
+
+            match commands.try_recv().expect("a command was sent") {
+                ServiceCommand::Submit { base_ref, .. } => {
+                    assert_eq!(base_ref.as_deref(), Some("release/next"));
+                }
+                _ => panic!("expected a Submit command"),
+            }
+        }
+
+        /// Switching to a different project clears a chosen base override so
+        /// a stale branch from another repository cannot leak in.
+        #[gpui::test]
+        fn selecting_a_project_clears_the_base_branch_override(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.projects = vec![app_model::ProjectMetadata {
+                    id: "/tmp/project".to_owned(),
+                    path: "/tmp/project".to_owned(),
+                    name: "project".to_owned(),
+                    default_branch: Some("main".to_owned()),
+                    last_opened_at: "1".to_owned(),
+                }];
+                view.selected_project = std::path::PathBuf::from("/tmp/project");
+                view.draft_base_ref = Some("release/next".to_owned());
+                cx.notify();
+            });
+
+            view.update(cx, |view, cx| {
+                view.select_project("/tmp/project", cx);
+            });
+
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.draft_base_ref, None);
+            });
+        }
+
         /// The location pill is offered for projects and switches the target.
         #[gpui::test]
         fn location_pill_switches_where_the_session_runs(cx: &mut TestAppContext) {
@@ -13983,6 +18300,7 @@ mod tests {
             state.changes = app_model::ChangesView {
                 base: Some("abc1234".to_owned()),
                 base_label: Some("main".to_owned()),
+                tracking_ref: Some("origin/main".to_owned()),
                 head: Some("def5678".to_owned()),
                 branch: Some("feature".to_owned()),
                 files,
@@ -14009,6 +18327,75 @@ mod tests {
             });
             cx.simulate_resize(gpui::size(gpui::px(1_400.0), gpui::px(800.0)));
             cx.run_until_parked();
+        }
+
+        #[gpui::test]
+        fn changes_refresh_button_requests_a_forced_base_refresh(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            open_changes(&view, cx, Vec::new());
+
+            let refresh = cx
+                .debug_bounds("changes-refresh")
+                .expect("changes refresh button");
+            cx.simulate_click(refresh.center(), Modifiers::none());
+
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(ServiceCommand::RefreshChanges {
+                    app_session_id,
+                    force: true,
+                }) if app_session_id == "session-1"
+            ));
+        }
+
+        #[gpui::test]
+        fn changes_base_menu_selects_a_persisted_comparison_branch(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            open_changes(&view, cx, Vec::new());
+            view.update(cx, |view, cx| {
+                view.base_ref_options = vec!["release/next".to_owned()];
+                view.base_menu_visibility = crate::SettingsVisibility::Open;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let option = cx
+                .debug_bounds("changes-base-option-0")
+                .expect("base branch option");
+            cx.simulate_click(option.center(), Modifiers::none());
+
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(ServiceCommand::SetBaseRef {
+                    app_session_id,
+                    base_ref,
+                }) if app_session_id == "session-1" && base_ref == "release/next"
+            ));
+        }
+
+        #[gpui::test]
+        fn changes_base_menu_can_reset_to_the_project_default(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            open_changes(&view, cx, Vec::new());
+            view.update(cx, |view, cx| {
+                view.base_default_ref = Some("main".to_owned());
+                view.base_menu_visibility = crate::SettingsVisibility::Open;
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let reset = cx
+                .debug_bounds("changes-base-reset")
+                .expect("reset base option");
+            cx.simulate_click(reset.center(), Modifiers::none());
+
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(ServiceCommand::SetBaseRef {
+                    app_session_id,
+                    base_ref,
+                }) if app_session_id == "session-1" && base_ref == "main"
+            ));
         }
 
         fn changes_scroll(
@@ -14368,6 +18755,7 @@ mod tests {
             );
             view.update(cx, |view, cx| {
                 view.toggle_change("session-1", "src/lib.rs");
+                view.toggle_tool("c1");
                 cx.notify();
             });
             updates
@@ -14378,7 +18766,254 @@ mod tests {
 
             view.read_with(cx, |view, _| {
                 assert!(!view.change_expanded("session-1", "src/lib.rs"));
+                assert!(!view.expanded_tools.contains_key("session-1"));
             });
+        }
+
+        // --- Wheel handoff between nested scroll regions ---------------------
+
+        /// A session whose transcript is long enough to scroll, with one tool
+        /// entry whose output is `lines` long.
+        fn transcript_with_tool_output(lines: usize) -> SessionSnapshot {
+            let mut state = snapshot("session-1", "First session");
+            for index in 0..80 {
+                state.transcript.push(app_model::TranscriptMessage {
+                    id: format!("m{index}"),
+                    role: app_model::TranscriptRole::Assistant,
+                    content: format!("message {index} with enough text to take a line"),
+                    state: app_model::TranscriptState::Complete,
+                    timestamp: "1".to_owned(),
+                    sequence: u64::try_from(index).unwrap_or(0) + 1,
+                    attachments: Vec::new(),
+                });
+            }
+            let mut sequence = 1_000;
+            let mut apply = |raw: &serde_json::Value, state: &mut app_model::SessionSnapshot| {
+                sequence += 1;
+                state.apply(app_model::DomainEvent::from_sdk_event_for(
+                    "session-1",
+                    sequence,
+                    raw,
+                ));
+            };
+            apply(
+                &serde_json::json!({"id":"t","type":"tool.execution_start",
+                    "data":{"toolCallId":"c1","toolName":"bash",
+                            "arguments":{"command":"seq"},
+                            "shellToolInfo":{"displayCommand":"seq",
+                                             "hasWriteFileRedirection":false,
+                                             "possiblePaths":[]}}}),
+                &mut state,
+            );
+            let output = (1..=lines)
+                .map(|n| n.to_string())
+                .collect::<Vec<_>>()
+                .join("\n");
+            apply(
+                &serde_json::json!({"id":"p","type":"tool.execution_partial_result",
+                    "data":{"toolCallId":"c1","partialOutput": output}}),
+                &mut state,
+            );
+            state
+        }
+
+        fn show(
+            view: &gpui::Entity<SessionMvpView>,
+            cx: &mut VisualTestContext,
+            state: SessionSnapshot,
+        ) {
+            view.update(cx, |view, cx| {
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(state))];
+                view.selected_session = Some("session-1".to_owned());
+                view.expanded_tools
+                    .entry("session-1".to_owned())
+                    .or_default()
+                    .insert("c1".to_owned());
+                cx.notify();
+            });
+            cx.run_until_parked();
+        }
+
+        fn wheel(cx: &mut VisualTestContext, at: gpui::Point<gpui::Pixels>, x: f32, y: f32) {
+            cx.simulate_event(gpui::ScrollWheelEvent {
+                position: at,
+                delta: gpui::ScrollDelta::Pixels(gpui::point(gpui::px(x), gpui::px(y))),
+                modifiers: Modifiers::none(),
+                touch_phase: gpui::TouchPhase::Moved,
+            });
+            cx.run_until_parked();
+        }
+
+        fn transcript_offset(
+            view: &gpui::Entity<SessionMvpView>,
+            cx: &mut VisualTestContext,
+        ) -> gpui::Pixels {
+            view.read_with(cx, |view, _| {
+                view.transcript_list.scroll_px_offset_for_scrollbar().y
+            })
+        }
+
+        fn detail_offset(
+            view: &gpui::Entity<SessionMvpView>,
+            cx: &mut VisualTestContext,
+        ) -> gpui::Pixels {
+            view.read_with(cx, |view, _| {
+                view.scroll_handle("tool-output-c1")
+                    .expect("the output block tracks a scroll handle")
+                    .offset()
+                    .y
+            })
+        }
+
+        /// A block short enough to need no scrolling used to swallow the wheel,
+        /// which left the transcript stuck wherever the pointer happened to be.
+        #[gpui::test]
+        fn a_detail_block_with_nothing_to_scroll_leaves_the_wheel_alone(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            show(&view, cx, transcript_with_tool_output(1));
+
+            let block = cx
+                .debug_bounds("tool-detail")
+                .expect("the output block is rendered");
+            let before = transcript_offset(&view, cx);
+            wheel(cx, block.center(), 0.0, 400.0);
+            let after = transcript_offset(&view, cx);
+
+            assert!(
+                after != before,
+                "a block with nothing to scroll must let the transcript move: {before:?} -> {after:?}"
+            );
+        }
+
+        #[gpui::test]
+        fn a_scrollable_detail_block_takes_the_wheel_from_the_transcript(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            show(&view, cx, transcript_with_tool_output(500));
+            let block = cx
+                .debug_bounds("tool-detail")
+                .expect("the output block is rendered");
+            // Streaming output follows its tail, so start from the top.
+            view.update(cx, |view, cx| {
+                view.scroll_handle("tool-output-c1")
+                    .expect("scroll handle")
+                    .set_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let transcript_before = transcript_offset(&view, cx);
+            wheel(cx, block.center(), 0.0, -200.0);
+
+            assert!(
+                detail_offset(&view, cx) < gpui::px(0.0),
+                "the block under the pointer must scroll"
+            );
+            assert_eq!(
+                transcript_offset(&view, cx),
+                transcript_before,
+                "the transcript must not scroll along with the block"
+            );
+        }
+
+        /// The handoff: once the inner block has nothing left to give, the
+        /// surface behind it takes over instead of the gesture dying.
+        #[gpui::test]
+        fn a_detail_block_at_its_end_hands_the_wheel_back(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            show(&view, cx, transcript_with_tool_output(500));
+            let block = cx
+                .debug_bounds("tool-detail")
+                .expect("the output block is rendered");
+            // Park the block against its top edge, with the transcript sitting
+            // at its tail so there is room above it to take over.
+            view.update(cx, |view, cx| {
+                view.scroll_handle("tool-output-c1")
+                    .expect("scroll handle")
+                    .set_offset(gpui::point(gpui::px(0.0), gpui::px(0.0)));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let transcript_before = transcript_offset(&view, cx);
+            wheel(cx, block.center(), 0.0, 200.0);
+
+            assert_eq!(
+                detail_offset(&view, cx),
+                gpui::px(0.0),
+                "the block is already at its end"
+            );
+            assert_ne!(
+                transcript_offset(&view, cx),
+                transcript_before,
+                "a block at its end must hand the wheel to the transcript"
+            );
+        }
+
+        /// Diffs scroll sideways inside a panel that scrolls down, so a
+        /// vertical wheel over one belongs to the panel.
+        #[gpui::test]
+        fn a_vertical_wheel_over_a_diff_scrolls_the_changes_panel(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let files: Vec<_> = (0..40)
+                .map(|index| {
+                    changed_file(
+                        Box::leak(format!("src/file_{index}.rs").into_boxed_str()),
+                        app_model::ChangeStatus::Modified,
+                        Some(&long_diff(40)),
+                    )
+                })
+                .collect();
+            open_changes(&view, cx, files);
+            view.update(cx, |view, cx| {
+                view.toggle_change("session-1", "src/file_0.rs");
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let diff = cx
+                .debug_bounds("change-diff-src/file_0.rs")
+                .expect("the diff is rendered");
+            let before = changes_scroll(&view, cx).offset().y;
+            wheel(cx, diff.center(), 0.0, -120.0);
+
+            assert!(
+                changes_scroll(&view, cx).offset().y < before,
+                "a vertical wheel over a diff must scroll the panel"
+            );
+        }
+
+        /// The diff still owns sideways gestures, and must not pass them on for
+        /// the panel to turn into vertical movement.
+        #[gpui::test]
+        fn a_horizontal_wheel_over_a_diff_stays_in_the_diff(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let files: Vec<_> = (0..40)
+                .map(|index| {
+                    changed_file(
+                        Box::leak(format!("src/file_{index}.rs").into_boxed_str()),
+                        app_model::ChangeStatus::Modified,
+                        Some(&format!("+{}\n", "x".repeat(400))),
+                    )
+                })
+                .collect();
+            open_changes(&view, cx, files);
+            view.update(cx, |view, cx| {
+                view.toggle_change("session-1", "src/file_0.rs");
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let diff = cx
+                .debug_bounds("change-diff-src/file_0.rs")
+                .expect("the diff is rendered");
+            let before = changes_scroll(&view, cx).offset().y;
+            wheel(cx, diff.center(), -80.0, 0.0);
+
+            let after = changes_scroll(&view, cx).offset().y;
+            assert!(
+                (f32::from(after - before)).abs() < f32::EPSILON,
+                "a sideways gesture must not scroll the panel: {before:?} -> {after:?}"
+            );
         }
 
         #[gpui::test]

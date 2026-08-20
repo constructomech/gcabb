@@ -1,7 +1,9 @@
 #![allow(clippy::missing_errors_doc)]
 
 use std::collections::HashMap;
+use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
+use std::sync::{Arc, Mutex as StdMutex};
 
 use app_model::{
     AgentOption, InteractionRequest, InteractionResponse, PromptAttachment, SessionControls,
@@ -9,8 +11,8 @@ use app_model::{
 };
 use async_trait::async_trait;
 use copilot_provider::{
-    AgentProvider, ProviderCompatibility, ProviderError, ProviderEvent, ProviderInteraction,
-    ProviderSession, Result, SDK_CRATE_VERSION, SessionRequest,
+    AgentProvider, AgentProviderFactory, ProviderCompatibility, ProviderError, ProviderEvent,
+    ProviderInteraction, ProviderSession, Result, SDK_CRATE_VERSION, SessionRequest,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -115,7 +117,9 @@ pub fn large_session_events(config: LargeSessionConfig) -> Vec<Value> {
 
 #[derive(Default)]
 pub struct FakeProvider {
+    working_directory: PathBuf,
     started: AtomicBool,
+    process_id: AtomicU64,
     next_session: AtomicU64,
     script: Mutex<Vec<Value>>,
     history: Mutex<HashMap<String, Vec<Value>>>,
@@ -125,6 +129,11 @@ pub struct FakeProvider {
     fail_history: AtomicBool,
     fail_tool_discovery: AtomicBool,
     fail_title_generation: AtomicBool,
+    fail_start: AtomicBool,
+    fail_send: AtomicBool,
+    dirty_on_send_failure: AtomicBool,
+    fail_mode: AtomicBool,
+    fail_stop: AtomicBool,
     generated_title: Mutex<Option<String>>,
     extra_tools: Mutex<Vec<String>>,
     omit_tools: Mutex<Vec<String>>,
@@ -133,9 +142,19 @@ pub struct FakeProvider {
     skills: Mutex<Vec<WorkspaceResource>>,
     instructions: Mutex<Vec<WorkspaceResource>>,
     selected_agents: Mutex<HashMap<String, Option<String>>>,
+    sent_prompts: Mutex<Vec<String>>,
 }
 
 impl FakeProvider {
+    fn with_process_id(process_id: u64, working_directory: PathBuf) -> Self {
+        Self {
+            working_directory,
+            process_id: AtomicU64::new(process_id),
+            next_session: AtomicU64::new(process_id.saturating_mul(1_000)),
+            ..Self::default()
+        }
+    }
+
     #[must_use]
     pub fn with_script(script: Vec<Value>) -> Self {
         Self {
@@ -202,6 +221,11 @@ impl FakeProvider {
             .flatten()
     }
 
+    /// Prompts carried by each send, in order.
+    pub async fn sent_prompts(&self) -> Vec<String> {
+        self.sent_prompts.lock().await.clone()
+    }
+
     async fn tool_names(&self) -> Vec<String> {
         let omit = self.omit_tools.lock().await.clone();
         let extra = self.extra_tools.lock().await.clone();
@@ -219,6 +243,18 @@ impl FakeProvider {
 
     pub async fn active_sessions(&self) -> usize {
         self.live.lock().await.len()
+    }
+
+    #[must_use]
+    pub fn is_started(&self) -> bool {
+        self.started.load(Ordering::SeqCst)
+    }
+
+    #[must_use]
+    pub fn process_id(&self) -> Option<u32> {
+        u32::try_from(self.process_id.load(Ordering::SeqCst))
+            .ok()
+            .filter(|process_id| *process_id != 0)
     }
 
     pub async fn request_interaction(
@@ -283,12 +319,15 @@ impl FakeProvider {
 #[async_trait]
 impl AgentProvider for FakeProvider {
     async fn start(&self) -> Result<ProviderCompatibility> {
+        if self.fail_start.load(Ordering::SeqCst) {
+            return Err(ProviderError::Sdk("configured start failure".to_owned()));
+        }
         self.started.store(true, Ordering::SeqCst);
         Ok(ProviderCompatibility {
             sdk_crate_version: SDK_CRATE_VERSION.to_owned(),
             sdk_protocol_version: 3,
             negotiated_protocol_version: 3,
-            process_id: None,
+            process_id: self.process_id(),
             startup: None,
             available_modes: Vec::new(),
             available_models: Vec::new(),
@@ -300,6 +339,9 @@ impl AgentProvider for FakeProvider {
         self.live.lock().await.clear();
         self.interactions.lock().await.clear();
         self.selected_agents.lock().await.clear();
+        if self.fail_stop.load(Ordering::SeqCst) {
+            return Err(ProviderError::Sdk("configured stop failure".to_owned()));
+        }
         Ok(())
     }
 
@@ -342,13 +384,24 @@ impl AgentProvider for FakeProvider {
     async fn send(
         &self,
         sdk_session_id: &str,
-        _prompt: &str,
+        prompt: &str,
         attachments: &[PromptAttachment],
     ) -> Result<String> {
+        self.sent_prompts.lock().await.push(prompt.to_owned());
         self.sent_attachments
             .lock()
             .await
             .push(attachments.to_vec());
+        if self.fail_send.load(Ordering::SeqCst) {
+            if self.dirty_on_send_failure.load(Ordering::SeqCst) {
+                std::fs::write(
+                    self.working_directory.join("unsaved-from-failed-send.txt"),
+                    "preserve me\n",
+                )
+                .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+            }
+            return Err(ProviderError::Sdk("configured send failure".to_owned()));
+        }
         let script = self.script.lock().await.clone();
         for event in script {
             self.emit(sdk_session_id, event).await?;
@@ -399,6 +452,9 @@ impl AgentProvider for FakeProvider {
     }
 
     async fn set_mode(&self, _sdk_session_id: &str, _mode: &str) -> Result<()> {
+        if self.fail_mode.load(Ordering::SeqCst) {
+            return Err(ProviderError::Sdk("configured mode failure".to_owned()));
+        }
         Ok(())
     }
 
@@ -471,6 +527,151 @@ impl AgentProvider for FakeProvider {
             .take(4)
             .collect::<Vec<_>>()
             .join(" "))
+    }
+}
+
+#[derive(Clone, Default)]
+pub struct FakeProviderFactory {
+    state: Arc<FakeProviderFactoryState>,
+}
+
+#[derive(Default)]
+struct FakeProviderFactoryState {
+    next_provider: AtomicU64,
+    providers: StdMutex<Vec<Arc<FakeProvider>>>,
+    fail_start: AtomicBool,
+    fail_send: AtomicBool,
+    dirty_on_send_failure: AtomicBool,
+    fail_mode: AtomicBool,
+    fail_stop: AtomicBool,
+    fail_title_generation: AtomicBool,
+    generated_title: StdMutex<Option<String>>,
+}
+
+impl FakeProviderFactory {
+    #[must_use]
+    pub fn providers(&self) -> Vec<Arc<FakeProvider>> {
+        self.state
+            .providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+    }
+
+    pub fn fail_starts(&self, fail: bool) {
+        self.state.fail_start.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn fail_sends(&self, fail: bool) {
+        self.state.fail_send.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn dirty_on_send_failure(&self, dirty: bool) {
+        self.state
+            .dirty_on_send_failure
+            .store(dirty, Ordering::SeqCst);
+    }
+
+    pub fn fail_modes(&self, fail: bool) {
+        self.state.fail_mode.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn fail_stops(&self, fail: bool) {
+        self.state.fail_stop.store(fail, Ordering::SeqCst);
+    }
+
+    pub fn fail_title_generation(&self, fail: bool) {
+        self.state
+            .fail_title_generation
+            .store(fail, Ordering::SeqCst);
+    }
+
+    pub fn set_generated_title(&self, title: impl Into<String>) {
+        *self
+            .state
+            .generated_title
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = Some(title.into());
+    }
+}
+
+#[async_trait]
+impl AgentProviderFactory for FakeProviderFactory {
+    async fn compatibility(&self) -> Result<ProviderCompatibility> {
+        Ok(ProviderCompatibility {
+            sdk_crate_version: SDK_CRATE_VERSION.to_owned(),
+            sdk_protocol_version: 3,
+            negotiated_protocol_version: 3,
+            process_id: None,
+            startup: None,
+            available_modes: Vec::new(),
+            available_models: Vec::new(),
+        })
+    }
+
+    fn create(&self, working_directory: &Path) -> Arc<dyn AgentProvider> {
+        let process_id = self.state.next_provider.fetch_add(1, Ordering::SeqCst) + 1;
+        let provider = Arc::new(FakeProvider::with_process_id(
+            process_id,
+            working_directory.to_owned(),
+        ));
+        provider.fail_start.store(
+            self.state.fail_start.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        provider.fail_send.store(
+            self.state.fail_send.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        provider.dirty_on_send_failure.store(
+            self.state.dirty_on_send_failure.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        provider.fail_mode.store(
+            self.state.fail_mode.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        provider.fail_stop.store(
+            self.state.fail_stop.load(Ordering::SeqCst),
+            Ordering::SeqCst,
+        );
+        self.state
+            .providers
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .push(provider.clone());
+        provider
+    }
+
+    async fn generate_title(
+        &self,
+        prompt: &str,
+        _model: Option<&str>,
+        _working_directory: &Path,
+    ) -> Result<String> {
+        if self.state.fail_title_generation.load(Ordering::SeqCst) {
+            return Err(ProviderError::Sdk(
+                "configured title generation failure".to_owned(),
+            ));
+        }
+        Ok(self
+            .state
+            .generated_title
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
+            .unwrap_or_else(|| {
+                let title = prompt
+                    .split_whitespace()
+                    .take(4)
+                    .collect::<Vec<_>>()
+                    .join(" ");
+                if title.is_empty() {
+                    "Generated session title".to_owned()
+                } else {
+                    title
+                }
+            }))
     }
 }
 

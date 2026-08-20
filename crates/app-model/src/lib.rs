@@ -1,4 +1,4 @@
-use std::collections::HashSet;
+use std::collections::{BTreeMap, HashSet};
 use std::sync::Arc;
 
 use serde::{Deserialize, Serialize};
@@ -22,9 +22,8 @@ pub use tools::{
 };
 
 pub const DOMAIN_EVENT_VERSION: u16 = 1;
-/// Version 5 drops the embedded event log, which duplicated `domain_events`
-/// and made every snapshot grow with the length of the session.
-pub const SNAPSHOT_VERSION: u16 = 6;
+/// Version 8 retains permission requests and their outcomes in the timeline.
+pub const SNAPSHOT_VERSION: u16 = 8;
 
 #[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(rename_all = "snake_case")]
@@ -70,6 +69,23 @@ pub enum SessionStatus {
     Failed,
     Cancelled,
     Disconnected,
+    /// Persisted history is available, but the session's working directory is not.
+    Unavailable,
+}
+
+impl SessionStatus {
+    /// Whether the session still has work the runtime can be asked to stop.
+    ///
+    /// `Waiting` counts because a session parked on an unanswered permission or
+    /// input request is still mid-turn; without it the composer would offer no
+    /// way out of a session that never comes back.
+    #[must_use]
+    pub const fn is_busy(self) -> bool {
+        matches!(
+            self,
+            Self::Starting | Self::Recovering | Self::Running | Self::Waiting
+        )
+    }
 }
 
 #[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
@@ -224,6 +240,14 @@ pub struct InteractionRequest {
     pub choices: Vec<String>,
     pub allow_freeform: bool,
     pub details: Value,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct InteractionRecord {
+    pub request: InteractionRequest,
+    /// Event sequence after which the interaction was requested.
+    pub sequence: u64,
+    pub response: Option<InteractionResponse>,
 }
 
 #[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
@@ -531,8 +555,8 @@ pub struct SessionMetadata {
     pub mode: Option<String>,
     /// Git ref the changes view compares against.
     ///
-    /// Recorded once at session creation so the comparison stays stable even
-    /// if the base branch moves on. Phase 6 makes this user-selectable.
+    /// This is the logical branch selected by the user. Change refreshes resolve
+    /// its current upstream and merge-base commit.
     #[serde(default)]
     pub base_ref: Option<String>,
     pub created_at: String,
@@ -582,6 +606,56 @@ pub struct DomainEvent {
     pub raw: Value,
 }
 
+const DIAGNOSTIC_EVENT_LIMIT: usize = 40;
+
+/// Compact, user-facing telemetry projected from the SDK event stream.
+///
+/// The complete events remain in `domain_events`; this state keeps only the
+/// information needed to explain an in-flight pause without embedding another
+/// copy of the event log in every snapshot.
+#[derive(Clone, Debug, Default, Deserialize, PartialEq, Serialize)]
+pub struct AgentDiagnostics {
+    pub turn_started_at: Option<String>,
+    pub last_event_at: Option<String>,
+    pub last_event_type: Option<String>,
+    pub latest_intent: Option<String>,
+    pub activity: Option<String>,
+    pub model: Option<String>,
+    pub turn_id: Option<String>,
+    pub response_bytes: Option<u64>,
+    pub compaction: Option<CompactionDiagnostics>,
+    pub last_usage: Option<UsageDiagnostics>,
+    #[serde(default)]
+    pub event_counts: BTreeMap<String, u64>,
+    #[serde(default)]
+    pub recent_events: Vec<DiagnosticSignal>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct CompactionDiagnostics {
+    pub started_at: String,
+    pub trigger: Option<String>,
+    pub current_tokens: Option<u64>,
+    pub token_limit: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct UsageDiagnostics {
+    pub model: Option<String>,
+    pub duration_ms: Option<u64>,
+    pub input_tokens: Option<u64>,
+    pub output_tokens: Option<u64>,
+    pub cache_read_tokens: Option<u64>,
+}
+
+#[derive(Clone, Debug, Deserialize, PartialEq, Serialize)]
+pub struct DiagnosticSignal {
+    pub sequence: u64,
+    pub timestamp: String,
+    pub event_type: String,
+    pub summary: String,
+}
+
 impl DomainEvent {
     #[must_use]
     pub fn from_sdk_event(raw: &Value) -> Self {
@@ -624,6 +698,8 @@ pub struct SessionSnapshot {
     #[serde(default)]
     pub pending_interactions: Vec<InteractionRequest>,
     #[serde(default)]
+    pub interaction_history: Vec<InteractionRecord>,
+    #[serde(default)]
     pub controls: SessionControls,
     /// Tools the runtime advertises for this session, proven via `tools.list`.
     #[serde(default)]
@@ -637,6 +713,9 @@ pub struct SessionSnapshot {
     /// Worktree changes against the session's recorded base.
     #[serde(default)]
     pub changes: ChangesView,
+    /// Latest SDK lifecycle and progress signals for user-facing diagnostics.
+    #[serde(default)]
+    pub diagnostics: AgentDiagnostics,
     pub last_error: Option<String>,
     #[serde(skip)]
     seen_event_ids: HashSet<String>,
@@ -657,11 +736,13 @@ impl SessionSnapshot {
             last_sequence: 0,
             transcript: Vec::new(),
             pending_interactions: Vec::new(),
+            interaction_history: Vec::new(),
             controls,
             tool_catalog: ToolCatalog::default(),
             tool_activity: ToolActivity::default(),
             capabilities: CapabilityReport::default(),
             changes: ChangesView::default(),
+            diagnostics: AgentDiagnostics::default(),
             last_error: None,
             seen_event_ids: HashSet::new(),
         }
@@ -678,10 +759,12 @@ impl SessionSnapshot {
 
     /// Reconcile state that cannot still be active after reconnecting a runtime.
     pub fn reconcile_after_restart(&mut self, timestamp: &str) {
-        self.pending_interactions.clear();
+        self.cancel_pending_interactions();
         mark_streaming_interrupted(&mut self.transcript);
         tools::mark_running_invocations_cancelled(&mut self.tool_activity, timestamp);
         tools::mark_running_terminals_cancelled(&mut self.tool_activity, timestamp);
+        self.diagnostics.activity = None;
+        self.diagnostics.compaction = None;
         self.status = SessionStatus::Idle;
     }
 
@@ -722,6 +805,7 @@ impl SessionSnapshot {
             tools::mark_running_terminals_cancelled(&mut self.tool_activity, &event.timestamp);
         }
         tools::project(&mut self.tool_activity, &event);
+        Self::project_diagnostics(&mut self.diagnostics, &event);
         if event.source_type == "session.error" {
             self.last_error = Some(
                 event
@@ -736,7 +820,7 @@ impl SessionSnapshot {
         ApplyOutcome::Applied
     }
 
-    /// Messages and root-agent tool calls in the order they happened.
+    /// Messages, root-agent tool calls, and permission requests in causal order.
     ///
     /// Subagent calls are excluded here and reached through
     /// [`ToolActivity::children_of`], so delegated work appears beneath the
@@ -752,6 +836,12 @@ impl SessionSnapshot {
                     .root_invocations()
                     .into_iter()
                     .map(TimelineEntry::Tool),
+            )
+            .chain(
+                self.interaction_history
+                    .iter()
+                    .filter(|record| record.request.kind == InteractionKind::Permission)
+                    .map(TimelineEntry::Interaction),
             )
             .collect();
         // Sequence is monotonic per session, so this is a stable total order.
@@ -770,9 +860,226 @@ impl SessionSnapshot {
             .iter()
             .any(|pending| pending.id == request.id)
         {
+            if request.kind == InteractionKind::Permission {
+                self.interaction_history.push(InteractionRecord {
+                    request: request.clone(),
+                    sequence: self.last_sequence,
+                    response: None,
+                });
+            }
             self.pending_interactions.push(request);
             self.status = SessionStatus::Waiting;
         }
+    }
+
+    #[allow(
+        clippy::too_many_lines,
+        reason = "the event-to-diagnostic phase mapping is clearest as one exhaustive projection"
+    )]
+    fn project_diagnostics(diagnostics: &mut AgentDiagnostics, event: &DomainEvent) {
+        diagnostics.last_event_at = Some(event.timestamp.clone());
+        diagnostics.last_event_type = Some(event.source_type.clone());
+        *diagnostics
+            .event_counts
+            .entry(event.source_type.clone())
+            .or_default() += 1;
+        if event.agent_id.is_some() {
+            return;
+        }
+
+        let data = &event.details;
+        match event.source_type.as_str() {
+            "assistant.turn_start" => {
+                diagnostics.turn_started_at = Some(event.timestamp.clone());
+                diagnostics.latest_intent = None;
+                diagnostics.activity = Some("Preparing model request".to_owned());
+                diagnostics.model = string_field(data, "model");
+                diagnostics.turn_id = string_field(data, "turnId");
+                diagnostics.response_bytes = None;
+                diagnostics.compaction = None;
+            }
+            "assistant.turn_retry" => {
+                diagnostics.activity = Some(string_field(data, "reason").map_or_else(
+                    || "Retrying model request".to_owned(),
+                    |reason| format!("Retrying model request: {reason}"),
+                ));
+            }
+            "model.call_start" => {
+                diagnostics.activity = Some("Waiting for model response".to_owned());
+                if let Some(model) = string_field(data, "model") {
+                    diagnostics.model = Some(model);
+                }
+            }
+            "assistant.intent" => {
+                if let Some(intent) = string_field(data, "intent") {
+                    diagnostics.latest_intent = Some(intent.clone());
+                    diagnostics.activity = Some(intent);
+                }
+            }
+            "assistant.reasoning" | "assistant.reasoning_delta" => {
+                diagnostics.activity = Some("Model is reasoning".to_owned());
+            }
+            "assistant.server_tool_progress" => {
+                let kind = string_field(data, "kind").unwrap_or_else(|| "server tool".to_owned());
+                let status = string_field(data, "status").unwrap_or_else(|| "running".to_owned());
+                diagnostics.activity = Some(format!("{kind}: {status}"));
+            }
+            "assistant.streaming_delta" => {
+                diagnostics.activity = Some("Receiving model response".to_owned());
+                diagnostics.response_bytes =
+                    data.get("totalResponseSizeBytes").and_then(Value::as_u64);
+            }
+            "tool.execution_start" => {
+                diagnostics.activity = Some(format!(
+                    "Running {}",
+                    string_field(data, "toolName").unwrap_or_else(|| "tool".to_owned())
+                ));
+            }
+            "tool.execution_progress" => {
+                diagnostics.activity = string_field(data, "progressMessage")
+                    .or_else(|| Some("Tool is running".to_owned()));
+            }
+            "tool.execution_complete" => {
+                diagnostics.activity = Some("Processing tool result".to_owned());
+            }
+            "hook.start" => {
+                diagnostics.activity = Some(format!(
+                    "Running {} hook",
+                    string_field(data, "hookType").unwrap_or_else(|| "session".to_owned())
+                ));
+            }
+            "hook.progress" => {
+                diagnostics.activity =
+                    string_field(data, "message").or_else(|| Some("Hook is running".to_owned()));
+            }
+            "subagent.started" => {
+                diagnostics.activity = Some(format!(
+                    "Waiting for {}",
+                    string_field(data, "agentDisplayName").unwrap_or_else(|| "subagent".to_owned())
+                ));
+            }
+            "subagent.completed" | "subagent.failed" => {
+                diagnostics.activity = Some("Processing subagent result".to_owned());
+            }
+            "session.compaction_start" => {
+                diagnostics.activity = Some("Compacting conversation context".to_owned());
+                diagnostics.compaction = Some(CompactionDiagnostics {
+                    started_at: event.timestamp.clone(),
+                    trigger: string_field(data, "trigger"),
+                    current_tokens: data.get("currentTokens").and_then(Value::as_u64),
+                    token_limit: data.get("tokenLimit").and_then(Value::as_u64),
+                });
+            }
+            "session.compaction_complete" => {
+                diagnostics.activity = Some("Context compaction complete".to_owned());
+                diagnostics.compaction = None;
+            }
+            "assistant.usage" => {
+                diagnostics.last_usage = Some(UsageDiagnostics {
+                    model: string_field(data, "model"),
+                    duration_ms: data.get("duration").and_then(Value::as_u64),
+                    input_tokens: data.get("inputTokens").and_then(Value::as_u64),
+                    output_tokens: data.get("outputTokens").and_then(Value::as_u64),
+                    cache_read_tokens: data.get("cacheReadTokens").and_then(Value::as_u64),
+                });
+            }
+            "assistant.idle" => {
+                diagnostics.activity = Some("Waiting for background work".to_owned());
+            }
+            "session.idle" => {
+                diagnostics.activity = None;
+                diagnostics.compaction = None;
+            }
+            "session.error" => diagnostics.activity = Some("Agent encountered an error".to_owned()),
+            _ => {}
+        }
+
+        if let Some(summary) = Self::diagnostic_signal_summary(event) {
+            let signal = DiagnosticSignal {
+                sequence: event.sequence,
+                timestamp: event.timestamp.clone(),
+                event_type: event.source_type.clone(),
+                summary,
+            };
+            if diagnostics
+                .recent_events
+                .last()
+                .is_some_and(|previous| previous.event_type == signal.event_type)
+            {
+                diagnostics.recent_events.pop();
+            }
+            diagnostics.recent_events.push(signal);
+            let overflow = diagnostics
+                .recent_events
+                .len()
+                .saturating_sub(DIAGNOSTIC_EVENT_LIMIT);
+            if overflow > 0 {
+                diagnostics.recent_events.drain(..overflow);
+            }
+        }
+    }
+
+    fn diagnostic_signal_summary(event: &DomainEvent) -> Option<String> {
+        let data = &event.details;
+        let summary = match event.source_type.as_str() {
+            "assistant.turn_start" => string_field(data, "model").map_or_else(
+                || "Assistant turn started".to_owned(),
+                |model| format!("Using {model}"),
+            ),
+            "assistant.turn_retry" => string_field(data, "reason").map_or_else(
+                || "Model call retry".to_owned(),
+                |reason| format!("Retry: {reason}"),
+            ),
+            "model.call_start" => "Model request dispatched".to_owned(),
+            "assistant.intent" => string_field(data, "intent")?,
+            "assistant.reasoning" | "assistant.reasoning_delta" => "Reasoning activity".to_owned(),
+            "assistant.server_tool_progress" => format!(
+                "{}: {}",
+                string_field(data, "kind").unwrap_or_else(|| "Server tool".to_owned()),
+                string_field(data, "status").unwrap_or_else(|| "running".to_owned())
+            ),
+            "assistant.streaming_delta" => data
+                .get("totalResponseSizeBytes")
+                .and_then(Value::as_u64)
+                .map_or_else(
+                    || "Response stream active".to_owned(),
+                    |bytes| format!("{bytes} bytes received"),
+                ),
+            "tool.execution_start" => format!(
+                "Started {}",
+                string_field(data, "toolName").unwrap_or_else(|| "tool".to_owned())
+            ),
+            "tool.execution_progress" => string_field(data, "progressMessage")?,
+            "tool.execution_complete" => "Tool completed".to_owned(),
+            "hook.start" => format!(
+                "Started {} hook",
+                string_field(data, "hookType").unwrap_or_else(|| "session".to_owned())
+            ),
+            "hook.progress" => string_field(data, "message")?,
+            "hook.end" => "Hook completed".to_owned(),
+            "subagent.started" => format!(
+                "Started {}",
+                string_field(data, "agentDisplayName").unwrap_or_else(|| "subagent".to_owned())
+            ),
+            "subagent.completed" => "Subagent completed".to_owned(),
+            "subagent.failed" => string_field(data, "error").map_or_else(
+                || "Subagent failed".to_owned(),
+                |error| format!("Failed: {error}"),
+            ),
+            "session.compaction_start" => "Context compaction started".to_owned(),
+            "session.compaction_complete" => string_field(data, "error").map_or_else(
+                || "Context compaction completed".to_owned(),
+                |error| format!("Compaction failed: {error}"),
+            ),
+            "assistant.usage" => "Model usage reported".to_owned(),
+            "assistant.idle" => "Assistant loop idle; background work may remain".to_owned(),
+            "session.idle" => "Session idle".to_owned(),
+            "session.error" => string_field(data, "message")
+                .or_else(|| string_field(data, "error"))
+                .unwrap_or_else(|| "Session error".to_owned()),
+            _ => return None,
+        };
+        Some(truncate(&summary, 200))
     }
 
     pub fn remove_interaction(&mut self, interaction_id: &str) -> bool {
@@ -784,17 +1091,48 @@ impl SessionSnapshot {
         }
         self.pending_interactions.len() != original_len
     }
+
+    pub fn record_interaction_response(
+        &mut self,
+        interaction_id: &str,
+        response: InteractionResponse,
+    ) {
+        if let Some(record) = self
+            .interaction_history
+            .iter_mut()
+            .find(|record| record.request.id == interaction_id && record.response.is_none())
+        {
+            record.response = Some(response);
+        }
+    }
+
+    pub fn cancel_pending_interactions(&mut self) {
+        for record in &mut self.interaction_history {
+            if record.response.is_none()
+                && self
+                    .pending_interactions
+                    .iter()
+                    .any(|request| request.id == record.request.id)
+            {
+                record.response = Some(InteractionResponse::Cancel);
+            }
+        }
+        self.pending_interactions.clear();
+        if self.status == SessionStatus::Waiting {
+            self.status = SessionStatus::Running;
+        }
+    }
 }
 
 /// One item in the session timeline.
 ///
 /// The transcript alone shows only what the agent *said*; the timeline
-/// interleaves what it *did*, which is the difference between watching a
-/// session and watching a black box.
+/// interleaves what it *did* and asked permission to do.
 #[derive(Clone, Copy, Debug)]
 pub enum TimelineEntry<'a> {
     Message(&'a TranscriptMessage),
     Tool(&'a ToolInvocation),
+    Interaction(&'a InteractionRecord),
 }
 
 impl TimelineEntry<'_> {
@@ -803,6 +1141,7 @@ impl TimelineEntry<'_> {
         match self {
             Self::Message(message) => message.sequence,
             Self::Tool(invocation) => invocation.sequence,
+            Self::Interaction(record) => record.sequence,
         }
     }
 }
@@ -853,6 +1192,50 @@ fn status_for_event(event: &DomainEvent) -> Option<SessionStatus> {
     }
 }
 
+/// Whether a `user.message` is the runtime injecting a loaded skill rather than
+/// something the user wrote.
+///
+/// The runtime replays a skill's `SKILL.md` into the conversation as a user
+/// turn tagged `skill-<name>`. Rendering it as a user-authored message
+/// misattributes it and dumps a large internal context block into the
+/// transcript, so the timeline shows the `skill` tool call instead.
+fn is_skill_injection(event: &DomainEvent) -> bool {
+    event
+        .details
+        .get("source")
+        .and_then(Value::as_str)
+        .is_some_and(|source| source.starts_with("skill-"))
+}
+
+fn project_user_message(transcript: &mut Vec<TranscriptMessage>, event: &DomainEvent) {
+    if is_skill_injection(event) {
+        return;
+    }
+    let content = event
+        .details
+        .get("content")
+        .and_then(Value::as_str)
+        .unwrap_or_default();
+    let attachments = message_attachments(event);
+    // A screenshot on its own is a complete message, so an empty body
+    // is only uninteresting when nothing came with it.
+    if !content.is_empty() || !attachments.is_empty() {
+        transcript.push(TranscriptMessage {
+            id: event.id.clone(),
+            role: TranscriptRole::User,
+            content: content.to_owned(),
+            state: if event.details.get("delivery").and_then(Value::as_str) == Some("steering") {
+                TranscriptState::Pending
+            } else {
+                TranscriptState::Complete
+            },
+            timestamp: event.timestamp.clone(),
+            sequence: event.sequence,
+            attachments,
+        });
+    }
+}
+
 fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEvent) {
     if event.agent_id.is_some()
         || event
@@ -870,33 +1253,7 @@ fn project_transcript(transcript: &mut Vec<TranscriptMessage>, event: &DomainEve
                 message.state = TranscriptState::Complete;
             }
         }
-        "user.message" => {
-            let content = event
-                .details
-                .get("content")
-                .and_then(Value::as_str)
-                .unwrap_or_default();
-            let attachments = message_attachments(event);
-            // A screenshot on its own is a complete message, so an empty body
-            // is only uninteresting when nothing came with it.
-            if !content.is_empty() || !attachments.is_empty() {
-                transcript.push(TranscriptMessage {
-                    id: event.id.clone(),
-                    role: TranscriptRole::User,
-                    content: content.to_owned(),
-                    state: if event.details.get("delivery").and_then(Value::as_str)
-                        == Some("steering")
-                    {
-                        TranscriptState::Pending
-                    } else {
-                        TranscriptState::Complete
-                    },
-                    timestamp: event.timestamp.clone(),
-                    sequence: event.sequence,
-                    attachments,
-                });
-            }
-        }
+        "user.message" => project_user_message(transcript, event),
         "assistant.message_start" => {
             let id = message_id(event);
             if !transcript.iter().any(|message| message.id == id) {
@@ -1111,6 +1468,81 @@ mod tests {
             ApplyOutcome::Duplicate
         );
         assert_eq!(replayed, first);
+    }
+
+    #[test]
+    fn diagnostics_project_progress_without_retaining_reasoning_content() {
+        let mut state = SessionSnapshot::new(metadata());
+        let events = [
+            json!({
+                "id": "turn",
+                "timestamp": "1",
+                "type": "assistant.turn_start",
+                "data": {"turnId": "turn-7", "model": "gpt-test"}
+            }),
+            json!({
+                "id": "intent",
+                "timestamp": "2",
+                "type": "assistant.intent",
+                "data": {"intent": "Inspecting the session state"}
+            }),
+            json!({
+                "id": "child-turn",
+                "agentId": "agent-1",
+                "timestamp": "2",
+                "type": "assistant.turn_start",
+                "data": {"turnId": "child-turn", "model": "child-model"}
+            }),
+            json!({
+                "id": "reasoning",
+                "timestamp": "3",
+                "type": "assistant.reasoning",
+                "data": {"reasoningId": "r", "content": "private chain of thought"}
+            }),
+            json!({
+                "id": "compact",
+                "timestamp": "4",
+                "type": "session.compaction_start",
+                "data": {"trigger": "threshold", "currentTokens": 900, "tokenLimit": 1000}
+            }),
+        ];
+        for (index, raw) in events.iter().enumerate() {
+            state.apply(DomainEvent::from_sdk_event_for(
+                "app-session",
+                index as u64 + 1,
+                raw,
+            ));
+        }
+
+        assert_eq!(
+            state.diagnostics.latest_intent.as_deref(),
+            Some("Inspecting the session state")
+        );
+        assert_eq!(state.diagnostics.model.as_deref(), Some("gpt-test"));
+        assert_eq!(state.diagnostics.turn_id.as_deref(), Some("turn-7"));
+        assert_eq!(
+            state.diagnostics.activity.as_deref(),
+            Some("Compacting conversation context")
+        );
+        assert_eq!(
+            state
+                .diagnostics
+                .compaction
+                .as_ref()
+                .and_then(|compaction| compaction.current_tokens),
+            Some(900)
+        );
+        assert_eq!(
+            state.diagnostics.event_counts.get("assistant.reasoning"),
+            Some(&1)
+        );
+        assert!(
+            state
+                .diagnostics
+                .recent_events
+                .iter()
+                .all(|event| !event.summary.contains("private chain of thought"))
+        );
     }
 
     #[test]
@@ -1342,9 +1774,30 @@ mod tests {
         state.add_interaction(request.clone());
         state.add_interaction(request);
         assert_eq!(state.pending_interactions.len(), 1);
+        assert_eq!(state.interaction_history.len(), 1);
         assert_eq!(state.status, SessionStatus::Waiting);
+        state.record_interaction_response("permission-1", InteractionResponse::ApproveForSession);
         assert!(state.remove_interaction("permission-1"));
         assert!(state.pending_interactions.is_empty());
+        assert_eq!(
+            state.interaction_history[0].response,
+            Some(InteractionResponse::ApproveForSession)
+        );
+
+        let repeated = state.interaction_history[0].request.clone();
+        state.add_interaction(repeated);
+        state.record_interaction_response(
+            "permission-1",
+            InteractionResponse::Reject { feedback: None },
+        );
+        assert_eq!(
+            state.interaction_history[0].response,
+            Some(InteractionResponse::ApproveForSession)
+        );
+        assert_eq!(
+            state.interaction_history[1].response,
+            Some(InteractionResponse::Reject { feedback: None })
+        );
     }
 
     #[test]
@@ -1932,6 +2385,7 @@ mod tests {
             .map(|entry| match entry {
                 TimelineEntry::Message(_) => "message",
                 TimelineEntry::Tool(_) => "tool",
+                TimelineEntry::Interaction(_) => "interaction",
             })
             .collect();
         assert_eq!(shape, ["message", "tool", "tool", "message"]);
@@ -1949,6 +2403,46 @@ mod tests {
         assert_eq!(edit.verb(), "Edit");
         assert_eq!(edit.summary(), "src/lib.rs");
         assert!(edit.diff().is_some_and(|diff| diff.contains("+new")));
+    }
+
+    /// Loading a skill injects the skill file as a `user.message`. Rendering it
+    /// as something the user typed misattributes it and dumps the whole skill
+    /// into the transcript, so only the tool call should appear.
+    #[test]
+    fn injected_skill_context_stays_out_of_the_transcript() {
+        let mut state = SessionSnapshot::new(metadata());
+        apply_all(
+            &mut state,
+            vec![
+                json!({"id":"u","type":"user.message","data":{"content":"open a pull request"}}),
+                json!({"id":"t","type":"tool.execution_start",
+                       "data":{"toolCallId":"c1","toolName":"skill",
+                               "arguments":{"skill":"create-pr"}}}),
+                json!({"id":"inject","type":"user.message","data":{
+                    "content":"<skill-context name=\"create-pr\">\nBase directory…",
+                    "source":"skill-create-pr"
+                }}),
+                json!({"id":"tc","type":"tool.execution_complete",
+                       "data":{"toolCallId":"c1","success":true}}),
+            ],
+        );
+
+        let user_messages: Vec<&str> = state
+            .transcript
+            .iter()
+            .filter(|message| message.role == TranscriptRole::User)
+            .map(|message| message.content.as_str())
+            .collect();
+        assert_eq!(user_messages, ["open a pull request"]);
+
+        // The skill still shows up, as the tool activity that loaded it.
+        let TimelineEntry::Tool(skill) = state.timeline()[1] else {
+            panic!("expected a tool entry");
+        };
+        assert_eq!(
+            format!("{} {}", skill.verb(), skill.summary_line()),
+            "Reading skill create-pr"
+        );
     }
 
     /// A multi-line command must not become a multi-line header; it filled the

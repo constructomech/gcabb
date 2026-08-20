@@ -10,8 +10,9 @@
 //! reports committed, staged, unstaged, and untracked changes in one view.
 //! Selectable bases and merge-base discovery arrive in Phase 6.
 
+use std::io::Write as _;
 use std::path::{Path, PathBuf};
-use std::process::{Command, Output};
+use std::process::{Command, Output, Stdio};
 
 use app_model::changes::{ChangeStage, ChangeStatus, ChangedFile, ChangesView, DiffStats};
 use thiserror::Error;
@@ -27,6 +28,8 @@ pub enum GitError {
     Command { command: String, stderr: String },
     #[error("path is not inside a git worktree: {0}")]
     NotAWorktree(PathBuf),
+    #[error("worktree path already exists: {0}")]
+    WorktreePathExists(PathBuf),
 }
 
 pub type Result<T> = std::result::Result<T, GitError>;
@@ -62,7 +65,12 @@ impl GitService {
     }
 
     fn run_raw(&self, args: &[&str]) -> Result<Output> {
-        Command::new("git")
+        self.command(args).output().map_err(GitError::from)
+    }
+
+    fn command(&self, args: &[&str]) -> Command {
+        let mut command = Command::new("git");
+        command
             .arg("-C")
             .arg(&self.worktree)
             // Keep output stable regardless of the developer's git config.
@@ -71,9 +79,34 @@ impl GitService {
             .arg("core.quotepath=false")
             .arg("-c")
             .arg("diff.noprefix=false")
-            .args(args)
-            .output()
-            .map_err(GitError::from)
+            .args(args);
+        command
+    }
+
+    /// Run a git command that reads its input from stdin.
+    fn run_with_stdin(&self, args: &[&str], input: &str) -> Result<String> {
+        let mut child = self
+            .command(args)
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .stderr(Stdio::piped())
+            .spawn()?;
+        child
+            .stdin
+            .take()
+            .ok_or_else(|| GitError::Command {
+                command: args.join(" "),
+                stderr: "git did not provide a stdin pipe".to_owned(),
+            })?
+            .write_all(input.as_bytes())?;
+        let output = child.wait_with_output()?;
+        if !output.status.success() {
+            return Err(GitError::Command {
+                command: args.join(" "),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        Ok(String::from_utf8_lossy(&output.stdout).into_owned())
     }
 
     /// Whether the configured path is inside a git worktree.
@@ -92,6 +125,99 @@ impl GitService {
             .run(&["rev-parse", "--abbrev-ref", "HEAD"])?
             .trim()
             .to_owned())
+    }
+
+    /// Canonical path of the main checkout backing this worktree.
+    ///
+    /// Falls back to the configured path when it is not a repository, so
+    /// callers can compare ownership without special-casing plain directories.
+    #[must_use]
+    pub fn repository_root(&self) -> PathBuf {
+        let root = self
+            .worktree
+            .canonicalize()
+            .unwrap_or_else(|_| self.worktree.clone());
+        self.run(&["worktree", "list", "--porcelain"])
+            .ok()
+            .and_then(|output| {
+                output
+                    .lines()
+                    .find_map(|line| line.strip_prefix("worktree ").map(str::to_owned))
+            })
+            .map_or(root, |path| {
+                let path = PathBuf::from(path);
+                path.canonicalize().unwrap_or(path)
+            })
+    }
+
+    /// Resolve a logical local branch through its configured upstream.
+    #[must_use]
+    pub fn tracking_ref(&self, base_ref: &str) -> String {
+        let local_ref = format!("refs/heads/{base_ref}");
+        self.run(&[
+            "for-each-ref",
+            "--format=%(upstream:short)",
+            local_ref.as_str(),
+        ])
+        .ok()
+        .map(|value| value.trim().to_owned())
+        .filter(|value| !value.is_empty())
+        .unwrap_or_else(|| base_ref.to_owned())
+    }
+
+    /// Local and remote-tracking branches available as comparison bases.
+    pub fn base_refs(&self) -> Result<Vec<String>> {
+        let output = self.run(&[
+            "for-each-ref",
+            "--format=%(refname:short)",
+            "refs/heads",
+            "refs/remotes",
+        ])?;
+        let mut refs = output
+            .lines()
+            .map(str::trim)
+            .filter(|reference| !reference.is_empty() && !reference.ends_with("/HEAD"))
+            .map(str::to_owned)
+            .collect::<Vec<_>>();
+        refs.sort_by_key(|reference| (reference.contains('/'), reference.clone()));
+        refs.dedup();
+        Ok(refs)
+    }
+
+    /// Fetch the remote-tracking ref backing a logical base branch.
+    ///
+    /// Returns `false` when the selected base is local-only.
+    pub fn fetch_base_ref(&self, base_ref: &str) -> Result<bool> {
+        let tracking_ref = self.tracking_ref(base_ref);
+        let remotes = self.run(&["remote"])?;
+        let Some((remote, branch)) = remotes.lines().find_map(|remote| {
+            tracking_ref
+                .strip_prefix(remote)
+                .and_then(|rest| rest.strip_prefix('/'))
+                .map(|branch| (remote, branch))
+        }) else {
+            return Ok(false);
+        };
+        let source = format!("refs/heads/{branch}");
+        let destination = format!("refs/remotes/{tracking_ref}");
+        let refspec = format!("{source}:{destination}");
+        self.run(&["fetch", "--quiet", remote, &refspec])?;
+        Ok(true)
+    }
+
+    /// Repository default branch, independent of the currently checked-out branch.
+    #[must_use]
+    pub fn default_branch(&self) -> Option<String> {
+        if let Ok(head) = self.run(&["symbolic-ref", "--short", "refs/remotes/origin/HEAD"]) {
+            let head = head.trim();
+            return Some(
+                head.split_once('/')
+                    .map_or_else(|| head.to_owned(), |(_, branch)| branch.to_owned()),
+            );
+        }
+        ["main", "master"]
+            .into_iter()
+            .find_map(|candidate| self.branch_exists(candidate).then(|| candidate.to_owned()))
     }
 
     /// Merge base between `HEAD` and `base_ref`.
@@ -116,11 +242,29 @@ impl GitService {
         let path_string = path.to_string_lossy().into_owned();
         // Resolve the base first so a missing ref fails here with a clear
         // error rather than leaving a half-created worktree behind.
-        let base = self
-            .merge_base(base_ref)
-            .unwrap_or_else(|_| base_ref.to_owned());
+        let tracking_ref = self.tracking_ref(base_ref);
+        let base = self.merge_base(&tracking_ref).unwrap_or(tracking_ref);
         self.run(&["worktree", "add", "-b", branch, &path_string, &base])?;
         Ok(branch.to_owned())
+    }
+
+    /// Recreate a missing linked worktree from an existing local branch.
+    ///
+    /// This never creates a branch or overwrites a path. It is intended for
+    /// recovering an app-managed worktree whose directory was removed while its
+    /// branch and session history remained.
+    pub fn recreate_worktree(&self, path: &Path, branch: &str) -> Result<()> {
+        if path.exists() {
+            return Err(GitError::WorktreePathExists(path.to_owned()));
+        }
+        self.run(&["rev-parse", "--verify", &format!("refs/heads/{branch}")])?;
+        self.run(&["worktree", "prune"])?;
+        if let Some(parent) = path.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        let path_string = path.to_string_lossy().into_owned();
+        self.run(&["worktree", "add", &path_string, branch])?;
+        Ok(())
     }
 
     /// Whether `branch` already exists in this repository.
@@ -156,6 +300,56 @@ impl GitService {
         Ok(())
     }
 
+    /// Remove a linked worktree even when it still holds uncommitted work.
+    ///
+    /// Only for callers that have already preserved that work. Note that
+    /// git-ignored files -- build output, local configuration -- go with the
+    /// directory and are not preserved by anything.
+    pub fn force_remove_worktree(&self, path: &Path) -> Result<()> {
+        let path_string = path.to_string_lossy().into_owned();
+        self.run(&["worktree", "remove", "--force", &path_string])?;
+        let _ = self.run(&["worktree", "prune"]);
+        Ok(())
+    }
+
+    /// Capture everything in this worktree that is not in its `HEAD` commit as
+    /// a single patch.
+    ///
+    /// Staged, unstaged, and untracked files are all included, so a worktree
+    /// can be thrown away and rebuilt later without losing work. Everything is
+    /// staged first because an untracked file has no entry to diff against
+    /// otherwise; the worktree is being discarded, so its index does not
+    /// outlive the call. Returns `None` when there is nothing to capture.
+    ///
+    /// Git-ignored files are *not* captured. They are build output and local
+    /// configuration by declaration, and including directories like `target`
+    /// or `node_modules` would make the patch unusable. Callers that go on to
+    /// delete the worktree are deleting those files.
+    pub fn capture_uncommitted_patch(&self) -> Result<Option<String>> {
+        if self.is_clean() {
+            return Ok(None);
+        }
+        self.run(&["add", "--all"])?;
+        // `--binary` keeps images and other non-text files reconstructible.
+        let patch = self.run(&["diff", "--binary", "--cached", "HEAD"])?;
+        if patch.trim().is_empty() {
+            return Ok(None);
+        }
+        Ok(Some(patch))
+    }
+
+    /// Re-apply a patch captured by [`Self::capture_uncommitted_patch`].
+    ///
+    /// The index is updated too, so files that were untracked when the patch
+    /// was taken come back tracked rather than as unexplained new files.
+    pub fn apply_patch(&self, patch: &str) -> Result<()> {
+        self.run_with_stdin(
+            &["apply", "--binary", "--index", "--whitespace=nowarn", "-"],
+            patch,
+        )?;
+        Ok(())
+    }
+
     /// Delete a branch only when it has been merged into `base_ref`.
     ///
     /// Unmerged work keeps its branch, so a deleted session never takes
@@ -184,10 +378,12 @@ impl GitService {
             };
         }
 
-        match self.collect_changes(base_ref) {
+        let tracking_ref = self.tracking_ref(base_ref);
+        match self.collect_changes(&tracking_ref) {
             Ok((base, head, branch, files)) => ChangesView {
                 base: Some(base),
                 base_label: Some(base_ref.to_owned()),
+                tracking_ref: Some(tracking_ref),
                 head: Some(head),
                 branch: Some(branch),
                 files,
@@ -196,6 +392,7 @@ impl GitService {
             },
             Err(error) => ChangesView {
                 base_label: Some(base_ref.to_owned()),
+                tracking_ref: Some(tracking_ref),
                 generated_at: Some(generated_at),
                 error: Some(error.to_string()),
                 ..ChangesView::default()
@@ -531,6 +728,47 @@ mod tests {
     }
 
     #[test]
+    fn logical_base_uses_its_upstream_when_local_branch_is_stale() {
+        let dir = repo();
+        let path = dir.path();
+        let remote = tempfile::tempdir().expect("remote");
+        git(remote.path(), &["init", "--bare"]);
+        git(
+            path,
+            &["remote", "add", "origin", &remote.path().to_string_lossy()],
+        );
+        git(path, &["push", "-u", "origin", "main"]);
+        let stale_main = GitService::new(path).head_commit().unwrap();
+
+        fs::write(path.join("upstream.txt"), "upstream\n").expect("upstream file");
+        git(path, &["add", "upstream.txt"]);
+        git(path, &["commit", "-m", "upstream"]);
+        git(path, &["push", "origin", "main"]);
+        git(path, &["branch", "-f", "main-stale", &stale_main]);
+        git(path, &["checkout", "-b", "session"]);
+        fs::write(path.join("session.txt"), "session\n").expect("session file");
+        git(path, &["add", "session.txt"]);
+        git(path, &["commit", "-m", "session"]);
+        git(path, &["branch", "-f", "main", &stale_main]);
+
+        let service = GitService::new(path);
+        let view = service.changes("main", "now".to_owned());
+
+        assert_eq!(service.tracking_ref("main"), "origin/main");
+        assert_eq!(view.tracking_ref.as_deref(), Some("origin/main"));
+        assert_eq!(view.files.len(), 1, "files: {:?}", view.files);
+        assert!(view.file("session.txt").is_some());
+
+        let outside = tempfile::tempdir().expect("worktree root");
+        let worktree = outside.path().join("new-session");
+        service
+            .create_worktree(&worktree, "gcabb/new-session", "main")
+            .expect("worktree from tracked base");
+        assert!(worktree.join("upstream.txt").exists());
+        assert!(!worktree.join("session.txt").exists());
+    }
+
+    #[test]
     fn totals_match_per_file_stats() {
         let dir = repo();
         let path = dir.path();
@@ -564,6 +802,31 @@ mod tests {
         let session = GitService::new(&worktree);
         assert_eq!(session.current_branch().unwrap(), "session/one");
         assert_eq!(GitService::new(path).current_branch().unwrap(), "main");
+    }
+
+    #[test]
+    fn recreates_a_missing_worktree_from_its_existing_branch() {
+        let dir = repo();
+        let outside = tempfile::tempdir().expect("tempdir");
+        let worktree = outside.path().join("session-worktree");
+        let service = GitService::new(dir.path());
+        service
+            .create_worktree(&worktree, "session/recover", "main")
+            .expect("worktree created");
+        service
+            .remove_worktree(&worktree)
+            .expect("worktree removed");
+
+        assert!(!worktree.exists());
+        assert!(service.branch_exists("session/recover"));
+        service
+            .recreate_worktree(&worktree, "session/recover")
+            .expect("worktree recreated");
+
+        assert_eq!(
+            GitService::new(&worktree).current_branch().unwrap(),
+            "session/recover"
+        );
     }
 
     #[test]
