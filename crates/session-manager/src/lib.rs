@@ -7,12 +7,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
     ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus, DomainEvent,
-    InteractionResponse, OutputStreamKind, ProjectMetadata, PromptAttachment, SessionKind,
-    SessionMetadata, SessionSnapshot, SessionStatus, TitleSource, ToolCatalog,
+    InteractionResponse, OutputStreamKind, ProjectMetadata, PromptAttachment, QueueDelivery,
+    QueueItem, QueueItemState, SessionKind, SessionMetadata, SessionSnapshot, SessionStatus,
+    TitleSource, ToolCatalog,
 };
 use copilot_provider::{
     AgentProvider, AgentProviderFactory, ProviderCompatibility, ProviderError, ProviderEvent,
-    ProviderInteraction, ProviderSession, SessionRequest,
+    ProviderInteraction, ProviderSession, QueueDeliveryRequest, SessionRequest,
 };
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
 use git_service::GitService;
@@ -464,6 +465,84 @@ impl SessionHandle {
         response_rx
             .await
             .map_err(|_| SessionManagerError::ActorClosed)?
+    }
+
+    async fn queue(&self, command: QueueCommand) -> Result<Option<String>> {
+        let (response_tx, response_rx) = oneshot::channel();
+        self.command_tx
+            .send(SessionCommand::Queue {
+                command,
+                response: response_tx,
+            })
+            .await
+            .map_err(|_| SessionManagerError::ActorClosed)?;
+        response_rx
+            .await
+            .map_err(|_| SessionManagerError::ActorClosed)?
+    }
+
+    /// Add a prompt to the end of the queue, returning its identifier.
+    pub async fn enqueue(&self, prompt: impl Into<String>) -> Result<String> {
+        self.enqueue_with(prompt, None, QueueDelivery::WhenIdle)
+            .await
+    }
+
+    /// Add a prompt to the queue with an explicit delivery mode.
+    pub async fn enqueue_with(
+        &self,
+        prompt: impl Into<String>,
+        display_prompt: Option<String>,
+        delivery: QueueDelivery,
+    ) -> Result<String> {
+        self.queue(QueueCommand::Enqueue {
+            prompt: prompt.into(),
+            display_prompt,
+            delivery,
+        })
+        .await?
+        .ok_or(SessionManagerError::ActorClosed)
+    }
+
+    /// Edit a queued prompt that has not been delivered.
+    pub async fn update_queued(
+        &self,
+        id: impl Into<String>,
+        prompt: impl Into<String>,
+        display_prompt: Option<String>,
+    ) -> Result<()> {
+        self.queue(QueueCommand::UpdateText {
+            id: id.into(),
+            prompt: prompt.into(),
+            display_prompt,
+        })
+        .await
+        .map(|_| ())
+    }
+
+    /// Remove a queued prompt.
+    pub async fn remove_queued(&self, id: impl Into<String>) -> Result<()> {
+        self.queue(QueueCommand::Remove { id: id.into() })
+            .await
+            .map(|_| ())
+    }
+
+    /// Reorder the queue to match the given identifiers.
+    pub async fn reorder_queue(&self, ordered_ids: Vec<String>) -> Result<()> {
+        self.queue(QueueCommand::Reorder { ordered_ids })
+            .await
+            .map(|_| ())
+    }
+
+    /// Suspend or resume draining.
+    pub async fn set_queue_paused(&self, paused: bool) -> Result<()> {
+        self.queue(QueueCommand::SetPaused { paused })
+            .await
+            .map(|_| ())
+    }
+
+    /// Drop every pending item from the queue.
+    pub async fn clear_queue(&self) -> Result<()> {
+        self.queue(QueueCommand::Clear).await.map(|_| ())
     }
 }
 
@@ -2055,6 +2134,37 @@ enum SessionCommand {
         control: SessionControlCommand,
         response: oneshot::Sender<Result<()>>,
     },
+    Queue {
+        command: QueueCommand,
+        response: oneshot::Sender<Result<Option<String>>>,
+    },
+}
+
+/// Edits to the durable queue.
+///
+/// Every variant is answerable while the agent is mid-turn: the queue is
+/// GCABB's own state, so none of these wait on the runtime being ready.
+pub enum QueueCommand {
+    Enqueue {
+        prompt: String,
+        display_prompt: Option<String>,
+        delivery: QueueDelivery,
+    },
+    UpdateText {
+        id: String,
+        prompt: String,
+        display_prompt: Option<String>,
+    },
+    Remove {
+        id: String,
+    },
+    Reorder {
+        ordered_ids: Vec<String>,
+    },
+    SetPaused {
+        paused: bool,
+    },
+    Clear,
 }
 
 enum SessionCommandKind {
@@ -2100,6 +2210,8 @@ struct SessionActor {
 
 impl SessionActor {
     async fn run(mut self) {
+        self.load_queue();
+        self.publish(false);
         loop {
             tokio::select! {
                 event = self.provider_events.recv() => {
@@ -2186,6 +2298,10 @@ impl SessionActor {
                             let result = self.apply_control(control).await;
                             let _ = response.send(result);
                         }
+                        Some(SessionCommand::Queue { command, response }) => {
+                            let result = self.apply_queue(command).await;
+                            let _ = response.send(result);
+                        }
                         None => {
                             let _ = self.disconnect().await;
                             break;
@@ -2219,6 +2335,7 @@ impl SessionActor {
                 };
                 if refresh_after {
                     self.refresh_changes_if_needed(raw).await;
+                    self.sync_queue(raw).await;
                 }
             }
             Ok(false) => {
@@ -2485,6 +2602,181 @@ impl SessionActor {
         self.snapshots.send_replace(Arc::new(self.state.clone()));
     }
 
+    /// Load the durable queue into the snapshot.
+    fn load_queue(&mut self) {
+        let session_id = self.state.metadata.id.clone();
+        match self.storage.queue_view(&session_id) {
+            Ok(queue) => self.state.queue = queue,
+            Err(error) => self.record_actor_error("queue_view", &error.to_string()),
+        }
+    }
+
+    /// Re-read the queue from storage so the snapshot matches what was written.
+    fn reload_queue(&mut self) -> Result<()> {
+        self.state.queue = self.storage.queue_view(&self.state.metadata.id)?;
+        Ok(())
+    }
+
+    async fn apply_queue(&mut self, command: QueueCommand) -> Result<Option<String>> {
+        let session_id = self.state.metadata.id.clone();
+        let mut queued_id = None;
+        match command {
+            QueueCommand::Enqueue {
+                prompt,
+                display_prompt,
+                delivery,
+            } => {
+                let now = timestamp();
+                let item = QueueItem {
+                    id: Uuid::new_v4().to_string(),
+                    session_id: session_id.clone(),
+                    position: self.storage.next_queue_position(&session_id)?,
+                    prompt,
+                    display_prompt,
+                    state: QueueItemState::Pending,
+                    delivery,
+                    agent_mode: self.state.controls.mode.clone(),
+                    created_at: now.clone(),
+                    updated_at: now,
+                    error: None,
+                };
+                queued_id = Some(item.id.clone());
+                self.storage.upsert_queue_item(&item)?;
+            }
+            QueueCommand::UpdateText {
+                id,
+                prompt,
+                display_prompt,
+            } => {
+                // Only an undelivered item can be edited: once it has been
+                // handed over, the text the agent received is already fixed.
+                let Some(mut item) = self
+                    .storage
+                    .queue_view(&session_id)?
+                    .item(&id)
+                    .filter(|item| item.state.is_pending())
+                    .cloned()
+                else {
+                    return Ok(None);
+                };
+                item.prompt = prompt;
+                item.display_prompt = display_prompt;
+                item.updated_at = timestamp();
+                self.storage.upsert_queue_item(&item)?;
+            }
+            QueueCommand::Remove { id } => {
+                self.storage.delete_queue_item(&id)?;
+            }
+            QueueCommand::Reorder { ordered_ids } => {
+                self.storage.reorder_queue(&session_id, &ordered_ids)?;
+            }
+            QueueCommand::SetPaused { paused } => {
+                self.storage.set_queue_paused(&session_id, paused)?;
+            }
+            QueueCommand::Clear => {
+                for item in self.storage.queue_view(&session_id)?.items {
+                    if !item.state.is_pending() {
+                        continue;
+                    }
+                    self.storage.delete_queue_item(&item.id)?;
+                }
+            }
+        }
+        self.reload_queue()?;
+        self.publish(false);
+        self.drain_queue().await;
+        Ok(queued_id)
+    }
+
+    /// React to runtime signals that bear on the queue.
+    async fn sync_queue(&mut self, raw: &Value) {
+        if raw.get("type").and_then(Value::as_str) == Some("session.idle") {
+            self.drain_queue().await;
+        }
+    }
+
+    /// Retire items whose turn has finished.
+    ///
+    /// Called only when the session is idle, so anything still marked as
+    /// dispatched has had its turn run to completion.
+    /// Returns whether anything was retired, so the caller can publish. The
+    /// last item in a queue retires with nothing left to dispatch behind it,
+    /// and without a publish of its own it would sit in the UI as running
+    /// forever.
+    fn complete_dispatched(&mut self) -> bool {
+        let dispatched: Vec<_> = self
+            .state
+            .queue
+            .items
+            .iter()
+            .filter(|item| item.state == QueueItemState::Dispatched)
+            .cloned()
+            .collect();
+        if dispatched.is_empty() {
+            return false;
+        }
+        for mut item in dispatched {
+            item.state = QueueItemState::Completed;
+            item.updated_at = timestamp();
+            if let Err(error) = self.storage.upsert_queue_item(&item) {
+                self.record_actor_error("upsert_queue_item", &error.to_string());
+            }
+        }
+        if let Err(error) = self.reload_queue() {
+            self.record_actor_error("queue_view", &error.to_string());
+        }
+        true
+    }
+
+    /// Hand the next pending item to the agent when the session can take it.
+    ///
+    /// One item at a time: the next is delivered when the session next goes
+    /// idle, so a follow-up stays editable until the moment it is dispatched.
+    async fn drain_queue(&mut self) {
+        if self.state.status != SessionStatus::Idle {
+            return;
+        }
+        if self.complete_dispatched() {
+            self.publish(false);
+        }
+        if self.state.queue.paused {
+            return;
+        }
+        let Some(mut item) = self.state.queue.next_pending().cloned() else {
+            return;
+        };
+        let request = QueueDeliveryRequest {
+            prompt: item.prompt.clone(),
+            display_prompt: item.display_prompt.clone(),
+            delivery: item.delivery,
+            agent_mode: item.agent_mode.clone(),
+        };
+        item.updated_at = timestamp();
+        match self
+            .provider
+            .deliver_queued(&self.sdk_session_id, &request)
+            .await
+        {
+            Ok(_) => {
+                item.state = QueueItemState::Dispatched;
+                item.error = None;
+            }
+            Err(error) => {
+                // A failed item must not be retried on the next idle event, or
+                // a permanently failing prompt would block the whole queue.
+                item.state = QueueItemState::Failed;
+                item.error = Some(error.to_string());
+                self.record_actor_error("deliver_queued", &error.to_string());
+            }
+        }
+        if let Err(error) = self.storage.upsert_queue_item(&item) {
+            self.record_actor_error("upsert_queue_item", &error.to_string());
+        }
+        if let Err(error) = self.reload_queue() {
+            self.record_actor_error("queue_view", &error.to_string());
+        }
+        self.publish(false);
+    }
     fn record_actor_error(&self, operation: &str, error: &str) {
         self.diagnostics.record(DiagnosticEvent {
             timestamp: timestamp(),
