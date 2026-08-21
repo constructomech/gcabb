@@ -909,7 +909,6 @@ enum ServiceUpdate {
         selected: Option<String>,
     },
     WorkspaceConfigurationDiscovered(Vec<String>, WorkspaceConfiguration),
-    ConfigurationRootsChanged(Vec<String>),
     AutomationsChanged(Vec<Automation>),
     AutomationRunsChanged(Vec<AutomationRun>),
     SessionLaunchProgress(SessionLaunchProgress),
@@ -1042,12 +1041,6 @@ enum ServiceCommand {
     },
     RemoveProject {
         project_id: String,
-    },
-    // Handled by the service, but nothing sends it yet: the workspace
-    // configuration UI that would add a root is still to come.
-    #[allow(dead_code)]
-    AddConfigurationRoot {
-        path: PathBuf,
     },
     DiscoverWorkspaceConfiguration {
         project_paths: Vec<PathBuf>,
@@ -1394,18 +1387,6 @@ impl AppService {
                                 let selected = projects.first().map(|project| project.path.clone());
                                 let _ = update_tx
                                     .send(ServiceUpdate::ProjectsChanged { projects, selected });
-                            }
-                        }
-                        ServiceCommand::AddConfigurationRoot { path } => {
-                            match manager.add_configuration_root(&path) {
-                                Ok(roots) => {
-                                    let _ = update_tx
-                                        .send(ServiceUpdate::ConfigurationRootsChanged(roots));
-                                }
-                                Err(error) => {
-                                    let _ = update_tx
-                                        .send(ServiceUpdate::ActionFailed(error.to_string()));
-                                }
                             }
                         }
                         ServiceCommand::DiscoverWorkspaceConfiguration { project_paths } => {
@@ -1786,7 +1767,6 @@ async fn handle_service_command(
         // are handled before this dispatch.
         ServiceCommand::AddProject { .. }
         | ServiceCommand::RemoveProject { .. }
-        | ServiceCommand::AddConfigurationRoot { .. }
         | ServiceCommand::DiscoverWorkspaceConfiguration { .. }
         | ServiceCommand::SaveAutomation(_)
         | ServiceCommand::DeleteAutomation { .. }
@@ -3132,9 +3112,42 @@ impl SessionMvpView {
             .is_some_and(|service| service.drain(update_ui))
     }
 
+    /// Moves a session into the archived list, dropping its live projection.
+    fn apply_session_archived(
+        &mut self,
+        session: SessionMetadata,
+        archived_at: String,
+        cx: &mut Context<Self>,
+    ) {
+        let id = session.id.clone();
+        self.archiving_sessions.remove(&id);
+        self.forget_session(&id, cx);
+        self.archived_sessions.retain(|row| row.id != id);
+        self.archived_sessions.insert(
+            0,
+            ArchivedSessionRow {
+                id,
+                title: session.title,
+                archived_at,
+            },
+        );
+    }
+
+    /// Returns an archived session to the session list.
+    fn apply_session_unarchived(&mut self, session: SessionMetadata) {
+        let id = session.id.clone();
+        self.archiving_sessions.remove(&id);
+        self.archived_sessions.retain(|row| row.id != id);
+        if !self.sessions.iter().any(|existing| existing.id() == id) {
+            // Restored as a metadata-only placeholder; selecting it
+            // reconnects it the same way any stored session does.
+            self.sessions
+                .insert(0, SessionProjection::bootstrap(session));
+        }
+    }
+
     /// Drains pending service updates, returning whether any were applied so the
     /// caller can skip repainting when the poll tick found nothing to do.
-    #[allow(clippy::too_many_lines)]
     fn apply_service_updates(&mut self, cx: &mut Context<Self>) -> bool {
         let mut changed = false;
         loop {
@@ -3181,22 +3194,8 @@ impl SessionMvpView {
                 ServiceUpdate::WorkspaceConfigurationDiscovered(project_paths, configuration) => {
                     self.apply_workspace_configuration(&project_paths, configuration);
                 }
-                ServiceUpdate::ConfigurationRootsChanged(configuration_roots) => {
-                    self.configuration_roots =
-                        configuration_roots.into_iter().map(PathBuf::from).collect();
-                    self.request_agent_discovery();
-                }
                 ServiceUpdate::AutomationsChanged(automations) => {
-                    self.automations_panel.automations = automations;
-                    if self.automations_panel.editing.as_ref().is_some_and(|id| {
-                        !self
-                            .automations_panel
-                            .automations
-                            .iter()
-                            .any(|automation| &automation.id == id)
-                    }) {
-                        self.begin_new_automation(cx);
-                    }
+                    self.apply_automations_changed(automations, cx);
                 }
                 ServiceUpdate::AutomationRunsChanged(runs) => {
                     self.automations_panel.runs = runs;
@@ -3219,18 +3218,7 @@ impl SessionMvpView {
                     session,
                     archived_at,
                 } => {
-                    let id = session.id.clone();
-                    self.archiving_sessions.remove(&id);
-                    self.forget_session(&id, cx);
-                    self.archived_sessions.retain(|row| row.id != id);
-                    self.archived_sessions.insert(
-                        0,
-                        ArchivedSessionRow {
-                            id,
-                            title: session.title,
-                            archived_at,
-                        },
-                    );
+                    self.apply_session_archived(session, archived_at, cx);
                 }
                 ServiceUpdate::SessionArchiveFailed {
                     app_session_id,
@@ -3240,15 +3228,7 @@ impl SessionMvpView {
                     self.action_error = Some(error);
                 }
                 ServiceUpdate::SessionUnarchived(session) => {
-                    let id = session.id.clone();
-                    self.archiving_sessions.remove(&id);
-                    self.archived_sessions.retain(|row| row.id != id);
-                    if !self.sessions.iter().any(|existing| existing.id() == id) {
-                        // Restored as a metadata-only placeholder; selecting it
-                        // reconnects it the same way any stored session does.
-                        self.sessions
-                            .insert(0, SessionProjection::bootstrap(session));
-                    }
+                    self.apply_session_unarchived(session);
                 }
                 ServiceUpdate::PromptAccepted(origin) => {
                     if let Some(id) = origin.as_deref() {

@@ -125,6 +125,26 @@ impl SessionMvpView {
         cx.notify();
     }
 
+    /// Adopts a new automation list, restarting the draft editor when the
+    /// automation it was editing no longer exists.
+    pub fn apply_automations_changed(
+        &mut self,
+        automations: Vec<Automation>,
+        cx: &mut Context<Self>,
+    ) {
+        self.automations_panel.automations = automations;
+        let editing_vanished = self.automations_panel.editing.as_ref().is_some_and(|id| {
+            !self
+                .automations_panel
+                .automations
+                .iter()
+                .any(|automation| &automation.id == id)
+        });
+        if editing_vanished {
+            self.begin_new_automation(cx);
+        }
+    }
+
     pub fn close_automations(&mut self, cx: &mut Context<Self>) {
         self.automations_panel.open = false;
         self.automations_panel.open_menu = None;
@@ -290,29 +310,12 @@ impl SessionMvpView {
         self.automations_panel.open_menu =
             (self.automations_panel.open_menu != Some(menu)).then_some(menu);
     }
-
-    #[allow(clippy::too_many_lines)]
     pub fn automation_menu_options(
         &self,
         menu: AutomationMenu,
     ) -> (&'static str, String, Vec<(String, String, String)>) {
         match menu {
-            AutomationMenu::Model => {
-                let mut options = vec![(
-                    String::new(),
-                    "Default model".to_owned(),
-                    "Use the provider's default model".to_owned(),
-                )];
-                options.extend(self.model_options());
-                (
-                    "Model",
-                    self.automations_panel
-                        .draft_model
-                        .clone()
-                        .unwrap_or_default(),
-                    options,
-                )
-            }
+            AutomationMenu::Model => self.automation_model_menu(),
             AutomationMenu::Agent => (
                 "Agent",
                 self.automations_panel
@@ -321,88 +324,115 @@ impl SessionMvpView {
                     .unwrap_or_default(),
                 self.agent_options(),
             ),
-            AutomationMenu::Project => {
-                let mut options = vec![(
-                    String::new(),
-                    "No workspace".to_owned(),
-                    "Run without repository context".to_owned(),
-                )];
-                options.extend(
-                    self.projects
-                        .iter()
-                        .filter(|project| Path::new(&project.path).is_dir())
-                        .map(|project| {
-                            (
-                                project.path.clone(),
-                                project.name.clone(),
-                                project.path.clone(),
-                            )
-                        }),
-                );
-                (
-                    "Workspace",
-                    self.automations_panel
-                        .draft_project
-                        .clone()
-                        .unwrap_or_default(),
-                    options,
-                )
-            }
-            AutomationMenu::Mode => {
-                let mut options = self.mode_options();
-                if options.is_empty() {
-                    options = ["autopilot", "interactive", "plan"]
-                        .into_iter()
-                        .map(|mode| (mode.to_owned(), title_case(mode), String::new()))
-                        .collect();
-                }
-                ("Mode", self.automations_panel.draft_mode.clone(), options)
-            }
-            AutomationMenu::Effort => {
-                let mut options = vec![(
-                    String::new(),
-                    "Default reasoning".to_owned(),
-                    "Use the model's default reasoning effort".to_owned(),
-                )];
-                if let Some(model) = self.automations_panel.draft_model.as_deref() {
-                    options.extend(self.supported_reasoning_efforts(model).into_iter().map(
-                        |effort| {
-                            let label = effort_label(&effort);
-                            (effort, label, String::new())
-                        },
-                    ));
-                }
-                (
-                    "Reasoning effort",
-                    self.automations_panel
-                        .draft_effort
-                        .clone()
-                        .unwrap_or_default(),
-                    options,
-                )
-            }
-            AutomationMenu::Context => {
-                let mut options = vec![(
-                    String::new(),
-                    "Default context".to_owned(),
-                    "Use the model's default context window".to_owned(),
-                )];
-                if let Some(model) = self.automations_panel.draft_model.as_deref() {
-                    options.extend(self.context_windows(model).into_iter().map(|window| {
-                        let label = context_window_label(&window);
-                        (window.tier, label, String::new())
-                    }));
-                }
-                (
-                    "Context length",
-                    self.automations_panel
-                        .draft_context_tier
-                        .clone()
-                        .unwrap_or_default(),
-                    options,
-                )
-            }
+            AutomationMenu::Project => self.automation_project_menu(),
+            AutomationMenu::Mode => self.automation_mode_menu(),
+            AutomationMenu::Effort => self.automation_effort_menu(),
+            AutomationMenu::Context => self.automation_context_menu(),
         }
+    }
+
+    fn automation_model_menu(&self) -> (&'static str, String, Vec<(String, String, String)>) {
+        let options = default_first(
+            "Default model",
+            "Use the provider's default model",
+            self.model_options(),
+        );
+        (
+            "Model",
+            self.automations_panel
+                .draft_model
+                .clone()
+                .unwrap_or_default(),
+            options,
+        )
+    }
+
+    fn automation_project_menu(&self) -> (&'static str, String, Vec<(String, String, String)>) {
+        let projects = self
+            .projects
+            .iter()
+            .filter(|project| Path::new(&project.path).is_dir())
+            .map(|project| {
+                (
+                    project.path.clone(),
+                    project.name.clone(),
+                    project.path.clone(),
+                )
+            });
+        let options = default_first("No workspace", "Run without repository context", projects);
+        (
+            "Workspace",
+            self.automations_panel
+                .draft_project
+                .clone()
+                .unwrap_or_default(),
+            options,
+        )
+    }
+
+    fn automation_mode_menu(&self) -> (&'static str, String, Vec<(String, String, String)>) {
+        let mut options = self.mode_options();
+        if options.is_empty() {
+            options = ["autopilot", "interactive", "plan"]
+                .into_iter()
+                .map(|mode| (mode.to_owned(), title_case(mode), String::new()))
+                .collect();
+        }
+        ("Mode", self.automations_panel.draft_mode.clone(), options)
+    }
+
+    fn automation_effort_menu(&self) -> (&'static str, String, Vec<(String, String, String)>) {
+        let efforts = self
+            .automations_panel
+            .draft_model
+            .as_deref()
+            .map(|model| self.supported_reasoning_efforts(model))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|effort| {
+                let label = effort_label(&effort);
+                (effort, label, String::new())
+            });
+        let options = default_first(
+            "Default reasoning",
+            "Use the model's default reasoning effort",
+            efforts,
+        );
+        (
+            "Reasoning effort",
+            self.automations_panel
+                .draft_effort
+                .clone()
+                .unwrap_or_default(),
+            options,
+        )
+    }
+
+    fn automation_context_menu(&self) -> (&'static str, String, Vec<(String, String, String)>) {
+        let windows = self
+            .automations_panel
+            .draft_model
+            .as_deref()
+            .map(|model| self.context_windows(model))
+            .unwrap_or_default()
+            .into_iter()
+            .map(|window| {
+                let label = context_window_label(&window);
+                (window.tier, label, String::new())
+            });
+        let options = default_first(
+            "Default context",
+            "Use the model's default context window",
+            windows,
+        );
+        (
+            "Context length",
+            self.automations_panel
+                .draft_context_tier
+                .clone()
+                .unwrap_or_default(),
+            options,
+        )
     }
 
     pub fn choose_automation_option(&mut self, menu: AutomationMenu, value: String) {
@@ -440,7 +470,6 @@ impl SessionMvpView {
         self.automations_panel.open_menu = None;
     }
 
-    #[allow(clippy::too_many_lines)]
     pub fn automation_choice_control(
         &self,
         menu: AutomationMenu,
@@ -492,59 +521,16 @@ impl SessionMvpView {
                                 .bg(rgb(PANEL))
                                 .shadow_lg()
                                 .children(options.into_iter().enumerate().map(
-                                    |(index, (value, label, description))| {
-                                        let selected = value == selected;
-                                        let option_value = value.clone();
-                                        let has_description = !description.is_empty();
-                                        let option_selector = format!("{id}-option-{index}");
-                                        div()
-                                            .id((id, index))
-                                            .debug_selector(move || option_selector.clone())
-                                            .role(Role::ListBoxOption)
-                                            .aria_label(label.clone())
-                                            .aria_selected(selected)
-                                            .when(has_description, |option| {
-                                                option.aria_description(description.clone())
-                                            })
-                                            .focusable()
-                                            .tab_stop(true)
-                                            .flex()
-                                            .items_center()
-                                            .gap_2()
-                                            .px_2()
-                                            .py_2()
-                                            .rounded_md()
-                                            .bg(rgb(if selected { ELEVATED } else { PANEL }))
-                                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                                            .on_click(cx.listener(move |view, _, _, cx| {
-                                                view.choose_automation_option(
-                                                    menu,
-                                                    option_value.clone(),
-                                                );
-                                                cx.notify();
-                                            }))
-                                            .child(
-                                                div()
-                                                    .w(px(16.0))
-                                                    .flex_shrink_0()
-                                                    .text_color(rgb(BLUE))
-                                                    .child(if selected { "\u{2713}" } else { "" }),
-                                            )
-                                            .child(
-                                                div()
-                                                    .min_w_0()
-                                                    .flex()
-                                                    .flex_col()
-                                                    .child(label)
-                                                    .when(has_description, |content| {
-                                                        content.child(
-                                                            div()
-                                                                .text_xs()
-                                                                .text_color(rgb(MUTED))
-                                                                .child(description),
-                                                        )
-                                                    }),
-                                            )
+                                    |(index, option)| {
+                                        let is_selected = option.0 == selected;
+                                        automation_choice_option(
+                                            id,
+                                            index,
+                                            menu,
+                                            option,
+                                            is_selected,
+                                            cx,
+                                        )
                                     },
                                 )),
                         ),
@@ -1139,6 +1125,71 @@ impl SessionMvpView {
                 ),
         )
     }
+}
+
+/// Renders one row of an automation dropdown.
+fn automation_choice_option(
+    id: &'static str,
+    index: usize,
+    menu: AutomationMenu,
+    option: (String, String, String),
+    selected: bool,
+    cx: &mut Context<SessionMvpView>,
+) -> gpui::Stateful<gpui::Div> {
+    let (value, label, description) = option;
+    let has_description = !description.is_empty();
+    let option_selector = format!("{id}-option-{index}");
+    div()
+        .id((id, index))
+        .debug_selector(move || option_selector.clone())
+        .role(Role::ListBoxOption)
+        .aria_label(label.clone())
+        .aria_selected(selected)
+        .when(has_description, |option| {
+            option.aria_description(description.clone())
+        })
+        .focusable()
+        .tab_stop(true)
+        .flex()
+        .items_center()
+        .gap_2()
+        .px_2()
+        .py_2()
+        .rounded_md()
+        .bg(rgb(if selected { ELEVATED } else { PANEL }))
+        .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+        .on_click(cx.listener(move |view, _, _, cx| {
+            view.choose_automation_option(menu, value.clone());
+            cx.notify();
+        }))
+        .child(
+            div()
+                .w(px(16.0))
+                .flex_shrink_0()
+                .text_color(rgb(BLUE))
+                .child(if selected { "\u{2713}" } else { "" }),
+        )
+        .child(
+            div()
+                .min_w_0()
+                .flex()
+                .flex_col()
+                .child(label)
+                .when(has_description, |content| {
+                    content.child(div().text_xs().text_color(rgb(MUTED)).child(description))
+                }),
+        )
+}
+
+/// Builds a choice list whose first entry is the "leave unset" option.
+fn default_first(
+    label: &str,
+    detail: &str,
+    rest: impl IntoIterator<Item = (String, String, String)>,
+) -> Vec<(String, String, String)> {
+    let mut options = vec![(String::new(), label.to_owned(), detail.to_owned())];
+    options.extend(rest);
+    options
 }
 
 fn automation_input_field(
