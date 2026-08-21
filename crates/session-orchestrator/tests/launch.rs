@@ -77,6 +77,7 @@ fn project_request(
             display_name: "README.md".to_owned(),
         }],
         model: Some("model-1".to_owned()),
+        agent: None,
         mode: "autopilot".to_owned(),
         reasoning_effort: Some("high".to_owned()),
         context_tier: Some("long_context".to_owned()),

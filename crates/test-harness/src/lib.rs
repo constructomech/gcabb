@@ -6,8 +6,8 @@ use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 
 use app_model::{
-    InteractionRequest, InteractionResponse, PromptAttachment, SessionControls, ToolCatalog,
-    ToolClass, ToolDescriptor, ToolSource,
+    AgentOption, InteractionRequest, InteractionResponse, PromptAttachment, SessionControls,
+    ToolCatalog, ToolClass, ToolDescriptor, ToolSource, WorkspaceConfiguration, WorkspaceResource,
 };
 use async_trait::async_trait;
 use copilot_provider::{
@@ -139,6 +139,10 @@ pub struct FakeProvider {
     extra_tools: Mutex<Vec<String>>,
     omit_tools: Mutex<Vec<String>>,
     sent_attachments: Mutex<Vec<Vec<PromptAttachment>>>,
+    agents: Mutex<Vec<AgentOption>>,
+    skills: Mutex<Vec<WorkspaceResource>>,
+    instructions: Mutex<Vec<WorkspaceResource>>,
+    selected_agents: Mutex<HashMap<String, Option<String>>>,
     sent_prompts: Mutex<Vec<String>>,
     /// Follow-ups handed to the fake agent, in delivery order, keyed by session.
     delivered_queue: Mutex<HashMap<String, Vec<QueueDeliveryRequest>>>,
@@ -198,6 +202,27 @@ impl FakeProvider {
     /// Attachments carried by each send, in order.
     pub async fn sent_attachments(&self) -> Vec<Vec<PromptAttachment>> {
         self.sent_attachments.lock().await.clone()
+    }
+
+    pub async fn set_agents(&self, agents: Vec<AgentOption>) {
+        *self.agents.lock().await = agents;
+    }
+
+    pub async fn set_workspace_resources(
+        &self,
+        skills: Vec<WorkspaceResource>,
+        instructions: Vec<WorkspaceResource>,
+    ) {
+        *self.skills.lock().await = skills;
+        *self.instructions.lock().await = instructions;
+    }
+    pub async fn selected_agent(&self, sdk_session_id: &str) -> Option<String> {
+        self.selected_agents
+            .lock()
+            .await
+            .get(sdk_session_id)
+            .cloned()
+            .flatten()
     }
 
     /// Prompts carried by each send, in order.
@@ -332,6 +357,7 @@ impl AgentProvider for FakeProvider {
         self.started.store(false, Ordering::SeqCst);
         self.live.lock().await.clear();
         self.interactions.lock().await.clear();
+        self.selected_agents.lock().await.clear();
         if self.fail_stop.load(Ordering::SeqCst) {
             return Err(ProviderError::Sdk("configured stop failure".to_owned()));
         }
@@ -349,6 +375,10 @@ impl AgentProvider for FakeProvider {
             .await
             .entry(sdk_session_id.clone())
             .or_default();
+        self.selected_agents
+            .lock()
+            .await
+            .insert(sdk_session_id.clone(), None);
         Ok(self.connect(sdk_session_id).await)
     }
 
@@ -363,6 +393,10 @@ impl AgentProvider for FakeProvider {
         if !self.history.lock().await.contains_key(sdk_session_id) {
             return Err(ProviderError::SessionNotFound(sdk_session_id.to_owned()));
         }
+        self.selected_agents
+            .lock()
+            .await
+            .insert(sdk_session_id.to_owned(), None);
         Ok(self.connect(sdk_session_id.to_owned()).await)
     }
 
@@ -438,8 +472,12 @@ impl AgentProvider for FakeProvider {
             .ok_or_else(|| ProviderError::SessionNotFound(sdk_session_id.to_owned()))
     }
 
-    async fn controls(&self, _sdk_session_id: &str) -> Result<SessionControls> {
-        Ok(SessionControls::default())
+    async fn controls(&self, sdk_session_id: &str) -> Result<SessionControls> {
+        Ok(SessionControls {
+            agent: self.selected_agent(sdk_session_id).await,
+            available_agents: self.agents.lock().await.clone(),
+            ..SessionControls::default()
+        })
     }
 
     async fn set_model(
@@ -459,6 +497,14 @@ impl AgentProvider for FakeProvider {
         Ok(())
     }
 
+    async fn set_agent(&self, sdk_session_id: &str, agent: Option<&str>) -> Result<()> {
+        self.selected_agents
+            .lock()
+            .await
+            .insert(sdk_session_id.to_owned(), agent.map(str::to_owned));
+        Ok(())
+    }
+
     async fn set_reasoning_effort(&self, _sdk_session_id: &str, _effort: &str) -> Result<()> {
         Ok(())
     }
@@ -470,9 +516,21 @@ impl AgentProvider for FakeProvider {
             .remove(sdk_session_id)
             .ok_or_else(|| ProviderError::SessionNotFound(sdk_session_id.to_owned()))?;
         self.interactions.lock().await.remove(sdk_session_id);
+        self.selected_agents.lock().await.remove(sdk_session_id);
         Ok(())
     }
 
+    async fn discover_configuration(
+        &self,
+        _project_paths: &[std::path::PathBuf],
+    ) -> Result<WorkspaceConfiguration> {
+        Ok(WorkspaceConfiguration {
+            agents: self.agents.lock().await.clone(),
+            skills: self.skills.lock().await.clone(),
+            instructions: self.instructions.lock().await.clone(),
+            errors: Vec::new(),
+        })
+    }
     async fn discover_tools(&self, _model: Option<&str>) -> Result<ToolCatalog> {
         if self.fail_tool_discovery.load(Ordering::SeqCst) {
             return Err(ProviderError::Sdk("tool discovery unavailable".to_owned()));

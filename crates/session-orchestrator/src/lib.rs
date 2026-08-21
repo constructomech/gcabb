@@ -49,6 +49,7 @@ pub struct LaunchRequest {
     pub attachments: Vec<PromptAttachment>,
     pub model: Option<String>,
     pub mode: String,
+    pub agent: Option<String>,
     pub reasoning_effort: Option<String>,
     pub context_tier: Option<String>,
     pub base_ref: Option<String>,
@@ -329,6 +330,7 @@ impl SessionOrchestrator {
                 title_source,
                 model: request.model.clone(),
                 mode: Some(request.mode.clone()),
+                agent: request.agent.clone(),
                 reasoning_effort: request.reasoning_effort.clone(),
                 context_tier: request.context_tier.clone(),
                 base_ref: request.base_ref.clone(),
@@ -337,6 +339,7 @@ impl SessionOrchestrator {
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned()),
                 kind: request.kind,
+                unattended: false,
             })
             .await
     }

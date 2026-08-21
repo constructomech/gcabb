@@ -223,6 +223,7 @@ pub struct CreateSessionRequest {
     pub title_source: TitleSource,
     pub model: Option<String>,
     pub mode: Option<String>,
+    pub agent: Option<String>,
     pub reasoning_effort: Option<String>,
     pub context_tier: Option<String>,
     /// Git ref the changes view compares against, e.g. `main`.
@@ -231,6 +232,14 @@ pub struct CreateSessionRequest {
     pub repository_root: Option<String>,
     /// Whether this is a project session or a standalone chat.
     pub kind: SessionKind,
+    /// Whether the session runs without a human who could answer prompts.
+    ///
+    /// Automation runs have no window and no one to approve a permission
+    /// request, so a prompt would otherwise park the session in
+    /// [`SessionStatus::Waiting`](app_model::SessionStatus::Waiting) until the
+    /// caller's timeout expires. Unattended sessions approve tool use up front
+    /// instead of stalling on a question nobody can see.
+    pub unattended: bool,
 }
 
 #[derive(Clone)]
@@ -413,6 +422,10 @@ impl SessionHandle {
 
     pub async fn set_mode(&self, mode: impl Into<String>) -> Result<()> {
         self.control(SessionControlCommand::Mode(mode.into())).await
+    }
+
+    pub async fn set_agent(&self, agent: Option<String>) -> Result<()> {
+        self.control(SessionControlCommand::Agent(agent)).await
     }
 
     pub async fn set_reasoning_effort(&self, effort: impl Into<String>) -> Result<()> {
@@ -725,13 +738,46 @@ impl SessionManager {
         stop_error.map_or(Ok(()), |error| Err(error.into()))
     }
 
+    pub async fn discover_configuration(
+        &self,
+        project_paths: &[PathBuf],
+    ) -> Result<app_model::WorkspaceConfiguration> {
+        let working_directory = project_paths
+            .first()
+            .map_or_else(|| Path::new("."), PathBuf::as_path);
+        let provider = self.provider_factory.create(working_directory);
+        let isolated = self.provider_factory.isolates_session_runtimes();
+        provider.start().await?;
+        let result = provider.discover_configuration(project_paths).await;
+        if isolated {
+            let cleanup = provider.stop().await;
+            match (result, cleanup) {
+                (Ok(configuration), Ok(())) => Ok(configuration),
+                (Err(error), _) | (Ok(_), Err(error)) => Err(error.into()),
+            }
+        } else {
+            result.map_err(Into::into)
+        }
+    }
+
+    async fn select_agent_or_disconnect(
+        provider: &Arc<dyn AgentProvider>,
+        sdk_session_id: &str,
+        agent: Option<&str>,
+    ) -> Result<()> {
+        let Some(agent) = agent else {
+            return Ok(());
+        };
+        if let Err(error) = provider.set_agent(sdk_session_id, Some(agent)).await {
+            let _ = provider.disconnect(sdk_session_id).await;
+            return Err(error.into());
+        }
+        Ok(())
+    }
+
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionHandle> {
         let app_session_id = Uuid::new_v4().to_string();
-        let auto_approve_tools = is_gcabb_worktree(
-            request.kind,
-            &request.project_path,
-            request.repository_root.as_deref(),
-        );
+        let auto_approve_tools = auto_approves_tools(&request);
         let provider = self.provider_factory.create(&request.project_path);
         let isolated = self.provider_factory.isolates_session_runtimes();
         let compatibility = match provider.start().await {
@@ -758,6 +804,12 @@ impl SessionManager {
                     auto_approve_tools,
                 })
                 .await?;
+            Self::select_agent_or_disconnect(
+                &provider,
+                &provider_session.sdk_session_id,
+                request.agent.as_deref(),
+            )
+            .await?;
             let controls = match provider.controls(&provider_session.sdk_session_id).await {
                 Ok(controls) => controls,
                 Err(error) => {
@@ -791,6 +843,9 @@ impl SessionManager {
             }
             if request.context_tier.is_some() {
                 state.controls.context_tier = request.context_tier;
+            }
+            if request.agent.is_some() {
+                state.controls.agent = request.agent;
             }
             // Prove inherited tool capabilities through the SDK before the first
             // prompt, so a runtime that is missing file or shell tools is visible
@@ -1836,6 +1891,12 @@ impl SessionManager {
                 },
             )
             .await?;
+        Self::select_agent_or_disconnect(
+            &provider,
+            &metadata.sdk_session_id,
+            state.controls.agent.as_deref(),
+        )
+        .await?;
         let resume_ms = elapsed_ms(resume_started);
         let history_started = Instant::now();
         let history = match provider.history(&metadata.sdk_session_id).await {
@@ -2183,6 +2244,7 @@ enum SessionControlCommand {
         context_tier: Option<String>,
     },
     Mode(String),
+    Agent(Option<String>),
     ReasoningEffort(String),
     ContextTier(String),
     BaseRef(String),
@@ -2502,6 +2564,12 @@ impl SessionActor {
                 self.provider.set_mode(&self.sdk_session_id, &mode).await?;
                 self.state.controls.mode = Some(mode.clone());
                 self.state.metadata.mode = Some(mode);
+            }
+            SessionControlCommand::Agent(agent) => {
+                self.provider
+                    .set_agent(&self.sdk_session_id, agent.as_deref())
+                    .await?;
+                self.state.controls.agent = agent;
             }
             SessionControlCommand::ReasoningEffort(effort) => {
                 self.provider
@@ -3004,6 +3072,20 @@ fn elapsed_ms(started: Instant) -> u64 {
     u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX)
 }
 
+/// Whether a session should approve tool use without asking.
+///
+/// Attended sessions only skip prompts inside a GCABB-created worktree, where
+/// the checkout is disposable. Unattended sessions have no one to ask, so a
+/// prompt would stall them rather than protect anything.
+fn auto_approves_tools(request: &CreateSessionRequest) -> bool {
+    request.unattended
+        || is_gcabb_worktree(
+            request.kind,
+            &request.project_path,
+            request.repository_root.as_deref(),
+        )
+}
+
 fn is_gcabb_worktree(
     kind: SessionKind,
     working_directory: &Path,
@@ -3078,6 +3160,24 @@ mod tests {
         assert!(!is_gcabb_worktree(SessionKind::Project, &worktree, None,));
     }
 
+    #[test]
+    fn unattended_sessions_auto_approve_tools_outside_a_worktree() {
+        let repository = PathBuf::from("repository");
+        let mut attended = request(repository.clone());
+        attended.repository_root = repository.to_str().map(str::to_owned);
+
+        // A session in the repository root itself normally prompts.
+        assert!(!auto_approves_tools(&attended));
+
+        // An automation run has no window in which to answer that prompt, so
+        // it approves up front instead of stalling in `Waiting`.
+        let unattended = CreateSessionRequest {
+            unattended: true,
+            ..attended
+        };
+        assert!(auto_approves_tools(&unattended));
+    }
+
     fn request(path: PathBuf) -> CreateSessionRequest {
         CreateSessionRequest {
             project_path: path,
@@ -3087,9 +3187,11 @@ mod tests {
             kind: SessionKind::Project,
             model: None,
             mode: Some("interactive".to_owned()),
+            agent: None,
             reasoning_effort: Some("medium".to_owned()),
             context_tier: None,
             base_ref: None,
+            unattended: false,
         }
     }
 
@@ -4055,7 +4157,7 @@ mod tests {
         let provider = Arc::new(FakeProvider::default());
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         let diagnostics = Arc::new(MemoryDiagnostics::default());
-        let manager = SessionManager::new(provider, storage.clone(), diagnostics);
+        let manager = SessionManager::new(provider.clone(), storage.clone(), diagnostics);
         manager.start().await.unwrap();
         let handle = manager
             .create_session(request(std::env::temp_dir()))
@@ -4064,6 +4166,10 @@ mod tests {
 
         handle.set_model("model-1").await.unwrap();
         handle.set_mode("plan").await.unwrap();
+        handle
+            .set_agent(Some("code-reviewer".to_owned()))
+            .await
+            .unwrap();
         handle.set_reasoning_effort("high").await.unwrap();
         handle
             .set_model_with_reasoning_effort("model-2", Some("medium".to_owned()))
@@ -4073,6 +4179,14 @@ mod tests {
         let snapshot = handle.snapshot();
         assert_eq!(snapshot.controls.model.as_deref(), Some("model-2"));
         assert_eq!(snapshot.controls.mode.as_deref(), Some("plan"));
+        assert_eq!(snapshot.controls.agent.as_deref(), Some("code-reviewer"));
+        assert_eq!(
+            provider
+                .selected_agent(&snapshot.metadata.sdk_session_id)
+                .await
+                .as_deref(),
+            Some("code-reviewer")
+        );
         assert_eq!(
             snapshot.controls.reasoning_effort.as_deref(),
             Some("medium")

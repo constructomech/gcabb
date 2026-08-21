@@ -69,8 +69,10 @@ fn request(project: &std::path::Path, title: &str) -> CreateSessionRequest {
         kind: SessionKind::Project,
         model: None,
         mode: Some("interactive".to_owned()),
+        agent: None,
         reasoning_effort: Some("low".to_owned()),
         context_tier: None,
         base_ref: None,
+        unattended: false,
     }
 }

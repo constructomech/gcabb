@@ -65,9 +65,11 @@ fn request(path: &Path) -> CreateSessionRequest {
         kind: SessionKind::Project,
         model: None,
         mode: Some("interactive".to_owned()),
+        agent: None,
         reasoning_effort: None,
         base_ref: Some("main".to_owned()),
         context_tier: None,
+        unattended: false,
     }
 }
 

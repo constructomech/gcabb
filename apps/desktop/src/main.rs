@@ -2,16 +2,16 @@ use std::cell::RefCell;
 use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
-use std::sync::mpsc::{Receiver, Sender, TryRecvError, channel};
+use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
 use std::sync::{Arc, Mutex};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    ChangeStatus, ChangedFile, ContextWindowOption, InteractionKind, InteractionResponse,
-    OutputStreamKind, ProjectMetadata, PromptAttachment, QueueItemState, SessionKind,
-    SessionLocation, SessionMetadata, SessionSnapshot, SessionStatus, TranscriptRole,
-    TranscriptState,
+    AgentOption, Automation, AutomationRun, ChangeStatus, ChangedFile, ContextWindowOption,
+    InteractionKind, InteractionResponse, OutputStreamKind, ProjectMetadata, PromptAttachment,
+    QueueItemState, SessionKind, SessionLocation, SessionMetadata, SessionSnapshot, SessionStatus,
+    TranscriptRole, TranscriptState, WorkspaceConfiguration, WorkspaceResource,
 };
 use chrono::DateTime;
 use copilot_provider::{CopilotProviderFactory, ProviderCompatibility};
@@ -42,11 +42,15 @@ use ui_components::{
 use updater::install::InstallLayout;
 use updater::version::BuildStamp;
 
+mod automation_runner;
+mod automations_ui;
 mod markdown;
 mod settings;
 mod syntax;
 mod updates;
 
+use automation_runner::AutomationContext;
+use automations_ui::AutomationsPanel;
 use markdown::{MarkdownDocument, MarkdownNode, MarkdownTag};
 use settings::AppSettings;
 use updates::{UpdateRequest, UpdateService, UpdateUi};
@@ -124,6 +128,9 @@ type ScrollWheelGuard = Box<dyn Fn(&gpui::ScrollWheelEvent, &mut Window, &mut Ap
 
 /// Scroll region behind the Changes panel's single scrollbar.
 const CHANGES_SCROLL_ID: &str = "changes-scroll";
+const AUTOMATION_LIST_SCROLL_ID: &str = "automation-list-scroll";
+const AUTOMATION_FORM_SCROLL_ID: &str = "automation-form-scroll";
+const AUTOMATION_HISTORY_SCROLL_ID: &str = "automation-history-scroll";
 /// Scroll region of the composer's mode, model, and effort menus.
 const CONTROL_MENU_SCROLL_ID: &str = "control-menu-scroll";
 /// Scroll region for a permission request's requested-action detail, which
@@ -869,6 +876,8 @@ enum ServiceUpdate {
         compatibility: ProviderCompatibility,
         projects: Vec<ProjectMetadata>,
         failures: Vec<RestoreFailure>,
+        automations: Vec<Automation>,
+        automation_runs: Vec<AutomationRun>,
     },
     SessionHydrated(SessionHandle),
     SessionAdded(SessionHandle),
@@ -898,6 +907,9 @@ enum ServiceUpdate {
         projects: Vec<ProjectMetadata>,
         selected: Option<String>,
     },
+    WorkspaceConfigurationDiscovered(Vec<String>, WorkspaceConfiguration),
+    AutomationsChanged(Vec<Automation>),
+    AutomationRunsChanged(Vec<AutomationRun>),
     SessionLaunchProgress(SessionLaunchProgress),
     PromptAccepted(Option<String>),
     ActionFailed(String),
@@ -917,6 +929,7 @@ enum ServiceCommand {
         attachments: Vec<PromptAttachment>,
         project_path: PathBuf,
         model: Option<String>,
+        agent: Option<String>,
         mode: String,
         reasoning_effort: Option<String>,
         context_tier: Option<String>,
@@ -962,6 +975,10 @@ enum ServiceCommand {
     SetMode {
         app_session_id: String,
         mode: String,
+    },
+    SetAgent {
+        app_session_id: String,
+        agent: Option<String>,
     },
     SetReasoningEffort {
         app_session_id: String,
@@ -1024,6 +1041,16 @@ enum ServiceCommand {
     RemoveProject {
         project_id: String,
     },
+    DiscoverWorkspaceConfiguration {
+        project_paths: Vec<PathBuf>,
+    },
+    SaveAutomation(Automation),
+    DeleteAutomation {
+        automation_id: String,
+    },
+    RunAutomationNow {
+        automation_id: String,
+    },
     Stop,
 }
 
@@ -1040,6 +1067,8 @@ struct BootstrapState {
     /// Sessions the user archived, shown only in settings.
     archived: Vec<ArchivedSessionRow>,
     selected_session: Option<String>,
+    automations: Vec<Automation>,
+    automation_runs: Vec<AutomationRun>,
 }
 
 /// One archived session as the settings list needs it.
@@ -1065,6 +1094,7 @@ impl AppService {
                 ));
             }
         };
+        automation_runner::recover_interrupted_runs(&storage);
         let storage_ms = elapsed_millis(storage_started);
         let bootstrap = BootstrapState {
             projects: storage.list_projects().unwrap_or_else(|error| {
@@ -1089,6 +1119,14 @@ impl AppService {
                 })
                 .collect(),
             selected_session: storage.selected_session().unwrap_or(None),
+            automations: storage.list_automations().unwrap_or_else(|error| {
+                tracing::error!(%error, "failed to list bootstrap automations");
+                Vec::new()
+            }),
+            automation_runs: storage.list_automation_runs(100).unwrap_or_else(|error| {
+                tracing::error!(%error, "failed to list bootstrap automation runs");
+                Vec::new()
+            }),
         };
         diagnostics.record(DiagnosticEvent {
             timestamp: timestamp(),
@@ -1112,6 +1150,7 @@ impl AppService {
         let (update_tx, updates) = channel();
         let (commands, command_rx) = channel();
         let (stopped_tx, stopped) = channel();
+        let automation_workspace = chats_directory(&project_root);
         thread::Builder::new()
             .name("gcabb-services".to_owned())
             .spawn(move || {
@@ -1139,10 +1178,16 @@ impl AppService {
                     runtime_state: runtime_state_root(),
                 };
                 let manager = Arc::new(
-                    SessionManager::new(provider_factory, storage, diagnostics.clone())
+                    SessionManager::new(provider_factory, storage.clone(), diagnostics.clone())
                         .with_session_roots(session_roots.clone()),
                 );
                 let orchestrator = SessionOrchestrator::new(manager.clone(), session_roots.clone());
+                let automations = AutomationContext::new(
+                    manager.clone(),
+                    storage.clone(),
+                    update_tx.clone(),
+                    automation_workspace,
+                );
                 // Projects are configured by the user, not inferred from the
                 // launch directory. Auto-registering the launch repository
                 // would silently re-add a project the user had removed.
@@ -1207,6 +1252,8 @@ impl AppService {
                             compatibility,
                             projects,
                             failures: report.failed,
+                            automations: storage.list_automations().unwrap_or_default(),
+                            automation_runs: storage.list_automation_runs(100).unwrap_or_default(),
                         });
                     }
                     Err(error) => {
@@ -1216,7 +1263,19 @@ impl AppService {
                     }
                 }
 
-                while let Ok(command) = command_rx.recv() {
+                let mut last_automation_tick = Instant::now()
+                    .checked_sub(Duration::from_secs(30))
+                    .unwrap_or_else(Instant::now);
+                loop {
+                    if last_automation_tick.elapsed() >= Duration::from_secs(15) {
+                        automations.dispatch_due(&runtime);
+                        last_automation_tick = Instant::now();
+                    }
+                    let command = match command_rx.recv_timeout(Duration::from_secs(1)) {
+                        Ok(command) => command,
+                        Err(RecvTimeoutError::Timeout) => continue,
+                        Err(RecvTimeoutError::Disconnected) => break,
+                    };
                     if matches!(command, ServiceCommand::Stop) {
                         let _ = runtime.block_on(manager.stop());
                         break;
@@ -1328,6 +1387,34 @@ impl AppService {
                                     .send(ServiceUpdate::ProjectsChanged { projects, selected });
                             }
                         }
+                        ServiceCommand::DiscoverWorkspaceConfiguration { project_paths } => {
+                            match runtime.block_on(manager.discover_configuration(&project_paths)) {
+                                Ok(configuration) => {
+                                    let _ = update_tx.send(
+                                        ServiceUpdate::WorkspaceConfigurationDiscovered(
+                                            project_paths
+                                                .into_iter()
+                                                .map(|path| path.to_string_lossy().into_owned())
+                                                .collect(),
+                                            configuration,
+                                        ),
+                                    );
+                                }
+                                Err(error) => {
+                                    let _ = update_tx
+                                        .send(ServiceUpdate::ActionFailed(error.to_string()));
+                                }
+                            }
+                        }
+                        ServiceCommand::SaveAutomation(automation) => {
+                            automations.save(automation);
+                        }
+                        ServiceCommand::DeleteAutomation { automation_id } => {
+                            automations.delete(&automation_id);
+                        }
+                        ServiceCommand::RunAutomationNow { automation_id } => {
+                            automations.run_now(&runtime, &automation_id);
+                        }
                         command => {
                             let submit_origin = match &command {
                                 ServiceCommand::Submit { app_session_id, .. } => {
@@ -1432,6 +1519,7 @@ async fn handle_service_command(
             attachments,
             project_path,
             model,
+            agent,
             mode,
             reasoning_effort,
             context_tier,
@@ -1466,6 +1554,7 @@ async fn handle_service_command(
                             attachments,
                             model,
                             mode,
+                            agent,
                             reasoning_effort,
                             context_tier,
                             base_ref,
@@ -1612,6 +1701,16 @@ async fn handle_service_command(
             .set_mode(mode)
             .await
             .map_err(|error| error.to_string())?,
+        ServiceCommand::SetAgent {
+            app_session_id,
+            agent,
+        } => manager
+            .session(&app_session_id)
+            .await
+            .map_err(|error| error.to_string())?
+            .set_agent(agent)
+            .await
+            .map_err(|error| error.to_string())?,
         ServiceCommand::SetReasoningEffort {
             app_session_id,
             effort,
@@ -1666,6 +1765,10 @@ async fn handle_service_command(
         // are handled before this dispatch.
         ServiceCommand::AddProject { .. }
         | ServiceCommand::RemoveProject { .. }
+        | ServiceCommand::DiscoverWorkspaceConfiguration { .. }
+        | ServiceCommand::SaveAutomation(_)
+        | ServiceCommand::DeleteAutomation { .. }
+        | ServiceCommand::RunAutomationNow { .. }
         | ServiceCommand::DeleteSession { .. }
         | ServiceCommand::ArchiveSession { .. }
         | ServiceCommand::UnarchiveSession { .. }
@@ -1952,6 +2055,7 @@ enum ControlMenu {
     Location,
     Base,
     Mode,
+    Agent,
     Model,
     Effort,
     Context,
@@ -2146,8 +2250,13 @@ struct SessionMvpView {
     follow_up_input: Entity<TextInput>,
     draft_mode: String,
     draft_model: Option<String>,
+    draft_agent: Option<String>,
     draft_effort: String,
     draft_context_tier: Option<String>,
+    discovered_agents: Vec<AgentOption>,
+    discovered_skills: Vec<WorkspaceResource>,
+    discovered_instructions: Vec<WorkspaceResource>,
+    configuration_errors: Vec<String>,
     /// Base branch chosen for the next new session's worktree, overriding
     /// the project's default branch. Resets whenever the project changes so
     /// a stale override from a different repository cannot leak in.
@@ -2196,6 +2305,7 @@ struct SessionMvpView {
     running_since: HashMap<String, Instant>,
     last_event_seen: HashMap<String, (u64, Instant)>,
     last_activity_repaint: Instant,
+    automations_panel: AutomationsPanel,
     _poll_task: gpui::Task<()>,
     _running_tick_task: gpui::Task<()>,
     _update_poll_task: gpui::Task<()>,
@@ -2284,6 +2394,7 @@ impl SessionMvpView {
             view.commit_rename(&event.text, cx);
         })
         .detach();
+        let automations_panel = AutomationsPanel::new(cx);
 
         let poll_task = cx.spawn(async move |view, cx| {
             loop {
@@ -2407,8 +2518,13 @@ impl SessionMvpView {
             follow_up_input,
             draft_mode: "interactive".to_owned(),
             draft_model: None,
+            draft_agent: None,
             draft_effort: "medium".to_owned(),
             draft_context_tier: None,
+            discovered_agents: Vec::new(),
+            discovered_skills: Vec::new(),
+            discovered_instructions: Vec::new(),
+            configuration_errors: Vec::new(),
             draft_base_ref: None,
             sidebar_open: true,
             panel_open: false,
@@ -2436,6 +2552,7 @@ impl SessionMvpView {
             running_since: HashMap::new(),
             last_event_seen: HashMap::new(),
             last_activity_repaint: Instant::now(),
+            automations_panel,
             _poll_task: poll_task,
             _running_tick_task: running_tick_task,
             _update_poll_task: update_poll_task,
@@ -2991,6 +3108,40 @@ impl SessionMvpView {
             .is_some_and(|service| service.drain(update_ui))
     }
 
+    /// Moves a session into the archived list, dropping its live projection.
+    fn apply_session_archived(
+        &mut self,
+        session: SessionMetadata,
+        archived_at: String,
+        cx: &mut Context<Self>,
+    ) {
+        let id = session.id.clone();
+        self.archiving_sessions.remove(&id);
+        self.forget_session(&id, cx);
+        self.archived_sessions.retain(|row| row.id != id);
+        self.archived_sessions.insert(
+            0,
+            ArchivedSessionRow {
+                id,
+                title: session.title,
+                archived_at,
+            },
+        );
+    }
+
+    /// Returns an archived session to the session list.
+    fn apply_session_unarchived(&mut self, session: SessionMetadata) {
+        let id = session.id.clone();
+        self.archiving_sessions.remove(&id);
+        self.archived_sessions.retain(|row| row.id != id);
+        if !self.sessions.iter().any(|existing| existing.id() == id) {
+            // Restored as a metadata-only placeholder; selecting it
+            // reconnects it the same way any stored session does.
+            self.sessions
+                .insert(0, SessionProjection::bootstrap(session));
+        }
+    }
+
     /// Drains pending service updates, returning whether any were applied so the
     /// caller can skip repainting when the poll tick found nothing to do.
     fn apply_service_updates(&mut self, cx: &mut Context<Self>) -> bool {
@@ -3006,10 +3157,15 @@ impl SessionMvpView {
                     compatibility,
                     projects,
                     failures,
+                    automations,
+                    automation_runs,
                 } => {
                     self.startup = StartupState::Ready(compatibility);
                     self.projects = projects;
+                    self.automations_panel.automations = automations;
+                    self.automations_panel.runs = automation_runs;
                     self.apply_restore_failures(failures);
+                    self.request_agent_discovery();
                 }
                 ServiceUpdate::SessionHydrated(handle) => {
                     self.upsert_hydrated_session(handle, cx);
@@ -3027,6 +3183,15 @@ impl SessionMvpView {
                 }
                 ServiceUpdate::ProjectsChanged { projects, selected } => {
                     self.apply_projects_changed(projects, selected, cx);
+                }
+                ServiceUpdate::WorkspaceConfigurationDiscovered(project_paths, configuration) => {
+                    self.apply_workspace_configuration(&project_paths, configuration);
+                }
+                ServiceUpdate::AutomationsChanged(automations) => {
+                    self.apply_automations_changed(automations, cx);
+                }
+                ServiceUpdate::AutomationRunsChanged(runs) => {
+                    self.automations_panel.runs = runs;
                 }
                 ServiceUpdate::SessionLaunchProgress(progress) => {
                     self.session_launch = Some(progress);
@@ -3046,18 +3211,7 @@ impl SessionMvpView {
                     session,
                     archived_at,
                 } => {
-                    let id = session.id.clone();
-                    self.archiving_sessions.remove(&id);
-                    self.forget_session(&id, cx);
-                    self.archived_sessions.retain(|row| row.id != id);
-                    self.archived_sessions.insert(
-                        0,
-                        ArchivedSessionRow {
-                            id,
-                            title: session.title,
-                            archived_at,
-                        },
-                    );
+                    self.apply_session_archived(session, archived_at, cx);
                 }
                 ServiceUpdate::SessionArchiveFailed {
                     app_session_id,
@@ -3067,15 +3221,7 @@ impl SessionMvpView {
                     self.action_error = Some(error);
                 }
                 ServiceUpdate::SessionUnarchived(session) => {
-                    let id = session.id.clone();
-                    self.archiving_sessions.remove(&id);
-                    self.archived_sessions.retain(|row| row.id != id);
-                    if !self.sessions.iter().any(|existing| existing.id() == id) {
-                        // Restored as a metadata-only placeholder; selecting it
-                        // reconnects it the same way any stored session does.
-                        self.sessions
-                            .insert(0, SessionProjection::bootstrap(session));
-                    }
+                    self.apply_session_unarchived(session);
                 }
                 ServiceUpdate::PromptAccepted(origin) => {
                     if let Some(id) = origin.as_deref() {
@@ -3100,6 +3246,8 @@ impl SessionMvpView {
     fn apply_bootstrap(&mut self, bootstrap: BootstrapState) {
         self.projects = bootstrap.projects;
         self.archived_sessions = bootstrap.archived;
+        self.automations_panel.automations = bootstrap.automations;
+        self.automations_panel.runs = bootstrap.automation_runs;
         self.sessions = bootstrap
             .sessions
             .into_iter()
@@ -3191,6 +3339,34 @@ impl SessionMvpView {
         }
     }
 
+    fn apply_workspace_configuration(
+        &mut self,
+        project_paths: &[String],
+        configuration: WorkspaceConfiguration,
+    ) {
+        let expected = self
+            .agent_discovery_paths()
+            .into_iter()
+            .map(|path| path.to_string_lossy().into_owned())
+            .collect::<Vec<_>>();
+        if project_paths != expected {
+            return;
+        }
+        self.discovered_agents = configuration.agents;
+        self.discovered_skills = configuration.skills;
+        self.discovered_instructions = configuration.instructions;
+        self.configuration_errors = configuration.errors;
+        if self.selected_session.is_none()
+            && self.draft_agent.as_ref().is_some_and(|selected| {
+                !self
+                    .discovered_agents
+                    .iter()
+                    .any(|agent| agent.id == *selected && agent.user_invocable != Some(false))
+            })
+        {
+            self.draft_agent = None;
+        }
+    }
     /// Adopt a new project list, selecting `selected` when one was given.
     fn apply_projects_changed(
         &mut self,
@@ -3339,6 +3515,7 @@ impl SessionMvpView {
             attachments,
             project_path,
             model: self.draft_model.clone(),
+            agent: self.draft_agent.clone(),
             mode: self.draft_mode.clone(),
             reasoning_effort: reasoning_effort_for_model(&supported_efforts, &self.draft_effort),
             context_tier: self.selectable_context_tier(),
@@ -3482,9 +3659,15 @@ impl SessionMvpView {
         self.switch_composer_draft(None, cx);
         self.startup_navigation = StartupNavigation::Changed;
         self.action_error = None;
+        self.draft_agent = None;
+        self.discovered_agents.clear();
+        self.discovered_skills.clear();
+        self.discovered_instructions.clear();
+        self.configuration_errors.clear();
         let _ = self.commands.send(ServiceCommand::Select {
             app_session_id: None,
         });
+        self.request_agent_discovery();
         cx.notify();
     }
 
@@ -3651,6 +3834,7 @@ impl SessionMvpView {
             }
             self.draft_mode = controls.mode.unwrap_or_else(|| "interactive".to_owned());
             self.draft_model = controls.model;
+            self.draft_agent = controls.agent;
             self.draft_effort = controls
                 .reasoning_effort
                 .unwrap_or_else(|| "medium".to_owned());
@@ -3678,6 +3862,11 @@ impl SessionMvpView {
         self.project_branch = git_output(Path::new(path), &["branch", "--show-current"]);
         // New sessions run in the project directory the user chose.
         self.workspace_root = PathBuf::from(path);
+        self.draft_agent = None;
+        self.discovered_agents.clear();
+        self.discovered_skills.clear();
+        self.discovered_instructions.clear();
+        self.configuration_errors.clear();
         let selected_session = self
             .sessions
             .iter()
@@ -3690,10 +3879,39 @@ impl SessionMvpView {
         {
             self.workspace_root = workspace;
         }
+        if let Some(agent) = self
+            .selected()
+            .and_then(|session| session.snapshot.controls.agent.clone())
+        {
+            self.draft_agent = Some(agent);
+        }
         let _ = self.commands.send(ServiceCommand::Select {
             app_session_id: self.selected_session.clone(),
         });
+        self.request_agent_discovery();
         cx.notify();
+    }
+
+    fn agent_discovery_path(&self) -> Option<String> {
+        self.projects
+            .iter()
+            .find(|project| Path::new(&project.path) == self.selected_project)
+            .map(|project| project.path.clone())
+    }
+
+    fn agent_discovery_paths(&self) -> Vec<PathBuf> {
+        self.agent_discovery_path()
+            .map(PathBuf::from)
+            .into_iter()
+            .collect()
+    }
+
+    fn request_agent_discovery(&self) {
+        let _ = self
+            .commands
+            .send(ServiceCommand::DiscoverWorkspaceConfiguration {
+                project_paths: self.agent_discovery_paths(),
+            });
     }
 
     /// Open the platform folder picker and register the chosen directory.
@@ -4656,6 +4874,16 @@ impl SessionMvpView {
                     });
                 }
             }
+            ControlMenu::Agent => {
+                let agent = (!value.is_empty()).then_some(value);
+                self.draft_agent.clone_from(&agent);
+                if let Some(id) = self.selected_session.clone() {
+                    let _ = self.commands.send(ServiceCommand::SetAgent {
+                        app_session_id: id,
+                        agent,
+                    });
+                }
+            }
             ControlMenu::Model => {
                 let supported_efforts = self.supported_reasoning_efforts(&value);
                 self.draft_model = Some(value.clone());
@@ -4940,6 +5168,82 @@ impl SessionMvpView {
             .unwrap_or_else(|| selected.to_owned())
     }
 
+    fn agent_options(&self) -> Vec<(String, String, String)> {
+        let session_agents = self.selected().map_or(&[][..], |session| {
+            session.snapshot.controls.available_agents.as_slice()
+        });
+        let mut seen = HashSet::new();
+        let agents = self
+            .discovered_agents
+            .iter()
+            .chain(session_agents)
+            .filter(|agent| agent.user_invocable != Some(false))
+            .filter(|agent| seen.insert(agent.id.clone()))
+            .collect::<Vec<_>>();
+        let default_description = if agents.is_empty()
+            && self.discovered_skills.is_empty()
+            && self.discovered_instructions.is_empty()
+        {
+            "No GitHub agents, skills, or instructions found".to_owned()
+        } else {
+            format!(
+                "Workspace context: {} agents · {} skills · {} instructions",
+                agents.len(),
+                self.discovered_skills.len(),
+                self.discovered_instructions.len()
+            )
+        };
+        std::iter::once((
+            String::new(),
+            "Default agent".to_owned(),
+            default_description,
+        ))
+        .chain(agents.into_iter().map(|agent| {
+            let description = match (&agent.description[..], agent.model.as_deref()) {
+                ("", Some(model)) => format!("Preferred model: {model}"),
+                ("", None) => "Custom agent".to_owned(),
+                (description, Some(model)) => format!("{description} · {model}"),
+                (description, None) => description.to_owned(),
+            };
+            (agent.id.clone(), agent.name.clone(), description)
+        }))
+        .collect()
+    }
+    fn draft_agent_label(&self) -> String {
+        let Some(selected) = self.draft_agent.as_deref() else {
+            return "Default agent".to_owned();
+        };
+        self.agent_options()
+            .into_iter()
+            .find_map(|(id, label, _)| (id == selected).then_some(label))
+            .unwrap_or_else(|| selected.to_owned())
+    }
+
+    fn workspace_configuration_summary(&self) -> impl IntoElement {
+        let skills = resource_names(&self.discovered_skills);
+        let instructions = resource_names(&self.discovered_instructions);
+        let errors = self.configuration_errors.join(" · ");
+        div()
+            .id("workspace-configuration-summary")
+            .mt_2()
+            .pt_2()
+            .px_2()
+            .border_t_1()
+            .border_color(rgb(BORDER))
+            .text_xs()
+            .text_color(rgb(MUTED))
+            .child(format!(
+                "Skills ({}): {skills}",
+                self.discovered_skills.len()
+            ))
+            .child(format!(
+                "Instructions ({}): {instructions}",
+                self.discovered_instructions.len()
+            ))
+            .when(!errors.is_empty(), |summary| {
+                summary.child(div().text_color(rgb(RED)).child(errors))
+            })
+    }
     #[allow(clippy::too_many_lines)]
     fn control_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let menu = self.open_control_menu?;
@@ -4980,6 +5284,11 @@ impl SessionMvpView {
                 ("Base branch", selected, options)
             }
             ControlMenu::Mode => ("Mode", self.draft_mode.clone(), self.mode_options()),
+            ControlMenu::Agent => (
+                "Agent",
+                self.draft_agent.clone().unwrap_or_default(),
+                self.agent_options(),
+            ),
             ControlMenu::Model => {
                 let options = self.model_options();
                 let selected = self
@@ -5008,7 +5317,7 @@ impl SessionMvpView {
                 ("Context length", selected, options)
             }
         };
-        let width = if menu == ControlMenu::Model {
+        let width = if matches!(menu, ControlMenu::Agent | ControlMenu::Model) {
             px(340.0)
         } else {
             px(260.0)
@@ -5095,7 +5404,10 @@ impl SessionMvpView {
                                 },
                             ))
                     },
-                )),
+                ))
+                .when(menu == ControlMenu::Agent, |popup| {
+                    popup.child(self.workspace_configuration_summary())
+                }),
         )
     }
 
@@ -5408,11 +5720,28 @@ impl SessionMvpView {
                             })),
                     )
                     .child(disabled_destination("destination-my-work", "☷", "My work"))
-                    .child(disabled_destination(
-                        "destination-automations",
-                        "□",
-                        "Automations",
-                    ))
+                    .child(
+                        div()
+                            .id("destination-automations")
+                            .accessibility_id("destination-automations")
+                            .role(Role::Button)
+                            .aria_label("Automations")
+                            .focusable()
+                            .tab_stop(true)
+                            .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
+                            .flex()
+                            .items_center()
+                            .gap_3()
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .child(div().text_color(rgb(MUTED)).child("□"))
+                            .child("Automations")
+                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                view.open_automations(cx);
+                            })),
+                    )
                     .child(disabled_destination("destination-search", "⌕", "Search")),
             )
             .child(
@@ -5834,7 +6163,17 @@ impl SessionMvpView {
         // viewport — so a press on the visible thumb was classified as a press
         // on bare track and jumped the content instead of grabbing.
         let geometry = Self::scrollbar_geometry(handle)?;
-        Some(Self::scrollbar_element(id, geometry, group, cx))
+        Some(Self::scrollbar_element(id, geometry, group, cx, false))
+    }
+
+    fn visible_scrollbar(
+        id: &str,
+        handle: &gpui::ScrollHandle,
+        group: SharedString,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let geometry = Self::scrollbar_geometry(handle)?;
+        Some(Self::scrollbar_element(id, geometry, group, cx, true).into_any_element())
     }
 
     fn transcript_scrollbar(
@@ -5850,6 +6189,7 @@ impl SessionMvpView {
             geometry,
             group,
             cx,
+            false,
         ))
     }
 
@@ -5858,21 +6198,32 @@ impl SessionMvpView {
         geometry: ScrollbarGeometry,
         group: SharedString,
         cx: &mut Context<Self>,
+        always_visible: bool,
     ) -> impl IntoElement + use<> {
         let track_id = id.to_owned();
         let thumb_id = id.to_owned();
+        let debug_id = id.to_owned();
 
         div()
             .id(SharedString::from(format!("{id}-scrollbar")))
-            .debug_selector(|| "scrollbar".to_owned())
+            .debug_selector(move || {
+                if always_visible {
+                    format!("{debug_id}-visible-scrollbar")
+                } else {
+                    "scrollbar".to_owned()
+                }
+            })
             .occlude()
             .absolute()
             .top_0()
             .right_0()
             .w(px(SCROLLBAR_WIDTH))
             .h(px(geometry.track))
-            .opacity(0.0)
-            .group_hover(group, |style| style.opacity(1.0))
+            .opacity(if always_visible { 1.0 } else { 0.0 })
+            .when(always_visible, |track| track.rounded_full().bg(rgb(SUBTLE)))
+            .when(!always_visible, |track| {
+                track.group_hover(group, |style| style.opacity(1.0))
+            })
             // Pressing bare track jumps the thumb there and starts a drag.
             .on_mouse_down(
                 MouseButton::Left,
@@ -9449,6 +9800,7 @@ impl SessionMvpView {
         let mode = title_case(&self.draft_mode);
         let effort = effort_label(&self.draft_effort);
         let model = self.draft_model_label();
+        let agent = self.draft_agent_label();
         let supports_reasoning = !self.effort_options().is_empty();
         let context_control = self.context_control(cx);
         let selected = self.selected();
@@ -9524,6 +9876,13 @@ impl SessionMvpView {
                         mode,
                         ControlMenu::Mode,
                         self.open_control_menu == Some(ControlMenu::Mode),
+                        cx,
+                    ))
+                    .child(control_pill(
+                        "agent",
+                        agent,
+                        ControlMenu::Agent,
+                        self.open_control_menu == Some(ControlMenu::Agent),
                         cx,
                     ))
                     .child(control_pill(
@@ -9654,6 +10013,7 @@ impl SessionMvpView {
         let branch = self.composer_branch_label();
         let mode = title_case(&self.draft_mode);
         let model = self.draft_model_label();
+        let agent = self.draft_agent_label();
         let effort = effort_label(&self.draft_effort);
         let supports_reasoning = !self.effort_options().is_empty();
         let context_control = self.context_control(cx);
@@ -9722,6 +10082,13 @@ impl SessionMvpView {
                                 mode,
                                 ControlMenu::Mode,
                                 self.open_control_menu == Some(ControlMenu::Mode),
+                                cx,
+                            ))
+                            .child(control_pill(
+                                "agent",
+                                agent,
+                                ControlMenu::Agent,
+                                self.open_control_menu == Some(ControlMenu::Agent),
                                 cx,
                             ))
                             .child(div().h(px(20.0)).border_l_1().border_color(rgb(BORDER)))
@@ -10355,6 +10722,8 @@ impl Render for SessionMvpView {
                 view.dismiss_image_preview(cx);
                 view.diagnostics_visibility = SettingsVisibility::Closed;
                 view.settings_visibility = SettingsVisibility::Closed;
+                view.automations_panel.open = false;
+                view.automations_panel.open_menu = None;
                 if view.renaming_session.is_some() {
                     view.cancel_rename(cx);
                 }
@@ -10632,6 +11001,7 @@ impl Render for SessionMvpView {
             .when_some(self.project_context_menu(cx), gpui::ParentElement::child)
             .when_some(self.rename_dialog(cx), gpui::ParentElement::child)
             .when_some(self.settings_dialog(cx), gpui::ParentElement::child)
+            .when_some(self.automations_dialog(cx), gpui::ParentElement::child)
             .when_some(self.diagnostics_dialog(cx), gpui::ParentElement::child)
             .when_some(self.image_preview_overlay(cx), gpui::ParentElement::child)
     }
@@ -10892,6 +11262,23 @@ fn changes_badge(session: Option<&SessionProjection>) -> String {
     )
 }
 
+fn resource_names(resources: &[WorkspaceResource]) -> String {
+    if resources.is_empty() {
+        return "None".to_owned();
+    }
+    let visible = resources
+        .iter()
+        .take(6)
+        .map(|resource| resource.name.as_str())
+        .collect::<Vec<_>>()
+        .join(", ");
+    let remaining = resources.len().saturating_sub(6);
+    if remaining == 0 {
+        visible
+    } else {
+        format!("{visible} + {remaining} more")
+    }
+}
 fn control_pill(
     id: &'static str,
     value: String,
@@ -10904,12 +11291,14 @@ fn control_pill(
         ControlMenu::Location => "Where to run this session",
         ControlMenu::Base => "Base branch",
         ControlMenu::Mode => "Mode",
+        ControlMenu::Agent => "Agent",
         ControlMenu::Model => "Model",
         ControlMenu::Effort => "Reasoning effort",
         ControlMenu::Context => "Context length",
     };
     div()
         .id(id)
+        .debug_selector(move || id.to_owned())
         .accessibility_id(id)
         .role(Role::ComboBox)
         .aria_label(label)
@@ -10951,6 +11340,7 @@ fn control_menu_id(menu: ControlMenu) -> &'static str {
         ControlMenu::Location => "location",
         ControlMenu::Base => "base",
         ControlMenu::Mode => "mode",
+        ControlMenu::Agent => "agent",
         ControlMenu::Model => "model",
         ControlMenu::Effort => "effort",
         ControlMenu::Context => "context",
@@ -10988,9 +11378,10 @@ fn control_menu_offset(menu: ControlMenu) -> u16 {
         ControlMenu::Location => 96,
         ControlMenu::Base => 176,
         ControlMenu::Mode => 40,
-        ControlMenu::Model => 128,
-        ControlMenu::Effort => 216,
-        ControlMenu::Context => 304,
+        ControlMenu::Agent => 128,
+        ControlMenu::Model => 216,
+        ControlMenu::Effort => 304,
+        ControlMenu::Context => 392,
     }
 }
 
@@ -11605,14 +11996,15 @@ fn main() {
 }
 
 #[cfg(test)]
-mod tests {
-    use app_model::ContextWindowOption;
+pub(crate) mod tests {
+    use app_model::{ContextWindowOption, InteractionKind, InteractionResponse};
 
     use super::{
-        COMPACT_WIDTH, ControlMenu, UPDATE_POLL_INTERVAL, UPDATE_POLL_JITTER, compact_layout,
-        context_window_label, control_menu_id, control_menu_offset, default_branch,
-        default_context_tier, effort_label, migrate_persistent_data, reasoning_effort_for_model,
-        repository_root, toggled_menu, token_label, update_poll_delay_for,
+        COMPACT_WIDTH, ControlMenu, UPDATE_POLL_INTERVAL, UPDATE_POLL_JITTER, choice_response,
+        compact_layout, context_window_label, control_menu_id, control_menu_offset, default_branch,
+        default_context_tier, effort_label, migrate_persistent_data, permission_scope_description,
+        reasoning_effort_for_model, repository_root, toggled_menu, token_label,
+        update_poll_delay_for,
     };
     use app_model::SessionLocation;
     use std::fmt::Write as _;
@@ -11780,6 +12172,26 @@ mod tests {
     }
 
     #[test]
+    fn permission_scope_choices_map_to_their_explicit_responses() {
+        assert_eq!(
+            choice_response(InteractionKind::Permission, "Allow once"),
+            InteractionResponse::Approve
+        );
+        assert_eq!(
+            choice_response(InteractionKind::Permission, "Allow for this session"),
+            InteractionResponse::ApproveForSession
+        );
+        assert_eq!(
+            choice_response(InteractionKind::Permission, "Always allow for this project"),
+            InteractionResponse::ApproveForLocation
+        );
+        assert_eq!(
+            choice_response(InteractionKind::Permission, "Always allow this domain"),
+            InteractionResponse::ApprovePermanently
+        );
+    }
+
+    #[test]
     fn search_briefs_report_zero_and_parsed_match_counts() {
         assert_eq!(
             super::SessionMvpView::reported_match_count("No matches found."),
@@ -11794,11 +12206,23 @@ mod tests {
     }
 
     #[test]
+    fn permission_scope_copy_explains_how_long_each_approval_lasts() {
+        assert!(permission_scope_description("Allow once").contains("Only this request"));
+        assert!(permission_scope_description("Allow for this session").contains("session ends"));
+        assert!(
+            permission_scope_description("Always allow for this project").contains("this project")
+        );
+        assert!(
+            permission_scope_description("Always allow this domain").contains("across sessions")
+        );
+    }
+
+    #[test]
     fn transcript_selection_clamps_when_streaming_rewrites_a_block() {
         let mut selection = super::TranscriptTextSelection::default();
-        let original = gpui::SharedString::from("é");
+        let original = gpui::SharedString::from("?");
         selection.begin("block".to_owned(), (1, 0), &original, 0);
-        selection.extend("block".to_owned(), (1, 0), &original, "é".len());
+        selection.extend("block".to_owned(), (1, 0), &original, "?".len());
         selection.register_block("block", (1, 0), "x".into(), Vec::new());
 
         assert_eq!(selection.selected_text().as_deref(), Some("x"));
@@ -11953,14 +12377,16 @@ mod tests {
     #[test]
     fn selector_menus_align_with_their_composer_pills() {
         assert_eq!(control_menu_offset(ControlMenu::Mode), 40);
-        assert_eq!(control_menu_offset(ControlMenu::Model), 128);
-        assert_eq!(control_menu_offset(ControlMenu::Effort), 216);
+        assert_eq!(control_menu_offset(ControlMenu::Agent), 128);
+        assert_eq!(control_menu_offset(ControlMenu::Model), 216);
+        assert_eq!(control_menu_offset(ControlMenu::Effort), 304);
         assert_eq!(control_menu_offset(ControlMenu::Base), 176);
     }
 
     #[test]
     fn selector_accessibility_ids_match_their_triggers() {
         assert_eq!(control_menu_id(ControlMenu::Mode), "mode");
+        assert_eq!(control_menu_id(ControlMenu::Agent), "agent");
         assert_eq!(control_menu_id(ControlMenu::Model), "model");
         assert_eq!(control_menu_id(ControlMenu::Effort), "effort");
         assert_eq!(control_menu_id(ControlMenu::Base), "base");
@@ -12002,7 +12428,7 @@ mod tests {
     #[test]
     fn context_selector_only_appears_for_multiple_windows() {
         assert_eq!(control_menu_id(ControlMenu::Context), "context");
-        assert_eq!(control_menu_offset(ControlMenu::Context), 304);
+        assert_eq!(control_menu_offset(ControlMenu::Context), 392);
     }
 
     #[test]
@@ -12092,7 +12518,7 @@ mod tests {
         );
     }
 
-    mod interaction {
+    pub(crate) mod interaction {
         use app_model::{
             InteractionKind, InteractionRequest, InteractionResponse, SessionKind, SessionMetadata,
             SessionSnapshot, SessionStatus, TitleSource,
@@ -12145,7 +12571,7 @@ mod tests {
         }
 
         /// Build the real view with one session row rendered.
-        fn setup(
+        pub(crate) fn setup(
             cx: &mut TestAppContext,
         ) -> (
             gpui::Entity<SessionMvpView>,
@@ -12367,6 +12793,8 @@ mod tests {
                 sessions: vec![first, second],
                 archived: Vec::new(),
                 selected_session: Some("session-2".to_owned()),
+                automations: Vec::new(),
+                automation_runs: Vec::new(),
             });
             cx.update(super::super::bind_app_keys);
             let (view, cx) = cx.add_window_view(|_, cx| {
@@ -12404,6 +12832,8 @@ mod tests {
                 sessions: vec![metadata],
                 archived: Vec::new(),
                 selected_session: Some("session-1".to_owned()),
+                automations: Vec::new(),
+                automation_runs: Vec::new(),
             });
             cx.update(super::super::bind_app_keys);
             let (view, cx) = cx.add_window_view(|_, cx| {
@@ -12455,6 +12885,8 @@ mod tests {
                     sessions: vec![snapshot("session-1", "First session").metadata],
                     archived: Vec::new(),
                     selected_session: Some("session-1".to_owned()),
+                    automations: Vec::new(),
+                    automation_runs: Vec::new(),
                 });
             });
 
@@ -12473,6 +12905,8 @@ mod tests {
                     sessions: vec![snapshot("session-1", "First session").metadata],
                     archived: Vec::new(),
                     selected_session: Some("session-1".to_owned()),
+                    automations: Vec::new(),
+                    automation_runs: Vec::new(),
                 });
             });
             view.update_in(cx, SessionMvpView::new_session);
@@ -12591,6 +13025,8 @@ mod tests {
                     sessions: vec![legacy],
                     archived: Vec::new(),
                     selected_session: Some("session-1".to_owned()),
+                    automations: Vec::new(),
+                    automation_runs: Vec::new(),
                 });
             });
             let mut adopted = snapshot("session-1", "Legacy session");
@@ -12627,6 +13063,8 @@ mod tests {
                     sessions: vec![snapshot("session-1", "First session").metadata],
                     archived: Vec::new(),
                     selected_session: Some("session-1".to_owned()),
+                    automations: Vec::new(),
+                    automation_runs: Vec::new(),
                 });
             });
             updates
@@ -12641,6 +13079,8 @@ mod tests {
                         available_models: Vec::new(),
                     },
                     projects: Vec::new(),
+                    automations: Vec::new(),
+                    automation_runs: Vec::new(),
                     failures: vec![session_manager::RestoreFailure {
                         app_session_id: "session-1".to_owned(),
                         sdk_session_id: "sdk-session-1".to_owned(),
@@ -12725,6 +13165,79 @@ mod tests {
                 view.select_session("session-1".to_owned(), cx);
                 assert!(view.composer.read(cx).value().is_empty());
             });
+        }
+
+        #[gpui::test]
+        fn agent_selector_is_visible_without_custom_agents(cx: &mut TestAppContext) {
+            let (_view, cx, _commands) = setup(cx);
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("agent").is_some());
+        }
+        #[gpui::test]
+        fn discovered_project_agents_survive_an_empty_selected_session_roster(
+            cx: &mut TestAppContext,
+        ) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, _| {
+                view.selected_session = Some("session-1".to_owned());
+                view.discovered_agents = vec![app_model::AgentOption {
+                    id: "workspace-reviewer".to_owned(),
+                    name: "Workspace reviewer".to_owned(),
+                    description: "Reviews the selected workspace".to_owned(),
+                    model: None,
+                    user_invocable: Some(true),
+                }];
+                assert!(
+                    view.sessions[0]
+                        .snapshot
+                        .controls
+                        .available_agents
+                        .is_empty()
+                );
+                assert!(
+                    view.agent_options()
+                        .iter()
+                        .any(|(id, _, _)| id == "workspace-reviewer")
+                );
+            });
+        }
+        #[gpui::test]
+        fn custom_agent_selector_excludes_delegation_only_agents(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let mut snapshot = (*view.sessions[0].snapshot).clone();
+                snapshot.controls.available_agents = vec![
+                    app_model::AgentOption {
+                        id: "reviewer".to_owned(),
+                        name: "Reviewer".to_owned(),
+                        description: "Reviews changes".to_owned(),
+                        model: None,
+                        user_invocable: Some(true),
+                    },
+                    app_model::AgentOption {
+                        id: "explore".to_owned(),
+                        name: "Explore".to_owned(),
+                        description: "Repository research".to_owned(),
+                        model: None,
+                        user_invocable: Some(false),
+                    },
+                ];
+                view.sessions[0].snapshot = Arc::new(snapshot);
+                view.selected_session = Some("session-1".to_owned());
+
+                let options = view.agent_options();
+                assert!(options.iter().any(|(id, _, _)| id == "reviewer"));
+                assert!(!options.iter().any(|(id, _, _)| id == "explore"));
+                view.choose_control(super::super::ControlMenu::Agent, "reviewer".to_owned(), cx);
+            });
+
+            assert!(matches!(
+                commands.try_recv().expect("agent selection command"),
+                ServiceCommand::SetAgent {
+                    app_session_id,
+                    agent: Some(agent),
+                } if app_session_id == "session-1" && agent == "reviewer"
+            ));
         }
 
         #[gpui::test]
