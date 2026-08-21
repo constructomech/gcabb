@@ -876,7 +876,6 @@ enum ServiceUpdate {
         compatibility: ProviderCompatibility,
         projects: Vec<ProjectMetadata>,
         failures: Vec<RestoreFailure>,
-        configuration_roots: Vec<String>,
         automations: Vec<Automation>,
         automation_runs: Vec<AutomationRun>,
     },
@@ -1253,7 +1252,6 @@ impl AppService {
                             compatibility,
                             projects,
                             failures: report.failed,
-                            configuration_roots: manager.configuration_roots().unwrap_or_default(),
                             automations: storage.list_automations().unwrap_or_default(),
                             automation_runs: storage.list_automation_runs(100).unwrap_or_default(),
                         });
@@ -2259,7 +2257,6 @@ struct SessionMvpView {
     discovered_skills: Vec<WorkspaceResource>,
     discovered_instructions: Vec<WorkspaceResource>,
     configuration_errors: Vec<String>,
-    configuration_roots: Vec<PathBuf>,
     /// Base branch chosen for the next new session's worktree, overriding
     /// the project's default branch. Resets whenever the project changes so
     /// a stale override from a different repository cannot leak in.
@@ -2528,7 +2525,6 @@ impl SessionMvpView {
             discovered_skills: Vec::new(),
             discovered_instructions: Vec::new(),
             configuration_errors: Vec::new(),
-            configuration_roots: Vec::new(),
             draft_base_ref: None,
             sidebar_open: true,
             panel_open: false,
@@ -3161,7 +3157,6 @@ impl SessionMvpView {
                     compatibility,
                     projects,
                     failures,
-                    configuration_roots,
                     automations,
                     automation_runs,
                 } => {
@@ -3169,8 +3164,6 @@ impl SessionMvpView {
                     self.projects = projects;
                     self.automations_panel.automations = automations;
                     self.automations_panel.runs = automation_runs;
-                    self.configuration_roots =
-                        configuration_roots.into_iter().map(PathBuf::from).collect();
                     self.apply_restore_failures(failures);
                     self.request_agent_discovery();
                 }
@@ -3907,13 +3900,10 @@ impl SessionMvpView {
     }
 
     fn agent_discovery_paths(&self) -> Vec<PathBuf> {
-        let mut paths = self.configuration_roots.clone();
-        if let Some(project_path) = self.agent_discovery_path().map(PathBuf::from)
-            && !paths.contains(&project_path)
-        {
-            paths.insert(0, project_path);
-        }
-        paths
+        self.agent_discovery_path()
+            .map(PathBuf::from)
+            .into_iter()
+            .collect()
     }
 
     fn request_agent_discovery(&self) {
@@ -13089,7 +13079,6 @@ pub(crate) mod tests {
                         available_models: Vec::new(),
                     },
                     projects: Vec::new(),
-                    configuration_roots: Vec::new(),
                     automations: Vec::new(),
                     automation_runs: Vec::new(),
                     failures: vec![session_manager::RestoreFailure {

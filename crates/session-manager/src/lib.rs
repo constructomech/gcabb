@@ -760,22 +760,6 @@ impl SessionManager {
         }
     }
 
-    pub fn configuration_roots(&self) -> Result<Vec<String>> {
-        self.storage.configuration_roots().map_err(Into::into)
-    }
-
-    pub fn add_configuration_root(&self, root: &Path) -> Result<Vec<String>> {
-        let root = root.to_string_lossy().into_owned();
-        let mut roots = self.storage.configuration_roots()?;
-        if !roots
-            .iter()
-            .any(|existing| existing.eq_ignore_ascii_case(&root))
-        {
-            roots.push(root);
-            self.storage.set_configuration_roots(&roots)?;
-        }
-        Ok(roots)
-    }
     async fn select_agent_or_disconnect(
         provider: &Arc<dyn AgentProvider>,
         sdk_session_id: &str,

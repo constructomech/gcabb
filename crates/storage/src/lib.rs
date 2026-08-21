@@ -285,29 +285,6 @@ impl Storage {
         Ok(())
     }
 
-    pub fn set_configuration_roots(&self, roots: &[String]) -> Result<()> {
-        let value = serde_json::to_string(roots)?;
-        self.connection()?.execute(
-            "INSERT INTO app_state (key, value) VALUES ('configuration_roots', ?1)
-             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
-            [value],
-        )?;
-        Ok(())
-    }
-
-    pub fn configuration_roots(&self) -> Result<Vec<String>> {
-        self.connection()?
-            .query_row(
-                "SELECT value FROM app_state WHERE key = 'configuration_roots'",
-                [],
-                |row| row.get::<_, String>(0),
-            )
-            .optional()?
-            .map_or_else(
-                || Ok(Vec::new()),
-                |value| serde_json::from_str(&value).map_err(Into::into),
-            )
-    }
     pub fn selected_session(&self) -> Result<Option<String>> {
         self.connection()?
             .query_row(
