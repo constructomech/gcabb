@@ -7907,15 +7907,21 @@ impl SessionMvpView {
                 .tab_stop(true)
                 .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                 .flex()
-                .items_center()
+                .items_start()
                 .gap_2()
                 .px_3()
                 .py_2()
                 .rounded_md()
                 .border_1()
                 .border_color(rgb(BORDER))
-                .child(div().flex_1().child(choice))
-                .child(div().text_xs().text_color(rgb(MUTED)).child(description))
+                .child(div().flex_1().min_w_0().child(choice))
+                .child(
+                    div()
+                        .flex_shrink_0()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(description),
+                )
                 .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                 .on_click(cx.listener(move |view, _, _, _| {
                     let _ = view.commands.send(ServiceCommand::Respond {
@@ -10415,7 +10421,7 @@ impl SessionMvpView {
                     .tab_stop(true)
                     .focus_visible(|style| style.border_1().border_color(rgb(BLUE)))
                     .flex()
-                    .items_center()
+                    .items_start()
                     .gap_2()
                     .px_3()
                     .py_2()
@@ -10424,10 +10430,11 @@ impl SessionMvpView {
                     .child(
                         div()
                             .w(px(28.0))
+                            .flex_shrink_0()
                             .text_color(rgb(MUTED))
                             .child(format!("{}.", index + 1)),
                     )
-                    .child(div().flex_1().child(choice.clone()))
+                    .child(div().flex_1().min_w_0().child(choice.clone()))
                     .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                     .on_click(cx.listener(move |view, _, _, _| {
                         let _ = view.commands.send(ServiceCommand::Respond {
@@ -10456,6 +10463,7 @@ impl SessionMvpView {
                 .child(
                     div()
                         .id("interaction-panel")
+                        .debug_selector(|| "interaction-panel".to_owned())
                         .mx_auto()
                         .w_full()
                         .max_w(px(CONVERSATION_COLUMN_WIDTH))
@@ -10565,7 +10573,7 @@ impl SessionMvpView {
                                                 style.border_1().border_color(rgb(BLUE))
                                             })
                                             .flex()
-                                            .items_center()
+                                            .items_start()
                                             .gap_2()
                                             .px_3()
                                             .py_3()
@@ -10574,6 +10582,7 @@ impl SessionMvpView {
                                             .child(
                                                 div()
                                                     .w(px(28.0))
+                                                    .flex_shrink_0()
                                                     .text_color(rgb(MUTED))
                                                     .child(format!("{}.", index + 1)),
                                             )
@@ -10582,6 +10591,7 @@ impl SessionMvpView {
                                                     .flex()
                                                     .flex_col()
                                                     .flex_1()
+                                                    .min_w_0()
                                                     .gap_1()
                                                     .child(
                                                         div()
@@ -13391,6 +13401,52 @@ pub(crate) mod tests {
                 }
                 _ => panic!("expected an interaction response"),
             }
+        }
+
+        /// Regression: long option labels in the user-input dialog ran past the
+        /// right edge of their row and were clipped. Options now wrap inside the
+        /// dialog width and the row grows taller to fit the wrapped text.
+        #[gpui::test]
+        fn long_question_choices_wrap_inside_the_dialog(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                Arc::make_mut(&mut view.sessions[0].snapshot)
+                    .pending_interactions
+                    .push(interaction(
+                        InteractionKind::UserInput,
+                        "Copilot needs your input",
+                        "Which approach should I take?",
+                        &[
+                            "Rework the session orchestrator so archived worktrees are rebuilt \
+                             lazily on unarchive, keeping untracked work intact and avoiding a \
+                             full clone every time the user reopens an older session",
+                            "Short",
+                        ],
+                        true,
+                    ));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let panel = cx
+                .debug_bounds("interaction-panel")
+                .expect("interaction panel rendered");
+            let long = cx
+                .debug_bounds("interaction-choice-0")
+                .expect("long choice rendered");
+            let short = cx
+                .debug_bounds("interaction-choice-1")
+                .expect("short choice rendered");
+
+            assert!(
+                long.origin.x + long.size.width <= panel.origin.x + panel.size.width,
+                "a long option should stay inside the dialog instead of overflowing it"
+            );
+            assert!(
+                long.size.height > short.size.height,
+                "a long option should wrap onto extra lines and grow the row height"
+            );
         }
 
         #[gpui::test]
