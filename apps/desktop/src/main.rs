@@ -37,7 +37,8 @@ use session_orchestrator::{
 use storage::Storage;
 use tokio::sync::watch;
 use ui_components::{
-    ImagesPasted, InputQueued, InputSubmitted, PastedImage, TextInput, bind_text_input_keys,
+    CompletionItem, ImagesPasted, InputChanged, InputQueued, InputSubmitted, PastedImage,
+    TextInput, bind_text_input_keys,
 };
 use updater::install::InstallLayout;
 use updater::version::BuildStamp;
@@ -46,6 +47,7 @@ mod automation_runner;
 mod automations_ui;
 mod markdown;
 mod settings;
+mod slash_commands;
 mod syntax;
 mod updates;
 
@@ -2358,16 +2360,24 @@ impl SessionMvpView {
             )
         });
         cx.subscribe(&composer, |view, _, event: &InputSubmitted, cx| {
-            view.submit_prompt(event.text.clone());
+            if !view.run_slash_command(&event.text, cx) {
+                view.submit_prompt(event.text.clone());
+            }
             cx.notify();
         })
         .detach();
         // Ctrl+Enter lines the prompt up behind the agent's current work
         // instead of interrupting it, which Enter would do mid-turn.
         cx.subscribe(&composer, |view, _, event: &InputQueued, cx| {
-            view.submit_follow_up(&event.text, cx);
-            view.composer.update(cx, TextInput::clear);
+            if !view.run_slash_command(&event.text, cx) {
+                view.submit_follow_up(&event.text, cx);
+                view.composer.update(cx, TextInput::clear);
+            }
             cx.notify();
+        })
+        .detach();
+        cx.subscribe(&composer, |view, _, event: &InputChanged, cx| {
+            view.offer_slash_completions(&event.text, event.cursor, cx);
         })
         .detach();
         cx.subscribe(&composer, |view, _, event: &ImagesPasted, cx| {
@@ -4758,12 +4768,77 @@ impl SessionMvpView {
     fn submit_composer(&mut self, cx: &mut Context<Self>) {
         let prompt = self.composer.read(cx).value();
         let prompt = prompt.trim();
+        if self.run_slash_command(prompt, cx) {
+            cx.notify();
+            return;
+        }
         // An attachment alone is a complete message; a screenshot often says
         // everything the user wants to say.
         if !prompt.is_empty() || !self.draft_attachments.is_empty() {
             self.submit_prompt(prompt.to_owned());
             cx.notify();
         }
+    }
+
+    /// Run composer text as a slash command when that is what it is.
+    ///
+    /// Returns whether the text was handled, so callers can fall back to
+    /// sending it to the agent.
+    fn run_slash_command(&mut self, text: &str, cx: &mut Context<Self>) -> bool {
+        match slash_commands::resolve(text, self.selected_session.is_some()) {
+            slash_commands::Resolution::Prompt => false,
+            slash_commands::Resolution::Rejected(reason) => {
+                self.action_error = Some(reason);
+                true
+            }
+            slash_commands::Resolution::Run(command) => {
+                self.action_error = None;
+                match command {
+                    slash_commands::Command::QueueFollowUp(prompt) => {
+                        self.submit_follow_up(&prompt, cx);
+                    }
+                }
+                self.clear_composer(cx);
+                true
+            }
+        }
+    }
+
+    /// Empty the composer along with the draft it was restoring.
+    fn clear_composer(&mut self, cx: &mut Context<Self>) {
+        if let Some(id) = self.selected_session.as_ref() {
+            self.session_drafts.remove(id);
+        } else {
+            self.home_draft.clear();
+        }
+        self.composer.update(cx, TextInput::clear);
+    }
+
+    /// Offer the commands that match the name being typed in the composer.
+    fn offer_slash_completions(&mut self, text: &str, cursor: usize, cx: &mut Context<Self>) {
+        let Some((range, name)) = slash_commands::completion_query(text, cursor) else {
+            self.composer.update(cx, |input, cx| {
+                input.clear_completions(cx);
+            });
+            return;
+        };
+        let session_selected = self.selected_session.is_some();
+        let items = slash_commands::matching(name)
+            .into_iter()
+            .map(|command| CompletionItem {
+                id: command.name.into(),
+                label: command.usage().into(),
+                detail: command
+                    .unavailable_reason(session_selected)
+                    .unwrap_or_else(|| command.summary.to_owned())
+                    .into(),
+                replacement: command.completion().into(),
+                enabled: command.is_available(session_selected),
+            })
+            .collect();
+        self.composer.update(cx, |input, cx| {
+            input.set_completions(range, items, cx);
+        });
     }
 
     fn toggle_control_menu(&mut self, menu: ControlMenu) {
@@ -9789,6 +9864,75 @@ impl SessionMvpView {
             .into_any_element()
     }
 
+    /// The command list floating above the composer while a `/` name is typed.
+    fn slash_command_menu(&self, cx: &mut Context<Self>) -> Option<gpui::AnyElement> {
+        let menu = self.composer.read(cx).completions()?;
+        let selected = menu.selected();
+        let items = menu.items().to_vec();
+        Some(
+            div()
+                .id("slash-command-menu")
+                .debug_selector(|| "slash-command-menu".to_owned())
+                .accessibility_id("slash-command-menu")
+                .role(Role::ListBox)
+                .aria_label("Slash commands")
+                .absolute()
+                .bottom_full()
+                .left_0()
+                .mb_2()
+                .w_full()
+                .max_w(px(CONVERSATION_COLUMN_WIDTH))
+                .p_2()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(PANEL))
+                .shadow_lg()
+                .children(items.into_iter().enumerate().map(|(index, item)| {
+                    let is_selected = index == selected;
+                    div()
+                        .id(("slash-command-option", index))
+                        .debug_selector(move || format!("slash-command-{index}"))
+                        .accessibility_id(format!("slash-command-{}", item.id))
+                        .role(Role::ListBoxOption)
+                        .aria_label(item.label.clone())
+                        .aria_description(item.detail.clone())
+                        .aria_selected(is_selected)
+                        .flex()
+                        .flex_col()
+                        .px_2()
+                        .py_2()
+                        .rounded_md()
+                        .bg(if is_selected {
+                            rgb(ELEVATED)
+                        } else {
+                            rgb(PANEL)
+                        })
+                        .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                        .on_click(cx.listener(move |view, _, window, cx| {
+                            view.composer.update(cx, |input, cx| {
+                                input.accept_completion(index, window, cx);
+                            });
+                            window.focus(&view.composer.focus_handle(cx), cx);
+                            cx.notify();
+                        }))
+                        .child(
+                            div()
+                                // An unavailable command stays listed but reads
+                                // as out of reach rather than broken.
+                                .text_color(if item.enabled {
+                                    rgb(PRIMARY)
+                                } else {
+                                    rgb(MUTED)
+                                })
+                                .child(item.label),
+                        )
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(item.detail))
+                }))
+                .into_any_element(),
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
     fn session_composer(&self, cx: &mut Context<Self>) -> gpui::AnyElement {
         if self
@@ -9847,6 +9991,7 @@ impl SessionMvpView {
             .border_color(rgb(BORDER))
             .rounded_lg()
             .shadow_lg()
+            .children(self.slash_command_menu(cx))
             .child(self.composer.clone())
             .children(self.attachment_strip(cx))
             .child(
@@ -10035,6 +10180,7 @@ impl SessionMvpView {
             .rounded_lg()
             .bg(rgb(SUBTLE))
             .shadow_lg()
+            .children(self.slash_command_menu(cx))
             .child(
                 div()
                     .flex()
@@ -10708,6 +10854,7 @@ impl Render for SessionMvpView {
         div()
             .id("gcabb")
             .accessibility_id("gcabb")
+            .key_context("App")
             .role(Role::Application)
             .aria_label("GCABB")
             .on_action(cx.listener(|_, _: &FocusNext, window, cx| {
@@ -11829,9 +11976,12 @@ fn bind_app_keys(cx: &mut App) {
     bind_text_input_keys(cx);
     cx.bind_keys([
         KeyBinding::new("secondary-c", CopyTranscript, Some("TranscriptSelection")),
-        KeyBinding::new("escape", DismissPopup, None),
-        KeyBinding::new("tab", FocusNext, None),
-        KeyBinding::new("shift-tab", FocusPrevious, None),
+        // Scoped to the app rather than left global so that a focused control,
+        // such as a text input offering completions, can claim these keys first
+        // and fall through to here when it has nothing to do with them.
+        KeyBinding::new("escape", DismissPopup, Some("App")),
+        KeyBinding::new("tab", FocusNext, Some("App")),
+        KeyBinding::new("shift-tab", FocusPrevious, Some("App")),
     ]);
 }
 
@@ -14171,6 +14321,231 @@ pub(crate) mod tests {
                     "the platform paste shortcut did not reach the composer"
                 );
                 assert!(view.draft_attachments[0].is_image());
+            });
+        }
+
+        /// Typing a `/` name has to offer the commands it could become, or the
+        /// vocabulary is invisible.
+        #[gpui::test]
+        fn typing_a_slash_name_offers_the_commands_it_matches(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.select_session("session-1".to_owned(), cx);
+                view.composer
+                    .update(cx, |input, cx| input.set_value("/ne", cx));
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, cx| {
+                let menu = view
+                    .composer
+                    .read(cx)
+                    .completions()
+                    .expect("a slash name offers completions");
+                let item = menu.items().first().expect("/next is offered");
+                assert_eq!(item.label.as_ref(), "/next <instructions>");
+                assert!(item.enabled, "/next runs with a session selected");
+            });
+            let menu = cx
+                .debug_bounds("slash-command-menu")
+                .expect("the offered commands were never drawn");
+            let input = cx.debug_bounds("composer-input").expect("composer drawn");
+            assert!(
+                menu.bottom() <= input.top(),
+                "the command list covered the text being typed: {menu:?} over {input:?}"
+            );
+        }
+
+        /// A command that acts on a session stays listed with nothing selected
+        /// so it can be discovered, but says why it cannot run.
+        #[gpui::test]
+        fn session_commands_are_listed_but_disabled_at_home(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update_in(cx, |view, window, cx| {
+                view.new_session(window, cx);
+                view.composer
+                    .update(cx, |input, cx| input.set_value("/", cx));
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, cx| {
+                let menu = view
+                    .composer
+                    .read(cx)
+                    .completions()
+                    .expect("an empty slash offers every command");
+                let item = menu.items().first().expect("/next is offered");
+                assert!(!item.enabled);
+                assert!(item.detail.contains("session"), "{}", item.detail);
+            });
+        }
+
+        /// Enter finishes the highlighted command instead of sending a
+        /// half-typed one to the agent.
+        #[gpui::test]
+        fn enter_completes_the_highlighted_command(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update_in(cx, |view, window, cx| {
+                view.select_session("session-1".to_owned(), cx);
+                let handle = gpui::Focusable::focus_handle(view.composer.read(cx), cx);
+                window.focus(&handle, cx);
+                view.composer
+                    .update(cx, |input, cx| input.set_value("/ne", cx));
+            });
+            cx.run_until_parked();
+
+            cx.simulate_keystrokes("enter");
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, cx| {
+                assert_eq!(view.composer.read(cx).value(), "/next ");
+                assert!(
+                    view.composer.read(cx).completions().is_none(),
+                    "the menu stayed open past the command name"
+                );
+            });
+            assert!(
+                !commands
+                    .try_iter()
+                    .any(|command| matches!(command, ServiceCommand::Submit { .. })),
+                "completing a command sent it to the agent"
+            );
+        }
+
+        #[gpui::test]
+        fn next_queues_its_argument_as_a_follow_up(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.select_session("session-1".to_owned(), cx);
+                view.composer
+                    .update(cx, |input, cx| input.set_value("/next run the tests", cx));
+                view.submit_composer(cx);
+            });
+            cx.run_until_parked();
+
+            let queued = commands
+                .try_iter()
+                .find_map(|command| match command {
+                    ServiceCommand::EnqueuePrompt {
+                        app_session_id,
+                        prompt,
+                    } => Some((app_session_id, prompt)),
+                    _ => None,
+                })
+                .expect("/next queued a follow-up");
+            assert_eq!(queued, ("session-1".to_owned(), "run the tests".to_owned()));
+            view.read_with(cx, |view, cx| {
+                assert!(view.composer.read(cx).value().is_empty());
+                assert!(view.action_error.is_none());
+            });
+        }
+
+        /// A command with a missing or unusable argument must explain itself
+        /// rather than reaching the agent as a stray prompt.
+        #[gpui::test]
+        fn an_incomplete_command_reports_its_usage(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.select_session("session-1".to_owned(), cx);
+                view.composer
+                    .update(cx, |input, cx| input.set_value("/next", cx));
+                view.submit_composer(cx);
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, cx| {
+                let error = view.action_error.as_deref().expect("usage was reported");
+                assert!(error.contains("/next <instructions>"), "{error}");
+                assert_eq!(view.composer.read(cx).value(), "/next");
+            });
+            assert!(
+                !commands.try_iter().any(|command| matches!(
+                    command,
+                    ServiceCommand::Submit { .. } | ServiceCommand::EnqueuePrompt { .. }
+                )),
+                "an incomplete command still reached the agent"
+            );
+        }
+
+        /// A leading slash is also how absolute paths start, so text that is
+        /// not shaped like a command has to stay an ordinary prompt.
+        #[gpui::test]
+        fn a_leading_path_is_still_sent_as_a_prompt(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.select_session("session-1".to_owned(), cx);
+                view.composer.update(cx, |input, cx| {
+                    input.set_value("/tmp/notes.md needs a summary", cx);
+                });
+                view.submit_composer(cx);
+            });
+            cx.run_until_parked();
+
+            assert!(
+                commands
+                    .try_iter()
+                    .any(|command| matches!(command, ServiceCommand::Submit { .. })),
+                "a path prompt was swallowed as a command"
+            );
+            view.read_with(cx, |view, _| assert!(view.action_error.is_none()));
+        }
+
+        /// Escape closes the command list without also dismissing whatever else
+        /// Escape would have reached.
+        #[gpui::test]
+        fn escape_closes_the_command_list_and_keeps_the_text(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update_in(cx, |view, window, cx| {
+                view.select_session("session-1".to_owned(), cx);
+                let handle = gpui::Focusable::focus_handle(view.composer.read(cx), cx);
+                window.focus(&handle, cx);
+                view.composer
+                    .update(cx, |input, cx| input.set_value("/ne", cx));
+            });
+            cx.run_until_parked();
+
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, cx| {
+                assert!(view.composer.read(cx).completions().is_none());
+                assert_eq!(view.composer.read(cx).value(), "/ne");
+            });
+        }
+
+        /// Tab completes a command, but only while there is one to complete;
+        /// otherwise it still walks the focus order.
+        #[gpui::test]
+        fn tab_completes_a_command_before_it_moves_focus(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            let composer = view.update_in(cx, |view, window, cx| {
+                view.select_session("session-1".to_owned(), cx);
+                let handle = gpui::Focusable::focus_handle(view.composer.read(cx), cx);
+                window.focus(&handle, cx);
+                view.composer
+                    .update(cx, |input, cx| input.set_value("/ne", cx));
+                handle
+            });
+            cx.run_until_parked();
+
+            cx.simulate_keystrokes("tab");
+            cx.run_until_parked();
+
+            view.update_in(cx, |view, window, cx| {
+                assert_eq!(view.composer.read(cx).value(), "/next ");
+                assert!(
+                    composer.is_focused(window),
+                    "completing a command gave the focus away"
+                );
+            });
+
+            cx.simulate_keystrokes("tab");
+            cx.run_until_parked();
+            view.update_in(cx, |_, window, _| {
+                assert!(
+                    !composer.is_focused(window),
+                    "tab stopped moving focus once no command was offered"
+                );
             });
         }
 

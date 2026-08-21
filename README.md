@@ -15,6 +15,8 @@ activity, commands, and changes visible as they happen.
 - Work in isolated project worktrees without blocking other sessions.
 - Stream the conversation and inspect main-agent, subagent, and tool activity.
 - Respond to permission, elicitation, user-input, plan, and mode requests.
+- Type `/` in the composer to autocomplete app commands, including `/next` to
+  queue what the agent should do after the current turn.
 - Choose a discovered custom agent, model, mode, reasoning effort, and context length.
 - Discover repository and user agents, skills, and instructions for each workspace.
 - Save app-open automations with natural-language schedules, optional conditions, and run history.

@@ -36,7 +36,9 @@ actions!(
         Paste,
         Copy,
         Cut,
-        SelectAll
+        SelectAll,
+        AcceptCompletion,
+        DismissCompletion
     ]
 );
 
@@ -73,6 +75,59 @@ pub struct PastedImage {
     pub mime_type: String,
 }
 
+/// The content of an input changed.
+///
+/// The input owns no vocabulary of its own, so it reports every edit and lets
+/// its owner decide which completions, if any, the new content deserves.
+#[derive(Clone, Debug)]
+pub struct InputChanged {
+    pub text: String,
+    /// Byte offset of the caret within `text`.
+    pub cursor: usize,
+}
+
+/// One entry in an input's completion menu.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionItem {
+    /// Stable identity, used to keep the highlight on the same entry while the
+    /// offered list is recomputed.
+    pub id: SharedString,
+    pub label: SharedString,
+    pub detail: SharedString,
+    /// Text that replaces the completed range when this entry is accepted.
+    pub replacement: SharedString,
+    /// Whether accepting the entry can actually do anything right now.
+    ///
+    /// Unavailable entries stay listed so the vocabulary is discoverable, and
+    /// the owner explains why they cannot run.
+    pub enabled: bool,
+}
+
+/// The completions currently offered for an input.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct CompletionMenu {
+    range: Range<usize>,
+    items: Vec<CompletionItem>,
+    selected: usize,
+}
+
+impl CompletionMenu {
+    #[must_use]
+    pub fn items(&self) -> &[CompletionItem] {
+        &self.items
+    }
+
+    #[must_use]
+    pub fn selected(&self) -> usize {
+        self.selected
+    }
+
+    #[must_use]
+    pub fn selected_item(&self) -> Option<&CompletionItem> {
+        self.items.get(self.selected)
+    }
+}
+
 pub struct TextInput {
     accessibility_id: SharedString,
     focus_handle: FocusHandle,
@@ -87,6 +142,7 @@ pub struct TextInput {
     cursor_blink_started_at: Instant,
     cursor_blink_enabled: bool,
     cursor_blink_task: Option<Task<()>>,
+    completions: Option<CompletionMenu>,
 }
 
 impl TextInput {
@@ -110,6 +166,7 @@ impl TextInput {
             cursor_blink_started_at: Instant::now(),
             cursor_blink_enabled: false,
             cursor_blink_task: None,
+            completions: None,
         }
     }
 
@@ -169,11 +226,112 @@ impl TextInput {
         self.selection_anchor = self.content.len();
         self.marked_range = None;
         self.reset_cursor_blink();
+        self.emit_changed(cx);
         cx.notify();
     }
 
     pub fn clear(&mut self, cx: &mut Context<Self>) {
         self.set_value("", cx);
+    }
+
+    fn emit_changed(&mut self, cx: &mut Context<Self>) {
+        cx.emit(InputChanged {
+            text: self.content.to_string(),
+            cursor: self.cursor_offset(),
+        });
+    }
+
+    /// Offer `items` as completions for the text in `range`.
+    ///
+    /// An empty list closes the menu, so an owner can call this on every edit
+    /// without tracking whether a menu is already open.
+    pub fn set_completions(
+        &mut self,
+        range: Range<usize>,
+        items: Vec<CompletionItem>,
+        cx: &mut Context<Self>,
+    ) {
+        if items.is_empty() {
+            self.clear_completions(cx);
+            return;
+        }
+        // Typing narrows the list while the user may have already arrowed onto
+        // an entry, so the highlight follows that entry rather than snapping
+        // back to the top.
+        let selected = self
+            .completions
+            .as_ref()
+            .and_then(CompletionMenu::selected_item)
+            .and_then(|item| items.iter().position(|candidate| candidate.id == item.id))
+            .unwrap_or(0);
+        let menu = CompletionMenu {
+            range,
+            items,
+            selected,
+        };
+        if self.completions.as_ref() == Some(&menu) {
+            return;
+        }
+        self.completions = Some(menu);
+        cx.notify();
+    }
+
+    pub fn clear_completions(&mut self, cx: &mut Context<Self>) {
+        if self.completions.take().is_some() {
+            cx.notify();
+        }
+    }
+
+    #[must_use]
+    pub fn completions(&self) -> Option<&CompletionMenu> {
+        self.completions.as_ref()
+    }
+
+    /// Replace the completed range with entry `index`.
+    ///
+    /// Returns whether an entry was actually accepted.
+    pub fn accept_completion(
+        &mut self,
+        index: usize,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) -> bool {
+        let Some(menu) = self.completions.take() else {
+            return false;
+        };
+        let Some(item) = menu.items.get(index) else {
+            self.completions = Some(menu);
+            return false;
+        };
+        let replacement = item.replacement.to_string();
+        let range = self.range_to_utf16(&menu.range);
+        self.replace_text_in_range(Some(range), &replacement, window, cx);
+        cx.notify();
+        true
+    }
+
+    fn accept_selected_completion(&mut self, window: &mut Window, cx: &mut Context<Self>) -> bool {
+        let selected = self.completions.as_ref().map(CompletionMenu::selected);
+        selected.is_some_and(|index| self.accept_completion(index, window, cx))
+    }
+
+    /// Move the highlight by `delta`, wrapping at both ends.
+    ///
+    /// Returns whether a menu was open to move through, so caret movement can
+    /// take over when it was not.
+    fn move_completion_selection(&mut self, delta: isize, cx: &mut Context<Self>) -> bool {
+        let Some(menu) = self.completions.as_mut() else {
+            return false;
+        };
+        let count = menu.items.len();
+        if count == 0 {
+            return false;
+        }
+        let count = isize::try_from(count).unwrap_or(isize::MAX);
+        let selected = isize::try_from(menu.selected).unwrap_or(0);
+        menu.selected = usize::try_from((selected + delta).rem_euclid(count)).unwrap_or(0);
+        cx.notify();
+        true
     }
 
     fn backspace(&mut self, _: &Backspace, window: &mut Window, cx: &mut Context<Self>) {
@@ -227,10 +385,16 @@ impl TextInput {
     }
 
     fn up(&mut self, _: &Up, _: &mut Window, cx: &mut Context<Self>) {
+        if self.move_completion_selection(-1, cx) {
+            return;
+        }
         self.move_to(self.vertical_offset(-1.), cx);
     }
 
     fn down(&mut self, _: &Down, _: &mut Window, cx: &mut Context<Self>) {
+        if self.move_completion_selection(1, cx) {
+            return;
+        }
         self.move_to(self.vertical_offset(1.), cx);
     }
 
@@ -258,18 +422,53 @@ impl TextInput {
         self.select_to(self.line_range(self.cursor_offset()).end, cx);
     }
 
-    fn submit(&mut self, _: &Submit, _: &mut Window, cx: &mut Context<Self>) {
+    fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
+        // A half-typed command is not a message, so an open menu takes the key
+        // and finishes the word instead.
+        if self.accept_selected_completion(window, cx) {
+            return;
+        }
         let text = self.content.trim().to_owned();
         if !text.is_empty() {
             cx.emit(InputSubmitted { text });
         }
     }
 
-    fn submit_queued(&mut self, _: &SubmitQueued, _: &mut Window, cx: &mut Context<Self>) {
+    fn submit_queued(&mut self, _: &SubmitQueued, window: &mut Window, cx: &mut Context<Self>) {
+        if self.accept_selected_completion(window, cx) {
+            return;
+        }
         let text = self.content.trim().to_owned();
         if !text.is_empty() {
             cx.emit(InputQueued { text });
         }
+    }
+
+    /// Complete the highlighted entry, or let Tab move focus when no menu is
+    /// open.
+    fn accept_completion_action(
+        &mut self,
+        _: &AcceptCompletion,
+        window: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if !self.accept_selected_completion(window, cx) {
+            cx.propagate();
+        }
+    }
+
+    /// Close the menu, or let Escape reach whatever it would normally dismiss.
+    fn dismiss_completion_action(
+        &mut self,
+        _: &DismissCompletion,
+        _: &mut Window,
+        cx: &mut Context<Self>,
+    ) {
+        if self.completions.is_none() {
+            cx.propagate();
+            return;
+        }
+        self.clear_completions(cx);
     }
 
     fn insert_newline(&mut self, _: &InsertNewline, window: &mut Window, cx: &mut Context<Self>) {
@@ -520,6 +719,7 @@ fn line_range(content: &str, offset: usize) -> Range<usize> {
 impl EventEmitter<InputSubmitted> for TextInput {}
 impl EventEmitter<InputQueued> for TextInput {}
 impl EventEmitter<ImagesPasted> for TextInput {}
+impl EventEmitter<InputChanged> for TextInput {}
 
 impl EntityInputHandler for TextInput {
     fn text_for_range(
@@ -587,6 +787,7 @@ impl EntityInputHandler for TextInput {
         self.selection_anchor = cursor;
         self.marked_range = None;
         self.reset_cursor_blink();
+        self.emit_changed(cx);
         cx.notify();
     }
 
@@ -860,6 +1061,8 @@ impl Render for TextInput {
             .on_action(cx.listener(Self::copy))
             .on_action(cx.listener(Self::cut))
             .on_action(cx.listener(Self::select_all))
+            .on_action(cx.listener(Self::accept_completion_action))
+            .on_action(cx.listener(Self::dismiss_completion_action))
             .on_mouse_down(MouseButton::Left, cx.listener(Self::on_mouse_down))
             .on_mouse_up(MouseButton::Left, cx.listener(Self::on_mouse_up))
             .on_mouse_up_out(MouseButton::Left, cx.listener(Self::on_mouse_up))
@@ -904,6 +1107,10 @@ pub fn bind_text_input_keys(cx: &mut App) {
         KeyBinding::new("secondary-c", Copy, Some("TextInput")),
         KeyBinding::new("secondary-x", Cut, Some("TextInput")),
         KeyBinding::new("secondary-a", SelectAll, Some("TextInput")),
+        // Both keys fall through to their usual meaning, focus movement and
+        // popup dismissal, whenever no completion menu is open.
+        KeyBinding::new("tab", AcceptCompletion, Some("TextInput")),
+        KeyBinding::new("escape", DismissCompletion, Some("TextInput")),
     ]);
 }
 
