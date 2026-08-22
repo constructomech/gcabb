@@ -82,8 +82,10 @@ pub struct SessionRequest {
 const CREATE_SESSION_TOOL_NAME: &str = "create_session";
 const GET_SESSION_TOOL_NAME: &str = "get_session";
 const SEND_SESSION_MESSAGE_TOOL_NAME: &str = "send_session_message";
+const RESPOND_TO_SESSION_PLAN_TOOL_NAME: &str = "respond_to_session_plan";
 const MAX_KICKOFF_PROMPT_BYTES: usize = 16 * 1024;
 const MAX_SESSION_MESSAGE_BYTES: usize = 16 * 1024;
+const MAX_PLAN_FEEDBACK_BYTES: usize = 4 * 1024;
 const MAX_TOOL_OPTION_BYTES: usize = 128;
 const MAX_SESSION_TITLE_BYTES: usize = 120;
 const MAX_SESSION_ID_BYTES: usize = 128;
@@ -193,6 +195,27 @@ pub enum SessionMessageDelivery {
     Queued,
 }
 
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlanContinuationAction {
+    Interactive,
+    Autopilot,
+    AutopilotFleet,
+    ExitOnly,
+}
+
+impl PlanContinuationAction {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Interactive => "interactive",
+            Self::Autopilot => "autopilot",
+            Self::AutopilotFleet => "autopilot_fleet",
+            Self::ExitOnly => "exit_only",
+        }
+    }
+}
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
 pub struct SendSessionMessageToolInput {
@@ -207,10 +230,39 @@ impl SendSessionMessageToolInput {
         if self.message.trim().is_empty() {
             return Err("message must not be empty".to_owned());
         }
+
         if self.message.len() > MAX_SESSION_MESSAGE_BYTES {
             return Err(format!(
                 "message exceeds the {MAX_SESSION_MESSAGE_BYTES}-byte limit"
             ));
+        }
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct RespondToSessionPlanToolInput {
+    pub session_id: String,
+    pub interaction_id: String,
+    pub approved: bool,
+    #[serde(default)]
+    pub feedback: Option<String>,
+    #[serde(default)]
+    pub selected_action: Option<PlanContinuationAction>,
+}
+
+impl RespondToSessionPlanToolInput {
+    fn validate(&self) -> std::result::Result<(), String> {
+        validate_identifier("session_id", &self.session_id)?;
+        validate_identifier("interaction_id", &self.interaction_id)?;
+        validate_optional(
+            "feedback",
+            self.feedback.as_deref(),
+            MAX_PLAN_FEEDBACK_BYTES,
+        )?;
+        if !self.approved && self.selected_action.is_some() {
+            return Err("selected_action is only valid when approved is true".to_owned());
         }
         Ok(())
     }
@@ -258,7 +310,16 @@ pub struct GetSessionToolResult {
     pub latest_assistant_result: Option<String>,
     pub transcript_tail: Vec<SessionTranscriptEntry>,
     pub pending_plan_summary: Option<String>,
+    pub pending_plan: Option<PendingPlanToolSummary>,
     pub changes: SessionChangeSummary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct PendingPlanToolSummary {
+    pub interaction_id: String,
+    pub summary: String,
+    pub actions: Vec<String>,
+    pub recommended_action: Option<String>,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize)]
@@ -269,11 +330,21 @@ pub struct SendSessionMessageToolResult {
     pub state: String,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct RespondToSessionPlanToolResult {
+    pub target_app_session_id: String,
+    pub interaction_id: String,
+    pub approved: bool,
+    pub selected_action: Option<PlanContinuationAction>,
+    pub status: String,
+}
+
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostToolCall {
     CreateSession(CreateSessionToolInput),
     GetSession(GetSessionToolInput),
     SendSessionMessage(SendSessionMessageToolInput),
+    RespondToSessionPlan(RespondToSessionPlanToolInput),
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -281,6 +352,7 @@ pub enum HostToolResult {
     CreateSession(CreateSessionToolResult),
     GetSession(Box<GetSessionToolResult>),
     SendSessionMessage(SendSessionMessageToolResult),
+    RespondToSessionPlan(RespondToSessionPlanToolResult),
 }
 
 #[derive(Debug)]
@@ -316,10 +388,27 @@ pub struct ChildLifecycleEvent {
     pub status: ChildLifecycleStatus,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanWaitingEvent {
+    pub child_session_id: String,
+    pub title: String,
+    pub interaction_id: String,
+    pub summary: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanInvalidatedEvent {
+    pub parent_session_id: String,
+    pub child_session_id: String,
+    pub interaction_id: String,
+}
+
 #[derive(Debug)]
 pub enum HostGatewayEvent {
     Tool(HostToolRequest),
     ChildLifecycle(ChildLifecycleEvent),
+    PlanWaiting(PlanWaitingEvent),
+    PlanInvalidated(PlanInvalidatedEvent),
 }
 
 #[derive(Clone, Debug)]
@@ -337,6 +426,17 @@ impl HostToolGateway {
         let _ = self
             .sender
             .send(HostGatewayEvent::ChildLifecycle(event))
+            .await;
+    }
+
+    pub async fn notify_plan_waiting(&self, event: PlanWaitingEvent) {
+        let _ = self.sender.send(HostGatewayEvent::PlanWaiting(event)).await;
+    }
+
+    pub async fn notify_plan_invalidated(&self, event: PlanInvalidatedEvent) {
+        let _ = self
+            .sender
+            .send(HostGatewayEvent::PlanInvalidated(event))
             .await;
     }
 }
@@ -464,6 +564,45 @@ impl ToolHandler for SendSessionMessageToolHandler {
     }
 }
 
+struct RespondToSessionPlanToolHandler {
+    binding: HostToolBinding,
+}
+
+#[async_trait]
+impl ToolHandler for RespondToSessionPlanToolHandler {
+    async fn call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> std::result::Result<ToolResult, github_copilot_sdk::Error> {
+        let input = invocation.params::<RespondToSessionPlanToolInput>()?;
+        if let Err(error) = input.validate() {
+            return Ok(tool_response("plan_response", Err(error)));
+        }
+        let (response, receiver) = oneshot::channel();
+        let result = call_host_tool(
+            &self.binding,
+            invocation.tool_call_id,
+            HostToolCall::RespondToSessionPlan(input),
+            response,
+            receiver,
+        )
+        .await;
+        Ok(tool_response(
+            "plan_response",
+            result.and_then(|result| match result {
+                HostToolResult::RespondToSessionPlan(result) => serde_json::to_value(result)
+                    .map_err(|error| {
+                        format!("failed to encode respond_to_session_plan response: {error}")
+                    }),
+                _ => Err(
+                    "respond_to_session_plan host service returned the wrong response type"
+                        .to_owned(),
+                ),
+            }),
+        ))
+    }
+}
+
 async fn call_host_tool(
     binding: &HostToolBinding,
     tool_call_id: String,
@@ -475,6 +614,7 @@ async fn call_host_tool(
         HostToolCall::CreateSession(_) => CREATE_SESSION_TOOL_NAME,
         HostToolCall::GetSession(_) => GET_SESSION_TOOL_NAME,
         HostToolCall::SendSessionMessage(_) => SEND_SESSION_MESSAGE_TOOL_NAME,
+        HostToolCall::RespondToSessionPlan(_) => RESPOND_TO_SESSION_PLAN_TOOL_NAME,
     };
     let request = HostToolRequest {
         caller_session_id: binding.caller_session_id.clone(),
@@ -619,11 +759,53 @@ fn send_session_message_tool(binding: HostToolBinding) -> Tool {
         .with_handler(Arc::new(SendSessionMessageToolHandler { binding }))
 }
 
-fn host_tools(binding: HostToolBinding) -> [Tool; 3] {
+fn respond_to_session_plan_tool(binding: HostToolBinding) -> Tool {
+    Tool::new(RESPOND_TO_SESSION_PLAN_TOOL_NAME)
+        .with_description(
+            "Approve or reject the exact pending plan previously inspected on an authorized descendant GCABB session.",
+        )
+        .with_parameters(
+            serde_json::from_value(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SESSION_ID_BYTES,
+                        "description": "Descendant GCABB app session id."
+                    },
+                    "interaction_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SESSION_ID_BYTES,
+                        "description": "Exact pending plan interaction id returned by get_session."
+                    },
+                    "approved": {"type": "boolean"},
+                    "feedback": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_PLAN_FEEDBACK_BYTES
+                    },
+                    "selected_action": {
+                        "type": "string",
+                        "enum": ["interactive", "autopilot", "autopilot_fleet", "exit_only"],
+                        "description": "Continuation action advertised by the pending plan."
+                    }
+                },
+                "required": ["session_id", "interaction_id", "approved"]
+            }))
+            .expect("respond_to_session_plan tool schema is an object"),
+        )
+        .with_handler(Arc::new(RespondToSessionPlanToolHandler { binding }))
+}
+
+fn host_tools(binding: HostToolBinding) -> [Tool; 4] {
     [
         create_session_tool(binding.clone()),
         get_session_tool(binding.clone()),
-        send_session_message_tool(binding),
+        send_session_message_tool(binding.clone()),
+        respond_to_session_plan_tool(binding),
     ]
 }
 
@@ -2260,7 +2442,7 @@ mod tests {
     use std::sync::Arc;
 
     use diagnostics::MemoryDiagnostics;
-    use github_copilot_sdk::handler::{PermissionHandler, PermissionResult};
+    use github_copilot_sdk::handler::{ExitPlanModeHandler, PermissionHandler, PermissionResult};
     use github_copilot_sdk::rpc::PermissionDecision;
     use github_copilot_sdk::{
         DeliveryMode, PermissionRequestData, PermissionRequestKind, RequestId, SessionId,
@@ -2273,7 +2455,8 @@ mod tests {
         AgentProviderFactory, CopilotProvider, CopilotProviderFactory, CreateSessionToolResult,
         GetSessionToolInput, GetSessionToolResult, HostGatewayEvent, HostToolBinding, HostToolCall,
         HostToolGateway, HostToolResult, InteractionBroker, InteractionResponse,
-        ProviderInteraction, SendSessionMessageToolInput, SendSessionMessageToolResult,
+        PlanContinuationAction, ProviderInteraction, RespondToSessionPlanToolInput,
+        RespondToSessionPlanToolResult, SendSessionMessageToolInput, SendSessionMessageToolResult,
         SessionChangeSummary, SessionMessageDelivery, SessionRequest, command_identifier,
         message_options, model_option, permission_choices, permission_domain,
         permission_for_domain, permission_for_location, permission_for_session,
@@ -2346,7 +2529,7 @@ mod tests {
     #[tokio::test]
     #[allow(
         clippy::too_many_lines,
-        reason = "one matrix verifies registration and dispatch for all three host tools"
+        reason = "one matrix verifies registration and dispatch for all host tools"
     )]
     async fn host_tools_are_registered_on_create_and_resume_and_bind_the_caller() {
         let (sender, mut requests) = mpsc::channel(1);
@@ -2368,7 +2551,12 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            ["create_session", "get_session", "send_session_message"]
+            [
+                "create_session",
+                "get_session",
+                "send_session_message",
+                "respond_to_session_plan"
+            ]
         );
         let parameters = &create.tools.as_ref().unwrap()[0].parameters;
         let properties = parameters
@@ -2386,7 +2574,12 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            ["create_session", "get_session", "send_session_message"]
+            [
+                "create_session",
+                "get_session",
+                "send_session_message",
+                "respond_to_session_plan"
+            ]
         );
 
         let create_tools = create.tools.unwrap();
@@ -2394,6 +2587,7 @@ mod tests {
         let handler = create_tools[0].handler().expect("create handler").clone();
         let get_handler = resume_tools[1].handler().expect("get handler").clone();
         let send_handler = resume_tools[2].handler().expect("send handler").clone();
+        let plan_handler = create_tools[3].handler().expect("plan handler").clone();
         let failure_handler = resume_tools[0].handler().expect("create handler").clone();
         let invocation: ToolInvocation = serde_json::from_value(json!({
             "sessionId": "sdk-parent",
@@ -2434,6 +2628,50 @@ mod tests {
 
         let invocation: ToolInvocation = serde_json::from_value(json!({
             "sessionId": "sdk-parent",
+            "toolCallId": "tool-call-plan",
+            "toolName": "respond_to_session_plan",
+            "arguments": {
+                "session_id": "child-1",
+                "interaction_id": "plan-1",
+                "approved": true,
+                "selected_action": "autopilot"
+            }
+        }))
+        .expect("tool invocation");
+        let call = tokio::spawn(async move { plan_handler.call(invocation).await });
+        let HostGatewayEvent::Tool(request) = requests.recv().await.expect("host request") else {
+            panic!("expected tool request");
+        };
+        assert_eq!(request.caller_session_id, "app-parent");
+        assert!(matches!(
+            &request.call,
+            HostToolCall::RespondToSessionPlan(input)
+                if input.session_id == "child-1"
+                    && input.interaction_id == "plan-1"
+                    && input.selected_action == Some(PlanContinuationAction::Autopilot)
+        ));
+        request
+            .response
+            .send(Ok(HostToolResult::RespondToSessionPlan(
+                RespondToSessionPlanToolResult {
+                    target_app_session_id: "child-1".to_owned(),
+                    interaction_id: "plan-1".to_owned(),
+                    approved: true,
+                    selected_action: Some(PlanContinuationAction::Autopilot),
+                    status: "submitted".to_owned(),
+                },
+            )))
+            .expect("respond");
+        let result = call.await.expect("handler task").expect("tool result");
+        assert!(matches!(
+            result,
+            ToolResult::Expanded(result)
+                if result.result_type == "success"
+                    && result.text_result_for_llm.contains("\"status\":\"submitted\"")
+        ));
+
+        let invocation: ToolInvocation = serde_json::from_value(json!({
+            "sessionId": "sdk-parent",
             "toolCallId": "tool-call-get",
             "toolName": "get_session",
             "arguments": {"session_id": "child-1"}
@@ -2462,6 +2700,7 @@ mod tests {
                     latest_assistant_result: Some("Done".to_owned()),
                     transcript_tail: Vec::new(),
                     pending_plan_summary: None,
+                    pending_plan: None,
                     changes: SessionChangeSummary {
                         branch: Some("gcabb/child".to_owned()),
                         head: Some("abc".to_owned()),
@@ -2554,6 +2793,13 @@ mod tests {
             "caller_session_id": "spoof"
         }));
         assert!(send.is_err());
+        let respond = serde_json::from_value::<RespondToSessionPlanToolInput>(json!({
+            "session_id": "child-1",
+            "interaction_id": "plan-1",
+            "approved": true,
+            "caller_session_id": "spoof"
+        }));
+        assert!(respond.is_err());
     }
 
     #[test]
@@ -2574,13 +2820,13 @@ mod tests {
     }
 
     async fn decide(broker: &InteractionBroker, data: PermissionRequestData) -> PermissionResult {
-        broker
-            .handle(
-                SessionId::from("session"),
-                RequestId::new("permission"),
-                data,
-            )
-            .await
+        PermissionHandler::handle(
+            broker,
+            SessionId::from("session"),
+            RequestId::new("permission"),
+            data,
+        )
+        .await
     }
 
     fn approved(result: &PermissionResult) -> bool {
@@ -2588,6 +2834,42 @@ mod tests {
             result,
             PermissionResult::Decision(PermissionDecision::ApproveOnce(_))
         )
+    }
+
+    #[tokio::test]
+    async fn exit_plan_mode_round_trips_selected_action_and_feedback() {
+        let worktree = tempfile::tempdir().expect("worktree");
+        let (broker, mut interactions) = worktree_broker(worktree.path());
+        let task = tokio::spawn(async move {
+            ExitPlanModeHandler::handle(
+                &broker,
+                SessionId::from("session"),
+                github_copilot_sdk::ExitPlanModeData {
+                    summary: "Implement the feature".to_owned(),
+                    plan_content: Some("Full plan".to_owned()),
+                    actions: vec!["interactive".to_owned(), "autopilot".to_owned()],
+                    recommended_action: "autopilot".to_owned(),
+                },
+            )
+            .await
+        });
+        let interaction = interactions.recv().await.expect("plan interaction");
+        assert_eq!(
+            interaction.request.kind,
+            app_model::InteractionKind::ExitPlanMode
+        );
+        assert_eq!(interaction.request.choices, ["interactive", "autopilot"]);
+        interaction
+            .response
+            .send(InteractionResponse::Submit {
+                value: Value::String("autopilot".to_owned()),
+                freeform: false,
+            })
+            .expect("send response");
+        let result = task.await.expect("join");
+        assert!(result.approved);
+        assert_eq!(result.selected_action.as_deref(), Some("autopilot"));
+        assert_eq!(result.feedback, None);
     }
 
     #[tokio::test]
