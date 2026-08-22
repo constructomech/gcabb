@@ -58,6 +58,7 @@ pub struct LaunchRequest {
     pub origin: LaunchOrigin,
     pub parent_session_id: Option<String>,
     pub host_tool_call_id: Option<String>,
+    pub notify_on_idle: Option<String>,
 }
 
 /// Observable milestones for launch UIs. Headless callers may ignore them.
@@ -233,18 +234,10 @@ impl SessionOrchestrator {
             }
         };
 
-        if let Err(error) = handle.set_mode(request.mode.clone()).await {
-            let cleanup = self
-                .compensate(
-                    Some(handle.id()),
-                    workspace.created.as_ref(),
-                    &SelectionRollback::Unchanged,
-                )
-                .await;
-            return Err(
-                LaunchError::new(LaunchStage::InitialMode, error.to_string()).with_cleanup(cleanup),
-            );
-        }
+        self.configure_notification(&request, &handle, &workspace)
+            .await?;
+
+        self.configure_mode(&request, &handle, &workspace).await?;
 
         self.activate(
             request.origin,
@@ -319,6 +312,55 @@ impl SessionOrchestrator {
         let _workspace_allocation = self.workspace_lock.lock().await;
         resolve_workspace(request, title, repository)
             .map_err(|error| LaunchError::new(LaunchStage::Worktree, error))
+    }
+
+    async fn configure_notification(
+        &self,
+        request: &LaunchRequest,
+        handle: &SessionHandle,
+        workspace: &Workspace,
+    ) -> Result<(), LaunchError> {
+        if request.host_tool_call_id.is_none() {
+            return Ok(());
+        }
+        if let Err(error) = self
+            .manager
+            .set_host_tool_notify_on_idle(handle.id(), request.notify_on_idle.as_deref())
+        {
+            let cleanup = self
+                .compensate(
+                    Some(handle.id()),
+                    workspace.created.as_ref(),
+                    &SelectionRollback::Unchanged,
+                )
+                .await;
+            return Err(
+                LaunchError::new(LaunchStage::Finalization, error.to_string())
+                    .with_cleanup(cleanup),
+            );
+        }
+        Ok(())
+    }
+
+    async fn configure_mode(
+        &self,
+        request: &LaunchRequest,
+        handle: &SessionHandle,
+        workspace: &Workspace,
+    ) -> Result<(), LaunchError> {
+        if let Err(error) = handle.set_mode(request.mode.clone()).await {
+            let cleanup = self
+                .compensate(
+                    Some(handle.id()),
+                    workspace.created.as_ref(),
+                    &SelectionRollback::Unchanged,
+                )
+                .await;
+            return Err(
+                LaunchError::new(LaunchStage::InitialMode, error.to_string()).with_cleanup(cleanup),
+            );
+        }
+        Ok(())
     }
 
     async fn finalize_host_launch(

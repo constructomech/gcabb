@@ -14,10 +14,11 @@ use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 11;
+const SCHEMA_VERSION: i64 = 12;
 /// Gap left between queue positions so an item can be moved between two
 /// neighbours without renumbering the rest of the queue.
 const QUEUE_POSITION_STRIDE: i64 = 1024;
+const MAX_COORDINATION_LIST_LIMIT: usize = 200;
 /// Initial restored output window. Older chunks stay in `SQLite` and can be
 /// prepended through `read_output` without inflating every restored snapshot.
 pub const RESTORED_OUTPUT_CHUNKS: u64 = 64;
@@ -50,6 +51,16 @@ pub enum StorageError {
     HostToolLaunchNotFound(String),
     #[error("host-tool call was already used by another or deleted child session")]
     HostToolCallAlreadyUsed,
+    #[error("unsupported host-tool notify-on-idle policy: {0}")]
+    InvalidHostToolNotifyOnIdle(String),
+    #[error("session is archived and cannot coordinate: {0}")]
+    CoordinationSessionArchived(String),
+    #[error("sessions belong to different projects: {0} and {1}")]
+    CoordinationProjectMismatch(String, String),
+    #[error("sessions are not in the same ancestry chain: {caller} and {target}")]
+    CoordinationUnrelated { caller: String, target: String },
+    #[error("coordination queue item must match record recipient and queue item id")]
+    CoordinationQueueMismatch,
     #[error(
         "output stream {kind}/{identity} is incomplete: expected {expected} chunks, read {actual}"
     )]
@@ -113,6 +124,62 @@ pub struct SessionArchiveRecord {
 pub struct ArchivedSession {
     pub metadata: SessionMetadata,
     pub archive: SessionArchiveRecord,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoordinationKind {
+    Message,
+    ChildCompletion,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoordinationDelivery {
+    Immediate,
+    WhenIdle,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoordinationState {
+    Pending,
+    Dispatched,
+    Delivered,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum CoordinationRelation {
+    SelfSession,
+    Ancestor,
+    Descendant,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoordinationRecord {
+    pub id: String,
+    pub sender_session_id: String,
+    pub recipient_session_id: String,
+    pub kind: CoordinationKind,
+    pub delivery: CoordinationDelivery,
+    pub state: CoordinationState,
+    pub body: String,
+    pub queue_item_id: Option<String>,
+    pub dedupe_id: String,
+    pub created_at: String,
+    pub updated_at: String,
+    pub delivered_at: Option<String>,
+    pub read_at: Option<String>,
+    pub error: Option<String>,
+}
+
+macro_rules! coordination_select {
+    ($suffix:literal) => {
+        concat!(
+            "SELECT id, sender_session_id, recipient_session_id, kind, delivery, state, body,
+                    queue_item_id, dedupe_id, created_at, updated_at, delivered_at, read_at, error
+             FROM coordination_items ",
+            $suffix
+        )
+    };
 }
 
 impl Storage {
@@ -290,6 +357,40 @@ impl Storage {
             ));
         }
         Ok(())
+    }
+
+    pub fn set_host_tool_notify_on_idle(
+        &self,
+        child_session_id: &str,
+        notify_on_idle: Option<&str>,
+    ) -> Result<()> {
+        if let Some(policy) = notify_on_idle
+            && policy != "once"
+        {
+            return Err(StorageError::InvalidHostToolNotifyOnIdle(policy.to_owned()));
+        }
+        let updated = self.connection()?.execute(
+            "UPDATE host_tool_launches SET notify_on_idle = ?1 WHERE child_session_id = ?2",
+            params![notify_on_idle, child_session_id],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::HostToolLaunchNotFound(
+                child_session_id.to_owned(),
+            ));
+        }
+        Ok(())
+    }
+
+    pub fn host_tool_notify_on_idle(&self, child_session_id: &str) -> Result<Option<String>> {
+        self.connection()?
+            .query_row(
+                "SELECT notify_on_idle FROM host_tool_launches WHERE child_session_id = ?1",
+                [child_session_id],
+                |row| row.get(0),
+            )
+            .optional()
+            .map(Option::flatten)
+            .map_err(Into::into)
     }
 
     pub fn upsert_project(&self, project: &ProjectMetadata) -> Result<()> {
@@ -903,6 +1004,212 @@ impl Storage {
         Ok(())
     }
 
+    /// Authorize model-visible coordination between sessions in one ancestry chain.
+    pub fn authorize_coordination(
+        &self,
+        caller_session_id: &str,
+        target_session_id: &str,
+    ) -> Result<CoordinationRelation> {
+        let connection = self.connection()?;
+        let caller = coordination_session(&connection, caller_session_id)?
+            .ok_or_else(|| StorageError::SessionNotFound(caller_session_id.to_owned()))?;
+        let target = coordination_session(&connection, target_session_id)?
+            .ok_or_else(|| StorageError::SessionNotFound(target_session_id.to_owned()))?;
+        if caller.archived {
+            return Err(StorageError::CoordinationSessionArchived(
+                caller_session_id.to_owned(),
+            ));
+        }
+        if target.archived {
+            return Err(StorageError::CoordinationSessionArchived(
+                target_session_id.to_owned(),
+            ));
+        }
+        if caller.project_key != target.project_key {
+            return Err(StorageError::CoordinationProjectMismatch(
+                caller_session_id.to_owned(),
+                target_session_id.to_owned(),
+            ));
+        }
+        if caller_session_id == target_session_id {
+            return Ok(CoordinationRelation::SelfSession);
+        }
+        if ancestry_contains(&connection, target.parent_session_id, caller_session_id)? {
+            return Ok(CoordinationRelation::Ancestor);
+        }
+        if ancestry_contains(&connection, caller.parent_session_id, target_session_id)? {
+            return Ok(CoordinationRelation::Descendant);
+        }
+        Err(StorageError::CoordinationUnrelated {
+            caller: caller_session_id.to_owned(),
+            target: target_session_id.to_owned(),
+        })
+    }
+
+    /// Atomically create a coordination ledger row and its optional queue work.
+    ///
+    /// Retrying the same sender/dedupe identity returns the original row and
+    /// never inserts another queue item.
+    pub fn create_coordination_item(
+        &self,
+        record: &CoordinationRecord,
+        queue_item: Option<&QueueItem>,
+    ) -> Result<CoordinationRecord> {
+        if let Some(item) = queue_item
+            && (item.session_id != record.recipient_session_id
+                || record.queue_item_id.as_deref() != Some(item.id.as_str()))
+        {
+            return Err(StorageError::CoordinationQueueMismatch);
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let inserted = transaction.execute(
+            "INSERT INTO coordination_items (
+                id, sender_session_id, recipient_session_id, kind, delivery, state, body,
+                queue_item_id, dedupe_id, created_at, updated_at, delivered_at, read_at, error
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+             )
+             ON CONFLICT(sender_session_id, dedupe_id) DO NOTHING",
+            params![
+                record.id,
+                record.sender_session_id,
+                record.recipient_session_id,
+                coordination_kind_to_str(&record.kind),
+                coordination_delivery_to_str(&record.delivery),
+                coordination_state_to_str(&record.state),
+                record.body,
+                record.queue_item_id,
+                record.dedupe_id,
+                record.created_at,
+                record.updated_at,
+                record.delivered_at,
+                record.read_at,
+                record.error,
+            ],
+        )?;
+        if inserted > 0
+            && let Some(item) = queue_item
+        {
+            insert_queue_item(&transaction, item)?;
+            synchronize_coordination_for_queue(&transaction, item)?;
+        }
+        let stored = transaction.query_row(
+            coordination_select!("WHERE sender_session_id = ?1 AND dedupe_id = ?2"),
+            params![record.sender_session_id, record.dedupe_id],
+            coordination_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(stored)
+    }
+
+    /// List recipient ledger rows in stable creation order.
+    pub fn list_coordination_items(
+        &self,
+        recipient_session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CoordinationRecord>> {
+        self.list_coordination_items_where(recipient_session_id, limit, false)
+    }
+
+    /// List unread recipient ledger rows in stable creation order.
+    pub fn list_unread_coordination_items(
+        &self,
+        recipient_session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CoordinationRecord>> {
+        self.list_coordination_items_where(recipient_session_id, limit, true)
+    }
+
+    /// List unread child completions without older unread messages consuming the bound.
+    pub fn list_unread_child_completion_items(
+        &self,
+        recipient_session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CoordinationRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(coordination_select!(
+            "WHERE recipient_session_id = ?1
+               AND kind = 'child_completion'
+               AND read_at IS NULL
+             ORDER BY created_at, id LIMIT ?2"
+        ))?;
+        let bounded_limit =
+            i64::try_from(limit.min(MAX_COORDINATION_LIST_LIMIT)).unwrap_or(i64::MAX);
+        let rows = statement.query_map(
+            params![recipient_session_id, bounded_limit],
+            coordination_from_row,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    fn list_coordination_items_where(
+        &self,
+        recipient_session_id: &str,
+        limit: usize,
+        unread_only: bool,
+    ) -> Result<Vec<CoordinationRecord>> {
+        let connection = self.connection()?;
+        let sql = if unread_only {
+            coordination_select!(
+                "WHERE recipient_session_id = ?1 AND read_at IS NULL
+                 ORDER BY created_at, id LIMIT ?2"
+            )
+        } else {
+            coordination_select!(
+                "WHERE recipient_session_id = ?1
+                 ORDER BY created_at, id LIMIT ?2"
+            )
+        };
+        let mut statement = connection.prepare(sql)?;
+        let bounded_limit =
+            i64::try_from(limit.min(MAX_COORDINATION_LIST_LIMIT)).unwrap_or(i64::MAX);
+        let rows = statement.query_map(
+            params![recipient_session_id, bounded_limit],
+            coordination_from_row,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// Mark one recipient-owned coordination row as read.
+    pub fn mark_coordination_read(
+        &self,
+        recipient_session_id: &str,
+        coordination_id: &str,
+        read_at: &str,
+    ) -> Result<bool> {
+        let changed = self.connection()?.execute(
+            "UPDATE coordination_items
+             SET read_at = ?1, updated_at = ?1
+             WHERE id = ?2 AND recipient_session_id = ?3 AND read_at IS NULL",
+            params![read_at, coordination_id, recipient_session_id],
+        )?;
+        Ok(changed > 0)
+    }
+
+    /// Clear unread child-completion notifications when a recipient inspects a child.
+    pub fn mark_child_completion_notifications_read(
+        &self,
+        recipient_session_id: &str,
+        child_session_id: &str,
+        read_at: &str,
+    ) -> Result<usize> {
+        self.connection()?
+            .execute(
+                "UPDATE coordination_items
+                 SET read_at = ?1, updated_at = ?1
+                 WHERE recipient_session_id = ?2
+                   AND sender_session_id = ?3
+                   AND kind = 'child_completion'
+                   AND read_at IS NULL",
+                params![read_at, recipient_session_id, child_session_id],
+            )
+            .map_err(Into::into)
+    }
+
     /// Read the durable queue for a session, ordered by position.
     pub fn queue_view(&self, session_id: &str) -> Result<QueueView> {
         let connection = self.connection()?;
@@ -946,7 +1253,9 @@ impl Storage {
 
     /// Insert or update a queue item.
     pub fn upsert_queue_item(&self, item: &QueueItem) -> Result<()> {
-        self.connection()?.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
             "INSERT INTO queue_items (
                 id, session_id, position, prompt, display_prompt, state, delivery,
                 agent_mode, created_at, updated_at, error
@@ -974,15 +1283,98 @@ impl Storage {
                 item.error,
             ],
         )?;
+        synchronize_coordination_for_queue(&transaction, item)?;
+        transaction.commit()?;
         Ok(())
     }
 
     /// Remove a queue item outright. Returns whether a row was deleted.
+    ///
+    /// Linked coordination provenance is retained and marked as a failed
+    /// delivery before the queue row is removed.
     pub fn delete_queue_item(&self, id: &str) -> Result<bool> {
-        let removed = self
-            .connection()?
-            .execute("DELETE FROM queue_items WHERE id = ?1", params![id])?;
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "UPDATE coordination_items
+             SET state = 'failed',
+                 error = 'coordination delivery cancelled before dispatch',
+                 updated_at = strftime('%Y-%m-%dT%H:%M:%fZ', 'now'),
+                 delivered_at = NULL,
+                 queue_item_id = NULL
+             WHERE queue_item_id = ?1
+               AND EXISTS (
+                   SELECT 1 FROM queue_items
+                   WHERE id = ?1 AND state = 'pending'
+               )",
+            params![id],
+        )?;
+        let removed = transaction.execute(
+            "DELETE FROM queue_items WHERE id = ?1 AND state = 'pending'",
+            params![id],
+        )?;
+        transaction.commit()?;
         Ok(removed > 0)
+    }
+
+    /// Reconcile coordination sends that reached the SDK but were not persisted.
+    ///
+    /// Only linked pending/dispatched queue rows for `recipient_session_id`
+    /// whose complete prompt exactly matches a transcript message are changed.
+    pub fn reconcile_coordination_queue_delivery(
+        &self,
+        recipient_session_id: &str,
+        delivered_prompts: &HashSet<String>,
+        delivered_at: &str,
+    ) -> Result<usize> {
+        if delivered_prompts.is_empty() {
+            return Ok(0);
+        }
+
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let mut reconciled = 0;
+        for prompt in delivered_prompts {
+            let queue_item_ids = {
+                let mut statement = transaction.prepare(
+                    "SELECT DISTINCT q.id
+                     FROM queue_items q
+                     JOIN coordination_items c
+                       ON c.queue_item_id = q.id
+                      AND c.recipient_session_id = q.session_id
+                     WHERE q.session_id = ?1
+                       AND q.prompt = ?2
+                       AND q.state IN ('pending', 'dispatched')",
+                )?;
+                statement
+                    .query_map(params![recipient_session_id, prompt], |row| {
+                        row.get::<_, String>(0)
+                    })?
+                    .collect::<rusqlite::Result<Vec<_>>>()?
+            };
+            for queue_item_id in queue_item_ids {
+                let updated = transaction.execute(
+                    "UPDATE queue_items
+                     SET state = 'completed', updated_at = ?1, error = NULL
+                     WHERE id = ?2
+                       AND session_id = ?3
+                       AND state IN ('pending', 'dispatched')",
+                    params![delivered_at, queue_item_id, recipient_session_id],
+                )?;
+                if updated == 0 {
+                    continue;
+                }
+                transaction.execute(
+                    "UPDATE coordination_items
+                     SET state = 'delivered', updated_at = ?1, delivered_at = ?1, error = NULL
+                     WHERE queue_item_id = ?2 AND recipient_session_id = ?3",
+                    params![delivered_at, queue_item_id, recipient_session_id],
+                )?;
+                reconciled += 1;
+            }
+        }
+        transaction.commit()?;
+        Ok(reconciled)
     }
 
     /// The position to use when appending to a session's queue.
@@ -1071,6 +1463,7 @@ impl Storage {
                 child_session_id TEXT UNIQUE
                     REFERENCES app_sessions(id) ON DELETE SET NULL,
                 completed INTEGER NOT NULL DEFAULT 0,
+                notify_on_idle TEXT,
                 PRIMARY KEY(parent_session_id, tool_call_id)
              );
              CREATE TABLE IF NOT EXISTS domain_events (
@@ -1168,6 +1561,30 @@ impl Storage {
              );
              CREATE INDEX IF NOT EXISTS queue_items_session_position
                 ON queue_items(session_id, position);
+             CREATE TABLE IF NOT EXISTS coordination_items (
+                id TEXT PRIMARY KEY,
+                sender_session_id TEXT NOT NULL
+                   REFERENCES app_sessions(id) ON DELETE CASCADE,
+                recipient_session_id TEXT NOT NULL
+                   REFERENCES app_sessions(id) ON DELETE CASCADE,
+                kind TEXT NOT NULL,
+                delivery TEXT NOT NULL,
+                state TEXT NOT NULL,
+                body TEXT NOT NULL,
+                queue_item_id TEXT,
+                dedupe_id TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                delivered_at TEXT,
+                read_at TEXT,
+                error TEXT,
+                UNIQUE(sender_session_id, dedupe_id)
+             );
+             CREATE INDEX IF NOT EXISTS coordination_items_recipient_order
+                ON coordination_items(recipient_session_id, created_at, id);
+             CREATE INDEX IF NOT EXISTS coordination_items_recipient_unread
+                ON coordination_items(recipient_session_id, created_at, id)
+                WHERE read_at IS NULL;
              CREATE TABLE IF NOT EXISTS queue_state (
                 session_id TEXT PRIMARY KEY REFERENCES app_sessions(id) ON DELETE CASCADE,
                 paused INTEGER NOT NULL DEFAULT 0
@@ -1200,6 +1617,7 @@ impl Storage {
             "launch_origin",
             "TEXT NOT NULL DEFAULT 'user'",
         )?;
+        add_column_if_missing(&transaction, "host_tool_launches", "notify_on_idle", "TEXT")?;
         transaction.execute(
             "INSERT OR IGNORE INTO host_tool_launches (
                 parent_session_id, tool_call_id, child_session_id, completed
@@ -1391,6 +1809,184 @@ fn queue_delivery_from_str(value: &str) -> QueueDelivery {
         "steer" => QueueDelivery::Steer,
         _ => QueueDelivery::WhenIdle,
     }
+}
+
+const fn coordination_kind_to_str(kind: &CoordinationKind) -> &'static str {
+    match kind {
+        CoordinationKind::Message => "message",
+        CoordinationKind::ChildCompletion => "child_completion",
+    }
+}
+
+fn coordination_kind_from_str(value: &str) -> CoordinationKind {
+    match value {
+        "child_completion" => CoordinationKind::ChildCompletion,
+        _ => CoordinationKind::Message,
+    }
+}
+
+const fn coordination_delivery_to_str(delivery: &CoordinationDelivery) -> &'static str {
+    match delivery {
+        CoordinationDelivery::Immediate => "immediate",
+        CoordinationDelivery::WhenIdle => "when_idle",
+    }
+}
+
+fn coordination_delivery_from_str(value: &str) -> CoordinationDelivery {
+    match value {
+        "immediate" => CoordinationDelivery::Immediate,
+        _ => CoordinationDelivery::WhenIdle,
+    }
+}
+
+const fn coordination_state_to_str(state: &CoordinationState) -> &'static str {
+    match state {
+        CoordinationState::Pending => "pending",
+        CoordinationState::Dispatched => "dispatched",
+        CoordinationState::Delivered => "delivered",
+        CoordinationState::Failed => "failed",
+    }
+}
+
+fn coordination_state_from_str(value: &str) -> CoordinationState {
+    match value {
+        "pending" => CoordinationState::Pending,
+        "dispatched" => CoordinationState::Dispatched,
+        "delivered" => CoordinationState::Delivered,
+        _ => CoordinationState::Failed,
+    }
+}
+
+fn coordination_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<CoordinationRecord> {
+    Ok(CoordinationRecord {
+        id: row.get(0)?,
+        sender_session_id: row.get(1)?,
+        recipient_session_id: row.get(2)?,
+        kind: coordination_kind_from_str(&row.get::<_, String>(3)?),
+        delivery: coordination_delivery_from_str(&row.get::<_, String>(4)?),
+        state: coordination_state_from_str(&row.get::<_, String>(5)?),
+        body: row.get(6)?,
+        queue_item_id: row.get(7)?,
+        dedupe_id: row.get(8)?,
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        delivered_at: row.get(11)?,
+        read_at: row.get(12)?,
+        error: row.get(13)?,
+    })
+}
+
+fn insert_queue_item(transaction: &rusqlite::Transaction<'_>, item: &QueueItem) -> Result<()> {
+    transaction.execute(
+        "INSERT INTO queue_items (
+            id, session_id, position, prompt, display_prompt, state, delivery,
+            agent_mode, created_at, updated_at, error
+         ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11)",
+        params![
+            item.id,
+            item.session_id,
+            item.position,
+            item.prompt,
+            item.display_prompt,
+            queue_state_to_str(item.state),
+            queue_delivery_to_str(item.delivery),
+            item.agent_mode,
+            item.created_at,
+            item.updated_at,
+            item.error,
+        ],
+    )?;
+    Ok(())
+}
+
+fn synchronize_coordination_for_queue(
+    transaction: &rusqlite::Transaction<'_>,
+    item: &QueueItem,
+) -> Result<()> {
+    let (state, delivered_at, error): (&str, Option<&str>, Option<&str>) = match item.state {
+        QueueItemState::Pending => ("pending", None, None),
+        QueueItemState::Dispatched => ("dispatched", None, None),
+        QueueItemState::Completed => ("delivered", Some(item.updated_at.as_str()), None),
+        QueueItemState::Failed => (
+            "failed",
+            None,
+            Some(item.error.as_deref().unwrap_or("queue delivery failed")),
+        ),
+        QueueItemState::Cancelled => (
+            "failed",
+            None,
+            Some(item.error.as_deref().unwrap_or("queue item cancelled")),
+        ),
+    };
+    transaction.execute(
+        "UPDATE coordination_items
+         SET state = ?1, updated_at = ?2, delivered_at = ?3, error = ?4
+         WHERE queue_item_id = ?5 AND recipient_session_id = ?6",
+        params![
+            state,
+            item.updated_at,
+            delivered_at,
+            error,
+            item.id,
+            item.session_id
+        ],
+    )?;
+    Ok(())
+}
+
+struct CoordinationSession {
+    project_key: String,
+    parent_session_id: Option<String>,
+    archived: bool,
+}
+
+fn coordination_session(
+    connection: &Connection,
+    session_id: &str,
+) -> Result<Option<CoordinationSession>> {
+    connection
+        .query_row(
+            "SELECT COALESCE(s.repository_root, s.project_path), s.parent_session_id,
+                    a.session_id IS NOT NULL
+             FROM app_sessions s
+             LEFT JOIN session_archives a ON a.session_id = s.id
+             WHERE s.id = ?1",
+            [session_id],
+            |row| {
+                Ok(CoordinationSession {
+                    project_key: row.get(0)?,
+                    parent_session_id: row.get(1)?,
+                    archived: row.get(2)?,
+                })
+            },
+        )
+        .optional()
+        .map_err(Into::into)
+}
+
+fn ancestry_contains(
+    connection: &Connection,
+    mut session_id: Option<String>,
+    expected_ancestor: &str,
+) -> Result<bool> {
+    let mut visited = HashSet::new();
+    while let Some(current) = session_id {
+        if current == expected_ancestor {
+            return Ok(true);
+        }
+        if !visited.insert(current.clone()) {
+            return Ok(false);
+        }
+        session_id = connection
+            .query_row(
+                "SELECT parent_session_id FROM app_sessions WHERE id = ?1",
+                [current],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+    }
+    Ok(false)
 }
 
 /// Add a column to an existing table unless it is already present.
@@ -2518,6 +3114,12 @@ mod tests {
         // The queue tables arrived in version 9 and must exist after an
         // upgrade, not only on a freshly created database.
         assert!(storage.queue_view("legacy").unwrap().is_empty());
+        assert!(
+            storage
+                .host_tool_notify_on_idle("legacy")
+                .unwrap()
+                .is_none()
+        );
     }
 
     #[test]
@@ -2574,6 +3176,52 @@ mod tests {
         storage
             .upsert_session(&orphan)
             .expect("an orphaned child remains independently writable");
+    }
+
+    #[test]
+    fn host_tool_notify_on_idle_migrates_and_round_trips() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gcabb.db");
+        let parent = distinct_root("notify-parent", "/tmp/project");
+        let child = child_metadata(&parent, 1);
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage.upsert_session(&parent).unwrap();
+            storage.upsert_session(&child).unwrap();
+            assert!(
+                storage
+                    .host_tool_notify_on_idle(&child.id)
+                    .unwrap()
+                    .is_none()
+            );
+            storage
+                .set_host_tool_notify_on_idle(&child.id, Some("once"))
+                .unwrap();
+            storage.complete_host_tool_launch(&child.id).unwrap();
+        }
+
+        let storage = Storage::open(&path).unwrap();
+        assert_eq!(
+            storage.host_tool_notify_on_idle(&child.id).unwrap(),
+            Some("once".to_owned())
+        );
+        storage
+            .set_host_tool_notify_on_idle(&child.id, None)
+            .unwrap();
+        assert!(
+            storage
+                .host_tool_notify_on_idle(&child.id)
+                .unwrap()
+                .is_none()
+        );
+        assert!(matches!(
+            storage.set_host_tool_notify_on_idle(&child.id, Some("always")),
+            Err(StorageError::InvalidHostToolNotifyOnIdle(policy)) if policy == "always"
+        ));
+        assert!(matches!(
+            storage.set_host_tool_notify_on_idle("missing-child", Some("once")),
+            Err(StorageError::HostToolLaunchNotFound(id)) if id == "missing-child"
+        ));
     }
 
     #[test]
@@ -2660,6 +3308,52 @@ mod tests {
             updated_at: "2".to_owned(),
             error: None,
         }
+    }
+
+    fn coordination_record(
+        id: &str,
+        sender_session_id: &str,
+        recipient_session_id: &str,
+        kind: CoordinationKind,
+        queue_item_id: Option<&str>,
+    ) -> CoordinationRecord {
+        CoordinationRecord {
+            id: id.to_owned(),
+            sender_session_id: sender_session_id.to_owned(),
+            recipient_session_id: recipient_session_id.to_owned(),
+            kind,
+            delivery: CoordinationDelivery::WhenIdle,
+            state: CoordinationState::Pending,
+            body: format!("body {id}"),
+            queue_item_id: queue_item_id.map(str::to_owned),
+            dedupe_id: format!("dedupe-{id}"),
+            created_at: "2026-08-21T01:00:00Z".to_owned(),
+            updated_at: "2026-08-21T01:00:00Z".to_owned(),
+            delivered_at: None,
+            read_at: None,
+            error: None,
+        }
+    }
+
+    fn archive_record(session_id: &str) -> SessionArchiveRecord {
+        SessionArchiveRecord {
+            session_id: session_id.to_owned(),
+            archived_at: "2026-08-21T02:00:00Z".to_owned(),
+            project_path: "/tmp/project".to_owned(),
+            repository_root: Some("/tmp/project".to_owned()),
+            branch: None,
+            head_commit: None,
+            patch: None,
+        }
+    }
+
+    fn distinct_root(id: &str, project_path: &str) -> SessionMetadata {
+        let mut root = metadata();
+        root.id = id.to_owned();
+        root.sdk_session_id = format!("sdk-{id}");
+        root.project_path = project_path.to_owned();
+        root.repository_root = None;
+        root
     }
 
     fn queue_storage() -> Storage {
@@ -2800,5 +3494,587 @@ mod tests {
         let storage = Storage::open(&path).unwrap();
         let sessions = storage.list_sessions().unwrap();
         assert_eq!(sessions[0].base_ref.as_deref(), Some("main"));
+    }
+
+    #[test]
+    fn coordination_schema_migrates_and_records_round_trip_after_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gcabb.db");
+        let root = distinct_root("root", "/tmp/project");
+        let child = child_metadata(&root, 1);
+        let mut expected = coordination_record(
+            "completion",
+            &child.id,
+            &root.id,
+            CoordinationKind::ChildCompletion,
+            None,
+        );
+        expected.delivery = CoordinationDelivery::Immediate;
+        expected.state = CoordinationState::Delivered;
+        expected.delivered_at = Some("2026-08-21T01:01:00Z".to_owned());
+        expected.read_at = Some("2026-08-21T01:02:00Z".to_owned());
+        expected.error = Some("provenance retained".to_owned());
+
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage.upsert_session(&root).unwrap();
+            storage.upsert_session(&child).unwrap();
+            assert_eq!(
+                storage.create_coordination_item(&expected, None).unwrap(),
+                expected
+            );
+            assert_eq!(storage.schema_version().unwrap(), 12);
+
+            let connection = storage.connection().unwrap();
+            let foreign_keys: HashSet<String> = connection
+                .prepare("PRAGMA foreign_key_list(coordination_items)")
+                .unwrap()
+                .query_map([], |row| row.get(3))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert_eq!(
+                foreign_keys,
+                HashSet::from([
+                    "sender_session_id".to_owned(),
+                    "recipient_session_id".to_owned()
+                ])
+            );
+            let indexes: HashSet<String> = connection
+                .prepare("PRAGMA index_list(coordination_items)")
+                .unwrap()
+                .query_map([], |row| row.get(1))
+                .unwrap()
+                .collect::<rusqlite::Result<_>>()
+                .unwrap();
+            assert!(indexes.contains("coordination_items_recipient_order"));
+            assert!(indexes.contains("coordination_items_recipient_unread"));
+        }
+
+        let storage = Storage::open(&path).unwrap();
+        assert_eq!(
+            storage.list_coordination_items(&root.id, 10).unwrap(),
+            vec![expected]
+        );
+        storage.delete_session(&child.id).unwrap();
+        assert!(
+            storage
+                .list_coordination_items(&root.id, 10)
+                .unwrap()
+                .is_empty()
+        );
+    }
+
+    #[test]
+    fn coordination_authorization_enforces_ancestry_project_and_liveness() {
+        let storage = Storage::open_in_memory().unwrap();
+        let root = distinct_root("root", "/tmp/project");
+        let child = child_metadata(&root, 1);
+        let grandchild = child_metadata(&child, 2);
+        let sibling = child_metadata(&root, 3);
+        let unrelated = distinct_root("unrelated", "/tmp/project");
+        let other_project = distinct_root("other-project", "/tmp/other");
+        for session in [
+            &root,
+            &child,
+            &grandchild,
+            &sibling,
+            &unrelated,
+            &other_project,
+        ] {
+            storage.upsert_session(session).unwrap();
+        }
+
+        assert_eq!(
+            storage.authorize_coordination(&root.id, &root.id).unwrap(),
+            CoordinationRelation::SelfSession
+        );
+        assert_eq!(
+            storage.authorize_coordination(&root.id, &child.id).unwrap(),
+            CoordinationRelation::Ancestor
+        );
+        assert_eq!(
+            storage.authorize_coordination(&child.id, &root.id).unwrap(),
+            CoordinationRelation::Descendant
+        );
+        assert_eq!(
+            storage
+                .authorize_coordination(&root.id, &grandchild.id)
+                .unwrap(),
+            CoordinationRelation::Ancestor
+        );
+        assert_eq!(
+            storage
+                .authorize_coordination(&grandchild.id, &root.id)
+                .unwrap(),
+            CoordinationRelation::Descendant
+        );
+        assert!(matches!(
+            storage.authorize_coordination(&child.id, &sibling.id),
+            Err(StorageError::CoordinationUnrelated { .. })
+        ));
+        assert!(matches!(
+            storage.authorize_coordination(&root.id, &unrelated.id),
+            Err(StorageError::CoordinationUnrelated { .. })
+        ));
+        assert!(matches!(
+            storage.authorize_coordination(&root.id, &other_project.id),
+            Err(StorageError::CoordinationProjectMismatch(_, _))
+        ));
+
+        storage.archive_session(&archive_record(&child.id)).unwrap();
+        assert!(matches!(
+            storage.authorize_coordination(&child.id, &root.id),
+            Err(StorageError::CoordinationSessionArchived(id)) if id == child.id
+        ));
+        assert!(matches!(
+            storage.authorize_coordination(&root.id, &child.id),
+            Err(StorageError::CoordinationSessionArchived(id)) if id == child.id
+        ));
+        storage.clear_session_archive(&child.id).unwrap();
+
+        storage.delete_session(&sibling.id).unwrap();
+        assert!(matches!(
+            storage.authorize_coordination(&root.id, &sibling.id),
+            Err(StorageError::SessionNotFound(id)) if id == sibling.id
+        ));
+        assert!(matches!(
+            storage.authorize_coordination("deleted-caller", &root.id),
+            Err(StorageError::SessionNotFound(id)) if id == "deleted-caller"
+        ));
+
+        let cycle_a = distinct_root("cycle-a", "/tmp/project");
+        let cycle_b = distinct_root("cycle-b", "/tmp/project");
+        storage.upsert_session(&cycle_a).unwrap();
+        storage.upsert_session(&cycle_b).unwrap();
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE app_sessions SET parent_session_id = CASE id
+                    WHEN 'cycle-a' THEN 'cycle-b' ELSE 'cycle-a' END
+                 WHERE id IN ('cycle-a', 'cycle-b')",
+                [],
+            )
+            .unwrap();
+        assert!(matches!(
+            storage.authorize_coordination(&root.id, &cycle_a.id),
+            Err(StorageError::CoordinationUnrelated { .. })
+        ));
+    }
+
+    #[test]
+    fn coordination_create_is_atomic_and_idempotent_with_queue_work() {
+        let storage = Storage::open_in_memory().unwrap();
+        let root = distinct_root("root", "/tmp/project");
+        let child = child_metadata(&root, 1);
+        storage.upsert_session(&root).unwrap();
+        storage.upsert_session(&child).unwrap();
+
+        let mut queued = queue_item("queue-1", 1024);
+        queued.session_id.clone_from(&child.id);
+        let record = coordination_record(
+            "message-1",
+            &root.id,
+            &child.id,
+            CoordinationKind::Message,
+            Some(&queued.id),
+        );
+        let first = storage
+            .create_coordination_item(&record, Some(&queued))
+            .unwrap();
+        let mut retry = record.clone();
+        retry.id = "different-id".to_owned();
+        retry.body = "retry body must not replace the original".to_owned();
+        assert_eq!(
+            storage
+                .create_coordination_item(&retry, Some(&queued))
+                .unwrap(),
+            first
+        );
+        assert_eq!(storage.queue_view(&child.id).unwrap().items.len(), 1);
+        assert_eq!(
+            storage.list_coordination_items(&child.id, 10).unwrap(),
+            vec![first]
+        );
+
+        let mut mismatched = queued;
+        mismatched.session_id.clone_from(&root.id);
+        assert!(matches!(
+            storage.create_coordination_item(
+                &coordination_record(
+                    "bad",
+                    &root.id,
+                    &child.id,
+                    CoordinationKind::Message,
+                    Some("queue-1")
+                ),
+                Some(&mismatched)
+            ),
+            Err(StorageError::CoordinationQueueMismatch)
+        ));
+    }
+
+    #[test]
+    fn queue_updates_synchronize_coordination_delivery_state_and_errors() {
+        let storage = Storage::open_in_memory().unwrap();
+        let root = distinct_root("root", "/tmp/project");
+        let child = child_metadata(&root, 1);
+        storage.upsert_session(&root).unwrap();
+        storage.upsert_session(&child).unwrap();
+
+        let mut queued = queue_item("queue-sync", 1024);
+        queued.session_id.clone_from(&child.id);
+        let record = coordination_record(
+            "message-sync",
+            &root.id,
+            &child.id,
+            CoordinationKind::Message,
+            Some(&queued.id),
+        );
+        storage
+            .create_coordination_item(&record, Some(&queued))
+            .unwrap();
+
+        queued.state = QueueItemState::Dispatched;
+        queued.updated_at = "2".to_owned();
+        storage.upsert_queue_item(&queued).unwrap();
+        let dispatched = storage.list_coordination_items(&child.id, 10).unwrap();
+        assert_eq!(dispatched[0].state, CoordinationState::Dispatched);
+        assert_eq!(dispatched[0].updated_at, "2");
+
+        queued.state = QueueItemState::Completed;
+        queued.updated_at = "3".to_owned();
+        storage.upsert_queue_item(&queued).unwrap();
+        let delivered = storage.list_coordination_items(&child.id, 10).unwrap();
+        assert_eq!(delivered[0].state, CoordinationState::Delivered);
+        assert_eq!(delivered[0].delivered_at.as_deref(), Some("3"));
+        assert_eq!(delivered[0].error, None);
+
+        queued.state = QueueItemState::Failed;
+        queued.updated_at = "4".to_owned();
+        queued.error = None;
+        storage.upsert_queue_item(&queued).unwrap();
+        let failed = storage.list_coordination_items(&child.id, 10).unwrap();
+        assert_eq!(failed[0].state, CoordinationState::Failed);
+        assert_eq!(failed[0].delivered_at, None);
+        assert_eq!(failed[0].error.as_deref(), Some("queue delivery failed"));
+
+        queued.state = QueueItemState::Cancelled;
+        queued.updated_at = "5".to_owned();
+        storage.upsert_queue_item(&queued).unwrap();
+        let cancelled = storage.list_coordination_items(&child.id, 10).unwrap();
+        assert_eq!(cancelled[0].state, CoordinationState::Failed);
+        assert_eq!(cancelled[0].error.as_deref(), Some("queue item cancelled"));
+    }
+
+    #[test]
+    fn deleting_linked_queue_work_retains_failed_coordination_provenance() {
+        let storage = Storage::open_in_memory().unwrap();
+        let root = distinct_root("root", "/tmp/project");
+        let child = child_metadata(&root, 1);
+        storage.upsert_session(&root).unwrap();
+        storage.upsert_session(&child).unwrap();
+
+        let mut queued = queue_item("queue-delete", 1024);
+        queued.session_id.clone_from(&child.id);
+        let record = coordination_record(
+            "message-delete",
+            &root.id,
+            &child.id,
+            CoordinationKind::Message,
+            Some(&queued.id),
+        );
+        storage
+            .create_coordination_item(&record, Some(&queued))
+            .unwrap();
+
+        assert!(storage.delete_queue_item(&queued.id).unwrap());
+        assert!(storage.queue_view(&child.id).unwrap().is_empty());
+        let retained = storage.list_coordination_items(&child.id, 10).unwrap();
+        assert_eq!(retained.len(), 1);
+        assert_eq!(retained[0].state, CoordinationState::Failed);
+        assert_eq!(
+            retained[0].error.as_deref(),
+            Some("coordination delivery cancelled before dispatch")
+        );
+        assert!(retained[0].queue_item_id.is_none());
+        assert!(retained[0].delivered_at.is_none());
+        assert_ne!(retained[0].updated_at, "2");
+    }
+
+    #[test]
+    fn stale_removal_cannot_relabel_dispatched_coordination_as_failed() {
+        let storage = Storage::open_in_memory().unwrap();
+        let root = distinct_root("root", "/tmp/project");
+        let child = child_metadata(&root, 1);
+        storage.upsert_session(&root).unwrap();
+        storage.upsert_session(&child).unwrap();
+
+        let mut queued = queue_item("queue-dispatched", 1024);
+        queued.session_id.clone_from(&child.id);
+        let record = coordination_record(
+            "message-dispatched",
+            &root.id,
+            &child.id,
+            CoordinationKind::Message,
+            Some(&queued.id),
+        );
+        storage
+            .create_coordination_item(&record, Some(&queued))
+            .unwrap();
+        queued.state = QueueItemState::Dispatched;
+        queued.updated_at = "3".to_owned();
+        storage.upsert_queue_item(&queued).unwrap();
+
+        assert!(!storage.delete_queue_item(&queued.id).unwrap());
+        assert_eq!(storage.queue_view(&child.id).unwrap().items.len(), 1);
+        let retained = storage.list_coordination_items(&child.id, 10).unwrap();
+        assert_eq!(retained[0].state, CoordinationState::Dispatched);
+        assert_eq!(
+            retained[0].queue_item_id.as_deref(),
+            Some(queued.id.as_str())
+        );
+        assert!(retained[0].error.is_none());
+    }
+
+    #[test]
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one restart scenario verifies every reconciliation exclusion and persisted state"
+    )]
+    fn reconciliation_completes_only_exact_linked_recipient_prompts_and_survives_reopen() {
+        let directory = tempdir().unwrap();
+        let path = directory.path().join("gcabb.db");
+        let root = distinct_root("root", "/tmp/project");
+        let child = child_metadata(&root, 1);
+        let other_child = child_metadata(&root, 2);
+        {
+            let storage = Storage::open(&path).unwrap();
+            storage.upsert_session(&root).unwrap();
+            storage.upsert_session(&child).unwrap();
+            storage.upsert_session(&other_child).unwrap();
+
+            let mut delivered = queue_item("queue-delivered", 1024);
+            delivered.session_id.clone_from(&child.id);
+            delivered.prompt = "coordination durable-id delivered".to_owned();
+            storage
+                .create_coordination_item(
+                    &coordination_record(
+                        "message-delivered",
+                        &root.id,
+                        &child.id,
+                        CoordinationKind::Message,
+                        Some(&delivered.id),
+                    ),
+                    Some(&delivered),
+                )
+                .unwrap();
+
+            let mut nonmatching = queue_item("queue-nonmatching", 2048);
+            nonmatching.session_id.clone_from(&child.id);
+            nonmatching.prompt = "coordination durable-id absent".to_owned();
+            nonmatching.state = QueueItemState::Dispatched;
+            storage
+                .create_coordination_item(
+                    &coordination_record(
+                        "message-nonmatching",
+                        &root.id,
+                        &child.id,
+                        CoordinationKind::Message,
+                        Some(&nonmatching.id),
+                    ),
+                    Some(&nonmatching),
+                )
+                .unwrap();
+
+            let mut generic = queue_item("queue-generic", 3072);
+            generic.session_id.clone_from(&child.id);
+            generic.prompt.clone_from(&delivered.prompt);
+            storage.upsert_queue_item(&generic).unwrap();
+
+            let mut other_recipient = queue_item("queue-other-recipient", 1024);
+            other_recipient.session_id.clone_from(&other_child.id);
+            other_recipient.prompt.clone_from(&delivered.prompt);
+            storage
+                .create_coordination_item(
+                    &coordination_record(
+                        "message-other-recipient",
+                        &root.id,
+                        &other_child.id,
+                        CoordinationKind::Message,
+                        Some(&other_recipient.id),
+                    ),
+                    Some(&other_recipient),
+                )
+                .unwrap();
+
+            assert_eq!(
+                storage
+                    .reconcile_coordination_queue_delivery(
+                        &child.id,
+                        &HashSet::from([delivered.prompt.clone()]),
+                        "2026-08-21T22:00:00Z",
+                    )
+                    .unwrap(),
+                1
+            );
+            assert_eq!(
+                storage
+                    .reconcile_coordination_queue_delivery(&child.id, &HashSet::new(), "ignored",)
+                    .unwrap(),
+                0
+            );
+
+            let child_queue = storage.queue_view(&child.id).unwrap();
+            assert_eq!(
+                child_queue
+                    .items
+                    .iter()
+                    .find(|item| item.id == delivered.id)
+                    .unwrap()
+                    .state,
+                QueueItemState::Completed
+            );
+            assert_eq!(
+                child_queue
+                    .items
+                    .iter()
+                    .find(|item| item.id == nonmatching.id)
+                    .unwrap()
+                    .state,
+                QueueItemState::Dispatched
+            );
+            assert_eq!(
+                child_queue
+                    .items
+                    .iter()
+                    .find(|item| item.id == generic.id)
+                    .unwrap()
+                    .state,
+                QueueItemState::Pending
+            );
+            assert_eq!(
+                storage.queue_view(&other_child.id).unwrap().items[0].state,
+                QueueItemState::Pending
+            );
+        }
+
+        let storage = Storage::open(&path).unwrap();
+        let child_queue = storage.queue_view(&child.id).unwrap();
+        let delivered_queue = child_queue
+            .items
+            .iter()
+            .find(|item| item.id == "queue-delivered")
+            .unwrap();
+        assert_eq!(delivered_queue.state, QueueItemState::Completed);
+        assert_eq!(delivered_queue.updated_at, "2026-08-21T22:00:00Z");
+        let coordination = storage
+            .list_coordination_items(&child.id, 10)
+            .unwrap()
+            .into_iter()
+            .find(|record| record.id == "message-delivered")
+            .unwrap();
+        assert_eq!(coordination.state, CoordinationState::Delivered);
+        assert_eq!(
+            coordination.delivered_at.as_deref(),
+            Some("2026-08-21T22:00:00Z")
+        );
+        assert_eq!(coordination.updated_at, "2026-08-21T22:00:00Z");
+    }
+
+    #[test]
+    fn coordination_unread_listing_is_bounded_and_marks_deterministically() {
+        let storage = Storage::open_in_memory().unwrap();
+        let root = distinct_root("root", "/tmp/project");
+        let child = child_metadata(&root, 1);
+        storage.upsert_session(&root).unwrap();
+        storage.upsert_session(&child).unwrap();
+
+        for index in (0..205).rev() {
+            let id = format!("completion-{index:03}");
+            let record = coordination_record(
+                &id,
+                &child.id,
+                &root.id,
+                CoordinationKind::ChildCompletion,
+                None,
+            );
+            storage.create_coordination_item(&record, None).unwrap();
+        }
+        let unread = storage
+            .list_unread_coordination_items(&root.id, usize::MAX)
+            .unwrap();
+        assert_eq!(unread.len(), MAX_COORDINATION_LIST_LIMIT);
+        assert_eq!(unread[0].id, "completion-000");
+        assert_eq!(unread[199].id, "completion-199");
+        assert!(
+            !storage
+                .mark_coordination_read(&child.id, "completion-000", "read-wrong-recipient")
+                .unwrap()
+        );
+        assert!(
+            storage
+                .mark_coordination_read(&root.id, "completion-000", "read-one")
+                .unwrap()
+        );
+        assert!(
+            !storage
+                .mark_coordination_read(&root.id, "completion-000", "read-again")
+                .unwrap()
+        );
+
+        assert_eq!(
+            storage
+                .mark_child_completion_notifications_read(&root.id, &child.id, "read-rest")
+                .unwrap(),
+            204
+        );
+        assert!(
+            storage
+                .list_unread_coordination_items(&root.id, 10)
+                .unwrap()
+                .is_empty()
+        );
+        let all = storage.list_coordination_items(&root.id, 1).unwrap();
+        assert_eq!(all[0].id, "completion-000");
+        assert_eq!(all[0].read_at.as_deref(), Some("read-one"));
+    }
+
+    #[test]
+    fn unread_child_bound_is_not_consumed_by_older_messages() {
+        let storage = Storage::open_in_memory().unwrap();
+        let root = distinct_root("root", "/tmp/project");
+        let child = child_metadata(&root, 1);
+        storage.upsert_session(&root).unwrap();
+        storage.upsert_session(&child).unwrap();
+        let message = coordination_record(
+            "a-message",
+            &child.id,
+            &root.id,
+            CoordinationKind::Message,
+            None,
+        );
+        let completion = coordination_record(
+            "z-completion",
+            &child.id,
+            &root.id,
+            CoordinationKind::ChildCompletion,
+            None,
+        );
+        storage.create_coordination_item(&message, None).unwrap();
+        storage.create_coordination_item(&completion, None).unwrap();
+
+        assert_eq!(
+            storage.list_unread_coordination_items(&root.id, 1).unwrap()[0].id,
+            "a-message"
+        );
+        assert_eq!(
+            storage
+                .list_unread_child_completion_items(&root.id, 1)
+                .unwrap()[0]
+                .id,
+            "z-completion"
+        );
     }
 }

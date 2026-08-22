@@ -3,7 +3,7 @@ use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::rc::Rc;
 use std::sync::mpsc::{Receiver, RecvTimeoutError, Sender, TryRecvError, channel};
-use std::sync::{Arc, Mutex};
+use std::sync::{Arc, Mutex, Weak};
 use std::thread;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
@@ -15,7 +15,8 @@ use app_model::{
 };
 use chrono::DateTime;
 use copilot_provider::{
-    CopilotProviderFactory, CreateSessionToolResult, HostToolGateway, HostToolRequest,
+    CopilotProviderFactory, CreateSessionToolInput, CreateSessionToolResult, HostGatewayEvent,
+    HostToolCall, HostToolGateway, HostToolRequest, HostToolResult, NotifyOnIdle,
     ProviderCompatibility,
 };
 use diagnostics::{DiagnosticEvent, DiagnosticsSink, TracingDiagnostics, init_tracing};
@@ -907,6 +908,14 @@ enum ServiceUpdate {
     },
     /// An archived session came back and must reappear in the sidebar.
     SessionUnarchived(SessionMetadata),
+    /// An agent-created child reached a durable terminal notification state.
+    ChildNotification {
+        child_session_id: String,
+        status: String,
+    },
+    ChildNotificationRead {
+        child_session_id: String,
+    },
     /// The configured project list changed, with the project to select next.
     ProjectsChanged {
         projects: Vec<ProjectMetadata>,
@@ -1056,6 +1065,10 @@ enum ServiceCommand {
     RunAutomationNow {
         automation_id: String,
     },
+    MarkChildNotificationRead {
+        parent_session_id: String,
+        child_session_id: String,
+    },
     Stop,
     SetHostWorktreesRoot(PathBuf),
 }
@@ -1075,6 +1088,7 @@ struct BootstrapState {
     selected_session: Option<String>,
     automations: Vec<Automation>,
     automation_runs: Vec<AutomationRun>,
+    unread_children: Vec<(String, String)>,
 }
 
 /// One archived session as the settings list needs it.
@@ -1083,6 +1097,31 @@ struct ArchivedSessionRow {
     id: String,
     title: String,
     archived_at: String,
+}
+
+fn bootstrap_unread_children(storage: &Storage) -> Vec<(String, String)> {
+    let Ok(sessions) = storage.list_sessions() else {
+        return Vec::new();
+    };
+    sessions
+        .iter()
+        .flat_map(|session| {
+            storage
+                .list_unread_child_completion_items(&session.id, 100)
+                .unwrap_or_default()
+        })
+        .map(|record| {
+            let status = serde_json::from_str::<serde_json::Value>(&record.body)
+                .ok()
+                .and_then(|body| {
+                    body.get("status")
+                        .and_then(serde_json::Value::as_str)
+                        .map(str::to_owned)
+                })
+                .unwrap_or_else(|| "completed".to_owned());
+            (record.sender_session_id, status)
+        })
+        .collect()
 }
 
 impl AppService {
@@ -1133,6 +1172,7 @@ impl AppService {
                 tracing::error!(%error, "failed to list bootstrap automation runs");
                 Vec::new()
             }),
+            unread_children: bootstrap_unread_children(&storage),
         };
         diagnostics.record(DiagnosticEvent {
             timestamp: timestamp(),
@@ -1193,7 +1233,7 @@ impl AppService {
                 let orchestrator = SessionOrchestrator::new(manager.clone(), session_roots.clone());
                 runtime.spawn(run_host_tool_gateway(
                     host_tool_rx,
-                    manager.clone(),
+                    Arc::downgrade(&manager),
                     orchestrator.clone(),
                     host_worktrees_root.clone(),
                     update_tx.clone(),
@@ -1359,6 +1399,7 @@ impl AppService {
                         ServiceCommand::UnarchiveSession { app_session_id } => {
                             match runtime.block_on(manager.unarchive_session(&app_session_id)) {
                                 Ok(restoration) => {
+                                    let restored_id = restoration.metadata.id.clone();
                                     let notice = restoration
                                         .worktree
                                         .as_ref()
@@ -1366,6 +1407,19 @@ impl AppService {
                                     let _ = update_tx.send(ServiceUpdate::SessionUnarchived(
                                         restoration.metadata,
                                     ));
+                                    if let Ok(unread) = manager.unread_child_notifications() {
+                                        for (_, child_session_id, status) in
+                                            unread.into_iter().filter(|(_, child_session_id, _)| {
+                                                child_session_id == &restored_id
+                                            })
+                                        {
+                                            let _ =
+                                                update_tx.send(ServiceUpdate::ChildNotification {
+                                                    child_session_id,
+                                                    status,
+                                                });
+                                        }
+                                    }
                                     if let Some(notice) = notice {
                                         let _ = update_tx.send(ServiceUpdate::ActionFailed(notice));
                                     }
@@ -1583,6 +1637,7 @@ async fn handle_service_command(
                             origin: LaunchOrigin::UserActivation,
                             parent_session_id: None,
                             host_tool_call_id: None,
+                            notify_on_idle: None,
                         },
                         |progress| {
                             let progress = match progress {
@@ -1784,6 +1839,15 @@ async fn handle_service_command(
         ServiceCommand::Select { app_session_id } => manager
             .set_selected_session(app_session_id.as_deref())
             .map_err(|error| error.to_string())?,
+        ServiceCommand::MarkChildNotificationRead {
+            parent_session_id,
+            child_session_id,
+        } => {
+            manager
+                .mark_child_notification_read(&parent_session_id, &child_session_id)
+                .map_err(|error| error.to_string())?;
+            let _ = updates.send(ServiceUpdate::ChildNotificationRead { child_session_id });
+        }
         // Project commands publish a project list instead of a session and
         // are handled before this dispatch.
         ServiceCommand::AddProject { .. }
@@ -1802,16 +1866,68 @@ async fn handle_service_command(
 }
 
 async fn run_host_tool_gateway(
-    mut requests: tokio::sync::mpsc::Receiver<HostToolRequest>,
-    manager: Arc<SessionManager>,
+    mut requests: tokio::sync::mpsc::Receiver<HostGatewayEvent>,
+    manager: Weak<SessionManager>,
     orchestrator: SessionOrchestrator,
     worktrees_root: Arc<Mutex<PathBuf>>,
     updates: Sender<ServiceUpdate>,
 ) {
     while let Some(request) = requests.recv().await {
-        let result =
-            create_agent_child(&manager, &orchestrator, &worktrees_root, &updates, &request).await;
-        let _ = request.response.send(result);
+        let Some(manager) = manager.upgrade() else {
+            break;
+        };
+        match request {
+            HostGatewayEvent::Tool(request) => {
+                let result = match &request.call {
+                    HostToolCall::CreateSession(input) => create_agent_child(
+                        manager.as_ref(),
+                        &orchestrator,
+                        &worktrees_root,
+                        &updates,
+                        &request,
+                        input,
+                    )
+                    .await
+                    .map(HostToolResult::CreateSession),
+                    HostToolCall::GetSession(input) => manager
+                        .get_session_for_coordination(&request.caller_session_id, &input.session_id)
+                        .await
+                        .map(Box::new)
+                        .map(HostToolResult::GetSession)
+                        .map_err(|error| error.to_string()),
+                    HostToolCall::SendSessionMessage(input) => manager
+                        .send_session_message(
+                            &request.caller_session_id,
+                            &request.tool_call_id,
+                            &input.session_id,
+                            &input.message,
+                            input.delivery,
+                        )
+                        .await
+                        .map(HostToolResult::SendSessionMessage)
+                        .map_err(|error| error.to_string()),
+                };
+                let _ = request.response.send(result);
+            }
+            HostGatewayEvent::ChildLifecycle(event) => {
+                match manager.handle_child_lifecycle(&event).await {
+                    Ok(Some(_)) => {
+                        let _ = updates.send(ServiceUpdate::ChildNotification {
+                            child_session_id: event.child_session_id,
+                            status: event.status.as_str().to_owned(),
+                        });
+                    }
+                    Ok(None) => {}
+                    Err(error) => {
+                        tracing::error!(
+                            %error,
+                            child_session_id = %event.child_session_id,
+                            "failed to persist child completion notification"
+                        );
+                    }
+                }
+            }
+        }
     }
 }
 
@@ -1821,6 +1937,7 @@ async fn create_agent_child(
     worktrees_root: &Mutex<PathBuf>,
     updates: &Sender<ServiceUpdate>,
     request: &HostToolRequest,
+    input: &CreateSessionToolInput,
 ) -> Result<CreateSessionToolResult, String> {
     if let Some(existing) = manager
         .session_for_tool_call(&request.caller_session_id, &request.tool_call_id)
@@ -1866,7 +1983,7 @@ async fn create_agent_child(
         });
     }
 
-    let launch = agent_child_launch_request(manager, worktrees_root, request).await?;
+    let launch = agent_child_launch_request(manager, worktrees_root, request, input).await?;
     let result = orchestrator
         .launch(launch, |_| {})
         .await
@@ -1892,6 +2009,7 @@ async fn agent_child_launch_request(
     manager: &SessionManager,
     worktrees_root: &Mutex<PathBuf>,
     request: &HostToolRequest,
+    input: &CreateSessionToolInput,
 ) -> Result<LaunchRequest, String> {
     let parent = manager
         .session_metadata_by_id(&request.caller_session_id)
@@ -1920,8 +2038,7 @@ async fn agent_child_launch_request(
         .lock()
         .map_err(|_| "configured worktree root is unavailable".to_owned())?
         .clone();
-    let title = request
-        .input
+    let title = input
         .title
         .as_ref()
         .map_or(LaunchTitle::Automatic, |title| LaunchTitle::Provided {
@@ -1934,33 +2051,25 @@ async fn agent_child_launch_request(
         worktrees_root: root,
         kind: SessionKind::Project,
         location: SessionLocation::NewWorktree,
-        prompt: request.input.prompt.clone(),
+        prompt: input.prompt.clone(),
         attachments: Vec::new(),
-        model: request
-            .input
+        model: input
             .model
             .clone()
             .or_else(|| controls.model.clone())
             .or_else(|| parent.model.clone()),
-        mode: request
-            .input
+        mode: input
             .mode
             .clone()
             .or_else(|| controls.mode.clone())
             .or_else(|| parent.mode.clone())
             .unwrap_or_else(|| "interactive".to_owned()),
-        agent: request
-            .input
-            .agent
-            .clone()
-            .or_else(|| controls.agent.clone()),
-        reasoning_effort: request
-            .input
+        agent: input.agent.clone().or_else(|| controls.agent.clone()),
+        reasoning_effort: input
             .reasoning_effort
             .clone()
             .or_else(|| controls.reasoning_effort.clone()),
-        context_tier: request
-            .input
+        context_tier: input
             .context_tier
             .clone()
             .or_else(|| controls.context_tier.clone()),
@@ -1969,6 +2078,9 @@ async fn agent_child_launch_request(
         origin: LaunchOrigin::Headless,
         parent_session_id: Some(parent.id),
         host_tool_call_id: Some(request.tool_call_id.clone()),
+        notify_on_idle: input.notify_on_idle.map(|policy| match policy {
+            NotifyOnIdle::Once => "once".to_owned(),
+        }),
     })
 }
 
@@ -2154,14 +2266,22 @@ fn ordered_project_sessions(
     traversal.ordered
 }
 
-fn session_row_accessible_label(title: &str, depth: usize, orphaned: bool) -> String {
-    if orphaned {
+fn session_row_accessible_label(
+    title: &str,
+    depth: usize,
+    orphaned: bool,
+    unread_status: Option<&str>,
+) -> String {
+    let label = if orphaned {
         format!("Agent-created session {title}, parent unavailable")
     } else if depth > 0 {
         format!("Agent-created child session {title}, level {depth}")
     } else {
         title.to_owned()
-    }
+    };
+    unread_status.map_or(label.clone(), |status| {
+        format!("{label}, unread child {status} notification")
+    })
 }
 
 const fn session_row_margin(depth: usize) -> f32 {
@@ -2608,6 +2728,9 @@ struct SessionMvpView {
     /// Sessions with an archive or unarchive in flight, treated like a delete
     /// so the row cannot be acted on twice.
     archiving_sessions: HashSet<String>,
+    /// Agent-created children with a durable completion notification that has
+    /// not been inspected yet.
+    unread_children: HashMap<String, String>,
     /// Archived sessions, newest first, offered for unarchiving in settings.
     archived_sessions: Vec<ArchivedSessionRow>,
     /// Startup progress shown before the new session has an id or transcript.
@@ -2867,6 +2990,7 @@ impl SessionMvpView {
             rename_input,
             deleting_sessions: HashSet::new(),
             archiving_sessions: HashSet::new(),
+            unread_children: HashMap::new(),
             archived_sessions: Vec::new(),
             session_launch: None,
             action_error: None,
@@ -3552,15 +3676,17 @@ impl SessionMvpView {
                 ServiceUpdate::SessionUnarchived(session) => {
                     self.apply_session_unarchived(session);
                 }
+                ServiceUpdate::ChildNotification {
+                    child_session_id,
+                    status,
+                } => {
+                    self.apply_child_notification(child_session_id, status);
+                }
+                ServiceUpdate::ChildNotificationRead { child_session_id } => {
+                    self.unread_children.remove(&child_session_id);
+                }
                 ServiceUpdate::PromptAccepted(origin) => {
-                    if let Some(id) = origin.as_deref() {
-                        self.session_drafts.remove(id);
-                    } else {
-                        self.home_draft.clear();
-                    }
-                    if self.selected_session == origin {
-                        self.composer.update(cx, TextInput::clear);
-                    }
+                    self.apply_prompt_accepted(origin.as_deref(), cx);
                 }
                 ServiceUpdate::ActionFailed(error) => {
                     self.session_launch = None;
@@ -3572,11 +3698,45 @@ impl SessionMvpView {
         changed
     }
 
+    fn apply_child_notification(&mut self, child_session_id: String, status: String) {
+        self.unread_children
+            .insert(child_session_id.clone(), status);
+        if self.selected_session.as_deref() != Some(child_session_id.as_str()) {
+            return;
+        }
+        let Some(parent_session_id) = self
+            .sessions
+            .iter()
+            .find(|session| session.id() == child_session_id)
+            .and_then(|session| session.snapshot.metadata.parent_session_id.clone())
+        else {
+            return;
+        };
+        let _ = self
+            .commands
+            .send(ServiceCommand::MarkChildNotificationRead {
+                parent_session_id,
+                child_session_id,
+            });
+    }
+
+    fn apply_prompt_accepted(&mut self, origin: Option<&str>, cx: &mut Context<Self>) {
+        if let Some(id) = origin {
+            self.session_drafts.remove(id);
+        } else {
+            self.home_draft.clear();
+        }
+        if self.selected_session.as_deref() == origin {
+            self.composer.update(cx, TextInput::clear);
+        }
+    }
+
     fn apply_bootstrap(&mut self, bootstrap: BootstrapState) {
         self.projects = bootstrap.projects;
         self.archived_sessions = bootstrap.archived;
         self.automations_panel.automations = bootstrap.automations;
         self.automations_panel.runs = bootstrap.automation_runs;
+        self.unread_children = bootstrap.unread_children.into_iter().collect();
         self.sessions = bootstrap
             .sessions
             .into_iter()
@@ -4126,6 +4286,20 @@ impl SessionMvpView {
         self.open_control_menu = None;
         self.base_menu_visibility = SettingsVisibility::Closed;
         self.base_default_ref = None;
+        if self.unread_children.contains_key(&id)
+            && let Some(parent_session_id) = self
+                .sessions
+                .iter()
+                .find(|session| session.id() == id)
+                .and_then(|session| session.snapshot.metadata.parent_session_id.clone())
+        {
+            let _ = self
+                .commands
+                .send(ServiceCommand::MarkChildNotificationRead {
+                    parent_session_id,
+                    child_session_id: id.clone(),
+                });
+        }
         self.switch_composer_draft(Some(id.clone()), cx);
         self.startup_navigation = StartupNavigation::Changed;
         let _ = self.commands.send(ServiceCommand::Select {
@@ -4523,6 +4697,7 @@ impl SessionMvpView {
             self.switch_composer_draft(None, cx);
         }
         self.session_drafts.remove(id);
+        self.unread_children.remove(id);
         self.expanded_changes.remove(id);
         self.expanded_tools.remove(id);
         if self.session_menu.as_ref().is_some_and(|menu| menu.id == id) {
@@ -5815,7 +5990,13 @@ impl SessionMvpView {
                 let id = session.id().to_owned();
                 let accessible_id = id.clone();
                 let label = session.snapshot.metadata.title.clone();
-                let accessible_label = session_row_accessible_label(&label, depth, orphaned);
+                let unread_status = self.unread_children.get(&id);
+                let accessible_label = session_row_accessible_label(
+                    &label,
+                    depth,
+                    orphaned,
+                    unread_status.map(String::as_str),
+                );
                 let menu_id = id.clone();
                 let menu_label = label.clone();
                 let selected = self.selected_session.as_deref() == Some(id.as_str());
@@ -5882,6 +6063,16 @@ impl SessionMvpView {
                                 "▾"
                             },
                         ))
+                    })
+                    .when(unread_status.is_some(), |row| {
+                        row.child(
+                            div()
+                                .debug_selector(|| "child-notification-unread".to_owned())
+                                .w(px(8.0))
+                                .h(px(8.0))
+                                .rounded_full()
+                                .bg(rgb(BLUE)),
+                        )
                     })
                     .child(if is_deleting {
                         progress_spinner(spinner_id).into_any_element()
@@ -13314,6 +13505,7 @@ pub(crate) mod tests {
                 selected_session: Some("session-2".to_owned()),
                 automations: Vec::new(),
                 automation_runs: Vec::new(),
+                unread_children: Vec::new(),
             });
             cx.update(super::super::bind_app_keys);
             let (view, cx) = cx.add_window_view(|_, cx| {
@@ -13355,6 +13547,7 @@ pub(crate) mod tests {
                 selected_session: Some("parent".to_owned()),
                 automations: Vec::new(),
                 automation_runs: Vec::new(),
+                unread_children: vec![("child".to_owned(), "failed".to_owned())],
             });
             cx.update(super::super::bind_app_keys);
             let (_view, cx) = cx.add_window_view(|_, cx| {
@@ -13376,12 +13569,13 @@ pub(crate) mod tests {
 
             assert!(cx.debug_bounds("agent-child-session-row").is_some());
             assert!(cx.debug_bounds("orphan-agent-session-row").is_some());
+            assert!(cx.debug_bounds("child-notification-unread").is_some());
             assert_eq!(
-                super::super::session_row_accessible_label("Child", 1, false),
+                super::super::session_row_accessible_label("Child", 1, false, None),
                 "Agent-created child session Child, level 1"
             );
             assert_eq!(
-                super::super::session_row_accessible_label("Orphan", 0, true),
+                super::super::session_row_accessible_label("Orphan", 0, true, None),
                 "Agent-created session Orphan, parent unavailable"
             );
         }
@@ -13444,6 +13638,87 @@ pub(crate) mod tests {
         }
 
         #[gpui::test]
+        fn child_notifications_are_unread_accessible_and_do_not_steal_selection(
+            cx: &mut TestAppContext,
+        ) {
+            let (view, cx, commands, updates) = setup_for_bootstrap(cx);
+            view.update(cx, |view, cx| {
+                view.sessions = vec![
+                    SessionProjection::for_test(SessionHandle::for_test(snapshot(
+                        "parent",
+                        "Parent session",
+                    ))),
+                    SessionProjection::for_test(SessionHandle::for_test(child_snapshot(
+                        "child",
+                        "Agent child",
+                        "parent",
+                    ))),
+                ];
+                view.selected_session = Some("parent".to_owned());
+                cx.notify();
+            });
+            updates
+                .send(ServiceUpdate::ChildNotification {
+                    child_session_id: "child".to_owned(),
+                    status: "failed".to_owned(),
+                })
+                .unwrap();
+            view.update(cx, |view, cx| {
+                view.apply_service_updates(cx);
+                assert_eq!(view.selected_session.as_deref(), Some("parent"));
+                assert_eq!(
+                    view.unread_children.get("child").map(String::as_str),
+                    Some("failed")
+                );
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("child-notification-unread").is_some());
+            assert!(
+                super::super::session_row_accessible_label("Agent child", 1, false, Some("failed"))
+                    .contains("unread child failed notification")
+            );
+
+            let child = cx
+                .debug_bounds("agent-child-session-row")
+                .expect("child row");
+            cx.simulate_click(child.center(), Modifiers::none());
+            cx.run_until_parked();
+
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(ServiceCommand::MarkChildNotificationRead {
+                    parent_session_id,
+                    child_session_id,
+                }) if parent_session_id == "parent" && child_session_id == "child"
+            ));
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(ServiceCommand::Select {
+                    app_session_id: Some(id)
+                }) if id == "child"
+            ));
+            view.read_with(cx, |view, _| {
+                assert!(view.unread_children.contains_key("child"));
+            });
+            updates
+                .send(ServiceUpdate::ChildNotificationRead {
+                    child_session_id: "child".to_owned(),
+                })
+                .unwrap();
+            view.update(cx, |view, cx| {
+                view.apply_service_updates(cx);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(!view.unread_children.contains_key("child"));
+            });
+            assert!(cx.debug_bounds("child-notification-unread").is_none());
+        }
+
+        #[gpui::test]
         fn recovering_session_shows_resuming_spinner_until_hydrated(cx: &mut TestAppContext) {
             let (mut service, _commands, updates) = AppService::for_test_with_updates();
             let metadata = snapshot("session-1", "First session").metadata;
@@ -13454,6 +13729,7 @@ pub(crate) mod tests {
                 selected_session: Some("session-1".to_owned()),
                 automations: Vec::new(),
                 automation_runs: Vec::new(),
+                unread_children: Vec::new(),
             });
             cx.update(super::super::bind_app_keys);
             let (view, cx) = cx.add_window_view(|_, cx| {
@@ -13507,6 +13783,7 @@ pub(crate) mod tests {
                     selected_session: Some("session-1".to_owned()),
                     automations: Vec::new(),
                     automation_runs: Vec::new(),
+                    unread_children: Vec::new(),
                 });
             });
 
@@ -13527,6 +13804,7 @@ pub(crate) mod tests {
                     selected_session: Some("session-1".to_owned()),
                     automations: Vec::new(),
                     automation_runs: Vec::new(),
+                    unread_children: Vec::new(),
                 });
             });
             view.update_in(cx, SessionMvpView::new_session);
@@ -13647,6 +13925,7 @@ pub(crate) mod tests {
                     selected_session: Some("session-1".to_owned()),
                     automations: Vec::new(),
                     automation_runs: Vec::new(),
+                    unread_children: Vec::new(),
                 });
             });
             let mut adopted = snapshot("session-1", "Legacy session");
@@ -13685,6 +13964,7 @@ pub(crate) mod tests {
                     selected_session: Some("session-1".to_owned()),
                     automations: Vec::new(),
                     automation_runs: Vec::new(),
+                    unread_children: Vec::new(),
                 });
             });
             updates

@@ -2,40 +2,73 @@
 
 Evidence for what GCABB inherits from the Copilot CLI runtime, what the
 application adds, and how that compares to other coding-agent harnesses. Most
-tools belong to the runtime; the host-provided `create_session` tool is the
-intentional exception.
+tools belong to the runtime; GCABB adds a narrow app-session coordination
+gateway for `create_session`, `get_session`, and `send_session_message`.
 
-## Host-provided `create_session`
+## Host-provided app-session coordination
 
-Every new and resumed project session receives a typed custom SDK tool named
-`create_session`. It launches an independent GCABB app session, not a Copilot
-CLI `task` subagent:
+Every new and resumed project session receives three typed custom SDK tools.
+They coordinate durable GCABB app sessions, not Copilot CLI `task` subagents:
 
 - `task` runs nested agent activity inside the calling CLI/session runtime.
 - `create_session` creates another durable app session with its own provider,
   client, CLI process, SDK session, managed worktree, sidebar row, and restart
   lifecycle.
+- `get_session` returns bounded status and work metadata for the caller, an
+  ancestor, or a descendant. It includes at most four capped transcript entries,
+  one capped completed assistant result, a pending plan summary when present,
+  and a capped change summary. It never returns raw tool output or an unbounded
+  transcript.
+- `send_session_message` sends an auditable durable message between an ancestor
+  and descendant in the same registered project. `immediate` maps to steering
+  delivery and may bypass older when-idle work while the recipient is busy;
+  `queued` waits for idle. Ordering stays stable within each delivery mode, and
+  child notifications all use the ordered when-idle path.
 
 The model supplies a kickoff prompt and may override the title, model, mode,
-agent, reasoning effort, and context tier. The host binds the caller identity
-and derives the registered project, repository, base branch, and configured
-worktree root; no path or parent-session input is accepted. SDK `toolCallId`
-is persisted with the child row and uniquely indexed per parent so retries
-return the existing child.
+agent, reasoning effort, and context tier. `notify_on_idle: "once"` requests one
+durable completion notification after the child's kickoff or current turn.
+The host binds the caller app-session identity and derives the registered
+project, repository, base branch, and configured worktree root; no path,
+project, parent, or spoofable sender input is accepted. SDK `toolCallId` is
+persisted so retries return the original child or message without duplicating
+work.
 
 Children are started headlessly and do not change selection or focus. The
 sidebar nests them under a live parent and keeps them at the project root with
 an explicit unavailable-parent label if the parent is archived or deleted.
 Archiving or deleting a parent never recursively affects child work.
 
+Coordination messages and notifications are recorded separately from the prompt
+queue with sender, recipient, kind, delivery mode, state, timestamps, dedupe
+identity, queue identity, read state, and explicit failure. The prompt queue
+remains the delivery mechanism. A busy parent receives child notifications in
+queue order; selecting the unread child clears the persisted unread marker
+without changing focus when the notification first arrives. Restart recovery
+re-emits eligible child terminal state through the same deduplicated ledger, so
+notification delivery is neither lost nor repeated.
+
+Authorization is ancestry-based: a caller may inspect itself, its ancestors,
+and its descendants, and may message only an ancestor or descendant. Siblings,
+unrelated sessions, different projects, archived sessions, deleted sessions,
+and sessions outside the registered project are rejected.
+
 Current limits are three child levels and five active direct children per
-parent. This surface is local-only, same-project-only, and does not yet provide
-completion notifications or child-to-parent messaging. Cloud sessions,
-cross-repository launches, recursive archive/delete, plan approval, and
-`send_session_message` are intentionally outside this version. If the app
-crashes in the narrow interval after recording a child but before confirming
-kickoff delivery, a retry returns an explicit interrupted-launch error with the
-child id rather than risking duplicate work.
+parent. This surface is local-only and same-project-only. Cloud sessions,
+cross-repository launches, recursive archive/delete, plan approval, forking,
+and `notify_on_idle: "always"` are intentionally outside this version. If the
+app crashes in the narrow interval after recording a child but before
+confirming kickoff delivery, a retry returns an explicit interrupted-launch
+error with the child id rather than risking duplicate work.
+
+### Messages versus CLI subagent events
+
+GCABB coordination messages and child notifications cross app-session runtime
+boundaries and remain in SQLite across process restarts. CLI subagent events
+(`task`, `read_agent`, `write_agent`, and `list_agents`) describe nested agents
+inside one Copilot CLI runtime. They remain projected as tool/subagent activity
+in that session's transcript and never grant access to another GCABB app
+session, worktree, queue, or coordination ledger.
 
 ## Verification method
 
