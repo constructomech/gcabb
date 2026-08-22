@@ -6,20 +6,25 @@ use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
-    ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus, DomainEvent,
+    ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus, DomainEvent, InteractionKind,
     InteractionResponse, OutputStreamKind, ProjectMetadata, PromptAttachment, QueueDelivery,
     QueueItem, QueueItemState, SessionKind, SessionLaunchOrigin, SessionMetadata, SessionSnapshot,
-    SessionStatus, TitleSource, ToolCatalog,
+    SessionStatus, TitleSource, ToolCatalog, TranscriptRole,
 };
 use copilot_provider::{
-    AgentProvider, AgentProviderFactory, HostToolBinding, HostToolGateway, ProviderCompatibility,
-    ProviderError, ProviderEvent, ProviderInteraction, ProviderSession, QueueDeliveryRequest,
-    SessionRequest,
+    AgentProvider, AgentProviderFactory, ChildLifecycleEvent, ChildLifecycleStatus,
+    GetSessionToolResult, HostToolBinding, HostToolGateway, ProviderCompatibility, ProviderError,
+    ProviderEvent, ProviderInteraction, ProviderSession, QueueDeliveryRequest,
+    SendSessionMessageToolResult, SessionChangeSummary, SessionMessageDelivery, SessionRequest,
+    SessionTranscriptEntry,
 };
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
 use git_service::GitService;
 use serde_json::{Value, json};
-use storage::{OutputRange, Storage, StorageError};
+use storage::{
+    CoordinationDelivery, CoordinationKind, CoordinationRecord, CoordinationRelation,
+    CoordinationState, OutputRange, Storage, StorageError,
+};
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
@@ -561,6 +566,11 @@ impl SessionHandle {
     pub async fn clear_queue(&self) -> Result<()> {
         self.queue(QueueCommand::Clear).await.map(|_| ())
     }
+
+    /// Reload queue work inserted atomically by another host service.
+    pub async fn sync_queue(&self) -> Result<()> {
+        self.queue(QueueCommand::Sync).await.map(|_| ())
+    }
 }
 
 #[derive(Default)]
@@ -1082,6 +1092,349 @@ impl SessionManager {
         self.storage
             .complete_host_tool_launch(child_session_id)
             .map_err(Into::into)
+    }
+
+    pub fn set_host_tool_notify_on_idle(
+        &self,
+        child_session_id: &str,
+        notify_on_idle: Option<&str>,
+    ) -> Result<()> {
+        self.storage
+            .set_host_tool_notify_on_idle(child_session_id, notify_on_idle)
+            .map_err(Into::into)
+    }
+
+    /// Return bounded model-visible state for an authorized family member.
+    pub async fn get_session_for_coordination(
+        &self,
+        caller_session_id: &str,
+        target_session_id: &str,
+    ) -> Result<GetSessionToolResult> {
+        let relation =
+            self.authorize_registered_coordination(caller_session_id, target_session_id)?;
+        let snapshot = self.coordination_snapshot(target_session_id).await?;
+        let metadata = &snapshot.metadata;
+        let transcript_tail = snapshot
+            .transcript
+            .iter()
+            .rev()
+            .take(4)
+            .collect::<Vec<_>>()
+            .into_iter()
+            .rev()
+            .map(|message| SessionTranscriptEntry {
+                role: transcript_role_label(message.role).to_owned(),
+                content: bounded_text(&message.content, 1_000),
+            })
+            .collect();
+        let latest_assistant_result = snapshot
+            .transcript
+            .iter()
+            .rev()
+            .find(|message| {
+                message.role == TranscriptRole::Assistant
+                    && message.state == app_model::TranscriptState::Complete
+            })
+            .map(|message| bounded_text(&message.content, 4_000));
+        let pending_plan_summary = snapshot
+            .pending_interactions
+            .iter()
+            .find(|interaction| interaction.kind == InteractionKind::ExitPlanMode)
+            .map(|interaction| {
+                interaction
+                    .details
+                    .get("plan")
+                    .or_else(|| interaction.details.get("summary"))
+                    .and_then(Value::as_str)
+                    .map_or_else(
+                        || bounded_text(&interaction.message, 2_000),
+                        |plan| bounded_text(plan, 2_000),
+                    )
+            });
+        let totals = snapshot.changes.totals();
+        let changes = SessionChangeSummary {
+            branch: snapshot
+                .changes
+                .branch
+                .as_deref()
+                .map(|branch| bounded_text(branch, 256)),
+            head: snapshot
+                .changes
+                .head
+                .as_deref()
+                .map(|head| bounded_text(head, 256)),
+            base: snapshot
+                .changes
+                .base_label
+                .as_deref()
+                .or(metadata.base_ref.as_deref())
+                .map(|base| bounded_text(base, 256)),
+            files_changed: snapshot.changes.files.len(),
+            insertions: totals.insertions,
+            deletions: totals.deletions,
+            paths: snapshot
+                .changes
+                .files
+                .iter()
+                .take(20)
+                .map(|file| bounded_text(&file.path, 240))
+                .collect(),
+            error: snapshot
+                .changes
+                .error
+                .as_deref()
+                .map(|error| bounded_text(error, 500)),
+        };
+        Ok(GetSessionToolResult {
+            app_session_id: metadata.id.clone(),
+            relationship: coordination_relation_label(&relation).to_owned(),
+            title: bounded_text(&metadata.title, 120),
+            status: session_status_label(snapshot.status).to_owned(),
+            project: bounded_text(metadata.project_key(), 1_024),
+            worktree: bounded_text(&metadata.project_path, 1_024),
+            branch: snapshot
+                .changes
+                .branch
+                .as_deref()
+                .map(|branch| bounded_text(branch, 256)),
+            latest_assistant_result,
+            transcript_tail,
+            pending_plan_summary,
+            changes,
+        })
+    }
+
+    /// Persist and schedule an idempotent parent/descendant message.
+    pub async fn send_session_message(
+        &self,
+        caller_session_id: &str,
+        tool_call_id: &str,
+        target_session_id: &str,
+        message: &str,
+        delivery: SessionMessageDelivery,
+    ) -> Result<SendSessionMessageToolResult> {
+        let relation =
+            self.authorize_registered_coordination(caller_session_id, target_session_id)?;
+        if relation == CoordinationRelation::SelfSession {
+            return Err(StorageError::CoordinationUnrelated {
+                caller: caller_session_id.to_owned(),
+                target: target_session_id.to_owned(),
+            }
+            .into());
+        }
+        let sender = self
+            .storage
+            .session_metadata(caller_session_id)?
+            .ok_or_else(|| SessionManagerError::SessionNotFound(caller_session_id.to_owned()))?;
+        let now = timestamp();
+        let coordination_id = Uuid::new_v4().to_string();
+        let queue_item_id = Uuid::new_v4().to_string();
+        let queue_delivery = match delivery {
+            SessionMessageDelivery::Immediate => QueueDelivery::Steer,
+            SessionMessageDelivery::Queued => QueueDelivery::WhenIdle,
+        };
+        let record = CoordinationRecord {
+            id: coordination_id.clone(),
+            sender_session_id: caller_session_id.to_owned(),
+            recipient_session_id: target_session_id.to_owned(),
+            kind: CoordinationKind::Message,
+            delivery: coordination_delivery(delivery),
+            state: CoordinationState::Pending,
+            body: message.to_owned(),
+            queue_item_id: Some(queue_item_id.clone()),
+            dedupe_id: format!("tool:{tool_call_id}"),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            delivered_at: None,
+            read_at: None,
+            error: None,
+        };
+        let queue_item = QueueItem {
+            id: queue_item_id,
+            session_id: target_session_id.to_owned(),
+            position: self.storage.next_queue_position(target_session_id)?,
+            prompt: format!(
+                "Cross-session message from {} ({}):\n\n{}\n\n[GCABB coordination id: {coordination_id}]",
+                sender.title, sender.id, message,
+            ),
+            display_prompt: Some(format!("Message from {}", sender.title)),
+            state: QueueItemState::Pending,
+            delivery: queue_delivery,
+            agent_mode: None,
+            created_at: now.clone(),
+            updated_at: now,
+            error: None,
+        };
+        let stored = self
+            .storage
+            .create_coordination_item(&record, Some(&queue_item))?;
+        self.sync_live_queue(&stored.recipient_session_id).await?;
+        let stored_delivery = match stored.delivery {
+            CoordinationDelivery::Immediate => SessionMessageDelivery::Immediate,
+            CoordinationDelivery::WhenIdle => SessionMessageDelivery::Queued,
+        };
+        Ok(SendSessionMessageToolResult {
+            message_id: stored.id,
+            recipient_app_session_id: stored.recipient_session_id,
+            delivery: stored_delivery,
+            state: coordination_state_label(&stored.state).to_owned(),
+        })
+    }
+
+    /// Persist a once-only child completion and queue it for the parent.
+    pub async fn handle_child_lifecycle(
+        &self,
+        event: &ChildLifecycleEvent,
+    ) -> Result<Option<CoordinationRecord>> {
+        if self
+            .storage
+            .host_tool_notify_on_idle(&event.child_session_id)?
+            .as_deref()
+            != Some("once")
+        {
+            return Ok(None);
+        }
+        let child = self
+            .storage
+            .session_metadata(&event.child_session_id)?
+            .ok_or_else(|| SessionManagerError::SessionNotFound(event.child_session_id.clone()))?;
+        let parent_session_id = child.parent_session_id.clone().ok_or_else(|| {
+            SessionManagerError::SessionNotFound(format!(
+                "parent for child {}",
+                event.child_session_id
+            ))
+        })?;
+        self.authorize_registered_coordination(&event.child_session_id, &parent_session_id)?;
+        let status = event.status.as_str();
+        let coordination_id = Uuid::new_v4().to_string();
+        let prompt = format!(
+            "Child session \"{}\" ({}) is {status}. Call get_session with session_id \"{}\" for bounded details.\n\n[GCABB coordination id: {coordination_id}]",
+            event.title, event.child_session_id, event.child_session_id,
+        );
+        let now = timestamp();
+        let queue_item_id = Uuid::new_v4().to_string();
+        let record = CoordinationRecord {
+            id: coordination_id.clone(),
+            sender_session_id: event.child_session_id.clone(),
+            recipient_session_id: parent_session_id.clone(),
+            kind: CoordinationKind::ChildCompletion,
+            delivery: CoordinationDelivery::WhenIdle,
+            state: CoordinationState::Pending,
+            body: json!({
+                "child_session_id": event.child_session_id,
+                "title": event.title,
+                "status": status
+            })
+            .to_string(),
+            queue_item_id: Some(queue_item_id.clone()),
+            dedupe_id: "child-completion-once".to_owned(),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            delivered_at: None,
+            read_at: None,
+            error: None,
+        };
+        let queue_item = QueueItem {
+            id: queue_item_id,
+            session_id: parent_session_id.clone(),
+            position: self.storage.next_queue_position(&parent_session_id)?,
+            prompt,
+            display_prompt: Some(format!("Child {status}: {}", event.title)),
+            state: QueueItemState::Pending,
+            delivery: QueueDelivery::WhenIdle,
+            agent_mode: None,
+            created_at: now.clone(),
+            updated_at: now,
+            error: None,
+        };
+        let stored = self
+            .storage
+            .create_coordination_item(&record, Some(&queue_item))?;
+        if stored.id != coordination_id {
+            return Ok(None);
+        }
+        self.sync_live_queue(&parent_session_id).await?;
+        Ok(Some(stored))
+    }
+
+    pub fn unread_child_notifications(&self) -> Result<Vec<(String, String, String)>> {
+        let mut unread = Vec::new();
+        for session in self.storage.list_sessions()? {
+            for record in self
+                .storage
+                .list_unread_child_completion_items(&session.id, 100)?
+            {
+                let status = serde_json::from_str::<Value>(&record.body)
+                    .ok()
+                    .and_then(|body| {
+                        body.get("status")
+                            .and_then(Value::as_str)
+                            .map(str::to_owned)
+                    })
+                    .unwrap_or_else(|| "completed".to_owned());
+                unread.push((
+                    record.recipient_session_id,
+                    record.sender_session_id,
+                    status,
+                ));
+            }
+        }
+        Ok(unread)
+    }
+
+    pub fn mark_child_notification_read(
+        &self,
+        parent_session_id: &str,
+        child_session_id: &str,
+    ) -> Result<usize> {
+        self.storage
+            .mark_child_completion_notifications_read(
+                parent_session_id,
+                child_session_id,
+                &timestamp(),
+            )
+            .map_err(Into::into)
+    }
+
+    fn authorize_registered_coordination(
+        &self,
+        caller_session_id: &str,
+        target_session_id: &str,
+    ) -> Result<CoordinationRelation> {
+        let relation = self
+            .storage
+            .authorize_coordination(caller_session_id, target_session_id)?;
+        let caller = self
+            .storage
+            .session_metadata(caller_session_id)?
+            .ok_or_else(|| SessionManagerError::SessionNotFound(caller_session_id.to_owned()))?;
+        if !self
+            .storage
+            .list_projects()?
+            .iter()
+            .any(|project| project.path == caller.project_key())
+        {
+            return Err(SessionManagerError::SessionNotFound(format!(
+                "registered project for session {caller_session_id}"
+            )));
+        }
+        Ok(relation)
+    }
+
+    async fn coordination_snapshot(&self, target_session_id: &str) -> Result<Arc<SessionSnapshot>> {
+        if let Ok(handle) = self.session(target_session_id).await {
+            return Ok(handle.snapshot());
+        }
+        Ok(Arc::new(
+            self.storage.recover_session(target_session_id)?.state,
+        ))
+    }
+
+    async fn sync_live_queue(&self, target_session_id: &str) -> Result<()> {
+        if let Ok(handle) = self.session(target_session_id).await {
+            handle.sync_queue().await?;
+        }
+        Ok(())
     }
 
     pub fn is_session_archived(&self, app_session_id: &str) -> Result<bool> {
@@ -1949,6 +2302,7 @@ impl SessionManager {
         let reconcile_started = Instant::now();
         reconcile_history(&self.storage, &mut state, history)?;
         let reconcile_ms = elapsed_ms(reconcile_started);
+        let recovered_child_lifecycle = restored_child_lifecycle(metadata, &state);
         let controls_started = Instant::now();
         state.controls = match provider.controls(&metadata.sdk_session_id).await {
             Ok(controls) => controls,
@@ -1969,6 +2323,11 @@ impl SessionManager {
         self.storage.write_snapshot(&state)?;
         let persistence_ms = elapsed_ms(persistence_started);
         let handle = self.spawn_actor(provider.clone(), isolated, state, provider_session);
+        if let (Some(gateway), Some(event)) =
+            (self.host_tool_gateway.as_ref(), recovered_child_lifecycle)
+        {
+            gateway.notify_child_lifecycle(event).await;
+        }
         self.record_restore_success(
             metadata.id.clone(),
             timing.started,
@@ -2127,6 +2486,7 @@ impl SessionManager {
             last_base_refresh: Instant::now(),
             commands: command_rx,
             snapshots: snapshot_tx,
+            host_tool_gateway: self.host_tool_gateway.clone(),
         };
         tokio::spawn(actor.run());
         SessionHandle {
@@ -2258,6 +2618,7 @@ pub enum QueueCommand {
         paused: bool,
     },
     Clear,
+    Sync,
 }
 
 enum SessionCommandKind {
@@ -2300,12 +2661,14 @@ struct SessionActor {
     last_base_refresh: Instant,
     commands: mpsc::Receiver<SessionCommand>,
     snapshots: watch::Sender<Arc<SessionSnapshot>>,
+    host_tool_gateway: Option<HostToolGateway>,
 }
 
 impl SessionActor {
     async fn run(mut self) {
         self.load_queue();
         self.publish(false);
+        self.drain_queue().await;
         loop {
             tokio::select! {
                 event = self.provider_events.recv() => {
@@ -2410,6 +2773,7 @@ impl SessionActor {
         let sequence = self.state.last_sequence + 1;
         let event = DomainEvent::from_sdk_event_for(&self.state.metadata.id, sequence, raw);
         let output_updates = app_model::tools::output_updates(&self.state.tool_activity, &event);
+        let previous_status = self.state.status;
         match self
             .storage
             .append_event_with_output(&event, &output_updates)
@@ -2420,6 +2784,7 @@ impl SessionActor {
                     if applied == ApplyOutcome::Applied {
                         let force_snapshot = self.state.status == SessionStatus::Idle
                             || self.state.status == SessionStatus::Failed
+                            || self.state.status == SessionStatus::Cancelled
                             || self.state.last_sequence.is_multiple_of(SNAPSHOT_INTERVAL);
                         self.publish(force_snapshot);
                         true
@@ -2430,13 +2795,39 @@ impl SessionActor {
                 if refresh_after {
                     self.refresh_changes_if_needed(raw).await;
                     self.sync_queue(raw).await;
+                    self.notify_parent_of_terminal_transition(previous_status)
+                        .await;
                 }
             }
+
             Ok(false) => {
                 self.state.last_sequence = sequence;
                 tracing::debug!(event_id = event.id, "duplicate event ignored");
             }
             Err(error) => self.record_actor_error("append_event", &error.to_string()),
+        }
+    }
+
+    async fn notify_parent_of_terminal_transition(&self, previous_status: SessionStatus) {
+        if self.state.metadata.launch_origin != SessionLaunchOrigin::AgentTool
+            || !previous_status.is_busy()
+        {
+            return;
+        }
+        let status = match self.state.status {
+            SessionStatus::Idle => ChildLifecycleStatus::Idle,
+            SessionStatus::Failed => ChildLifecycleStatus::Failed,
+            SessionStatus::Cancelled => ChildLifecycleStatus::Cancelled,
+            _ => return,
+        };
+        if let Some(gateway) = &self.host_tool_gateway {
+            gateway
+                .notify_child_lifecycle(ChildLifecycleEvent {
+                    child_session_id: self.state.metadata.id.clone(),
+                    title: self.state.metadata.title.clone(),
+                    status,
+                })
+                .await;
         }
     }
 
@@ -2705,6 +3096,25 @@ impl SessionActor {
     /// Load the durable queue into the snapshot.
     fn load_queue(&mut self) {
         let session_id = self.state.metadata.id.clone();
+        let delivered_prompts = self
+            .state
+            .transcript
+            .iter()
+            .rev()
+            .filter(|message| {
+                message.role == TranscriptRole::User
+                    && message.state == app_model::TranscriptState::Complete
+            })
+            .take(100)
+            .map(|message| message.content.clone())
+            .collect::<HashSet<_>>();
+        if let Err(error) = self.storage.reconcile_coordination_queue_delivery(
+            &session_id,
+            &delivered_prompts,
+            &timestamp(),
+        ) {
+            self.record_actor_error("reconcile_coordination_queue_delivery", &error.to_string());
+        }
         match self.storage.queue_view(&session_id) {
             Ok(queue) => self.state.queue = queue,
             Err(error) => self.record_actor_error("queue_view", &error.to_string()),
@@ -2781,6 +3191,7 @@ impl SessionActor {
                     self.storage.delete_queue_item(&item.id)?;
                 }
             }
+            QueueCommand::Sync => {}
         }
         self.reload_queue()?;
         self.publish(false);
@@ -2833,16 +3244,23 @@ impl SessionActor {
     /// One item at a time: the next is delivered when the session next goes
     /// idle, so a follow-up stays editable until the moment it is dispatched.
     async fn drain_queue(&mut self) {
-        if self.state.status != SessionStatus::Idle {
-            return;
-        }
-        if self.complete_dispatched() {
+        let is_idle = self.state.status == SessionStatus::Idle;
+        if is_idle && self.complete_dispatched() {
             self.publish(false);
         }
         if self.state.queue.paused {
             return;
         }
-        let Some(mut item) = self.state.queue.next_pending().cloned() else {
+        let next = if is_idle {
+            self.state.queue.next_pending()
+        } else {
+            self.state
+                .queue
+                .pending()
+                .filter(|item| item.delivery == QueueDelivery::Steer)
+                .min_by_key(|item| item.position)
+        };
+        let Some(mut item) = next.cloned() else {
             return;
         };
         let request = QueueDeliveryRequest {
@@ -3098,6 +3516,81 @@ fn timestamp() -> String {
         |_| "0".to_owned(),
         |duration| duration.as_millis().to_string(),
     )
+}
+
+fn restored_child_lifecycle(
+    metadata: &SessionMetadata,
+    state: &SessionSnapshot,
+) -> Option<ChildLifecycleEvent> {
+    (metadata.launch_origin == SessionLaunchOrigin::AgentTool && state.last_sequence > 0).then(
+        || ChildLifecycleEvent {
+            child_session_id: metadata.id.clone(),
+            title: metadata.title.clone(),
+            status: match state.status {
+                SessionStatus::Failed => ChildLifecycleStatus::Failed,
+                SessionStatus::Cancelled => ChildLifecycleStatus::Cancelled,
+                _ => ChildLifecycleStatus::Idle,
+            },
+        },
+    )
+}
+
+fn bounded_text(value: &str, max_chars: usize) -> String {
+    if value.chars().count() <= max_chars {
+        return value.to_owned();
+    }
+    let mut bounded = value
+        .chars()
+        .take(max_chars.saturating_sub(1))
+        .collect::<String>();
+    bounded.push('…');
+    bounded
+}
+
+const fn coordination_relation_label(relation: &CoordinationRelation) -> &'static str {
+    match relation {
+        CoordinationRelation::SelfSession => "self",
+        CoordinationRelation::Ancestor => "ancestor",
+        CoordinationRelation::Descendant => "descendant",
+    }
+}
+
+const fn coordination_delivery(delivery: SessionMessageDelivery) -> CoordinationDelivery {
+    match delivery {
+        SessionMessageDelivery::Immediate => CoordinationDelivery::Immediate,
+        SessionMessageDelivery::Queued => CoordinationDelivery::WhenIdle,
+    }
+}
+
+const fn coordination_state_label(state: &CoordinationState) -> &'static str {
+    match state {
+        CoordinationState::Pending => "pending",
+        CoordinationState::Dispatched => "dispatched",
+        CoordinationState::Delivered => "delivered",
+        CoordinationState::Failed => "failed",
+    }
+}
+
+const fn transcript_role_label(role: TranscriptRole) -> &'static str {
+    match role {
+        TranscriptRole::User => "user",
+        TranscriptRole::Assistant => "assistant",
+        TranscriptRole::System => "system",
+    }
+}
+
+const fn session_status_label(status: SessionStatus) -> &'static str {
+    match status {
+        SessionStatus::Starting => "starting",
+        SessionStatus::Recovering => "recovering",
+        SessionStatus::Running => "running",
+        SessionStatus::Waiting => "waiting",
+        SessionStatus::Idle => "idle",
+        SessionStatus::Failed => "failed",
+        SessionStatus::Cancelled => "cancelled",
+        SessionStatus::Disconnected => "disconnected",
+        SessionStatus::Unavailable => "unavailable",
+    }
 }
 
 fn elapsed_ms(started: Instant) -> u64 {
