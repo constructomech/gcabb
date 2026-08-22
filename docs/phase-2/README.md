@@ -48,6 +48,19 @@ Pending requests keep the session in `Waiting` even when unrelated nested events
 arrive. Close and shutdown cancel all pending callbacks before disconnecting so
 the SDK event loop cannot deadlock.
 
+## App-session host tools
+
+Custom SDK tools use a separate narrow request/one-shot response gateway. The
+provider's `ToolHandler` owns only a sender plus the host-bound app session id;
+it never holds the session manager or orchestrator. The desktop consumes those
+requests and calls `SessionOrchestrator::launch`, avoiding a provider-manager-
+orchestrator ownership cycle while keeping orchestration policy at app level.
+
+Agent-created child metadata, including parent id, provenance, and SDK tool-call
+identity, is written in the initial session insert before kickoff is submitted.
+The relationship therefore survives restart and cannot produce an unowned
+successful launch if hydration is interrupted.
+
 ## Transcript projection
 
 The reducer:

@@ -250,6 +250,9 @@ impl AutomationContext {
                 base_ref: None,
                 repository_root: repository,
                 kind,
+                parent_session_id: None,
+                launch_origin: app_model::SessionLaunchOrigin::User,
+                host_tool_call_id: None,
                 // Headless: a permission prompt would park the session in
                 // `Waiting` with no window in which to answer it.
                 unattended: true,
@@ -486,6 +489,9 @@ mod tests {
                 title: "Automation: maintenance".to_owned(),
                 title_source: TitleSource::Manual,
                 kind: SessionKind::Chat,
+                parent_session_id: None,
+                launch_origin: app_model::SessionLaunchOrigin::User,
+                host_tool_call_id: None,
                 model: None,
                 mode: Some("autopilot".to_owned()),
                 base_ref: None,

@@ -8,12 +8,13 @@ use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 use app_model::{
     ApplyOutcome, CapabilityId, CapabilityReport, CapabilityStatus, DomainEvent,
     InteractionResponse, OutputStreamKind, ProjectMetadata, PromptAttachment, QueueDelivery,
-    QueueItem, QueueItemState, SessionKind, SessionMetadata, SessionSnapshot, SessionStatus,
-    TitleSource, ToolCatalog,
+    QueueItem, QueueItemState, SessionKind, SessionLaunchOrigin, SessionMetadata, SessionSnapshot,
+    SessionStatus, TitleSource, ToolCatalog,
 };
 use copilot_provider::{
-    AgentProvider, AgentProviderFactory, ProviderCompatibility, ProviderError, ProviderEvent,
-    ProviderInteraction, ProviderSession, QueueDeliveryRequest, SessionRequest,
+    AgentProvider, AgentProviderFactory, HostToolBinding, HostToolGateway, ProviderCompatibility,
+    ProviderError, ProviderEvent, ProviderInteraction, ProviderSession, QueueDeliveryRequest,
+    SessionRequest,
 };
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
 use git_service::GitService;
@@ -232,6 +233,9 @@ pub struct CreateSessionRequest {
     pub repository_root: Option<String>,
     /// Whether this is a project session or a standalone chat.
     pub kind: SessionKind,
+    pub parent_session_id: Option<String>,
+    pub launch_origin: SessionLaunchOrigin,
+    pub host_tool_call_id: Option<String>,
     /// Whether the session runs without a human who could answer prompts.
     ///
     /// Automation runs have no window and no one to approve a permission
@@ -592,6 +596,7 @@ pub struct SessionManager {
     restoring: Mutex<HashSet<String>>,
     sessions: Mutex<HashMap<String, SessionRuntime>>,
     roots: SessionRoots,
+    host_tool_gateway: Option<HostToolGateway>,
 }
 
 impl SessionManager {
@@ -612,12 +617,19 @@ impl SessionManager {
             restoring: Mutex::new(HashSet::new()),
             sessions: Mutex::new(HashMap::new()),
             roots: SessionRoots::default(),
+            host_tool_gateway: None,
         }
     }
 
     #[must_use]
     pub fn with_session_roots(mut self, roots: SessionRoots) -> Self {
         self.roots = roots;
+        self
+    }
+
+    #[must_use]
+    pub fn with_host_tool_gateway(mut self, gateway: HostToolGateway) -> Self {
+        self.host_tool_gateway = Some(gateway);
         self
     }
 
@@ -776,6 +788,7 @@ impl SessionManager {
     }
 
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionHandle> {
+        let _lifecycle = self.lifecycle.lock().await;
         let app_session_id = Uuid::new_v4().to_string();
         let auto_approve_tools = auto_approves_tools(&request);
         let provider = self.provider_factory.create(&request.project_path);
@@ -802,6 +815,10 @@ impl SessionManager {
                     reasoning_effort: request.reasoning_effort.clone(),
                     context_tier: request.context_tier.clone(),
                     auto_approve_tools,
+                    host_tools: self
+                        .host_tool_gateway
+                        .clone()
+                        .map(|gateway| HostToolBinding::new(gateway, app_session_id.clone())),
                 })
                 .await?;
             Self::select_agent_or_disconnect(
@@ -817,36 +834,18 @@ impl SessionManager {
                     return Err(error.into());
                 }
             };
-            let now = timestamp();
-            let metadata = SessionMetadata {
-                id: app_session_id.clone(),
-                sdk_session_id: provider_session.sdk_session_id.clone(),
-                project_path: request.project_path.to_string_lossy().into_owned(),
-                repository_root: request.repository_root,
-                title: request.title,
-                title_source: request.title_source,
-                kind: request.kind,
-                model: request.model,
-                mode: request.mode,
-                base_ref: request.base_ref,
-                created_at: now.clone(),
-                updated_at: now,
-            };
+            let metadata = metadata_from_create_request(
+                &app_session_id,
+                &provider_session.sdk_session_id,
+                &request,
+            );
             if let Err(error) = self.storage.upsert_session(&metadata) {
                 let _ = provider.disconnect(&provider_session.sdk_session_id).await;
                 return Err(error.into());
             }
             let mut state = SessionSnapshot::new(metadata);
             state.controls = controls;
-            if request.reasoning_effort.is_some() {
-                state.controls.reasoning_effort = request.reasoning_effort;
-            }
-            if request.context_tier.is_some() {
-                state.controls.context_tier = request.context_tier;
-            }
-            if request.agent.is_some() {
-                state.controls.agent = request.agent;
-            }
+            apply_initial_controls(&mut state, &request);
             // Prove inherited tool capabilities through the SDK before the first
             // prompt, so a runtime that is missing file or shell tools is visible
             // as capability state rather than as an unexplained model failure.
@@ -1061,6 +1060,34 @@ impl SessionManager {
 
     pub fn session_metadata(&self) -> Result<Vec<SessionMetadata>> {
         self.storage.list_sessions().map_err(Into::into)
+    }
+
+    pub fn session_metadata_by_id(&self, app_session_id: &str) -> Result<Option<SessionMetadata>> {
+        self.storage
+            .session_metadata(app_session_id)
+            .map_err(Into::into)
+    }
+
+    pub fn session_for_tool_call(
+        &self,
+        parent_session_id: &str,
+        tool_call_id: &str,
+    ) -> Result<Option<storage::HostToolSession>> {
+        self.storage
+            .session_for_tool_call(parent_session_id, tool_call_id)
+            .map_err(Into::into)
+    }
+
+    pub fn complete_host_tool_launch(&self, child_session_id: &str) -> Result<()> {
+        self.storage
+            .complete_host_tool_launch(child_session_id)
+            .map_err(Into::into)
+    }
+
+    pub fn is_session_archived(&self, app_session_id: &str) -> Result<bool> {
+        self.storage
+            .is_session_archived(app_session_id)
+            .map_err(Into::into)
     }
 
     /// Rename a session.
@@ -1419,6 +1446,7 @@ impl SessionManager {
                 worktree: None,
             });
         };
+        self.storage.validate_session_unarchive(app_session_id)?;
         let worktree = Self::rebuild_worktree(&record);
         self.diagnostics.record(DiagnosticEvent {
             timestamp: timestamp(),
@@ -1888,6 +1916,10 @@ impl SessionManager {
                     mode: metadata.mode.clone(),
                     reasoning_effort: state.controls.reasoning_effort.clone(),
                     context_tier: state.controls.context_tier.clone(),
+                    host_tools: self
+                        .host_tool_gateway
+                        .clone()
+                        .map(|gateway| HostToolBinding::new(gateway, metadata.id.clone())),
                 },
             )
             .await?;
@@ -3086,6 +3118,49 @@ fn auto_approves_tools(request: &CreateSessionRequest) -> bool {
         )
 }
 
+fn metadata_from_create_request(
+    app_session_id: &str,
+    sdk_session_id: &str,
+    request: &CreateSessionRequest,
+) -> SessionMetadata {
+    let now = timestamp();
+    SessionMetadata {
+        id: app_session_id.to_owned(),
+        sdk_session_id: sdk_session_id.to_owned(),
+        project_path: request.project_path.to_string_lossy().into_owned(),
+        repository_root: request.repository_root.clone(),
+        title: request.title.clone(),
+        title_source: request.title_source,
+        kind: request.kind,
+        parent_session_id: request.parent_session_id.clone(),
+        launch_origin: request.launch_origin,
+        host_tool_call_id: request.host_tool_call_id.clone(),
+        model: request.model.clone(),
+        mode: request.mode.clone(),
+        base_ref: request.base_ref.clone(),
+        created_at: now.clone(),
+        updated_at: now,
+    }
+}
+
+fn apply_initial_controls(state: &mut SessionSnapshot, request: &CreateSessionRequest) {
+    if request.reasoning_effort.is_some() {
+        state
+            .controls
+            .reasoning_effort
+            .clone_from(&request.reasoning_effort);
+    }
+    if request.context_tier.is_some() {
+        state
+            .controls
+            .context_tier
+            .clone_from(&request.context_tier);
+    }
+    if request.agent.is_some() {
+        state.controls.agent.clone_from(&request.agent);
+    }
+}
+
 fn is_gcabb_worktree(
     kind: SessionKind,
     working_directory: &Path,
@@ -3185,6 +3260,9 @@ mod tests {
             title: "Foundation test".to_owned(),
             title_source: TitleSource::Manual,
             kind: SessionKind::Project,
+            parent_session_id: None,
+            launch_origin: SessionLaunchOrigin::User,
+            host_tool_call_id: None,
             model: None,
             mode: Some("interactive".to_owned()),
             agent: None,
@@ -3546,6 +3624,9 @@ mod tests {
             title: "Broken restore".to_owned(),
             title_source: TitleSource::Manual,
             kind: SessionKind::Project,
+            parent_session_id: None,
+            launch_origin: SessionLaunchOrigin::User,
+            host_tool_call_id: None,
             model: None,
             mode: None,
             base_ref: None,
@@ -3588,6 +3669,7 @@ mod tests {
                 reasoning_effort: None,
                 context_tier: None,
                 auto_approve_tools: false,
+                host_tools: None,
             })
             .await
             .unwrap();
@@ -3602,6 +3684,9 @@ mod tests {
             title: "Deleted worktree".to_owned(),
             title_source: TitleSource::Manual,
             kind: SessionKind::Project,
+            parent_session_id: None,
+            launch_origin: SessionLaunchOrigin::User,
+            host_tool_call_id: None,
             model: None,
             mode: None,
             base_ref: None,
@@ -3682,6 +3767,9 @@ mod tests {
             title: "Archive me".to_owned(),
             title_source: TitleSource::Manual,
             kind: SessionKind::Project,
+            parent_session_id: None,
+            launch_origin: SessionLaunchOrigin::User,
+            host_tool_call_id: None,
             model: None,
             mode: None,
             base_ref: Some("main".to_owned()),
@@ -3785,6 +3873,9 @@ mod tests {
             title: "Archive twice".to_owned(),
             title_source: TitleSource::Manual,
             kind: SessionKind::Project,
+            parent_session_id: None,
+            launch_origin: SessionLaunchOrigin::User,
+            host_tool_call_id: None,
             model: None,
             mode: None,
             base_ref: Some("main".to_owned()),
@@ -3846,6 +3937,9 @@ mod tests {
             title: "Unrestorable".to_owned(),
             title_source: TitleSource::Manual,
             kind: SessionKind::Project,
+            parent_session_id: None,
+            launch_origin: SessionLaunchOrigin::User,
+            host_tool_call_id: None,
             model: None,
             mode: None,
             base_ref: Some("main".to_owned()),
@@ -3903,6 +3997,9 @@ mod tests {
             title: "A chat".to_owned(),
             title_source: TitleSource::Manual,
             kind: SessionKind::Chat,
+            parent_session_id: None,
+            launch_origin: SessionLaunchOrigin::User,
+            host_tool_call_id: None,
             model: None,
             mode: None,
             base_ref: None,
@@ -3942,6 +4039,9 @@ mod tests {
             title: "Doomed".to_owned(),
             title_source: TitleSource::Manual,
             kind: SessionKind::Chat,
+            parent_session_id: None,
+            launch_origin: SessionLaunchOrigin::User,
+            host_tool_call_id: None,
             model: None,
             mode: None,
             base_ref: None,
@@ -3988,6 +4088,7 @@ mod tests {
                 reasoning_effort: None,
                 context_tier: None,
                 auto_approve_tools: true,
+                host_tools: None,
             })
             .await
             .unwrap();
@@ -4001,6 +4102,9 @@ mod tests {
             title: "Recover worktree".to_owned(),
             title_source: TitleSource::Manual,
             kind: SessionKind::Project,
+            parent_session_id: None,
+            launch_origin: SessionLaunchOrigin::User,
+            host_tool_call_id: None,
             model: None,
             mode: None,
             base_ref: Some("main".to_owned()),
@@ -4404,6 +4508,9 @@ mod tests {
                     title: "Legacy".to_owned(),
                     title_source: TitleSource::Manual,
                     kind: SessionKind::Project,
+                    parent_session_id: None,
+                    launch_origin: SessionLaunchOrigin::User,
+                    host_tool_call_id: None,
                     model: None,
                     mode: None,
                     base_ref: None,
@@ -4473,6 +4580,9 @@ mod tests {
                 title: "Already adopted".to_owned(),
                 title_source: TitleSource::Manual,
                 kind: SessionKind::Project,
+                parent_session_id: None,
+                launch_origin: SessionLaunchOrigin::User,
+                host_tool_call_id: None,
                 model: None,
                 mode: None,
                 base_ref: None,

@@ -5,15 +5,16 @@ use std::path::Path;
 use std::sync::{Mutex, MutexGuard};
 
 use app_model::{
-    Automation, AutomationRun, DomainEvent, OutputMetadata, OutputStreamKind, OutputStreamUpdate,
-    ProjectMetadata, QueueDelivery, QueueItem, QueueItemState, QueueView, SessionKind,
-    SessionMetadata, SessionSnapshot, TitleSource, ToolActivity, rebuild,
+    Automation, AutomationRun, DomainEvent, MAX_ACTIVE_DIRECT_CHILDREN, MAX_SESSION_NESTING_DEPTH,
+    OutputMetadata, OutputStreamKind, OutputStreamUpdate, ProjectMetadata, QueueDelivery,
+    QueueItem, QueueItemState, QueueView, SessionKind, SessionLaunchOrigin, SessionMetadata,
+    SessionSnapshot, TitleSource, ToolActivity, rebuild,
 };
 use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 10;
+const SCHEMA_VERSION: i64 = 11;
 /// Gap left between queue positions so an item can be moved between two
 /// neighbours without renumbering the rest of the queue.
 const QUEUE_POSITION_STRIDE: i64 = 1024;
@@ -31,6 +32,24 @@ pub enum StorageError {
     LockPoisoned,
     #[error("session not found: {0}")]
     SessionNotFound(String),
+    #[error("parent session not found or archived: {0}")]
+    ParentSessionNotFound(String),
+    #[error("child session must belong to the same project as parent session {0}")]
+    ParentProjectMismatch(String),
+    #[error("session parent relationship would create a cycle")]
+    ParentCycle,
+    #[error("agent-created sessions require a parent and host tool-call identity")]
+    InvalidChildProvenance,
+    #[error("session nesting exceeds the maximum depth of {MAX_SESSION_NESTING_DEPTH}")]
+    ParentDepthLimit,
+    #[error(
+        "parent session already has the maximum of {MAX_ACTIVE_DIRECT_CHILDREN} active children"
+    )]
+    ActiveChildLimit,
+    #[error("host-tool launch record not found for child session: {0}")]
+    HostToolLaunchNotFound(String),
+    #[error("host-tool call was already used by another or deleted child session")]
+    HostToolCallAlreadyUsed,
     #[error(
         "output stream {kind}/{identity} is incomplete: expected {expected} chunks, read {actual}"
     )]
@@ -51,6 +70,11 @@ pub struct Storage {
 pub struct RecoveredSession {
     pub state: SessionSnapshot,
     pub replayed_events: usize,
+}
+
+pub struct HostToolSession {
+    pub metadata: Option<SessionMetadata>,
+    pub launch_completed: bool,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -119,11 +143,17 @@ impl Storage {
     }
 
     pub fn upsert_session(&self, metadata: &SessionMetadata) -> Result<()> {
-        self.connection()?.execute(
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let launch_depth = validate_parent(&transaction, metadata)?;
+        transaction.execute(
             "INSERT INTO app_sessions (
                 id, sdk_session_id, project_path, repository_root, title, title_source,
-                kind, model, mode, base_ref, created_at, updated_at
-             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)
+                kind, parent_session_id, launch_origin, host_tool_call_id, model, mode, base_ref,
+                launch_depth, created_at, updated_at
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+             )
              ON CONFLICT(id) DO UPDATE SET
                 sdk_session_id = excluded.sdk_session_id,
                 project_path = excluded.project_path,
@@ -131,6 +161,9 @@ impl Storage {
                 title = excluded.title,
                 title_source = excluded.title_source,
                 kind = excluded.kind,
+                parent_session_id = excluded.parent_session_id,
+                launch_origin = excluded.launch_origin,
+                host_tool_call_id = excluded.host_tool_call_id,
                 model = excluded.model,
                 mode = excluded.mode,
                 base_ref = excluded.base_ref,
@@ -143,13 +176,49 @@ impl Storage {
                 metadata.title,
                 metadata.title_source.as_str(),
                 metadata.kind.as_str(),
+                metadata.parent_session_id,
+                metadata.launch_origin.as_str(),
+                metadata.host_tool_call_id,
                 metadata.model,
                 metadata.mode,
                 metadata.base_ref,
+                launch_depth,
                 metadata.created_at,
                 metadata.updated_at,
             ],
         )?;
+        if let (Some(parent_session_id), Some(tool_call_id)) = (
+            metadata.parent_session_id.as_deref(),
+            metadata.host_tool_call_id.as_deref(),
+        ) {
+            let existing_child = transaction
+                .query_row(
+                    "SELECT child_session_id FROM host_tool_launches
+                     WHERE parent_session_id = ?1 AND tool_call_id = ?2",
+                    params![parent_session_id, tool_call_id],
+                    |row| row.get::<_, Option<String>>(0),
+                )
+                .optional()?;
+            if existing_child.is_some()
+                && existing_child
+                    .as_ref()
+                    .and_then(Option::as_ref)
+                    .map(String::as_str)
+                    != Some(metadata.id.as_str())
+            {
+                return Err(StorageError::HostToolCallAlreadyUsed);
+            }
+            transaction.execute(
+                "INSERT INTO host_tool_launches (
+                    parent_session_id, tool_call_id, child_session_id, completed
+                 ) VALUES (?1, ?2, ?3, 0)
+                 ON CONFLICT(parent_session_id, tool_call_id) DO UPDATE SET
+                    child_session_id = excluded.child_session_id
+                 WHERE host_tool_launches.child_session_id = excluded.child_session_id",
+                params![parent_session_id, tool_call_id, metadata.id],
+            )?;
+        }
+        transaction.commit()?;
         Ok(())
     }
 
@@ -161,7 +230,7 @@ impl Storage {
     pub fn session_metadata(&self, app_session_id: &str) -> Result<Option<SessionMetadata>> {
         self.connection()?
             .query_row(
-                "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, model, mode, base_ref, created_at, updated_at
+                "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, parent_session_id, launch_origin, host_tool_call_id, model, mode, base_ref, created_at, updated_at
                  FROM app_sessions WHERE id = ?1",
                 [app_session_id],
                 metadata_from_row,
@@ -178,6 +247,49 @@ impl Storage {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    pub fn session_for_tool_call(
+        &self,
+        parent_session_id: &str,
+        tool_call_id: &str,
+    ) -> Result<Option<HostToolSession>> {
+        self.connection()?
+            .query_row(
+                "SELECT session.id, session.sdk_session_id, session.project_path,
+                        session.repository_root, session.title, session.title_source, session.kind,
+                        session.parent_session_id, session.launch_origin,
+                        session.host_tool_call_id, session.model, session.mode, session.base_ref,
+                        session.created_at, session.updated_at, launch.completed
+                 FROM host_tool_launches launch
+                 LEFT JOIN app_sessions session ON session.id = launch.child_session_id
+                 WHERE launch.parent_session_id = ?1 AND launch.tool_call_id = ?2",
+                params![parent_session_id, tool_call_id],
+                |row| {
+                    Ok(HostToolSession {
+                        metadata: row
+                            .get::<_, Option<String>>(0)?
+                            .map(|_| metadata_from_row(row))
+                            .transpose()?,
+                        launch_completed: row.get(15)?,
+                    })
+                },
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn complete_host_tool_launch(&self, child_session_id: &str) -> Result<()> {
+        let updated = self.connection()?.execute(
+            "UPDATE host_tool_launches SET completed = 1 WHERE child_session_id = ?1",
+            [child_session_id],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::HostToolLaunchNotFound(
+                child_session_id.to_owned(),
+            ));
+        }
+        Ok(())
     }
 
     pub fn upsert_project(&self, project: &ProjectMetadata) -> Result<()> {
@@ -299,7 +411,7 @@ impl Storage {
     pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, model, mode, base_ref, created_at, updated_at
+            "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, parent_session_id, launch_origin, host_tool_call_id, model, mode, base_ref, created_at, updated_at
              FROM app_sessions
              WHERE id NOT IN (SELECT session_id FROM session_archives)
              ORDER BY updated_at DESC, id",
@@ -413,7 +525,7 @@ impl Storage {
     pub fn list_archived_sessions(&self) -> Result<Vec<ArchivedSession>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT s.id, s.sdk_session_id, s.project_path, s.repository_root, s.title, s.title_source, s.kind, s.model, s.mode, s.base_ref, s.created_at, s.updated_at,
+            "SELECT s.id, s.sdk_session_id, s.project_path, s.repository_root, s.title, s.title_source, s.kind, s.parent_session_id, s.launch_origin, s.host_tool_call_id, s.model, s.mode, s.base_ref, s.created_at, s.updated_at,
                     a.archived_at, a.project_path, a.repository_root, a.branch, a.head_commit, a.patch
              FROM app_sessions s
              JOIN session_archives a ON a.session_id = s.id
@@ -424,12 +536,12 @@ impl Storage {
                 metadata: metadata_from_row(row)?,
                 archive: SessionArchiveRecord {
                     session_id: row.get(0)?,
-                    archived_at: row.get(12)?,
-                    project_path: row.get(13)?,
-                    repository_root: row.get(14)?,
-                    branch: row.get(15)?,
-                    head_commit: row.get(16)?,
-                    patch: row.get(17)?,
+                    archived_at: row.get(15)?,
+                    project_path: row.get(16)?,
+                    repository_root: row.get(17)?,
+                    branch: row.get(18)?,
+                    head_commit: row.get(19)?,
+                    patch: row.get(20)?,
                 },
             })
         })?;
@@ -500,8 +612,15 @@ impl Storage {
     /// Deliberately separate from [`Self::session_archive`]: the record holds
     /// the only copy of the session's uncommitted work, so a caller must be
     /// able to read it, rebuild from it, and only then discard it.
+    pub fn validate_session_unarchive(&self, session_id: &str) -> Result<()> {
+        let connection = self.connection()?;
+        validate_unarchive_child_count(&connection, session_id)
+    }
+
     pub fn clear_session_archive(&self, session_id: &str) -> Result<bool> {
-        let removed = self.connection()?.execute(
+        let connection = self.connection()?;
+        validate_unarchive_child_count(&connection, session_id)?;
+        let removed = connection.execute(
             "DELETE FROM session_archives WHERE session_id = ?1",
             [session_id],
         )?;
@@ -583,7 +702,7 @@ impl Storage {
         let connection = self.connection()?;
         let metadata = connection
             .query_row(
-                "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, model, mode, base_ref, created_at, updated_at
+                "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, parent_session_id, launch_origin, host_tool_call_id, model, mode, base_ref, created_at, updated_at
                  FROM app_sessions WHERE id = ?1",
                 [session_id],
                 metadata_from_row,
@@ -939,8 +1058,20 @@ impl Storage {
                 model TEXT,
                 mode TEXT,
                 base_ref TEXT,
+                parent_session_id TEXT,
+                launch_origin TEXT NOT NULL DEFAULT 'user',
+                host_tool_call_id TEXT,
+                launch_depth INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
+             );
+             CREATE TABLE IF NOT EXISTS host_tool_launches (
+                parent_session_id TEXT NOT NULL,
+                tool_call_id TEXT NOT NULL,
+                child_session_id TEXT UNIQUE
+                    REFERENCES app_sessions(id) ON DELETE SET NULL,
+                completed INTEGER NOT NULL DEFAULT 0,
+                PRIMARY KEY(parent_session_id, tool_call_id)
              );
              CREATE TABLE IF NOT EXISTS domain_events (
                 session_id TEXT NOT NULL REFERENCES app_sessions(id) ON DELETE CASCADE,
@@ -1050,6 +1181,34 @@ impl Storage {
         add_column_if_missing(&transaction, "app_sessions", "base_ref", "TEXT")?;
         add_column_if_missing(&transaction, "app_sessions", "repository_root", "TEXT")?;
         add_column_if_missing(&transaction, "app_sessions", "kind", "TEXT")?;
+        add_column_if_missing(&transaction, "app_sessions", "parent_session_id", "TEXT")?;
+        add_column_if_missing(&transaction, "app_sessions", "host_tool_call_id", "TEXT")?;
+        add_column_if_missing(
+            &transaction,
+            "app_sessions",
+            "launch_depth",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        transaction.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS app_sessions_host_tool_call
+             ON app_sessions(parent_session_id, host_tool_call_id)
+             WHERE parent_session_id IS NOT NULL AND host_tool_call_id IS NOT NULL;",
+        )?;
+        add_column_if_missing(
+            &transaction,
+            "app_sessions",
+            "launch_origin",
+            "TEXT NOT NULL DEFAULT 'user'",
+        )?;
+        transaction.execute(
+            "INSERT OR IGNORE INTO host_tool_launches (
+                parent_session_id, tool_call_id, child_session_id, completed
+             )
+             SELECT parent_session_id, host_tool_call_id, id, 1
+             FROM app_sessions
+             WHERE parent_session_id IS NOT NULL AND host_tool_call_id IS NOT NULL",
+            [],
+        )?;
         add_column_if_missing(
             &transaction,
             "app_sessions",
@@ -1253,6 +1412,129 @@ fn add_column_if_missing(
     Ok(())
 }
 
+fn validate_parent(connection: &Connection, metadata: &SessionMetadata) -> Result<usize> {
+    let existing_relationship = connection
+        .query_row(
+            "SELECT parent_session_id, launch_origin, host_tool_call_id, launch_depth
+             FROM app_sessions WHERE id = ?1",
+            [&metadata.id],
+            |row| {
+                Ok((
+                    row.get::<_, Option<String>>(0)?,
+                    row.get::<_, Option<String>>(1)?,
+                    row.get::<_, Option<String>>(2)?,
+                    row.get::<_, usize>(3)?,
+                ))
+            },
+        )
+        .optional()?;
+    if let Some((_, _, _, launch_depth)) = existing_relationship.as_ref().filter(
+        |(parent_session_id, launch_origin, host_tool_call_id, _)| {
+            parent_session_id == &metadata.parent_session_id
+                && SessionLaunchOrigin::from_str_or_default(launch_origin.as_deref())
+                    == metadata.launch_origin
+                && host_tool_call_id == &metadata.host_tool_call_id
+        },
+    ) {
+        return Ok(*launch_depth);
+    }
+
+    let Some(parent_id) = metadata.parent_session_id.as_deref() else {
+        if metadata.launch_origin != SessionLaunchOrigin::User
+            || metadata.host_tool_call_id.is_some()
+        {
+            return Err(StorageError::InvalidChildProvenance);
+        }
+        return Ok(0);
+    };
+    if metadata.launch_origin != SessionLaunchOrigin::AgentTool
+        || metadata
+            .host_tool_call_id
+            .as_deref()
+            .is_none_or(str::is_empty)
+    {
+        return Err(StorageError::InvalidChildProvenance);
+    }
+
+    let (parent_project, parent_depth) = connection
+        .query_row(
+            "SELECT COALESCE(repository_root, project_path), launch_depth
+             FROM app_sessions
+             WHERE id = ?1 AND id NOT IN (SELECT session_id FROM session_archives)",
+            [parent_id],
+            |row| Ok((row.get::<_, String>(0)?, row.get::<_, usize>(1)?)),
+        )
+        .optional()?
+        .ok_or_else(|| StorageError::ParentSessionNotFound(parent_id.to_owned()))?;
+    let child_project = metadata
+        .repository_root
+        .as_deref()
+        .unwrap_or(&metadata.project_path);
+    if parent_project != child_project {
+        return Err(StorageError::ParentProjectMismatch(parent_id.to_owned()));
+    }
+
+    let direct_children: usize = connection.query_row(
+        "SELECT COUNT(*)
+         FROM app_sessions
+         WHERE parent_session_id = ?1
+           AND id <> ?2
+           AND id NOT IN (SELECT session_id FROM session_archives)",
+        params![parent_id, metadata.id],
+        |row| row.get(0),
+    )?;
+    if direct_children >= MAX_ACTIVE_DIRECT_CHILDREN {
+        return Err(StorageError::ActiveChildLimit);
+    }
+
+    let mut ancestor = Some(parent_id.to_owned());
+    let mut visited = HashSet::new();
+    while let Some(id) = ancestor {
+        if id == metadata.id || !visited.insert(id.clone()) {
+            return Err(StorageError::ParentCycle);
+        }
+        ancestor = connection
+            .query_row(
+                "SELECT parent_session_id FROM app_sessions WHERE id = ?1",
+                [id],
+                |row| row.get(0),
+            )
+            .optional()?
+            .flatten();
+    }
+    let launch_depth = parent_depth.saturating_add(1);
+    if launch_depth > MAX_SESSION_NESTING_DEPTH {
+        return Err(StorageError::ParentDepthLimit);
+    }
+    Ok(launch_depth)
+}
+
+fn validate_unarchive_child_count(connection: &Connection, session_id: &str) -> Result<()> {
+    let parent_session_id = connection
+        .query_row(
+            "SELECT parent_session_id FROM app_sessions WHERE id = ?1",
+            [session_id],
+            |row| row.get::<_, Option<String>>(0),
+        )
+        .optional()?
+        .flatten();
+    if let Some(parent_session_id) = parent_session_id {
+        let active_siblings: usize = connection.query_row(
+            "SELECT COUNT(*)
+             FROM app_sessions
+             WHERE parent_session_id = ?1
+               AND id <> ?2
+               AND id NOT IN (SELECT session_id FROM session_archives)",
+            params![parent_session_id, session_id],
+            |row| row.get(0),
+        )?;
+        if active_siblings >= MAX_ACTIVE_DIRECT_CHILDREN {
+            return Err(StorageError::ActiveChildLimit);
+        }
+    }
+    Ok(())
+}
+
 fn metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMetadata> {
     Ok(SessionMetadata {
         id: row.get(0)?,
@@ -1262,11 +1544,16 @@ fn metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMetadat
         title: row.get(4)?,
         title_source: TitleSource::from_str_or_default(row.get::<_, Option<String>>(5)?.as_deref()),
         kind: SessionKind::from_str_or_default(row.get::<_, Option<String>>(6)?.as_deref()),
-        model: row.get(7)?,
-        mode: row.get(8)?,
-        base_ref: row.get(9)?,
-        created_at: row.get(10)?,
-        updated_at: row.get(11)?,
+        parent_session_id: row.get(7)?,
+        launch_origin: SessionLaunchOrigin::from_str_or_default(
+            row.get::<_, Option<String>>(8)?.as_deref(),
+        ),
+        host_tool_call_id: row.get(9)?,
+        model: row.get(10)?,
+        mode: row.get(11)?,
+        base_ref: row.get(12)?,
+        created_at: row.get(13)?,
+        updated_at: row.get(14)?,
     })
 }
 
@@ -1288,11 +1575,34 @@ mod tests {
             title: "Recovered session".to_owned(),
             title_source: TitleSource::Manual,
             kind: SessionKind::Project,
+            parent_session_id: None,
+            launch_origin: SessionLaunchOrigin::User,
+            host_tool_call_id: None,
             model: Some("test-model".to_owned()),
             mode: Some("interactive".to_owned()),
             base_ref: Some("main".to_owned()),
             created_at: "1".to_owned(),
             updated_at: "2".to_owned(),
+        }
+    }
+
+    fn child_metadata(parent: &SessionMetadata, suffix: usize) -> SessionMetadata {
+        SessionMetadata {
+            id: format!("child-{suffix}"),
+            sdk_session_id: format!("child-sdk-{suffix}"),
+            project_path: format!("/tmp/project/child-{suffix}"),
+            repository_root: Some(parent.project_key().to_owned()),
+            title: format!("Child {suffix}"),
+            title_source: TitleSource::Manual,
+            kind: SessionKind::Project,
+            parent_session_id: Some(parent.id.clone()),
+            launch_origin: SessionLaunchOrigin::AgentTool,
+            host_tool_call_id: Some(format!("tool-call-{suffix}")),
+            model: None,
+            mode: Some("autopilot".to_owned()),
+            base_ref: Some("main".to_owned()),
+            created_at: suffix.to_string(),
+            updated_at: suffix.to_string(),
         }
     }
 
@@ -2201,10 +2511,139 @@ mod tests {
         assert_eq!(sessions[0].id, "legacy");
         assert!(sessions[0].base_ref.is_none());
         assert_eq!(sessions[0].title_source, TitleSource::Manual);
+        assert!(sessions[0].parent_session_id.is_none());
+        assert_eq!(sessions[0].launch_origin, SessionLaunchOrigin::User);
+        assert!(sessions[0].host_tool_call_id.is_none());
 
         // The queue tables arrived in version 9 and must exist after an
         // upgrade, not only on a freshly created database.
         assert!(storage.queue_view("legacy").unwrap().is_empty());
+    }
+
+    #[test]
+    fn child_relationship_and_tool_call_identity_round_trip() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut parent = metadata();
+        parent.project_path = "/tmp/project".to_owned();
+        parent.repository_root = Some("/tmp/project".to_owned());
+        storage.upsert_session(&parent).unwrap();
+        let child = child_metadata(&parent, 1);
+
+        storage.upsert_session(&child).unwrap();
+
+        let pending = storage
+            .session_for_tool_call(&parent.id, "tool-call-1")
+            .unwrap()
+            .expect("launch record");
+        assert_eq!(pending.metadata, Some(child.clone()));
+        assert!(!pending.launch_completed);
+        storage.complete_host_tool_launch(&child.id).unwrap();
+        assert!(
+            storage
+                .session_for_tool_call(&parent.id, "tool-call-1")
+                .unwrap()
+                .unwrap()
+                .launch_completed
+        );
+        assert_eq!(
+            storage.list_sessions().unwrap(),
+            vec![parent.clone(), child.clone()]
+        );
+
+        storage.delete_session(&child.id).unwrap();
+        let tombstone = storage
+            .session_for_tool_call("app-session", "tool-call-1")
+            .unwrap()
+            .expect("deleted launch tombstone");
+        assert!(tombstone.metadata.is_none());
+        assert!(tombstone.launch_completed);
+        let mut replacement = child;
+        replacement.id = "replacement".to_owned();
+        replacement.sdk_session_id = "replacement-sdk".to_owned();
+        assert!(matches!(
+            storage.upsert_session(&replacement),
+            Err(StorageError::HostToolCallAlreadyUsed)
+        ));
+
+        let orphan_child = child_metadata(&parent, 2);
+        storage.upsert_session(&orphan_child).unwrap();
+        storage.delete_session(&parent.id).unwrap();
+        let mut orphan = storage.session_metadata(&orphan_child.id).unwrap().unwrap();
+        assert_eq!(orphan.parent_session_id.as_deref(), Some("app-session"));
+        orphan.title = "Still editable".to_owned();
+        storage
+            .upsert_session(&orphan)
+            .expect("an orphaned child remains independently writable");
+    }
+
+    #[test]
+    fn child_relationship_enforces_project_depth_count_and_cycles() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut root = metadata();
+        root.project_path = "/tmp/project".to_owned();
+        root.repository_root = Some("/tmp/project".to_owned());
+        storage.upsert_session(&root).unwrap();
+
+        let mut wrong_project = child_metadata(&root, 90);
+        wrong_project.repository_root = Some("/tmp/other".to_owned());
+        assert!(matches!(
+            storage.upsert_session(&wrong_project),
+            Err(StorageError::ParentProjectMismatch(_))
+        ));
+
+        for index in 0..MAX_ACTIVE_DIRECT_CHILDREN {
+            storage
+                .upsert_session(&child_metadata(&root, index + 1))
+                .unwrap();
+        }
+        assert!(matches!(
+            storage.upsert_session(&child_metadata(&root, 99)),
+            Err(StorageError::ActiveChildLimit)
+        ));
+        storage
+            .archive_session(&SessionArchiveRecord {
+                session_id: "child-1".to_owned(),
+                archived_at: "10".to_owned(),
+                project_path: "/tmp/project/child-1".to_owned(),
+                repository_root: Some("/tmp/project".to_owned()),
+                branch: None,
+                head_commit: None,
+                patch: None,
+            })
+            .unwrap();
+        storage
+            .upsert_session(&child_metadata(&root, 99))
+            .expect("archived children do not count against the active limit");
+        assert!(matches!(
+            storage.clear_session_archive("child-1"),
+            Err(StorageError::ActiveChildLimit)
+        ));
+
+        let depth_storage = Storage::open_in_memory().unwrap();
+        depth_storage.upsert_session(&root).unwrap();
+        let mut parent = root.clone();
+        for depth in 1..=MAX_SESSION_NESTING_DEPTH {
+            let child = child_metadata(&parent, 100 + depth);
+            depth_storage.upsert_session(&child).unwrap();
+            parent = child;
+        }
+        assert!(matches!(
+            depth_storage.upsert_session(&child_metadata(&parent, 200)),
+            Err(StorageError::ParentDepthLimit)
+        ));
+        let mut cyclic_root = root;
+        cyclic_root.parent_session_id = Some(parent.id.clone());
+        cyclic_root.launch_origin = SessionLaunchOrigin::AgentTool;
+        cyclic_root.host_tool_call_id = Some("cycle".to_owned());
+        assert!(matches!(
+            depth_storage.upsert_session(&cyclic_root),
+            Err(StorageError::ParentCycle)
+        ));
+        depth_storage.delete_session("child-101").unwrap();
+        assert!(matches!(
+            depth_storage.upsert_session(&child_metadata(&parent, 201)),
+            Err(StorageError::ParentDepthLimit)
+        ));
     }
 
     fn queue_item(id: &str, position: i64) -> QueueItem {

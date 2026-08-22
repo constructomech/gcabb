@@ -1,10 +1,41 @@
 # Copilot CLI Tool Surface
 
-Evidence for what GCABB inherits from the Copilot CLI runtime, and how that
-compares to other coding-agent harnesses. GCABB implements none of these tools;
-it hosts the runtime that owns them. This document exists so the host renders
-their activity correctly and so a runtime upgrade that changes the tool surface
-is detected rather than assumed.
+Evidence for what GCABB inherits from the Copilot CLI runtime, what the
+application adds, and how that compares to other coding-agent harnesses. Most
+tools belong to the runtime; the host-provided `create_session` tool is the
+intentional exception.
+
+## Host-provided `create_session`
+
+Every new and resumed project session receives a typed custom SDK tool named
+`create_session`. It launches an independent GCABB app session, not a Copilot
+CLI `task` subagent:
+
+- `task` runs nested agent activity inside the calling CLI/session runtime.
+- `create_session` creates another durable app session with its own provider,
+  client, CLI process, SDK session, managed worktree, sidebar row, and restart
+  lifecycle.
+
+The model supplies a kickoff prompt and may override the title, model, mode,
+agent, reasoning effort, and context tier. The host binds the caller identity
+and derives the registered project, repository, base branch, and configured
+worktree root; no path or parent-session input is accepted. SDK `toolCallId`
+is persisted with the child row and uniquely indexed per parent so retries
+return the existing child.
+
+Children are started headlessly and do not change selection or focus. The
+sidebar nests them under a live parent and keeps them at the project root with
+an explicit unavailable-parent label if the parent is archived or deleted.
+Archiving or deleting a parent never recursively affects child work.
+
+Current limits are three child levels and five active direct children per
+parent. This surface is local-only, same-project-only, and does not yet provide
+completion notifications or child-to-parent messaging. Cloud sessions,
+cross-repository launches, recursive archive/delete, plan approval, and
+`send_session_message` are intentionally outside this version. If the app
+crashes in the narrow interval after recording a child but before confirming
+kickoff delivery, a retry returns an explicit interrupted-launch error with the
+child id rather than risking duplicate work.
 
 ## Verification method
 

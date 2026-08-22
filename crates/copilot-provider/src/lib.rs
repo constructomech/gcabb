@@ -29,10 +29,12 @@ use github_copilot_sdk::rpc::{
     PermissionDecisionApproveForSessionApprovalWrite, SkillsDiscoverRequest, ToolsListRequest,
 };
 use github_copilot_sdk::session::Session;
+use github_copilot_sdk::tool::ToolHandler;
 use github_copilot_sdk::{
     Client, ClientMode, ClientOptions, DeliveryMode, ElicitationRequest, ElicitationResult,
     ExitPlanModeData, MessageOptions, PermissionRequestData, PermissionRequestKind, RequestId,
-    ResumeSessionConfig, SessionConfig, SessionId, SystemMessageConfig,
+    ResumeSessionConfig, SessionConfig, SessionId, SystemMessageConfig, Tool, ToolInvocation,
+    ToolResult, ToolResultExpanded,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -73,6 +75,218 @@ pub struct SessionRequest {
     /// Approve tool permissions that stay inside an isolated, GCABB-owned
     /// worktree. Requests that reach outside it are still prompted for.
     pub auto_approve_tools: bool,
+    /// Host-owned binding for tools made available to this app session.
+    pub host_tools: Option<HostToolBinding>,
+}
+
+const CREATE_SESSION_TOOL_NAME: &str = "create_session";
+const MAX_KICKOFF_PROMPT_BYTES: usize = 16 * 1024;
+const MAX_TOOL_OPTION_BYTES: usize = 128;
+const MAX_SESSION_TITLE_BYTES: usize = 120;
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct CreateSessionToolInput {
+    pub prompt: String,
+    #[serde(default)]
+    pub title: Option<String>,
+    #[serde(default)]
+    pub model: Option<String>,
+    #[serde(default)]
+    pub mode: Option<String>,
+    #[serde(default)]
+    pub agent: Option<String>,
+    #[serde(default)]
+    pub reasoning_effort: Option<String>,
+    #[serde(default)]
+    pub context_tier: Option<String>,
+}
+
+impl CreateSessionToolInput {
+    fn validate(&self) -> std::result::Result<(), String> {
+        if self.prompt.trim().is_empty() {
+            return Err("prompt must not be empty".to_owned());
+        }
+        if self.prompt.len() > MAX_KICKOFF_PROMPT_BYTES {
+            return Err(format!(
+                "prompt exceeds the {MAX_KICKOFF_PROMPT_BYTES}-byte limit"
+            ));
+        }
+        validate_optional("title", self.title.as_deref(), MAX_SESSION_TITLE_BYTES)?;
+        for (name, value) in [
+            ("model", self.model.as_deref()),
+            ("mode", self.mode.as_deref()),
+            ("agent", self.agent.as_deref()),
+            ("reasoning_effort", self.reasoning_effort.as_deref()),
+            ("context_tier", self.context_tier.as_deref()),
+        ] {
+            validate_optional(name, value, MAX_TOOL_OPTION_BYTES)?;
+        }
+        if let Some(mode) = self.mode.as_deref()
+            && !matches!(mode, "interactive" | "plan" | "autopilot")
+        {
+            return Err(format!("unsupported mode: {mode}"));
+        }
+        if let Some(tier) = self.context_tier.as_deref()
+            && !matches!(tier, "default" | "long_context")
+        {
+            return Err(format!("unsupported context tier: {tier}"));
+        }
+        Ok(())
+    }
+}
+
+fn validate_optional(
+    name: &str,
+    value: Option<&str>,
+    limit: usize,
+) -> std::result::Result<(), String> {
+    if let Some(value) = value {
+        if value.trim().is_empty() {
+            return Err(format!("{name} must not be empty when provided"));
+        }
+        if value.len() > limit {
+            return Err(format!("{name} exceeds the {limit}-byte limit"));
+        }
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct CreateSessionToolResult {
+    pub child_app_session_id: String,
+    pub title: String,
+    pub status: String,
+    pub project: String,
+    pub worktree: String,
+    pub branch: Option<String>,
+}
+
+#[derive(Debug)]
+pub struct HostToolRequest {
+    pub caller_session_id: String,
+    pub tool_call_id: String,
+    pub input: CreateSessionToolInput,
+    pub response: oneshot::Sender<std::result::Result<CreateSessionToolResult, String>>,
+}
+
+#[derive(Clone, Debug)]
+pub struct HostToolGateway {
+    sender: mpsc::Sender<HostToolRequest>,
+}
+
+impl HostToolGateway {
+    #[must_use]
+    pub fn new(sender: mpsc::Sender<HostToolRequest>) -> Self {
+        Self { sender }
+    }
+}
+
+#[derive(Clone, Debug)]
+pub struct HostToolBinding {
+    gateway: HostToolGateway,
+    caller_session_id: String,
+}
+
+impl HostToolBinding {
+    #[must_use]
+    pub fn new(gateway: HostToolGateway, caller_session_id: impl Into<String>) -> Self {
+        Self {
+            gateway,
+            caller_session_id: caller_session_id.into(),
+        }
+    }
+}
+
+struct CreateSessionToolHandler {
+    binding: HostToolBinding,
+}
+
+#[async_trait]
+impl ToolHandler for CreateSessionToolHandler {
+    async fn call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> std::result::Result<ToolResult, github_copilot_sdk::Error> {
+        let input = invocation.params::<CreateSessionToolInput>()?;
+        if let Err(error) = input.validate() {
+            return Ok(tool_response(Err(error)));
+        }
+        let (response, receiver) = oneshot::channel();
+        let request = HostToolRequest {
+            caller_session_id: self.binding.caller_session_id.clone(),
+            tool_call_id: invocation.tool_call_id,
+            input,
+            response,
+        };
+        if self.binding.gateway.sender.send(request).await.is_err() {
+            return Ok(tool_response(Err(
+                "create_session host service is unavailable".to_owned(),
+            )));
+        }
+        let result = receiver.await.unwrap_or_else(|_| {
+            Err("create_session host service closed without a response".to_owned())
+        });
+        Ok(tool_response(result))
+    }
+}
+
+fn tool_response(result: std::result::Result<CreateSessionToolResult, String>) -> ToolResult {
+    match result {
+        Ok(session) => ToolResult::Expanded(ToolResultExpanded::new(
+            json!({"ok": true, "session": session}).to_string(),
+            "success",
+        )),
+        Err(error) => ToolResult::Expanded(
+            ToolResultExpanded::new(json!({"ok": false, "error": &error}).to_string(), "failure")
+                .with_error(error),
+        ),
+    }
+}
+
+fn create_session_tool(binding: HostToolBinding) -> Tool {
+    Tool::new(CREATE_SESSION_TOOL_NAME)
+        .with_description(
+            "Create an independent local GCABB child session in a new worktree for this project.",
+        )
+        .with_parameters(
+            serde_json::from_value(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "prompt": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_KICKOFF_PROMPT_BYTES,
+                        "description": "Kickoff prompt for the child session."
+                    },
+                    "title": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SESSION_TITLE_BYTES,
+                        "description": "Optional human-friendly child session title."
+                    },
+                    "model": {"type": "string", "minLength": 1, "maxLength": MAX_TOOL_OPTION_BYTES},
+                    "mode": {
+                        "type": "string",
+                        "enum": ["interactive", "plan", "autopilot"]
+                    },
+                    "agent": {"type": "string", "minLength": 1, "maxLength": MAX_TOOL_OPTION_BYTES},
+                    "reasoning_effort": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_TOOL_OPTION_BYTES
+                    },
+                    "context_tier": {
+                        "type": "string",
+                        "enum": ["default", "long_context"]
+                    }
+                },
+                "required": ["prompt"]
+            }))
+            .expect("create_session tool schema is an object"),
+        )
+        .with_handler(Arc::new(CreateSessionToolHandler { binding }))
 }
 
 #[derive(Clone, Debug)]
@@ -628,6 +842,9 @@ impl CopilotProvider {
             .with_user_input_handler(broker.clone())
             .with_exit_plan_mode_handler(broker.clone())
             .with_auto_mode_switch_handler(broker);
+        if let Some(binding) = request.host_tools.clone() {
+            config = config.with_tools([create_session_tool(binding)]);
+        }
         config.skill_directories = repository_skill_directories(&request.working_directory);
         config.model.clone_from(&request.model);
         config
@@ -653,6 +870,9 @@ impl CopilotProvider {
             .with_user_input_handler(broker.clone())
             .with_exit_plan_mode_handler(broker.clone())
             .with_auto_mode_switch_handler(broker);
+        if let Some(binding) = request.host_tools.clone() {
+            config = config.with_tools([create_session_tool(binding)]);
+        }
         config.skill_directories = repository_skill_directories(&request.working_directory);
         config.model.clone_from(&request.model);
         config
@@ -1706,16 +1926,17 @@ mod tests {
     use github_copilot_sdk::rpc::PermissionDecision;
     use github_copilot_sdk::{
         DeliveryMode, PermissionRequestData, PermissionRequestKind, RequestId, SessionId,
+        ToolInvocation, ToolResult,
     };
     use serde_json::{Value, json};
     use tokio::sync::mpsc;
 
     use super::{
-        AgentProviderFactory, CopilotProvider, CopilotProviderFactory, InteractionBroker,
-        InteractionResponse, ProviderInteraction, SessionRequest, command_identifier,
-        message_options, model_option, permission_choices, permission_domain,
-        permission_for_domain, permission_for_location, permission_for_session,
-        permission_stays_in_worktree, resolve_root, sdk_context_windows,
+        AgentProviderFactory, CopilotProvider, CopilotProviderFactory, CreateSessionToolResult,
+        HostToolBinding, HostToolGateway, InteractionBroker, InteractionResponse,
+        ProviderInteraction, SessionRequest, command_identifier, message_options, model_option,
+        permission_choices, permission_domain, permission_for_domain, permission_for_location,
+        permission_for_session, permission_stays_in_worktree, resolve_root, sdk_context_windows,
     };
 
     fn interaction_broker() -> Arc<InteractionBroker> {
@@ -1779,6 +2000,104 @@ mod tests {
 
         assert_eq!(create.skill_directories, None);
         assert_eq!(resume.skill_directories, None);
+    }
+
+    #[tokio::test]
+    async fn create_session_tool_is_registered_on_create_and_resume_and_binds_the_caller() {
+        let (sender, mut requests) = mpsc::channel(1);
+        let request = SessionRequest {
+            working_directory: std::env::temp_dir(),
+            host_tools: Some(HostToolBinding::new(
+                HostToolGateway::new(sender),
+                "app-parent",
+            )),
+            ..SessionRequest::default()
+        };
+        let create = CopilotProvider::session_config(&request, interaction_broker());
+        let resume = CopilotProvider::resume_config("sdk-parent", &request, interaction_broker());
+        assert_eq!(
+            create
+                .tools
+                .as_ref()
+                .expect("create tools")
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["create_session"]
+        );
+        let parameters = &create.tools.as_ref().unwrap()[0].parameters;
+        let properties = parameters
+            .get("properties")
+            .and_then(Value::as_object)
+            .expect("object properties");
+        assert!(properties.contains_key("prompt"));
+        assert!(!properties.contains_key("project_path"));
+        assert!(!properties.contains_key("parent_session_id"));
+        assert_eq!(
+            resume
+                .tools
+                .as_ref()
+                .expect("resume tools")
+                .iter()
+                .map(|tool| tool.name.as_str())
+                .collect::<Vec<_>>(),
+            ["create_session"]
+        );
+
+        let handler = create.tools.unwrap()[0]
+            .handler()
+            .expect("create_session handler")
+            .clone();
+        let failure_handler = resume.tools.unwrap()[0]
+            .handler()
+            .expect("resumed create_session handler")
+            .clone();
+        let invocation: ToolInvocation = serde_json::from_value(json!({
+            "sessionId": "sdk-parent",
+            "toolCallId": "tool-call-1",
+            "toolName": "create_session",
+            "arguments": {"prompt": "Implement the child task"}
+        }))
+        .expect("tool invocation");
+        let call = tokio::spawn(async move { handler.call(invocation).await });
+        let request = requests.recv().await.expect("host request");
+        assert_eq!(request.caller_session_id, "app-parent");
+        assert_eq!(request.tool_call_id, "tool-call-1");
+        assert_eq!(request.input.prompt, "Implement the child task");
+        request
+            .response
+            .send(Ok(CreateSessionToolResult {
+                child_app_session_id: "child-1".to_owned(),
+                title: "Child".to_owned(),
+                status: "running".to_owned(),
+                project: "/repo".to_owned(),
+                worktree: "/worktrees/child".to_owned(),
+                branch: Some("gcabb/child".to_owned()),
+            }))
+            .expect("respond");
+        let result = call.await.expect("handler task").expect("tool result");
+        assert!(matches!(
+            result,
+            ToolResult::Expanded(result)
+                if result.result_type == "success"
+                    && result.text_result_for_llm.contains("\"child_app_session_id\":\"child-1\"")
+        ));
+
+        let invalid: ToolInvocation = serde_json::from_value(json!({
+            "sessionId": "sdk-parent",
+            "toolCallId": "tool-call-2",
+            "toolName": "create_session",
+            "arguments": {"prompt": ""}
+        }))
+        .expect("invalid tool invocation");
+        let result = failure_handler.call(invalid).await.expect("tool result");
+        assert!(matches!(
+            result,
+            ToolResult::Expanded(result)
+                if result.result_type == "failure"
+                    && result.error.as_deref() == Some("prompt must not be empty")
+        ));
+        assert!(requests.try_recv().is_err());
     }
 
     #[test]
