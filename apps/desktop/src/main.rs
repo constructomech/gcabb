@@ -14,7 +14,10 @@ use app_model::{
     TranscriptRole, TranscriptState, WorkspaceConfiguration, WorkspaceResource,
 };
 use chrono::DateTime;
-use copilot_provider::{CopilotProviderFactory, ProviderCompatibility};
+use copilot_provider::{
+    CopilotProviderFactory, CreateSessionToolResult, HostToolGateway, HostToolRequest,
+    ProviderCompatibility,
+};
 use diagnostics::{DiagnosticEvent, DiagnosticsSink, TracingDiagnostics, init_tracing};
 use git_service::GitService;
 use gpui::prelude::FluentBuilder;
@@ -1054,6 +1057,7 @@ enum ServiceCommand {
         automation_id: String,
     },
     Stop,
+    SetHostWorktreesRoot(PathBuf),
 }
 
 struct AppService {
@@ -1083,7 +1087,7 @@ struct ArchivedSessionRow {
 
 impl AppService {
     #[allow(clippy::too_many_lines)]
-    fn start(project_root: PathBuf, database_path: &Path) -> Self {
+    fn start(project_root: PathBuf, database_path: &Path, worktrees_root: PathBuf) -> Self {
         let startup_started = Instant::now();
         let diagnostics = Arc::new(TracingDiagnostics);
         let storage_started = Instant::now();
@@ -1174,16 +1178,26 @@ impl AppService {
                 let runtime_ms = elapsed_millis(runtime_started);
                 let provider_factory =
                     CopilotProviderFactory::new(project_root.clone(), diagnostics.clone());
+                let (host_tool_tx, host_tool_rx) = tokio::sync::mpsc::channel(16);
+                let host_worktrees_root = Arc::new(Mutex::new(worktrees_root));
                 let session_roots = SessionRoots {
-                    worktrees: None,
+                    worktrees: host_worktrees_root.lock().ok().map(|root| root.clone()),
                     attachments: attachments_directory(),
                     runtime_state: runtime_state_root(),
                 };
                 let manager = Arc::new(
                     SessionManager::new(provider_factory, storage.clone(), diagnostics.clone())
-                        .with_session_roots(session_roots.clone()),
+                        .with_session_roots(session_roots.clone())
+                        .with_host_tool_gateway(HostToolGateway::new(host_tool_tx)),
                 );
                 let orchestrator = SessionOrchestrator::new(manager.clone(), session_roots.clone());
+                runtime.spawn(run_host_tool_gateway(
+                    host_tool_rx,
+                    manager.clone(),
+                    orchestrator.clone(),
+                    host_worktrees_root.clone(),
+                    update_tx.clone(),
+                ));
                 let automations = AutomationContext::new(
                     manager.clone(),
                     storage.clone(),
@@ -1417,6 +1431,11 @@ impl AppService {
                         ServiceCommand::RunAutomationNow { automation_id } => {
                             automations.run_now(&runtime, &automation_id);
                         }
+                        ServiceCommand::SetHostWorktreesRoot(root) => {
+                            if let Ok(mut configured) = host_worktrees_root.lock() {
+                                *configured = root;
+                            }
+                        }
                         command => {
                             let submit_origin = match &command {
                                 ServiceCommand::Submit { app_session_id, .. } => {
@@ -1562,6 +1581,8 @@ async fn handle_service_command(
                             base_ref,
                             title: LaunchTitle::Automatic,
                             origin: LaunchOrigin::UserActivation,
+                            parent_session_id: None,
+                            host_tool_call_id: None,
                         },
                         |progress| {
                             let progress = match progress {
@@ -1774,9 +1795,181 @@ async fn handle_service_command(
         | ServiceCommand::DeleteSession { .. }
         | ServiceCommand::ArchiveSession { .. }
         | ServiceCommand::UnarchiveSession { .. }
-        | ServiceCommand::Stop => {}
+        | ServiceCommand::Stop
+        | ServiceCommand::SetHostWorktreesRoot(_) => {}
     }
     Ok(created)
+}
+
+async fn run_host_tool_gateway(
+    mut requests: tokio::sync::mpsc::Receiver<HostToolRequest>,
+    manager: Arc<SessionManager>,
+    orchestrator: SessionOrchestrator,
+    worktrees_root: Arc<Mutex<PathBuf>>,
+    updates: Sender<ServiceUpdate>,
+) {
+    while let Some(request) = requests.recv().await {
+        let result =
+            create_agent_child(&manager, &orchestrator, &worktrees_root, &updates, &request).await;
+        let _ = request.response.send(result);
+    }
+}
+
+async fn create_agent_child(
+    manager: &SessionManager,
+    orchestrator: &SessionOrchestrator,
+    worktrees_root: &Mutex<PathBuf>,
+    updates: &Sender<ServiceUpdate>,
+    request: &HostToolRequest,
+) -> Result<CreateSessionToolResult, String> {
+    if let Some(existing) = manager
+        .session_for_tool_call(&request.caller_session_id, &request.tool_call_id)
+        .map_err(|error| error.to_string())?
+    {
+        let Some(existing_metadata) = existing.metadata else {
+            return Err(if existing.launch_completed {
+                "the child session created by this call was deleted".to_owned()
+            } else {
+                "the earlier create_session call failed and was compensated; \
+                 this tool-call identity cannot be reused"
+                    .to_owned()
+            });
+        };
+        if !existing.launch_completed {
+            return Err(format!(
+                "the earlier create_session call was interrupted after creating child {}; \
+                 inspect that session before retrying",
+                existing_metadata.id
+            ));
+        }
+        if manager
+            .is_session_archived(&existing_metadata.id)
+            .map_err(|error| error.to_string())?
+        {
+            return Err(format!(
+                "the child session {} created by this call is archived",
+                existing_metadata.id
+            ));
+        }
+        let existing = existing_metadata;
+        let branch = GitService::new(&existing.project_path)
+            .current_branch()
+            .ok();
+        let project = existing.project_key().to_owned();
+        return Ok(CreateSessionToolResult {
+            child_app_session_id: existing.id,
+            title: existing.title,
+            status: "existing".to_owned(),
+            project,
+            worktree: existing.project_path,
+            branch,
+        });
+    }
+
+    let launch = agent_child_launch_request(manager, worktrees_root, request).await?;
+    let result = orchestrator
+        .launch(launch, |_| {})
+        .await
+        .map_err(|error| error.to_string())?;
+    let response = CreateSessionToolResult {
+        child_app_session_id: result.handle.id().to_owned(),
+        title: result.title,
+        status: "running".to_owned(),
+        project: result
+            .repository_root
+            .as_deref()
+            .unwrap_or(&result.project_path)
+            .to_string_lossy()
+            .into_owned(),
+        worktree: result.project_path.to_string_lossy().into_owned(),
+        branch: result.branch,
+    };
+    let _ = updates.send(ServiceUpdate::SessionHydrated(result.handle));
+    Ok(response)
+}
+
+async fn agent_child_launch_request(
+    manager: &SessionManager,
+    worktrees_root: &Mutex<PathBuf>,
+    request: &HostToolRequest,
+) -> Result<LaunchRequest, String> {
+    let parent = manager
+        .session_metadata_by_id(&request.caller_session_id)
+        .map_err(|error| error.to_string())?
+        .ok_or_else(|| "calling app session no longer exists".to_owned())?;
+    if parent.is_chat() {
+        return Err("create_session is only available to project sessions".to_owned());
+    }
+    let project = manager
+        .projects()
+        .map_err(|error| error.to_string())?
+        .into_iter()
+        .find(|project| project.path == parent.project_key())
+        .ok_or_else(|| "calling session does not belong to a registered project".to_owned())?;
+    let repository = PathBuf::from(&project.path);
+    if !repository.is_dir() || !GitService::new(&repository).is_worktree() {
+        return Err("calling session's registered repository is unavailable".to_owned());
+    }
+    let parent_handle = manager
+        .session(&request.caller_session_id)
+        .await
+        .map_err(|error| error.to_string())?;
+    let snapshot = parent_handle.snapshot();
+    let controls = &snapshot.controls;
+    let root = worktrees_root
+        .lock()
+        .map_err(|_| "configured worktree root is unavailable".to_owned())?
+        .clone();
+    let title = request
+        .input
+        .title
+        .as_ref()
+        .map_or(LaunchTitle::Automatic, |title| LaunchTitle::Provided {
+            title: title.clone(),
+            source: app_model::TitleSource::Manual,
+        });
+    Ok(LaunchRequest {
+        project_path: repository.clone(),
+        repository_root: Some(repository),
+        worktrees_root: root,
+        kind: SessionKind::Project,
+        location: SessionLocation::NewWorktree,
+        prompt: request.input.prompt.clone(),
+        attachments: Vec::new(),
+        model: request
+            .input
+            .model
+            .clone()
+            .or_else(|| controls.model.clone())
+            .or_else(|| parent.model.clone()),
+        mode: request
+            .input
+            .mode
+            .clone()
+            .or_else(|| controls.mode.clone())
+            .or_else(|| parent.mode.clone())
+            .unwrap_or_else(|| "interactive".to_owned()),
+        agent: request
+            .input
+            .agent
+            .clone()
+            .or_else(|| controls.agent.clone()),
+        reasoning_effort: request
+            .input
+            .reasoning_effort
+            .clone()
+            .or_else(|| controls.reasoning_effort.clone()),
+        context_tier: request
+            .input
+            .context_tier
+            .clone()
+            .or_else(|| controls.context_tier.clone()),
+        base_ref: parent.base_ref.clone().or(project.default_branch),
+        title,
+        origin: LaunchOrigin::Headless,
+        parent_session_id: Some(parent.id),
+        host_tool_call_id: Some(request.tool_call_id.clone()),
+    })
 }
 
 /// Register a user-chosen directory as a project.
@@ -1855,6 +2048,129 @@ struct SessionProjection {
     snapshot: Arc<SessionSnapshot>,
     /// When the current active turn began, retained across Starting -> Running.
     running_since: Option<Instant>,
+}
+
+type SessionTreeRow = (usize, usize, bool, bool);
+
+struct SessionTreeTraversal {
+    visited: HashSet<String>,
+    ordered: Vec<SessionTreeRow>,
+}
+
+fn append_project_children(
+    sessions: &[SessionProjection],
+    project_indices: &[usize],
+    parent_ids: &HashMap<String, String>,
+    parent_set: &HashSet<String>,
+    parent: &str,
+    depth: usize,
+    traversal: &mut SessionTreeTraversal,
+) {
+    for index in project_indices {
+        let id = sessions[*index].id();
+        if parent_ids
+            .get(id)
+            .is_some_and(|candidate| candidate == parent)
+            && traversal.visited.insert(id.to_owned())
+        {
+            traversal
+                .ordered
+                .push((*index, depth, false, parent_set.contains(id)));
+            append_project_children(
+                sessions,
+                project_indices,
+                parent_ids,
+                parent_set,
+                id,
+                depth + 1,
+                traversal,
+            );
+        }
+    }
+}
+
+fn ordered_project_sessions(
+    sessions: &[SessionProjection],
+    project_key: &str,
+) -> Vec<SessionTreeRow> {
+    let project_indices = sessions
+        .iter()
+        .enumerate()
+        .filter(|(_, session)| {
+            !session.snapshot.metadata.is_chat()
+                && session.snapshot.metadata.project_key() == project_key
+        })
+        .map(|(index, _)| index)
+        .collect::<Vec<_>>();
+    let active_ids = project_indices
+        .iter()
+        .map(|index| sessions[*index].id().to_owned())
+        .collect::<HashSet<_>>();
+    let parent_ids = project_indices
+        .iter()
+        .filter_map(|index| {
+            sessions[*index]
+                .snapshot
+                .metadata
+                .parent_session_id
+                .as_ref()
+                .filter(|parent| active_ids.contains(*parent))
+                .map(|parent| (sessions[*index].id().to_owned(), parent.clone()))
+        })
+        .collect::<HashMap<_, _>>();
+    let parent_set = parent_ids.values().cloned().collect::<HashSet<_>>();
+    let mut traversal = SessionTreeTraversal {
+        visited: HashSet::new(),
+        ordered: Vec::with_capacity(project_indices.len()),
+    };
+
+    for index in &project_indices {
+        let metadata = &sessions[*index].snapshot.metadata;
+        if parent_ids.contains_key(&metadata.id) || !traversal.visited.insert(metadata.id.clone()) {
+            continue;
+        }
+        let orphaned = metadata.parent_session_id.is_some();
+        traversal
+            .ordered
+            .push((*index, 0, orphaned, parent_set.contains(&metadata.id)));
+        append_project_children(
+            sessions,
+            &project_indices,
+            &parent_ids,
+            &parent_set,
+            &metadata.id,
+            1,
+            &mut traversal,
+        );
+    }
+    for index in project_indices {
+        let metadata = &sessions[index].snapshot.metadata;
+        if traversal.visited.insert(metadata.id.clone()) {
+            traversal
+                .ordered
+                .push((index, 0, metadata.parent_session_id.is_some(), false));
+        }
+    }
+    traversal.ordered
+}
+
+fn session_row_accessible_label(title: &str, depth: usize, orphaned: bool) -> String {
+    if orphaned {
+        format!("Agent-created session {title}, parent unavailable")
+    } else if depth > 0 {
+        format!("Agent-created child session {title}, level {depth}")
+    } else {
+        title.to_owned()
+    }
+}
+
+const fn session_row_margin(depth: usize) -> f32 {
+    match depth {
+        0 => 20.0,
+        1 => 36.0,
+        2 => 52.0,
+        _ => 68.0,
+    }
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -2739,6 +3055,9 @@ impl SessionMvpView {
                 .map_err(|error| format!("could not save worktree location: {error}"))?;
         }
         self.worktree_configuration.settings = settings;
+        let _ = self.commands.send(ServiceCommand::SetHostWorktreesRoot(
+            self.current_worktrees_root(),
+        ));
         Ok(())
     }
 
@@ -5489,15 +5808,14 @@ impl SessionMvpView {
     #[allow(clippy::too_many_lines)]
     fn sidebar(&self, compact: bool, cx: &mut Context<Self>) -> impl IntoElement {
         let selected_path = self.selected_project.to_string_lossy();
-        let sessions = self
-            .sessions
-            .iter()
-            .filter(|session| !session.snapshot.metadata.is_chat())
-            .filter(|session| session.snapshot.metadata.project_key() == selected_path)
-            .map(|session| {
+        let sessions = ordered_project_sessions(&self.sessions, &selected_path)
+            .into_iter()
+            .map(|(index, depth, orphaned, has_children)| {
+                let session = &self.sessions[index];
                 let id = session.id().to_owned();
                 let accessible_id = id.clone();
                 let label = session.snapshot.metadata.title.clone();
+                let accessible_label = session_row_accessible_label(&label, depth, orphaned);
                 let menu_id = id.clone();
                 let menu_label = label.clone();
                 let selected = self.selected_session.as_deref() == Some(id.as_str());
@@ -5505,10 +5823,24 @@ impl SessionMvpView {
                 let spinner_id = SharedString::from(format!("session-spinner-{id}"));
                 div()
                     .id(SharedString::from(format!("session-{id}")))
-                    .debug_selector(|| "session-row".to_owned())
+                    .debug_selector(move || {
+                        if orphaned {
+                            "orphan-agent-session-row".to_owned()
+                        } else if depth > 0 {
+                            "agent-child-session-row".to_owned()
+                        } else {
+                            "session-row".to_owned()
+                        }
+                    })
                     .accessibility_id(accessible_id)
                     .role(Role::ListItem)
-                    .aria_label(label)
+                    .aria_label(accessible_label)
+                    .aria_level(match depth {
+                        0 => 1,
+                        1 => 2,
+                        2 => 3,
+                        _ => 4,
+                    })
                     .aria_selected(selected)
                     .focusable()
                     .tab_stop(true)
@@ -5516,7 +5848,7 @@ impl SessionMvpView {
                     .flex()
                     .items_center()
                     .gap_2()
-                    .ml_5()
+                    .ml(px(session_row_margin(depth)))
                     .px_3()
                     .py_2()
                     .rounded_md()
@@ -5540,6 +5872,17 @@ impl SessionMvpView {
                             );
                         }),
                     )
+                    .when(depth > 0 || orphaned || has_children, |row| {
+                        row.child(div().w(px(12.0)).text_xs().text_color(rgb(MUTED)).child(
+                            if orphaned {
+                                "!"
+                            } else if depth > 0 {
+                                "↳"
+                            } else {
+                                "▾"
+                            },
+                        ))
+                    })
                     .child(if is_deleting {
                         progress_spinner(spinner_id).into_any_element()
                     } else {
@@ -12094,12 +12437,15 @@ fn main() {
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let branch = git_branch(&project_root);
     let worktree_configuration = WorktreeConfiguration::load(&data_dir);
+    let service_worktrees_root = worktree_configuration
+        .settings
+        .worktrees_root(&worktree_configuration.default_root);
     let service = match data_dir
         .as_ref()
         .map_err(Clone::clone)
         .and_then(|path| database_path(path))
     {
-        Ok(path) => AppService::start(project_root.clone(), &path),
+        Ok(path) => AppService::start(project_root.clone(), &path, service_worktrees_root),
         Err(error) => AppService::failed(error),
     };
     let chats_workspace = chats_directory(&project_root);
@@ -12680,8 +13026,8 @@ pub(crate) mod tests {
 
     pub(crate) mod interaction {
         use app_model::{
-            InteractionKind, InteractionRequest, InteractionResponse, SessionKind, SessionMetadata,
-            SessionSnapshot, SessionStatus, TitleSource,
+            InteractionKind, InteractionRequest, InteractionResponse, SessionKind,
+            SessionLaunchOrigin, SessionMetadata, SessionSnapshot, SessionStatus, TitleSource,
         };
         use gpui::{FollowMode, Modifiers, MouseButton, TestAppContext, VisualTestContext};
         use session_manager::SessionHandle;
@@ -12701,6 +13047,9 @@ pub(crate) mod tests {
                 title: title.to_owned(),
                 title_source: TitleSource::Manual,
                 kind: SessionKind::Project,
+                parent_session_id: None,
+                launch_origin: app_model::SessionLaunchOrigin::User,
+                host_tool_call_id: None,
                 model: None,
                 mode: None,
                 base_ref: None,
@@ -12708,6 +13057,16 @@ pub(crate) mod tests {
                 updated_at: "1".to_owned(),
             });
             state.status = app_model::SessionStatus::Idle;
+            state
+        }
+
+        fn child_snapshot(id: &str, title: &str, parent_id: &str) -> SessionSnapshot {
+            let mut state = snapshot(id, title);
+            state.metadata.project_path = format!("/tmp/worktrees/{id}");
+            state.metadata.parent_session_id = Some(parent_id.to_owned());
+            state.metadata.launch_origin = SessionLaunchOrigin::AgentTool;
+            state.metadata.host_tool_call_id = Some(format!("tool-{id}"));
+            state.status = SessionStatus::Running;
             state
         }
 
@@ -12981,6 +13340,107 @@ pub(crate) mod tests {
                     SessionStatus::Recovering
                 );
             });
+        }
+
+        #[gpui::test]
+        fn bootstrap_restores_nested_and_missing_parent_children(cx: &mut TestAppContext) {
+            let (mut service, _commands) = AppService::for_test();
+            let parent = snapshot("parent", "Parent").metadata;
+            let child = child_snapshot("child", "Child", "parent").metadata;
+            let orphan = child_snapshot("orphan", "Orphan", "archived-parent").metadata;
+            service.bootstrap = Some(super::super::BootstrapState {
+                projects: Vec::new(),
+                sessions: vec![orphan, child, parent],
+                archived: Vec::new(),
+                selected_session: Some("parent".to_owned()),
+                automations: Vec::new(),
+                automation_runs: Vec::new(),
+            });
+            cx.update(super::super::bind_app_keys);
+            let (_view, cx) = cx.add_window_view(|_, cx| {
+                SessionMvpView::new(
+                    service,
+                    std::path::PathBuf::from("/tmp/project"),
+                    "main".to_owned(),
+                    std::path::PathBuf::from("/tmp/chats"),
+                    None,
+                    crate::WorktreeConfiguration {
+                        data_dir: None,
+                        settings: crate::AppSettings::default(),
+                        default_root: std::path::PathBuf::from("/tmp/worktrees"),
+                    },
+                    cx,
+                )
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("agent-child-session-row").is_some());
+            assert!(cx.debug_bounds("orphan-agent-session-row").is_some());
+            assert_eq!(
+                super::super::session_row_accessible_label("Child", 1, false),
+                "Agent-created child session Child, level 1"
+            );
+            assert_eq!(
+                super::super::session_row_accessible_label("Orphan", 0, true),
+                "Agent-created session Orphan, parent unavailable"
+            );
+        }
+
+        #[gpui::test]
+        fn agent_children_nest_navigate_and_become_orphans_without_focus_theft(
+            cx: &mut TestAppContext,
+        ) {
+            let (view, cx, commands, updates) = setup_for_bootstrap(cx);
+            view.update(cx, |view, cx| {
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
+                    snapshot("parent", "Parent session"),
+                ))];
+                view.selected_session = Some("parent".to_owned());
+                cx.notify();
+            });
+            updates
+                .send(ServiceUpdate::SessionHydrated(SessionHandle::for_test(
+                    child_snapshot("child", "Agent child", "parent"),
+                )))
+                .unwrap();
+            view.update(cx, |view, cx| {
+                view.apply_service_updates(cx);
+                assert_eq!(view.selected_session.as_deref(), Some("parent"));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let parent = cx.debug_bounds("session-row").expect("parent row");
+            let child = cx
+                .debug_bounds("agent-child-session-row")
+                .expect("nested child row");
+            assert!(child.origin.x > parent.origin.x);
+            cx.simulate_click(child.center(), Modifiers::none());
+            cx.run_until_parked();
+            assert!(matches!(
+                commands.try_recv(),
+                Ok(ServiceCommand::Select {
+                    app_session_id: Some(id)
+                }) if id == "child"
+            ));
+
+            updates
+                .send(ServiceUpdate::SessionArchived {
+                    session: snapshot("parent", "Parent session").metadata,
+                    archived_at: "2".to_owned(),
+                })
+                .unwrap();
+            view.update(cx, |view, cx| {
+                view.apply_service_updates(cx);
+                assert_eq!(view.selected_session.as_deref(), Some("child"));
+                assert!(view.sessions.iter().any(|session| session.id() == "child"));
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds("orphan-agent-session-row").is_some(),
+                "a child with an archived parent must remain visible at the root"
+            );
         }
 
         #[gpui::test]

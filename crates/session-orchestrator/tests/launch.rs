@@ -60,6 +60,28 @@ fn harness(
     (manager, orchestrator)
 }
 
+fn harness_with_storage(
+    factory: FakeProviderFactory,
+    worktrees_root: PathBuf,
+) -> (Arc<SessionManager>, SessionOrchestrator, Arc<Storage>) {
+    let roots = SessionRoots {
+        worktrees: Some(worktrees_root),
+        attachments: None,
+        runtime_state: None,
+    };
+    let storage = Arc::new(Storage::open_in_memory().expect("storage"));
+    let manager = Arc::new(
+        SessionManager::new(
+            factory,
+            storage.clone(),
+            Arc::new(MemoryDiagnostics::default()),
+        )
+        .with_session_roots(roots.clone()),
+    );
+    let orchestrator = SessionOrchestrator::new(manager.clone(), roots);
+    (manager, orchestrator, storage)
+}
+
 fn project_request(
     repository: &Path,
     worktrees_root: &Path,
@@ -84,6 +106,8 @@ fn project_request(
         base_ref: Some("main".to_owned()),
         title: LaunchTitle::Automatic,
         origin,
+        parent_session_id: None,
+        host_tool_call_id: None,
     }
 }
 
@@ -218,6 +242,133 @@ async fn headless_launch_preserves_selection_and_user_launch_activates() {
         manager.selected_session().expect("selection").as_deref(),
         Some(visible.handle.id())
     );
+}
+
+#[tokio::test]
+async fn agent_child_launch_persists_ownership_and_keeps_parent_selected() {
+    let (_guard, repository) = repository();
+    let worktrees = tempfile::tempdir().expect("worktrees");
+    let factory = FakeProviderFactory::default();
+    let (manager, orchestrator, storage) =
+        harness_with_storage(factory.clone(), worktrees.path().to_owned());
+    let mut parent_request =
+        project_request(&repository, worktrees.path(), LaunchOrigin::UserActivation);
+    parent_request.title = LaunchTitle::Provided {
+        title: "Parent".to_owned(),
+        source: TitleSource::Manual,
+    };
+    let parent = orchestrator
+        .launch(parent_request, |_| {})
+        .await
+        .expect("parent launch");
+
+    let mut child_request = project_request(&repository, worktrees.path(), LaunchOrigin::Headless);
+    child_request.title = LaunchTitle::Provided {
+        title: "Agent child".to_owned(),
+        source: TitleSource::Manual,
+    };
+    child_request.parent_session_id = Some(parent.handle.id().to_owned());
+    child_request.host_tool_call_id = Some("tool-call-1".to_owned());
+    let child = orchestrator
+        .launch(child_request, |_| {})
+        .await
+        .expect("child launch");
+
+    assert_ne!(child.handle.id(), parent.handle.id());
+    assert_ne!(child.project_path, parent.project_path);
+    assert_eq!(factory.providers().len(), 2);
+    assert_eq!(
+        manager.selected_session().unwrap().as_deref(),
+        Some(parent.handle.id())
+    );
+    let metadata = storage
+        .session_metadata(child.handle.id())
+        .unwrap()
+        .unwrap();
+    assert_eq!(
+        metadata.parent_session_id.as_deref(),
+        Some(parent.handle.id())
+    );
+    assert_eq!(
+        metadata.launch_origin,
+        app_model::SessionLaunchOrigin::AgentTool
+    );
+    assert_eq!(metadata.host_tool_call_id.as_deref(), Some("tool-call-1"));
+    assert_eq!(
+        storage
+            .session_for_tool_call(parent.handle.id(), "tool-call-1")
+            .unwrap()
+            .and_then(|session| session.metadata.map(|metadata| metadata.id)),
+        Some(child.handle.id().to_owned())
+    );
+    assert!(
+        storage
+            .session_for_tool_call(parent.handle.id(), "tool-call-1")
+            .unwrap()
+            .unwrap()
+            .launch_completed
+    );
+}
+
+#[tokio::test]
+async fn concurrent_launches_allocate_distinct_worktrees() {
+    let (_guard, repository) = repository();
+    let worktrees = tempfile::tempdir().expect("worktrees");
+    let factory = FakeProviderFactory::default();
+    let (_manager, orchestrator) = harness(factory, worktrees.path().to_owned());
+    let mut first = project_request(&repository, worktrees.path(), LaunchOrigin::Headless);
+    first.title = LaunchTitle::Provided {
+        title: "Concurrent child".to_owned(),
+        source: TitleSource::Manual,
+    };
+    let second = first.clone();
+
+    let (first, second) = tokio::join!(
+        orchestrator.launch(first, |_| {}),
+        orchestrator.launch(second, |_| {})
+    );
+    let first = first.expect("first launch");
+    let second = second.expect("second launch");
+
+    assert_ne!(first.project_path, second.project_path);
+    assert_ne!(first.branch, second.branch);
+}
+
+#[tokio::test]
+async fn failed_agent_child_launch_compensates_session_and_idempotency_record() {
+    let (_guard, repository) = repository();
+    let worktrees = tempfile::tempdir().expect("worktrees");
+    let factory = FakeProviderFactory::default();
+    let (_manager, orchestrator, storage) =
+        harness_with_storage(factory.clone(), worktrees.path().to_owned());
+    let mut parent_request =
+        project_request(&repository, worktrees.path(), LaunchOrigin::UserActivation);
+    parent_request.title = LaunchTitle::Provided {
+        title: "Parent".to_owned(),
+        source: TitleSource::Manual,
+    };
+    let parent = orchestrator
+        .launch(parent_request, |_| {})
+        .await
+        .expect("parent launch");
+    factory.fail_sends(true);
+
+    let mut child_request = project_request(&repository, worktrees.path(), LaunchOrigin::Headless);
+    child_request.title = LaunchTitle::Provided {
+        title: "Failing child".to_owned(),
+        source: TitleSource::Manual,
+    };
+    child_request.parent_session_id = Some(parent.handle.id().to_owned());
+    child_request.host_tool_call_id = Some("tool-call-failure".to_owned());
+    assert!(orchestrator.launch(child_request, |_| {}).await.is_err());
+
+    let compensated = storage
+        .session_for_tool_call(parent.handle.id(), "tool-call-failure")
+        .unwrap()
+        .expect("failed launch tombstone");
+    assert!(compensated.metadata.is_none());
+    assert!(!compensated.launch_completed);
+    assert_eq!(storage.list_sessions().unwrap().len(), 1);
 }
 
 #[tokio::test]

@@ -12,10 +12,11 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use app_model::{PromptAttachment, SessionKind, SessionLocation, TitleSource};
+use app_model::{PromptAttachment, SessionKind, SessionLaunchOrigin, SessionLocation, TitleSource};
 use git_service::GitService;
 use session_manager::{CreateSessionRequest, SessionHandle, SessionManager, SessionRoots};
 use thiserror::Error;
+use tokio::sync::Mutex;
 
 /// Whether a launch is visible navigation or background orchestration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -55,6 +56,8 @@ pub struct LaunchRequest {
     pub base_ref: Option<String>,
     pub title: LaunchTitle,
     pub origin: LaunchOrigin,
+    pub parent_session_id: Option<String>,
+    pub host_tool_call_id: Option<String>,
 }
 
 /// Observable milestones for launch UIs. Headless callers may ignore them.
@@ -92,6 +95,7 @@ pub enum LaunchStage {
     Runtime,
     InitialMode,
     Kickoff,
+    Finalization,
     Activation,
 }
 
@@ -102,6 +106,7 @@ impl std::fmt::Display for LaunchStage {
             Self::Runtime => "runtime creation",
             Self::InitialMode => "initial mode setup",
             Self::Kickoff => "kickoff submission",
+            Self::Finalization => "launch finalization",
             Self::Activation => "session activation",
         })
     }
@@ -167,12 +172,17 @@ enum SelectionRollback {
 pub struct SessionOrchestrator {
     manager: Arc<SessionManager>,
     roots: SessionRoots,
+    workspace_lock: Arc<Mutex<()>>,
 }
 
 impl SessionOrchestrator {
     #[must_use]
     pub fn new(manager: Arc<SessionManager>, roots: SessionRoots) -> Self {
-        Self { manager, roots }
+        Self {
+            manager,
+            roots,
+            workspace_lock: Arc::new(Mutex::new(())),
+        }
     }
 
     /// Create an isolated runtime, apply caller-requested activation, and
@@ -197,8 +207,9 @@ impl SessionOrchestrator {
         if creates_worktree {
             on_progress(LaunchProgress::CreatingWorktree);
         }
-        let workspace = resolve_workspace(&request, &title, &repository)
-            .map_err(|error| LaunchError::new(LaunchStage::Worktree, error))?;
+        let workspace = self
+            .allocate_workspace(&request, &title, &repository)
+            .await?;
         if workspace.created.is_some() {
             on_progress(LaunchProgress::WorktreeReady(workspace.path.clone()));
         }
@@ -243,6 +254,7 @@ impl SessionOrchestrator {
         )
         .await?;
 
+        let host_launch = request.host_tool_call_id.is_some();
         let message_id = match handle
             .send_with_attachments(request.prompt.clone(), request.attachments)
             .await
@@ -261,6 +273,9 @@ impl SessionOrchestrator {
                 );
             }
         };
+
+        self.finalize_host_launch(host_launch, &handle, &workspace, &previous_selection)
+            .await?;
 
         if refine_title {
             let manager = self.manager.clone();
@@ -293,6 +308,43 @@ impl SessionOrchestrator {
             .selected_session()
             .map(SelectionRollback::Restore)
             .map_err(|error| LaunchError::new(LaunchStage::Activation, error.to_string()))
+    }
+
+    async fn allocate_workspace(
+        &self,
+        request: &LaunchRequest,
+        title: &str,
+        repository: &Path,
+    ) -> Result<Workspace, LaunchError> {
+        let _workspace_allocation = self.workspace_lock.lock().await;
+        resolve_workspace(request, title, repository)
+            .map_err(|error| LaunchError::new(LaunchStage::Worktree, error))
+    }
+
+    async fn finalize_host_launch(
+        &self,
+        host_launch: bool,
+        handle: &SessionHandle,
+        workspace: &Workspace,
+        previous_selection: &SelectionRollback,
+    ) -> Result<(), LaunchError> {
+        if !host_launch {
+            return Ok(());
+        }
+        if let Err(error) = self.manager.complete_host_tool_launch(handle.id()) {
+            let cleanup = self
+                .compensate(
+                    Some(handle.id()),
+                    workspace.created.as_ref(),
+                    previous_selection,
+                )
+                .await;
+            return Err(
+                LaunchError::new(LaunchStage::Finalization, error.to_string())
+                    .with_cleanup(cleanup),
+            );
+        }
+        Ok(())
     }
 
     async fn activate(
@@ -339,7 +391,14 @@ impl SessionOrchestrator {
                     .as_ref()
                     .map(|path| path.to_string_lossy().into_owned()),
                 kind: request.kind,
-                unattended: false,
+                parent_session_id: request.parent_session_id.clone(),
+                launch_origin: if request.parent_session_id.is_some() {
+                    SessionLaunchOrigin::AgentTool
+                } else {
+                    SessionLaunchOrigin::User
+                },
+                host_tool_call_id: request.host_tool_call_id.clone(),
+                unattended: request.parent_session_id.is_some(),
             })
             .await
     }

@@ -531,6 +531,38 @@ impl SessionKind {
     }
 }
 
+/// How an application session was launched.
+#[derive(Clone, Copy, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionLaunchOrigin {
+    #[default]
+    User,
+    AgentTool,
+}
+
+impl SessionLaunchOrigin {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::User => "user",
+            Self::AgentTool => "agent_tool",
+        }
+    }
+
+    #[must_use]
+    pub fn from_str_or_default(value: Option<&str>) -> Self {
+        match value {
+            Some("agent_tool") => Self::AgentTool,
+            _ => Self::User,
+        }
+    }
+}
+
+/// Agent-created sessions may nest this many levels below a user session.
+pub const MAX_SESSION_NESTING_DEPTH: usize = 3;
+/// A running parent may own at most this many non-archived direct children.
+pub const MAX_ACTIVE_DIRECT_CHILDREN: usize = 5;
+
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 pub struct SessionMetadata {
     pub id: String,
@@ -553,6 +585,14 @@ pub struct SessionMetadata {
     pub title_source: TitleSource,
     #[serde(default)]
     pub kind: SessionKind,
+    /// App session that launched this session through the host tool.
+    #[serde(default)]
+    pub parent_session_id: Option<String>,
+    #[serde(default)]
+    pub launch_origin: SessionLaunchOrigin,
+    /// SDK identity used to deduplicate retries of an agent host-tool call.
+    #[serde(default)]
+    pub host_tool_call_id: Option<String>,
     pub model: Option<String>,
     pub mode: Option<String>,
     /// Git ref the changes view compares against.
@@ -1440,6 +1480,9 @@ mod tests {
             title: "Test".to_owned(),
             title_source: TitleSource::Manual,
             kind: SessionKind::Project,
+            parent_session_id: None,
+            launch_origin: SessionLaunchOrigin::User,
+            host_tool_call_id: None,
             model: None,
             mode: None,
             base_ref: None,
