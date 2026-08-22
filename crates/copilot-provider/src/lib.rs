@@ -80,9 +80,19 @@ pub struct SessionRequest {
 }
 
 const CREATE_SESSION_TOOL_NAME: &str = "create_session";
+const GET_SESSION_TOOL_NAME: &str = "get_session";
+const SEND_SESSION_MESSAGE_TOOL_NAME: &str = "send_session_message";
 const MAX_KICKOFF_PROMPT_BYTES: usize = 16 * 1024;
+const MAX_SESSION_MESSAGE_BYTES: usize = 16 * 1024;
 const MAX_TOOL_OPTION_BYTES: usize = 128;
 const MAX_SESSION_TITLE_BYTES: usize = 120;
+const MAX_SESSION_ID_BYTES: usize = 128;
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum NotifyOnIdle {
+    Once,
+}
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(deny_unknown_fields)]
@@ -100,6 +110,8 @@ pub struct CreateSessionToolInput {
     pub reasoning_effort: Option<String>,
     #[serde(default)]
     pub context_tier: Option<String>,
+    #[serde(default)]
+    pub notify_on_idle: Option<NotifyOnIdle>,
 }
 
 impl CreateSessionToolInput {
@@ -162,23 +174,170 @@ pub struct CreateSessionToolResult {
     pub branch: Option<String>,
 }
 
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct GetSessionToolInput {
+    pub session_id: String,
+}
+
+impl GetSessionToolInput {
+    fn validate(&self) -> std::result::Result<(), String> {
+        validate_identifier("session_id", &self.session_id)
+    }
+}
+
+#[derive(Clone, Copy, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SessionMessageDelivery {
+    Immediate,
+    Queued,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct SendSessionMessageToolInput {
+    pub session_id: String,
+    pub message: String,
+    pub delivery: SessionMessageDelivery,
+}
+
+impl SendSessionMessageToolInput {
+    fn validate(&self) -> std::result::Result<(), String> {
+        validate_identifier("session_id", &self.session_id)?;
+        if self.message.trim().is_empty() {
+            return Err("message must not be empty".to_owned());
+        }
+        if self.message.len() > MAX_SESSION_MESSAGE_BYTES {
+            return Err(format!(
+                "message exceeds the {MAX_SESSION_MESSAGE_BYTES}-byte limit"
+            ));
+        }
+        Ok(())
+    }
+}
+
+fn validate_identifier(name: &str, value: &str) -> std::result::Result<(), String> {
+    if value.trim().is_empty() {
+        return Err(format!("{name} must not be empty"));
+    }
+    if value.len() > MAX_SESSION_ID_BYTES {
+        return Err(format!(
+            "{name} exceeds the {MAX_SESSION_ID_BYTES}-byte limit"
+        ));
+    }
+    Ok(())
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SessionTranscriptEntry {
+    pub role: String,
+    pub content: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SessionChangeSummary {
+    pub branch: Option<String>,
+    pub head: Option<String>,
+    pub base: Option<String>,
+    pub files_changed: usize,
+    pub insertions: u32,
+    pub deletions: u32,
+    pub paths: Vec<String>,
+    pub error: Option<String>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct GetSessionToolResult {
+    pub app_session_id: String,
+    pub relationship: String,
+    pub title: String,
+    pub status: String,
+    pub project: String,
+    pub worktree: String,
+    pub branch: Option<String>,
+    pub latest_assistant_result: Option<String>,
+    pub transcript_tail: Vec<SessionTranscriptEntry>,
+    pub pending_plan_summary: Option<String>,
+    pub changes: SessionChangeSummary,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize)]
+pub struct SendSessionMessageToolResult {
+    pub message_id: String,
+    pub recipient_app_session_id: String,
+    pub delivery: SessionMessageDelivery,
+    pub state: String,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HostToolCall {
+    CreateSession(CreateSessionToolInput),
+    GetSession(GetSessionToolInput),
+    SendSessionMessage(SendSessionMessageToolInput),
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum HostToolResult {
+    CreateSession(CreateSessionToolResult),
+    GetSession(Box<GetSessionToolResult>),
+    SendSessionMessage(SendSessionMessageToolResult),
+}
+
 #[derive(Debug)]
 pub struct HostToolRequest {
     pub caller_session_id: String,
     pub tool_call_id: String,
-    pub input: CreateSessionToolInput,
-    pub response: oneshot::Sender<std::result::Result<CreateSessionToolResult, String>>,
+    pub call: HostToolCall,
+    pub response: oneshot::Sender<std::result::Result<HostToolResult, String>>,
+}
+
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum ChildLifecycleStatus {
+    Idle,
+    Failed,
+    Cancelled,
+}
+
+impl ChildLifecycleStatus {
+    #[must_use]
+    pub const fn as_str(self) -> &'static str {
+        match self {
+            Self::Idle => "idle",
+            Self::Failed => "failed",
+            Self::Cancelled => "cancelled",
+        }
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ChildLifecycleEvent {
+    pub child_session_id: String,
+    pub title: String,
+    pub status: ChildLifecycleStatus,
+}
+
+#[derive(Debug)]
+pub enum HostGatewayEvent {
+    Tool(HostToolRequest),
+    ChildLifecycle(ChildLifecycleEvent),
 }
 
 #[derive(Clone, Debug)]
 pub struct HostToolGateway {
-    sender: mpsc::Sender<HostToolRequest>,
+    sender: mpsc::Sender<HostGatewayEvent>,
 }
 
 impl HostToolGateway {
     #[must_use]
-    pub fn new(sender: mpsc::Sender<HostToolRequest>) -> Self {
+    pub fn new(sender: mpsc::Sender<HostGatewayEvent>) -> Self {
         Self { sender }
+    }
+
+    pub async fn notify_child_lifecycle(&self, event: ChildLifecycleEvent) {
+        let _ = self
+            .sender
+            .send(HostGatewayEvent::ChildLifecycle(event))
+            .await;
     }
 }
 
@@ -210,31 +369,139 @@ impl ToolHandler for CreateSessionToolHandler {
     ) -> std::result::Result<ToolResult, github_copilot_sdk::Error> {
         let input = invocation.params::<CreateSessionToolInput>()?;
         if let Err(error) = input.validate() {
-            return Ok(tool_response(Err(error)));
+            return Ok(tool_response("session", Err(error)));
         }
         let (response, receiver) = oneshot::channel();
-        let request = HostToolRequest {
-            caller_session_id: self.binding.caller_session_id.clone(),
-            tool_call_id: invocation.tool_call_id,
-            input,
+        let result = call_host_tool(
+            &self.binding,
+            invocation.tool_call_id,
+            HostToolCall::CreateSession(input),
             response,
-        };
-        if self.binding.gateway.sender.send(request).await.is_err() {
-            return Ok(tool_response(Err(
-                "create_session host service is unavailable".to_owned(),
-            )));
-        }
-        let result = receiver.await.unwrap_or_else(|_| {
-            Err("create_session host service closed without a response".to_owned())
-        });
-        Ok(tool_response(result))
+            receiver,
+        )
+        .await;
+        Ok(tool_response(
+            "session",
+            result.and_then(|result| match result {
+                HostToolResult::CreateSession(result) => serde_json::to_value(result)
+                    .map_err(|error| format!("failed to encode create_session response: {error}")),
+                _ => Err("create_session host service returned the wrong response type".to_owned()),
+            }),
+        ))
     }
 }
 
-fn tool_response(result: std::result::Result<CreateSessionToolResult, String>) -> ToolResult {
+struct GetSessionToolHandler {
+    binding: HostToolBinding,
+}
+
+#[async_trait]
+impl ToolHandler for GetSessionToolHandler {
+    async fn call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> std::result::Result<ToolResult, github_copilot_sdk::Error> {
+        let input = invocation.params::<GetSessionToolInput>()?;
+        if let Err(error) = input.validate() {
+            return Ok(tool_response("session", Err(error)));
+        }
+        let (response, receiver) = oneshot::channel();
+        let result = call_host_tool(
+            &self.binding,
+            invocation.tool_call_id,
+            HostToolCall::GetSession(input),
+            response,
+            receiver,
+        )
+        .await;
+        Ok(tool_response(
+            "session",
+            result.and_then(|result| match result {
+                HostToolResult::GetSession(result) => serde_json::to_value(result)
+                    .map_err(|error| format!("failed to encode get_session response: {error}")),
+                _ => Err("get_session host service returned the wrong response type".to_owned()),
+            }),
+        ))
+    }
+}
+
+struct SendSessionMessageToolHandler {
+    binding: HostToolBinding,
+}
+
+#[async_trait]
+impl ToolHandler for SendSessionMessageToolHandler {
+    async fn call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> std::result::Result<ToolResult, github_copilot_sdk::Error> {
+        let input = invocation.params::<SendSessionMessageToolInput>()?;
+        if let Err(error) = input.validate() {
+            return Ok(tool_response("message", Err(error)));
+        }
+        let (response, receiver) = oneshot::channel();
+        let result = call_host_tool(
+            &self.binding,
+            invocation.tool_call_id,
+            HostToolCall::SendSessionMessage(input),
+            response,
+            receiver,
+        )
+        .await;
+        Ok(tool_response(
+            "message",
+            result.and_then(|result| match result {
+                HostToolResult::SendSessionMessage(result) => {
+                    serde_json::to_value(result).map_err(|error| {
+                        format!("failed to encode send_session_message response: {error}")
+                    })
+                }
+                _ => Err(
+                    "send_session_message host service returned the wrong response type".to_owned(),
+                ),
+            }),
+        ))
+    }
+}
+
+async fn call_host_tool(
+    binding: &HostToolBinding,
+    tool_call_id: String,
+    call: HostToolCall,
+    response: oneshot::Sender<std::result::Result<HostToolResult, String>>,
+    receiver: oneshot::Receiver<std::result::Result<HostToolResult, String>>,
+) -> std::result::Result<HostToolResult, String> {
+    let tool_name = match &call {
+        HostToolCall::CreateSession(_) => CREATE_SESSION_TOOL_NAME,
+        HostToolCall::GetSession(_) => GET_SESSION_TOOL_NAME,
+        HostToolCall::SendSessionMessage(_) => SEND_SESSION_MESSAGE_TOOL_NAME,
+    };
+    let request = HostToolRequest {
+        caller_session_id: binding.caller_session_id.clone(),
+        tool_call_id,
+        call,
+        response,
+    };
+    if binding
+        .gateway
+        .sender
+        .send(HostGatewayEvent::Tool(request))
+        .await
+        .is_err()
+    {
+        return Err(format!("{tool_name} host service is unavailable"));
+    }
+    receiver.await.unwrap_or_else(|_| {
+        Err(format!(
+            "{tool_name} host service closed without a response"
+        ))
+    })
+}
+
+fn tool_response(key: &str, result: std::result::Result<Value, String>) -> ToolResult {
     match result {
-        Ok(session) => ToolResult::Expanded(ToolResultExpanded::new(
-            json!({"ok": true, "session": session}).to_string(),
+        Ok(result) => ToolResult::Expanded(ToolResultExpanded::new(
+            json!({"ok": true, (key): result}).to_string(),
             "success",
         )),
         Err(error) => ToolResult::Expanded(
@@ -280,6 +547,11 @@ fn create_session_tool(binding: HostToolBinding) -> Tool {
                     "context_tier": {
                         "type": "string",
                         "enum": ["default", "long_context"]
+                    },
+                    "notify_on_idle": {
+                        "type": "string",
+                        "enum": ["once"],
+                        "description": "Notify this session once when the child finishes its kickoff or current turn."
                     }
                 },
                 "required": ["prompt"]
@@ -287,6 +559,72 @@ fn create_session_tool(binding: HostToolBinding) -> Tool {
             .expect("create_session tool schema is an object"),
         )
         .with_handler(Arc::new(CreateSessionToolHandler { binding }))
+}
+
+fn get_session_tool(binding: HostToolBinding) -> Tool {
+    Tool::new(GET_SESSION_TOOL_NAME)
+        .with_description(
+            "Inspect this GCABB app session or an authorized ancestor or descendant. Returns bounded status and work summaries, not an unbounded transcript.",
+        )
+        .with_parameters(
+            serde_json::from_value(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SESSION_ID_BYTES,
+                        "description": "GCABB app session id to inspect."
+                    }
+                },
+                "required": ["session_id"]
+            }))
+            .expect("get_session tool schema is an object"),
+        )
+        .with_handler(Arc::new(GetSessionToolHandler { binding }))
+}
+
+fn send_session_message_tool(binding: HostToolBinding) -> Tool {
+    Tool::new(SEND_SESSION_MESSAGE_TOOL_NAME)
+        .with_description(
+            "Send a durable message between an authorized GCABB parent and descendant session in the same registered project.",
+        )
+        .with_parameters(
+            serde_json::from_value(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "session_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SESSION_ID_BYTES,
+                        "description": "Recipient GCABB app session id."
+                    },
+                    "message": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SESSION_MESSAGE_BYTES
+                    },
+                    "delivery": {
+                        "type": "string",
+                        "enum": ["immediate", "queued"],
+                        "description": "Interrupt the current turn immediately or deliver in order when idle."
+                    }
+                },
+                "required": ["session_id", "message", "delivery"]
+            }))
+            .expect("send_session_message tool schema is an object"),
+        )
+        .with_handler(Arc::new(SendSessionMessageToolHandler { binding }))
+}
+
+fn host_tools(binding: HostToolBinding) -> [Tool; 3] {
+    [
+        create_session_tool(binding.clone()),
+        get_session_tool(binding.clone()),
+        send_session_message_tool(binding),
+    ]
 }
 
 #[derive(Clone, Debug)]
@@ -843,7 +1181,7 @@ impl CopilotProvider {
             .with_exit_plan_mode_handler(broker.clone())
             .with_auto_mode_switch_handler(broker);
         if let Some(binding) = request.host_tools.clone() {
-            config = config.with_tools([create_session_tool(binding)]);
+            config = config.with_tools(host_tools(binding));
         }
         config.skill_directories = repository_skill_directories(&request.working_directory);
         config.model.clone_from(&request.model);
@@ -871,7 +1209,7 @@ impl CopilotProvider {
             .with_exit_plan_mode_handler(broker.clone())
             .with_auto_mode_switch_handler(broker);
         if let Some(binding) = request.host_tools.clone() {
-            config = config.with_tools([create_session_tool(binding)]);
+            config = config.with_tools(host_tools(binding));
         }
         config.skill_directories = repository_skill_directories(&request.working_directory);
         config.model.clone_from(&request.model);
@@ -1933,10 +2271,13 @@ mod tests {
 
     use super::{
         AgentProviderFactory, CopilotProvider, CopilotProviderFactory, CreateSessionToolResult,
-        HostToolBinding, HostToolGateway, InteractionBroker, InteractionResponse,
-        ProviderInteraction, SessionRequest, command_identifier, message_options, model_option,
-        permission_choices, permission_domain, permission_for_domain, permission_for_location,
-        permission_for_session, permission_stays_in_worktree, resolve_root, sdk_context_windows,
+        GetSessionToolInput, GetSessionToolResult, HostGatewayEvent, HostToolBinding, HostToolCall,
+        HostToolGateway, HostToolResult, InteractionBroker, InteractionResponse,
+        ProviderInteraction, SendSessionMessageToolInput, SendSessionMessageToolResult,
+        SessionChangeSummary, SessionMessageDelivery, SessionRequest, command_identifier,
+        message_options, model_option, permission_choices, permission_domain,
+        permission_for_domain, permission_for_location, permission_for_session,
+        permission_stays_in_worktree, resolve_root, sdk_context_windows,
     };
 
     fn interaction_broker() -> Arc<InteractionBroker> {
@@ -2003,7 +2344,11 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn create_session_tool_is_registered_on_create_and_resume_and_binds_the_caller() {
+    #[allow(
+        clippy::too_many_lines,
+        reason = "one matrix verifies registration and dispatch for all three host tools"
+    )]
+    async fn host_tools_are_registered_on_create_and_resume_and_bind_the_caller() {
         let (sender, mut requests) = mpsc::channel(1);
         let request = SessionRequest {
             working_directory: std::env::temp_dir(),
@@ -2023,7 +2368,7 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            ["create_session"]
+            ["create_session", "get_session", "send_session_message"]
         );
         let parameters = &create.tools.as_ref().unwrap()[0].parameters;
         let properties = parameters
@@ -2041,17 +2386,15 @@ mod tests {
                 .iter()
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
-            ["create_session"]
+            ["create_session", "get_session", "send_session_message"]
         );
 
-        let handler = create.tools.unwrap()[0]
-            .handler()
-            .expect("create_session handler")
-            .clone();
-        let failure_handler = resume.tools.unwrap()[0]
-            .handler()
-            .expect("resumed create_session handler")
-            .clone();
+        let create_tools = create.tools.unwrap();
+        let resume_tools = resume.tools.unwrap();
+        let handler = create_tools[0].handler().expect("create handler").clone();
+        let get_handler = resume_tools[1].handler().expect("get handler").clone();
+        let send_handler = resume_tools[2].handler().expect("send handler").clone();
+        let failure_handler = resume_tools[0].handler().expect("create handler").clone();
         let invocation: ToolInvocation = serde_json::from_value(json!({
             "sessionId": "sdk-parent",
             "toolCallId": "tool-call-1",
@@ -2060,20 +2403,26 @@ mod tests {
         }))
         .expect("tool invocation");
         let call = tokio::spawn(async move { handler.call(invocation).await });
-        let request = requests.recv().await.expect("host request");
+        let HostGatewayEvent::Tool(request) = requests.recv().await.expect("host request") else {
+            panic!("expected tool request");
+        };
         assert_eq!(request.caller_session_id, "app-parent");
         assert_eq!(request.tool_call_id, "tool-call-1");
-        assert_eq!(request.input.prompt, "Implement the child task");
+        assert!(matches!(
+            &request.call,
+            HostToolCall::CreateSession(input)
+                if input.prompt == "Implement the child task"
+        ));
         request
             .response
-            .send(Ok(CreateSessionToolResult {
+            .send(Ok(HostToolResult::CreateSession(CreateSessionToolResult {
                 child_app_session_id: "child-1".to_owned(),
                 title: "Child".to_owned(),
                 status: "running".to_owned(),
                 project: "/repo".to_owned(),
                 worktree: "/worktrees/child".to_owned(),
                 branch: Some("gcabb/child".to_owned()),
-            }))
+            })))
             .expect("respond");
         let result = call.await.expect("handler task").expect("tool result");
         assert!(matches!(
@@ -2081,6 +2430,97 @@ mod tests {
             ToolResult::Expanded(result)
                 if result.result_type == "success"
                     && result.text_result_for_llm.contains("\"child_app_session_id\":\"child-1\"")
+        ));
+
+        let invocation: ToolInvocation = serde_json::from_value(json!({
+            "sessionId": "sdk-parent",
+            "toolCallId": "tool-call-get",
+            "toolName": "get_session",
+            "arguments": {"session_id": "child-1"}
+        }))
+        .expect("tool invocation");
+        let call = tokio::spawn(async move { get_handler.call(invocation).await });
+        let HostGatewayEvent::Tool(request) = requests.recv().await.expect("host request") else {
+            panic!("expected tool request");
+        };
+        assert_eq!(request.caller_session_id, "app-parent");
+        assert!(matches!(
+            &request.call,
+            HostToolCall::GetSession(input) if input.session_id == "child-1"
+        ));
+        request
+            .response
+            .send(Ok(HostToolResult::GetSession(Box::new(
+                GetSessionToolResult {
+                    app_session_id: "child-1".to_owned(),
+                    relationship: "descendant".to_owned(),
+                    title: "Child".to_owned(),
+                    status: "idle".to_owned(),
+                    project: "/repo".to_owned(),
+                    worktree: "/worktrees/child".to_owned(),
+                    branch: Some("gcabb/child".to_owned()),
+                    latest_assistant_result: Some("Done".to_owned()),
+                    transcript_tail: Vec::new(),
+                    pending_plan_summary: None,
+                    changes: SessionChangeSummary {
+                        branch: Some("gcabb/child".to_owned()),
+                        head: Some("abc".to_owned()),
+                        base: Some("main".to_owned()),
+                        files_changed: 1,
+                        insertions: 2,
+                        deletions: 0,
+                        paths: vec!["src/lib.rs".to_owned()],
+                        error: None,
+                    },
+                },
+            ))))
+            .expect("respond");
+        let result = call.await.expect("handler task").expect("tool result");
+        assert!(matches!(
+            result,
+            ToolResult::Expanded(result)
+                if result.result_type == "success"
+                    && result.text_result_for_llm.contains("\"relationship\":\"descendant\"")
+        ));
+
+        let invocation: ToolInvocation = serde_json::from_value(json!({
+            "sessionId": "sdk-parent",
+            "toolCallId": "tool-call-send",
+            "toolName": "send_session_message",
+            "arguments": {
+                "session_id": "child-1",
+                "message": "Please report status",
+                "delivery": "queued"
+            }
+        }))
+        .expect("tool invocation");
+        let call = tokio::spawn(async move { send_handler.call(invocation).await });
+        let HostGatewayEvent::Tool(request) = requests.recv().await.expect("host request") else {
+            panic!("expected tool request");
+        };
+        assert!(matches!(
+            &request.call,
+            HostToolCall::SendSessionMessage(input)
+                if input.session_id == "child-1"
+                    && input.delivery == SessionMessageDelivery::Queued
+        ));
+        request
+            .response
+            .send(Ok(HostToolResult::SendSessionMessage(
+                SendSessionMessageToolResult {
+                    message_id: "message-1".to_owned(),
+                    recipient_app_session_id: "child-1".to_owned(),
+                    delivery: SessionMessageDelivery::Queued,
+                    state: "pending".to_owned(),
+                },
+            )))
+            .expect("respond");
+        let result = call.await.expect("handler task").expect("tool result");
+        assert!(matches!(
+            result,
+            ToolResult::Expanded(result)
+                if result.result_type == "success"
+                    && result.text_result_for_llm.contains("\"message_id\":\"message-1\"")
         ));
 
         let invalid: ToolInvocation = serde_json::from_value(json!({
@@ -2098,6 +2538,22 @@ mod tests {
                     && result.error.as_deref() == Some("prompt must not be empty")
         ));
         assert!(requests.try_recv().is_err());
+    }
+
+    #[test]
+    fn host_tool_inputs_reject_paths_and_unknown_fields() {
+        let get = serde_json::from_value::<GetSessionToolInput>(json!({
+            "session_id": "child-1",
+            "project_path": "/tmp/spoof"
+        }));
+        assert!(get.is_err());
+        let send = serde_json::from_value::<SendSessionMessageToolInput>(json!({
+            "session_id": "child-1",
+            "message": "hello",
+            "delivery": "queued",
+            "caller_session_id": "spoof"
+        }));
+        assert!(send.is_err());
     }
 
     #[test]
