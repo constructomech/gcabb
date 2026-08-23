@@ -440,7 +440,7 @@ async fn native_fork_preserves_history_filesystem_provenance_and_retry_identity(
     );
     assert_eq!(
         std::fs::read(fork.project_path.join("README.md")).unwrap(),
-        b"unstaged after staged\n"
+        std::fs::read(source_path.join("README.md")).unwrap()
     );
     assert!(fork.project_path.join("moved.txt").is_file());
     assert!(!fork.project_path.join("renamed.txt").exists());
