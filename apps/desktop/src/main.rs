@@ -2547,6 +2547,10 @@ struct SessionMvpView {
     expanded_tool_outputs: HashSet<String>,
     /// Tool rows whose detailed card is open, keyed by session.
     expanded_tools: HashMap<String, HashSet<String>>,
+    /// Tool rows opened automatically after crossing the terminal delay.
+    auto_expanded_tools: HashMap<String, HashSet<String>>,
+    /// Tool rows the user explicitly collapsed, suppressing later auto-expansion.
+    collapsed_tools: HashMap<String, HashSet<String>>,
     /// Scrollbar currently being dragged, if any.
     ///
     /// Tracked on the view rather than the thumb so a drag keeps working once
@@ -2620,6 +2624,7 @@ struct SessionMvpView {
     update_service: Option<UpdateService>,
     settings_visibility: SettingsVisibility,
     diagnostics_visibility: SettingsVisibility,
+    terminal_auto_expand_delay_input: Entity<TextInput>,
     running_since: HashMap<String, Instant>,
     last_event_seen: HashMap<String, (u64, Instant)>,
     last_activity_repaint: Instant,
@@ -2720,6 +2725,25 @@ impl SessionMvpView {
             view.commit_rename(&event.text, cx);
         })
         .detach();
+        let terminal_auto_expand_delay_input =
+            cx.new(|cx| TextInput::new(cx, "terminal-auto-expand-delay", "Seconds"));
+        terminal_auto_expand_delay_input.update(cx, |input, cx| {
+            input.set_value(
+                format_terminal_auto_expand_delay(
+                    worktree_configuration.settings.terminal_auto_expand_delay(),
+                ),
+                cx,
+            );
+        });
+        cx.subscribe(
+            &terminal_auto_expand_delay_input,
+            |view, _, event: &InputSubmitted, cx| {
+                view.save_terminal_auto_expand_delay(&event.text, cx);
+            },
+        )
+        .detach();
+        cx.observe(&terminal_auto_expand_delay_input, |_, _, cx| cx.notify())
+            .detach();
         let automations_panel = AutomationsPanel::new(cx);
 
         let poll_task = cx.spawn(async move |view, cx| {
@@ -2734,8 +2758,14 @@ impl SessionMvpView {
                         let refreshed = view.refresh_snapshots();
                         let banner_changed = view.apply_update_events();
                         let timers_changed = view.sync_activity_timers();
+                        let terminals_expanded = view.sync_terminal_auto_expansion();
                         let repaint_timer = view.activity_timer_due();
-                        if updated || refreshed || banner_changed || timers_changed || repaint_timer
+                        if updated
+                            || refreshed
+                            || banner_changed
+                            || timers_changed
+                            || terminals_expanded
+                            || repaint_timer
                         {
                             cx.notify();
                         }
@@ -2831,6 +2861,8 @@ impl SessionMvpView {
             scroll_positions: RefCell::new(HashMap::new()),
             expanded_tool_outputs: HashSet::new(),
             expanded_tools: HashMap::new(),
+            auto_expanded_tools: HashMap::new(),
+            collapsed_tools: HashMap::new(),
             dragging_scrollbar: None,
             transcript_extent: (String::new(), 0, 0, 0, 0),
             restore_failures: Vec::new(),
@@ -2875,6 +2907,7 @@ impl SessionMvpView {
             update_service,
             settings_visibility: SettingsVisibility::Closed,
             diagnostics_visibility: SettingsVisibility::Closed,
+            terminal_auto_expand_delay_input,
             running_since: HashMap::new(),
             last_event_seen: HashMap::new(),
             last_activity_repaint: Instant::now(),
@@ -3061,6 +3094,34 @@ impl SessionMvpView {
         Ok(())
     }
 
+    fn save_terminal_auto_expand_delay(&mut self, value: &str, cx: &mut Context<Self>) {
+        let result = (|| {
+            let delay = parse_terminal_auto_expand_delay(value)?;
+            let mut settings = self.worktree_configuration.settings.clone();
+            settings.set_terminal_auto_expand_delay(delay);
+            if let Some(data_dir) = self.worktree_configuration.data_dir.as_deref() {
+                settings.save(data_dir).map_err(|error| {
+                    format!("could not save terminal auto-expand delay: {error}")
+                })?;
+            }
+            self.worktree_configuration.settings = settings;
+            Ok(delay)
+        })();
+
+        match result {
+            Ok(delay) => {
+                self.settings_error = None;
+                self.terminal_auto_expand_delay_input
+                    .update(cx, |input, cx| {
+                        input.set_value(format_terminal_auto_expand_delay(delay), cx);
+                    });
+                self.sync_terminal_auto_expansion();
+            }
+            Err(error) => self.settings_error = Some(error),
+        }
+        cx.notify();
+    }
+
     fn choose_worktrees_root(&mut self, cx: &mut Context<Self>) {
         self.settings_error = None;
         let paths = cx.prompt_for_paths(PathPromptOptions {
@@ -3244,6 +3305,67 @@ impl SessionMvpView {
             )
     }
 
+    fn settings_terminal_auto_expand_row(&self, cx: &mut Context<Self>) -> impl IntoElement {
+        div()
+            .flex()
+            .items_center()
+            .justify_between()
+            .gap_4()
+            .child(
+                div()
+                    .min_w_0()
+                    .flex_1()
+                    .flex()
+                    .flex_col()
+                    .gap_1()
+                    .child(div().child("Terminal auto-expand delay"))
+                    .child(div().text_xs().text_color(rgb(MUTED)).child(
+                        "Shell details start collapsed and open only if the command is still \
+                         running after this many seconds.",
+                    )),
+            )
+            .child(
+                div()
+                    .flex()
+                    .items_center()
+                    .gap_2()
+                    .child(
+                        div()
+                            .w(px(96.0))
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .rounded_md()
+                            .bg(rgb(BACKGROUND))
+                            .child(self.terminal_auto_expand_delay_input.clone()),
+                    )
+                    .child(
+                        div()
+                            .id("settings-save-terminal-delay")
+                            .accessibility_id("settings-save-terminal-delay")
+                            .role(Role::Button)
+                            .aria_label("Save terminal auto-expand delay")
+                            .focusable()
+                            .tab_stop(true)
+                            .px_3()
+                            .py_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .text_sm()
+                            .child("Save")
+                            .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                            .on_click(cx.listener(|view, _, _, cx| {
+                                let value = view
+                                    .terminal_auto_expand_delay_input
+                                    .read(cx)
+                                    .value()
+                                    .clone();
+                                view.save_terminal_auto_expand_delay(&value, cx);
+                            })),
+                    ),
+            )
+    }
+
     /// Archived sessions and the control that brings them back.
     ///
     /// Archiving is reachable from any session's context menu, so the reverse
@@ -3380,6 +3502,7 @@ impl SessionMvpView {
                                 .child("Settings"),
                         )
                         .child(self.settings_worktrees_row(cx))
+                        .child(self.settings_terminal_auto_expand_row(cx))
                         .child(self.settings_archive_section(cx))
                         .when_some(self.settings_error.clone(), |panel, error| {
                             panel.child(
@@ -3788,6 +3911,65 @@ impl SessionMvpView {
                 }
                 _ => {}
             }
+        }
+        changed
+    }
+
+    fn sync_terminal_auto_expansion(&mut self) -> bool {
+        let Some(now_millis) = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .ok()
+            .map(|duration| duration.as_millis())
+        else {
+            return false;
+        };
+        self.sync_terminal_auto_expansion_at(now_millis)
+    }
+
+    fn sync_terminal_auto_expansion_at(&mut self, now_millis: u128) -> bool {
+        let delay_millis = self
+            .worktree_configuration
+            .settings
+            .terminal_auto_expand_delay()
+            .as_millis();
+        let due = self
+            .sessions
+            .iter()
+            .flat_map(|session| {
+                session
+                    .snapshot
+                    .tool_activity
+                    .invocations
+                    .iter()
+                    .filter(|invocation| {
+                        invocation.class == app_model::ToolClass::Shell
+                            && Self::terminal_is_running_in(&session.snapshot, invocation)
+                            && timestamp_millis(&invocation.started_at).is_some_and(|started| {
+                                now_millis.saturating_sub(started) >= delay_millis
+                            })
+                    })
+                    .map(|invocation| (session.id().to_owned(), invocation.call_id.clone()))
+            })
+            .collect::<Vec<_>>();
+
+        let mut changed = false;
+        for (session_id, call_id) in due {
+            let manually_expanded = self
+                .expanded_tools
+                .get(&session_id)
+                .is_some_and(|tools| tools.contains(&call_id));
+            let manually_collapsed = self
+                .collapsed_tools
+                .get(&session_id)
+                .is_some_and(|tools| tools.contains(&call_id));
+            if manually_expanded || manually_collapsed {
+                continue;
+            }
+            changed |= self
+                .auto_expanded_tools
+                .entry(session_id)
+                .or_default()
+                .insert(call_id);
         }
         changed
     }
@@ -4525,6 +4707,8 @@ impl SessionMvpView {
         self.session_drafts.remove(id);
         self.expanded_changes.remove(id);
         self.expanded_tools.remove(id);
+        self.auto_expanded_tools.remove(id);
+        self.collapsed_tools.remove(id);
         if self.session_menu.as_ref().is_some_and(|menu| menu.id == id) {
             self.session_menu = None;
         }
@@ -6842,6 +7026,10 @@ impl SessionMvpView {
             self.expanded_tools
                 .get(session_id)
                 .is_some_and(|expanded| expanded.contains(call_id))
+                || self
+                    .auto_expanded_tools
+                    .get(session_id)
+                    .is_some_and(|expanded| expanded.contains(call_id))
         })
     }
 
@@ -6849,20 +7037,36 @@ impl SessionMvpView {
         let Some(session_id) = self.selected_session.clone() else {
             return;
         };
-        let expanded = self.expanded_tools.entry(session_id).or_default();
-        if !expanded.remove(call_id) {
-            expanded.insert(call_id.to_owned());
+        if self.tool_expanded(call_id) {
+            if let Some(expanded) = self.expanded_tools.get_mut(&session_id) {
+                expanded.remove(call_id);
+            }
+            if let Some(expanded) = self.auto_expanded_tools.get_mut(&session_id) {
+                expanded.remove(call_id);
+            }
+            self.collapsed_tools
+                .entry(session_id)
+                .or_default()
+                .insert(call_id.to_owned());
+        } else {
+            if let Some(collapsed) = self.collapsed_tools.get_mut(&session_id) {
+                collapsed.remove(call_id);
+            }
+            self.expanded_tools
+                .entry(session_id)
+                .or_default()
+                .insert(call_id.to_owned());
         }
     }
 
-    fn terminal_is_running(&self, invocation: &app_model::ToolInvocation) -> bool {
-        if invocation.class != app_model::ToolClass::Shell {
-            return false;
-        }
+    fn terminal_is_running_in(
+        snapshot: &SessionSnapshot,
+        invocation: &app_model::ToolInvocation,
+    ) -> bool {
         invocation
             .shell_id
             .as_deref()
-            .and_then(|shell_id| self.selected()?.snapshot.tool_activity.terminal(shell_id))
+            .and_then(|shell_id| snapshot.tool_activity.terminal(shell_id))
             .map_or(
                 invocation.state == app_model::InvocationState::Running,
                 app_model::TerminalSession::is_active,
@@ -7091,13 +7295,10 @@ impl SessionMvpView {
             .filter(|code| *code != 0)
             .map(|code| format!("exit {code}"));
         let argument_detail = Self::tool_argument_detail(invocation);
-        let terminal_running = self.terminal_is_running(invocation);
-        let expanded = terminal_running || self.tool_expanded(&invocation.call_id);
+        let expanded = self.tool_expanded(&invocation.call_id);
         let call_id = invocation.call_id.clone();
         let selector_call_id = invocation.call_id.clone();
-        let disclosure_label = if terminal_running {
-            format!("Details for {label}, expanded while terminal is running")
-        } else if expanded {
+        let disclosure_label = if expanded {
             format!("Collapse details for {label}")
         } else {
             format!("Expand details for {label}")
@@ -7361,9 +7562,7 @@ impl SessionMvpView {
                     })
                     .hover(|style| style.bg(rgb(SUBTLE)).cursor_pointer())
                     .on_click(cx.listener(move |view, _, _, cx| {
-                        if !terminal_running {
-                            view.toggle_tool(&call_id);
-                        }
+                        view.toggle_tool(&call_id);
                         cx.notify();
                     })),
             )
@@ -11584,6 +11783,55 @@ fn format_activity_duration(duration: Duration) -> String {
     }
 }
 
+fn parse_terminal_auto_expand_delay(value: &str) -> Result<Duration, String> {
+    let value = value.trim();
+    let mut parts = value.split('.');
+    let whole = parts.next().unwrap_or_default();
+    let fraction = parts.next().unwrap_or_default();
+    if value.is_empty()
+        || (whole.is_empty() && fraction.is_empty())
+        || parts.next().is_some()
+        || whole.starts_with('-')
+        || fraction.len() > 3
+        || (!whole.is_empty() && !whole.bytes().all(|byte| byte.is_ascii_digit()))
+        || (!fraction.is_empty() && !fraction.bytes().all(|byte| byte.is_ascii_digit()))
+    {
+        return Err(
+            "terminal auto-expand delay must be a non-negative number of seconds with up to three \
+             decimal places"
+                .to_owned(),
+        );
+    }
+    let whole_seconds = if whole.is_empty() {
+        0
+    } else {
+        whole
+            .parse::<u64>()
+            .map_err(|_| "terminal auto-expand delay is too large".to_owned())?
+    };
+    let whole_millis = whole_seconds
+        .checked_mul(1_000)
+        .ok_or_else(|| "terminal auto-expand delay is too large".to_owned())?;
+    let fraction_millis =
+        fraction.parse::<u64>().unwrap_or_default() * [1_000, 100, 10, 1][fraction.len()];
+    let millis = whole_millis
+        .checked_add(fraction_millis)
+        .ok_or_else(|| "terminal auto-expand delay is too large".to_owned())?;
+    Ok(Duration::from_millis(millis))
+}
+
+fn format_terminal_auto_expand_delay(delay: Duration) -> String {
+    let millis = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    let seconds = millis / 1_000;
+    let remainder = millis % 1_000;
+    if remainder == 0 {
+        return seconds.to_string();
+    }
+    format!("{seconds}.{remainder:03}")
+        .trim_end_matches('0')
+        .to_owned()
+}
+
 fn format_byte_count(bytes: u64) -> String {
     const KIB: u64 = 1024;
     const MIB: u64 = KIB * 1024;
@@ -12508,7 +12756,8 @@ pub(crate) mod tests {
     use super::{
         COMPACT_WIDTH, ControlMenu, UPDATE_POLL_INTERVAL, UPDATE_POLL_JITTER, choice_response,
         compact_layout, context_window_label, control_menu_id, control_menu_offset, default_branch,
-        default_context_tier, effort_label, migrate_persistent_data, permission_scope_description,
+        default_context_tier, effort_label, format_terminal_auto_expand_delay,
+        migrate_persistent_data, parse_terminal_auto_expand_delay, permission_scope_description,
         reasoning_effort_for_model, repository_root, toggled_menu, token_label,
         update_poll_delay_for,
     };
@@ -12516,6 +12765,7 @@ pub(crate) mod tests {
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
     use std::process::Command;
+    use std::time::Duration;
 
     fn git(dir: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -12559,6 +12809,22 @@ pub(crate) mod tests {
 
         assert_eq!(update_poll_delay_for(0), minimum);
         assert!(update_poll_delay_for(u64::MAX) <= maximum);
+    }
+
+    #[test]
+    fn terminal_auto_expand_delay_accepts_fractional_seconds() {
+        assert_eq!(
+            parse_terminal_auto_expand_delay("0.25").unwrap(),
+            Duration::from_millis(250)
+        );
+        assert_eq!(
+            format_terminal_auto_expand_delay(Duration::from_millis(2_500)),
+            "2.5"
+        );
+        assert!(parse_terminal_auto_expand_delay("-1").is_err());
+        assert!(parse_terminal_auto_expand_delay("later").is_err());
+        assert!(parse_terminal_auto_expand_delay(".").is_err());
+        assert!(parse_terminal_auto_expand_delay("0.0001").is_err());
     }
 
     #[test]
@@ -13026,8 +13292,9 @@ pub(crate) mod tests {
 
     pub(crate) mod interaction {
         use app_model::{
-            InteractionKind, InteractionRequest, InteractionResponse, SessionKind,
-            SessionLaunchOrigin, SessionMetadata, SessionSnapshot, SessionStatus, TitleSource,
+            InteractionKind, InteractionRequest, InteractionResponse, InvocationState, SessionKind,
+            SessionLaunchOrigin, SessionMetadata, SessionSnapshot, SessionStatus, TerminalState,
+            TitleSource,
         };
         use gpui::{FollowMode, Modifiers, MouseButton, TestAppContext, VisualTestContext};
         use session_manager::SessionHandle;
@@ -13057,6 +13324,25 @@ pub(crate) mod tests {
                 updated_at: "1".to_owned(),
             });
             state.status = app_model::SessionStatus::Idle;
+            state
+        }
+
+        fn running_terminal_snapshot(id: &str, started_at: &str) -> SessionSnapshot {
+            let mut state = snapshot(id, "Terminal session");
+            state.apply(app_model::DomainEvent::from_sdk_event_for(
+                id,
+                1,
+                &serde_json::json!({
+                    "id": format!("tool-{id}"),
+                    "timestamp": started_at,
+                    "type": "tool.execution_start",
+                    "data": {
+                        "toolCallId": "c1",
+                        "toolName": "bash",
+                        "arguments": {"command": "sleep 10", "shellId": "shell-1"}
+                    }
+                }),
+            ));
             state
         }
 
@@ -16031,67 +16317,145 @@ pub(crate) mod tests {
         }
 
         #[gpui::test]
-        fn running_terminals_expand_until_they_exit(cx: &mut TestAppContext) {
+        fn terminals_start_collapsed_and_open_only_after_the_delay(cx: &mut TestAppContext) {
             let (view, cx, _commands) = setup(cx);
-            let running = |completed: bool| {
-                let mut state = snapshot("session-1", "First session");
-                state.apply(app_model::DomainEvent::from_sdk_event_for(
-                    "session-1",
-                    1,
-                    &serde_json::json!({"id":"t","type":"tool.execution_start",
-                        "data":{"toolCallId":"c1","toolName":"bash",
-                                "arguments":{"command":"sleep 1","shellId":"shell-1"}}}),
-                ));
-                if completed {
-                    state.apply(app_model::DomainEvent::from_sdk_event_for(
-                        "session-1",
-                        2,
-                        &serde_json::json!({"id":"d","type":"tool.execution_complete",
-                        "data":{"toolCallId":"c1","toolName":"bash","success":true,
-                                "result":{"contents":[
-                                    {"type":"shell_exit","shellId":"shell-1","exitCode":0}
-                                ]}}}),
-                    ));
-                }
-                state
-            };
             view.update(cx, |view, cx| {
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
-                    running(false),
+                    running_terminal_snapshot("session-1", "1000"),
                 ))];
                 view.selected_session = Some("session-1".to_owned());
-                cx.notify();
-            });
-            cx.run_until_parked();
-
-            assert!(
-                cx.debug_bounds("tool-expanded-card").is_some(),
-                "a running terminal should reveal its details automatically"
-            );
-            view.read_with(cx, |view, _| {
-                assert!(
-                    !view.tool_expanded("c1"),
-                    "automatic expansion must not become a manual preference"
-                );
-            });
-
-            view.update(cx, |view, cx| {
-                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
-                    running(true),
-                ))];
+                assert!(!view.sync_terminal_auto_expansion_at(1_999));
                 cx.notify();
             });
             cx.run_until_parked();
 
             assert!(
                 cx.debug_bounds("tool-expanded-card").is_none(),
-                "the terminal should collapse after exit"
+                "a terminal must remain collapsed before the configured delay"
             );
-            expand_first_tool(cx);
+            view.update(cx, |view, cx| {
+                assert!(view.sync_terminal_auto_expansion_at(2_000));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
             assert!(
                 cx.debug_bounds("tool-expanded-card").is_some(),
-                "an exited terminal can still be opened manually"
+                "a terminal still running at the delay should open"
             );
+            view.read_with(cx, |view, _| {
+                assert!(view.tool_expanded("c1"));
+            });
+            view.update(cx, |view, _| {
+                assert!(!view.sync_terminal_auto_expansion_at(5_000));
+            });
+        }
+
+        #[gpui::test]
+        fn fast_and_restored_completed_terminals_never_auto_expand(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let completed =
+                    |id: &str, invocation_state: InvocationState, terminal_state: TerminalState| {
+                        let mut state = running_terminal_snapshot(id, "1000");
+                        let invocation = &mut state.tool_activity.invocations[0];
+                        invocation.state = invocation_state;
+                        invocation.completed_at = Some("1500".to_owned());
+                        state.tool_activity.terminals[0].state = terminal_state;
+                        SessionProjection::for_test(SessionHandle::for_test(state))
+                    };
+                view.sessions = vec![
+                    completed(
+                        "session-1",
+                        InvocationState::Succeeded,
+                        TerminalState::Exited,
+                    ),
+                    completed("session-2", InvocationState::Failed, TerminalState::Exited),
+                    completed(
+                        "session-3",
+                        InvocationState::Cancelled,
+                        TerminalState::Cancelled,
+                    ),
+                ];
+                view.selected_session = Some("session-1".to_owned());
+                assert!(!view.sync_terminal_auto_expansion_at(10_000));
+                assert!(view.auto_expanded_tools.is_empty());
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("tool-expanded-card").is_none(),
+                "a fast command stays collapsed even when viewed much later"
+            );
+        }
+
+        #[gpui::test]
+        fn user_disclosure_choices_override_terminal_automation(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
+                    running_terminal_snapshot("session-1", "1000"),
+                ))];
+                view.selected_session = Some("session-1".to_owned());
+                assert!(view.sync_terminal_auto_expansion_at(2_000));
+                view.toggle_tool("c1");
+                assert!(!view.tool_expanded("c1"));
+                assert!(!view.sync_terminal_auto_expansion_at(20_000));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("tool-expanded-card").is_none(),
+                "a user-collapsed running terminal must not reopen"
+            );
+            expand_first_tool(cx);
+            view.update(cx, |view, _| {
+                assert!(view.tool_expanded("c1"));
+                let snapshot = Arc::make_mut(&mut view.sessions[0].snapshot);
+                snapshot.tool_activity.invocations[0].state = InvocationState::Succeeded;
+                snapshot.tool_activity.terminals[0].state = TerminalState::Exited;
+                assert!(
+                    view.tool_expanded("c1"),
+                    "manual expansion must survive completion"
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn threshold_changes_apply_to_pending_terminals_without_closing_open_ones(
+            cx: &mut TestAppContext,
+        ) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, _| {
+                view.worktree_configuration
+                    .settings
+                    .set_terminal_auto_expand_delay(std::time::Duration::from_secs(2));
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
+                    running_terminal_snapshot("session-1", "1000"),
+                ))];
+                view.selected_session = Some("session-1".to_owned());
+                assert!(!view.sync_terminal_auto_expansion_at(2_500));
+
+                view.worktree_configuration
+                    .settings
+                    .set_terminal_auto_expand_delay(std::time::Duration::from_secs(1));
+                assert!(view.sync_terminal_auto_expansion_at(2_500));
+
+                view.worktree_configuration
+                    .settings
+                    .set_terminal_auto_expand_delay(std::time::Duration::from_secs(10));
+                assert!(view.tool_expanded("c1"));
+
+                let snapshot = Arc::make_mut(&mut view.sessions[0].snapshot);
+                snapshot.tool_activity.invocations[0].state = InvocationState::Failed;
+                snapshot.tool_activity.terminals[0].state = TerminalState::Cancelled;
+                assert!(
+                    view.tool_expanded("c1"),
+                    "completion, failure, or cancellation must not undo an existing disclosure"
+                );
+            });
         }
 
         #[gpui::test]

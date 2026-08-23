@@ -2,18 +2,32 @@
 
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
+use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
 
 pub const SETTINGS_FILE: &str = "app-settings.json";
+pub const DEFAULT_TERMINAL_AUTO_EXPAND_DELAY_MS: u64 = 1_000;
 
-#[derive(Clone, Debug, Default, Deserialize, Eq, PartialEq, Serialize)]
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
 #[serde(default)]
 pub struct AppSettings {
     /// Override for newly created worktrees. `None` keeps the platform default.
     worktrees_root: Option<PathBuf>,
     /// Roots GCABB has used, retained so existing worktrees remain managed.
     managed_worktrees_roots: Vec<PathBuf>,
+    /// How long a shell must remain running before its transcript card opens.
+    terminal_auto_expand_delay_ms: u64,
+}
+
+impl Default for AppSettings {
+    fn default() -> Self {
+        Self {
+            worktrees_root: None,
+            managed_worktrees_roots: Vec::new(),
+            terminal_auto_expand_delay_ms: DEFAULT_TERMINAL_AUTO_EXPAND_DELAY_MS,
+        }
+    }
 }
 
 impl AppSettings {
@@ -62,6 +76,15 @@ impl AppSettings {
     #[must_use]
     pub fn uses_default_worktrees_root(&self) -> bool {
         self.worktrees_root.is_none()
+    }
+
+    #[must_use]
+    pub fn terminal_auto_expand_delay(&self) -> Duration {
+        Duration::from_millis(self.terminal_auto_expand_delay_ms)
+    }
+
+    pub fn set_terminal_auto_expand_delay(&mut self, delay: Duration) {
+        self.terminal_auto_expand_delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
     }
 
     /// Change where future worktrees are created while retaining ownership of
@@ -147,6 +170,8 @@ fn is_gcabb_worktree_path(relative: &Path, exact: bool) -> bool {
 
 #[cfg(test)]
 mod tests {
+    use std::time::Duration;
+
     use super::AppSettings;
 
     #[test]
@@ -184,9 +209,27 @@ mod tests {
         let custom = data.path().join("custom");
         let mut settings = AppSettings::default();
         settings.set_worktrees_root(custom, &default);
+        settings.set_terminal_auto_expand_delay(Duration::from_millis(2_500));
         settings.save(data.path()).unwrap();
 
         assert_eq!(AppSettings::load(data.path()), settings);
+    }
+
+    #[test]
+    fn missing_terminal_delay_uses_one_second() {
+        let data = tempfile::tempdir().unwrap();
+        std::fs::write(
+            AppSettings::path(data.path()),
+            r#"{"managed_worktrees_roots":[]}"#,
+        )
+        .unwrap();
+
+        let settings = AppSettings::load(data.path());
+
+        assert_eq!(
+            settings.terminal_auto_expand_delay(),
+            Duration::from_secs(1)
+        );
     }
 
     #[test]
