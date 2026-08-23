@@ -974,6 +974,11 @@ enum ServiceUpdate {
     AutomationRunsChanged(Vec<AutomationRun>),
     SessionLaunchProgress(SessionLaunchProgress),
     PromptAccepted(Option<String>),
+    InteractionResponseFailed {
+        app_session_id: String,
+        interaction_id: String,
+        error: String,
+    },
     ActionFailed(String),
     Failed(String),
 }
@@ -1500,6 +1505,14 @@ impl AppService {
                                 }
                                 _ => None,
                             };
+                            let interaction_origin = match &command {
+                                ServiceCommand::Respond {
+                                    app_session_id,
+                                    interaction_id,
+                                    ..
+                                } => Some((app_session_id.clone(), interaction_id.clone())),
+                                _ => None,
+                            };
                             match runtime.block_on(handle_service_command(
                                 &manager,
                                 &orchestrator,
@@ -1520,7 +1533,19 @@ impl AppService {
                                     }
                                 }
                                 Err(error) => {
-                                    let _ = update_tx.send(ServiceUpdate::ActionFailed(error));
+                                    if let Some((app_session_id, interaction_id)) =
+                                        interaction_origin
+                                    {
+                                        let _ = update_tx.send(
+                                            ServiceUpdate::InteractionResponseFailed {
+                                                app_session_id,
+                                                interaction_id,
+                                                error,
+                                            },
+                                        );
+                                    } else {
+                                        let _ = update_tx.send(ServiceUpdate::ActionFailed(error));
+                                    }
                                     let sessions = runtime.block_on(manager.sessions());
                                     let _ =
                                         update_tx.send(ServiceUpdate::SessionsDiscovered(sessions));
@@ -2625,6 +2650,8 @@ struct SessionMvpView {
     /// Incomplete prompts keyed by the session they belong to.
     session_drafts: HashMap<String, String>,
     interaction_input: Entity<TextInput>,
+    /// Interaction responses sent to the service but not yet reflected in a snapshot.
+    responding_interactions: HashSet<(String, String)>,
     /// Prompt the developer is adding to the follow-up queue.
     follow_up_input: Entity<TextInput>,
     draft_mode: String,
@@ -2930,6 +2957,7 @@ impl SessionMvpView {
             home_draft: String::new(),
             session_drafts: HashMap::new(),
             interaction_input,
+            responding_interactions: HashSet::new(),
             follow_up_input,
             draft_mode: "interactive".to_owned(),
             draft_model: None,
@@ -3651,6 +3679,28 @@ impl SessionMvpView {
         }
     }
 
+    fn apply_interaction_response_failed(
+        &mut self,
+        app_session_id: String,
+        interaction_id: String,
+        error: String,
+    ) {
+        self.responding_interactions
+            .remove(&(app_session_id, interaction_id));
+        self.action_error = Some(error);
+    }
+
+    fn apply_prompt_accepted(&mut self, origin: Option<&str>, cx: &mut Context<Self>) {
+        if let Some(id) = origin {
+            self.session_drafts.remove(id);
+        } else {
+            self.home_draft.clear();
+        }
+        if self.selected_session.as_deref() == origin {
+            self.composer.update(cx, TextInput::clear);
+        }
+    }
+
     /// Drains pending service updates, returning whether any were applied so the
     /// caller can skip repainting when the poll tick found nothing to do.
     fn apply_service_updates(&mut self, cx: &mut Context<Self>) -> bool {
@@ -3733,15 +3783,13 @@ impl SessionMvpView {
                     self.apply_session_unarchived(session);
                 }
                 ServiceUpdate::PromptAccepted(origin) => {
-                    if let Some(id) = origin.as_deref() {
-                        self.session_drafts.remove(id);
-                    } else {
-                        self.home_draft.clear();
-                    }
-                    if self.selected_session == origin {
-                        self.composer.update(cx, TextInput::clear);
-                    }
+                    self.apply_prompt_accepted(origin.as_deref(), cx);
                 }
+                ServiceUpdate::InteractionResponseFailed {
+                    app_session_id,
+                    interaction_id,
+                    error,
+                } => self.apply_interaction_response_failed(app_session_id, interaction_id, error),
                 ServiceUpdate::ActionFailed(error) => {
                     self.session_launch = None;
                     self.action_error = Some(error);
@@ -3921,7 +3969,49 @@ impl SessionMvpView {
                 changed = true;
             }
         }
+        if changed {
+            let pending_interactions = self
+                .sessions
+                .iter()
+                .flat_map(|session| {
+                    session
+                        .snapshot
+                        .pending_interactions
+                        .iter()
+                        .map(|interaction| (session.id().to_owned(), interaction.id.clone()))
+                })
+                .collect::<HashSet<_>>();
+            self.responding_interactions
+                .retain(|interaction| pending_interactions.contains(interaction));
+        }
         changed
+    }
+
+    fn respond_to_interaction(
+        &mut self,
+        app_session_id: String,
+        interaction_id: String,
+        response: InteractionResponse,
+        cx: &mut Context<Self>,
+    ) {
+        let key = (app_session_id.clone(), interaction_id.clone());
+        if !self.responding_interactions.insert(key.clone()) {
+            return;
+        }
+        self.action_error = None;
+        if self
+            .commands
+            .send(ServiceCommand::Respond {
+                app_session_id,
+                interaction_id,
+                response,
+            })
+            .is_err()
+        {
+            self.responding_interactions.remove(&key);
+            self.action_error = Some("The session service is unavailable.".to_owned());
+        }
+        cx.notify();
     }
 
     fn sync_activity_timers(&mut self) -> bool {
@@ -8585,19 +8675,60 @@ impl SessionMvpView {
         cx: &mut Context<Self>,
     ) -> impl IntoElement {
         let request = &record.request;
+        let pending_permissions = snapshot
+            .pending_interactions
+            .iter()
+            .filter(|interaction| interaction.kind == InteractionKind::Permission)
+            .collect::<Vec<_>>();
+        let pending_position = record.response.is_none().then(|| {
+            pending_permissions
+                .iter()
+                .position(|interaction| interaction.id == request.id)
+        });
+        let pending_position = pending_position.flatten();
+        let queue_label = if pending_permissions.len() > 1 {
+            pending_position.map(|position| {
+                format!("Request {} of {}", position + 1, pending_permissions.len())
+            })
+        } else {
+            (snapshot.interaction_history.len() > 1)
+                .then(|| format!("Permission request {}", interaction_index + 1))
+        };
+        let response_in_flight = self
+            .responding_interactions
+            .contains(&(snapshot.metadata.id.clone(), request.id.clone()));
+        let is_actionable = pending_position == Some(0) && !response_in_flight;
         let details = (!request.details.is_null()).then(|| {
             serde_json::to_string_pretty(&request.details)
                 .unwrap_or_else(|_| request.details.to_string())
         });
-        let status = record.response.as_ref().map(|response| match response {
-            InteractionResponse::Approve
-            | InteractionResponse::ApproveForSession
-            | InteractionResponse::ApproveForLocation
-            | InteractionResponse::ApprovePermanently => "Allowed",
-            InteractionResponse::Reject { .. } => "Denied",
-            InteractionResponse::Cancel => "Cancelled",
-            InteractionResponse::Submit { .. } => "Answered",
-        });
+        let status = record
+            .response
+            .as_ref()
+            .map(|response| match response {
+                InteractionResponse::Approve
+                | InteractionResponse::ApproveForSession
+                | InteractionResponse::ApproveForLocation
+                | InteractionResponse::ApprovePermanently => "Allowed",
+                InteractionResponse::Reject { .. } => "Denied",
+                InteractionResponse::Cancel => "Cancelled",
+                InteractionResponse::Submit { .. } => "Answered",
+            })
+            .or_else(|| response_in_flight.then_some("Submitting response"))
+            .or_else(|| {
+                pending_position
+                    .is_some_and(|position| position > 0)
+                    .then_some("Queued")
+            });
+        let accessible_label = [
+            queue_label.clone(),
+            Some(format!("Permission required: {}", request.message)),
+            status.map(str::to_owned),
+        ]
+        .into_iter()
+        .flatten()
+        .collect::<Vec<_>>()
+        .join(". ");
         let turn = snapshot
             .transcript
             .iter()
@@ -8646,12 +8777,13 @@ impl SessionMvpView {
                         .child(description),
                 )
                 .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
-                .on_click(cx.listener(move |view, _, _, _| {
-                    let _ = view.commands.send(ServiceCommand::Respond {
-                        app_session_id: session_id.clone(),
-                        interaction_id: interaction_id.clone(),
-                        response: choice_response(InteractionKind::Permission, &response_choice),
-                    });
+                .on_click(cx.listener(move |view, _, _, cx| {
+                    view.respond_to_interaction(
+                        session_id.clone(),
+                        interaction_id.clone(),
+                        choice_response(InteractionKind::Permission, &response_choice),
+                        cx,
+                    );
                 }))
         });
 
@@ -8663,7 +8795,7 @@ impl SessionMvpView {
             .debug_selector(|| "permission-entry".to_owned())
             .accessibility_id(format!("permission-{interaction_index}-{}", request.id))
             .role(Role::ListItem)
-            .aria_label(format!("Permission required: {}", request.message))
+            .aria_label(accessible_label)
             .w_full()
             .p_4()
             .rounded_lg()
@@ -8683,9 +8815,39 @@ impl SessionMvpView {
                             .child(request.title.clone()),
                     )
                     .when_some(status, |heading, status| {
-                        heading.child(div().text_xs().text_color(rgb(MUTED)).child(status))
+                        heading.child(
+                            div()
+                                .id(SharedString::from(format!(
+                                    "permission-status-{interaction_index}"
+                                )))
+                                .debug_selector(move || {
+                                    format!("permission-status-{interaction_index}")
+                                })
+                                .accessibility_id(format!("permission-status-{interaction_index}"))
+                                .role(Role::Status)
+                                .aria_label(status)
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(status),
+                        )
                     }),
             )
+            .when_some(queue_label, |card, label| {
+                card.child(
+                    div()
+                        .id(SharedString::from(format!(
+                            "permission-position-{interaction_index}"
+                        )))
+                        .debug_selector(move || format!("permission-position-{interaction_index}"))
+                        .accessibility_id(format!("permission-position-{interaction_index}"))
+                        .role(Role::Status)
+                        .aria_label(label.clone())
+                        .mt_1()
+                        .text_xs()
+                        .text_color(rgb(MUTED))
+                        .child(label),
+                )
+            })
             .child(div().mt_1().text_xs().text_color(rgb(MUTED)).child(context))
             .child(
                 div()
@@ -8725,7 +8887,7 @@ impl SessionMvpView {
                         .child(details),
                 )
             })
-            .when(record.response.is_none(), |card| {
+            .when(is_actionable, |card| {
                 card.child(div().mt_3().flex().flex_col().gap_2().children(choices))
             })
     }
@@ -14488,6 +14650,14 @@ pub(crate) mod tests {
             assert!(cx.debug_bounds("permission-entry").is_some());
             assert!(cx.debug_bounds("interaction-prompt").is_none());
             assert!(cx.debug_bounds("composer").is_none());
+            assert!(
+                cx.debug_bounds("permission-position-0").is_none(),
+                "a single permission should not show queue chrome"
+            );
+            assert!(
+                cx.debug_bounds("permission-status-0").is_none(),
+                "an unanswered single permission should keep the existing clean heading"
+            );
             let scope = cx
                 .debug_bounds("permission-scope-1")
                 .expect("session permission rendered");
@@ -14518,6 +14688,162 @@ pub(crate) mod tests {
 
             assert!(cx.debug_bounds("permission-entry").is_some());
             assert!(cx.debug_bounds("permission-scope-1").is_none());
+        }
+
+        #[gpui::test]
+        fn consecutive_permissions_show_queue_progress_and_advance_in_order(
+            cx: &mut TestAppContext,
+        ) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                let first = interaction(
+                    InteractionKind::Permission,
+                    "Permission required",
+                    "Run cargo test",
+                    &["Allow once"],
+                    false,
+                );
+                let mut second = interaction(
+                    InteractionKind::Permission,
+                    "Permission required",
+                    "Read Cargo.lock",
+                    &["Allow once"],
+                    false,
+                );
+                second.id = "interaction-2".to_owned();
+                let snapshot = Arc::make_mut(&mut view.sessions[0].snapshot);
+                snapshot.add_interaction(first);
+                snapshot.add_interaction(second);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("permission-position-0").is_some());
+            assert!(cx.debug_bounds("permission-position-1").is_some());
+            assert!(cx.debug_bounds("permission-status-0").is_none());
+            assert!(
+                cx.debug_bounds("permission-status-1").is_some(),
+                "the second request should be visibly queued"
+            );
+
+            let first_scope = cx
+                .debug_bounds("permission-scope-0")
+                .expect("the head permission is actionable");
+            cx.simulate_click(first_scope.center(), Modifiers::none());
+            cx.run_until_parked();
+            assert!(
+                cx.debug_bounds("permission-status-0").is_some(),
+                "submitting a response should immediately replace the actions with status"
+            );
+            assert!(
+                cx.debug_bounds("permission-scope-0").is_none(),
+                "an in-flight response must not remain actionable"
+            );
+            match commands.try_recv().expect("the first response was sent") {
+                ServiceCommand::Respond { interaction_id, .. } => {
+                    assert_eq!(interaction_id, "interaction-1");
+                }
+                _ => panic!("expected an interaction response"),
+            }
+
+            view.update(cx, |view, cx| {
+                let snapshot = Arc::make_mut(&mut view.sessions[0].snapshot);
+                snapshot.record_interaction_response("interaction-1", InteractionResponse::Approve);
+                snapshot.remove_interaction("interaction-1");
+                view.responding_interactions
+                    .remove(&("session-1".to_owned(), "interaction-1".to_owned()));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(
+                cx.debug_bounds("permission-status-0").is_some(),
+                "the accepted request should retain its outcome"
+            );
+            assert!(
+                cx.debug_bounds("permission-status-1").is_none(),
+                "the next request should visibly become active"
+            );
+            let second_scope = cx
+                .debug_bounds("permission-scope-0")
+                .expect("the next permission becomes actionable");
+            cx.simulate_click(second_scope.center(), Modifiers::none());
+            match commands.try_recv().expect("the second response was sent") {
+                ServiceCommand::Respond { interaction_id, .. } => {
+                    assert_eq!(interaction_id, "interaction-2");
+                }
+                _ => panic!("expected an interaction response"),
+            }
+        }
+
+        #[gpui::test]
+        fn interaction_response_is_only_submitted_once_while_in_flight(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.action_error = Some("previous response failed".to_owned());
+                view.respond_to_interaction(
+                    "session-1".to_owned(),
+                    "interaction-1".to_owned(),
+                    InteractionResponse::Approve,
+                    cx,
+                );
+                view.respond_to_interaction(
+                    "session-1".to_owned(),
+                    "interaction-1".to_owned(),
+                    InteractionResponse::Approve,
+                    cx,
+                );
+            });
+            view.read_with(cx, |view, _| assert!(view.action_error.is_none()));
+
+            assert_eq!(
+                commands
+                    .try_iter()
+                    .filter(|command| matches!(command, ServiceCommand::Respond { .. }))
+                    .count(),
+                1
+            );
+        }
+
+        #[gpui::test]
+        fn reused_permission_id_does_not_reactivate_the_completed_card(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                let first = interaction(
+                    InteractionKind::Permission,
+                    "Permission required",
+                    "Run cargo test",
+                    &["Allow once"],
+                    false,
+                );
+                let second = interaction(
+                    InteractionKind::Permission,
+                    "Permission required",
+                    "Read Cargo.lock",
+                    &["Allow once"],
+                    false,
+                );
+                let snapshot = Arc::make_mut(&mut view.sessions[0].snapshot);
+                snapshot.add_interaction(first);
+                snapshot.record_interaction_response("interaction-1", InteractionResponse::Approve);
+                snapshot.remove_interaction("interaction-1");
+                snapshot.add_interaction(second);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let new_position = cx
+                .debug_bounds("permission-position-1")
+                .expect("the new request is numbered");
+            let scope = cx
+                .debug_bounds("permission-scope-0")
+                .expect("the new request remains actionable");
+            assert!(
+                scope.origin.y > new_position.origin.y,
+                "the action must belong to the new card, not the completed card with the same id"
+            );
         }
 
         /// Regression: a permission's requested-action detail could run to

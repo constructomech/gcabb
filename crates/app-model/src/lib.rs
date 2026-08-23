@@ -1855,6 +1855,51 @@ mod tests {
     }
 
     #[test]
+    fn consecutive_permission_responses_advance_one_request_at_a_time() {
+        let mut state = SessionSnapshot::new(metadata());
+        let request = |id: &str| InteractionRequest {
+            id: id.to_owned(),
+            session_id: "app-session".to_owned(),
+            kind: InteractionKind::Permission,
+            title: "Permission required".to_owned(),
+            message: format!("Run {id}?"),
+            choices: vec!["Allow once".to_owned()],
+            allow_freeform: false,
+            details: Value::Null,
+        };
+        state.add_interaction(request("permission-1"));
+        state.add_interaction(request("permission-2"));
+
+        state.record_interaction_response("permission-1", InteractionResponse::Approve);
+        assert!(state.remove_interaction("permission-1"));
+        assert!(!state.remove_interaction("permission-1"));
+        assert_eq!(
+            state
+                .pending_interactions
+                .iter()
+                .map(|request| request.id.as_str())
+                .collect::<Vec<_>>(),
+            ["permission-2"]
+        );
+        assert_eq!(
+            state.interaction_history[0].response,
+            Some(InteractionResponse::Approve)
+        );
+        assert_eq!(state.interaction_history[1].response, None);
+
+        state.record_interaction_response(
+            "permission-2",
+            InteractionResponse::Reject { feedback: None },
+        );
+        assert!(state.remove_interaction("permission-2"));
+        assert!(state.pending_interactions.is_empty());
+        assert_eq!(
+            state.interaction_history[1].response,
+            Some(InteractionResponse::Reject { feedback: None })
+        );
+    }
+
+    #[test]
     fn phase_one_snapshots_gain_phase_two_defaults() {
         let snapshot: SessionSnapshot = serde_json::from_value(json!({
             "version": 1,
