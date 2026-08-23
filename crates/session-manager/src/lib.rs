@@ -71,6 +71,8 @@ pub enum SessionManagerError {
     SessionRestoreInProgress(String),
     #[error("session cannot be forked: {0}")]
     InvalidFork(String),
+    #[error("project cannot be used for an agent-created session: {0}")]
+    InvalidProjectTarget(String),
     #[error(
         "saved session working directory does not exist or cannot be accessed: {0}. \
          Restore the directory or delete this session."
@@ -1034,6 +1036,7 @@ impl SessionManager {
 
     pub async fn create_session(&self, request: CreateSessionRequest) -> Result<SessionHandle> {
         let _lifecycle = self.lifecycle.lock().await;
+        self.validate_agent_target_registered(&request)?;
         let app_session_id = Uuid::new_v4().to_string();
         let auto_approve_tools = auto_approves_tools(&request);
         let provider = self.provider_factory.create(&request.project_path);
@@ -1122,6 +1125,29 @@ impl SessionManager {
                 Err(error)
             }
         }
+    }
+
+    fn validate_agent_target_registered(&self, request: &CreateSessionRequest) -> Result<()> {
+        if request.launch_origin != SessionLaunchOrigin::AgentTool
+            || request.kind != SessionKind::Project
+        {
+            return Ok(());
+        }
+        let project_key = request
+            .repository_root
+            .as_deref()
+            .unwrap_or_else(|| request.project_path.to_str().unwrap_or_default());
+        if self
+            .storage
+            .list_projects()?
+            .into_iter()
+            .any(|project| project.path == project_key)
+        {
+            return Ok(());
+        }
+        Err(SessionManagerError::SessionNotFound(format!(
+            "registered project for agent-created session at {project_key}"
+        )))
     }
 
     /// Create an SDK-native fork from a live project runtime and resume it in a
@@ -1489,6 +1515,79 @@ impl SessionManager {
 
     pub fn projects(&self) -> Result<Vec<ProjectMetadata>> {
         self.storage.list_projects().map_err(Into::into)
+    }
+
+    /// Bounded project list for the `list_projects` host tool.
+    pub fn list_projects_for_tool(
+        &self,
+        caller_session_id: &str,
+    ) -> Result<copilot_provider::ListProjectsToolResult> {
+        self.authorize_registered_coordination(caller_session_id, caller_session_id)?;
+        self.resolve_target_project(None, caller_session_id)?;
+        let projects = self.storage.list_projects()?;
+        Ok(copilot_provider::ListProjectsToolResult {
+            projects: projects
+                .into_iter()
+                .filter(|project| {
+                    let path = Path::new(&project.path);
+                    path.is_dir() && GitService::new(path).is_worktree()
+                })
+                .take(100)
+                .map(|project| copilot_provider::ListProjectsToolEntry {
+                    id: project_tool_id(&project.id),
+                    name: bounded_text(&project.name, 256),
+                    repository: bounded_text(repository_label(&project), 256),
+                    default_branch: project
+                        .default_branch
+                        .map(|branch| bounded_text(&branch, 256)),
+                })
+                .collect(),
+        })
+    }
+
+    /// Resolve a target project for cross-project child creation.
+    ///
+    /// When `project_id` is `None`, returns the caller's own project. When set,
+    /// resolves to the named registered local repository project, rejecting
+    /// unknown, removed, or non-git projects.
+    pub fn resolve_target_project(
+        &self,
+        project_id: Option<&str>,
+        caller_session_id: &str,
+    ) -> Result<ProjectMetadata> {
+        let projects = self.storage.list_projects()?;
+        let project = match project_id {
+            None => {
+                let caller = self
+                    .storage
+                    .session_metadata(caller_session_id)?
+                    .ok_or_else(|| {
+                        SessionManagerError::SessionNotFound(caller_session_id.to_owned())
+                    })?;
+                projects
+                    .into_iter()
+                    .find(|project| project.path == caller.project_key())
+                    .ok_or_else(|| {
+                        SessionManagerError::SessionNotFound(format!(
+                            "registered project for session {caller_session_id}"
+                        ))
+                    })?
+            }
+            Some(id) => projects
+                .into_iter()
+                .find(|project| project_tool_id(&project.id) == id)
+                .ok_or_else(|| {
+                    SessionManagerError::SessionNotFound(format!("registered project {id}"))
+                })?,
+        };
+        let path = std::path::Path::new(&project.path);
+        if !path.is_dir() || !GitService::new(path).is_worktree() {
+            return Err(SessionManagerError::InvalidProjectTarget(format!(
+                "project {} is not available as a local git repository",
+                project_tool_id(&project.id)
+            )));
+        }
+        Ok(project)
     }
 
     pub fn session_metadata(&self) -> Result<Vec<SessionMetadata>> {
@@ -2041,19 +2140,20 @@ impl SessionManager {
         let relation = self
             .storage
             .authorize_coordination(caller_session_id, target_session_id)?;
-        let caller = self
-            .storage
-            .session_metadata(caller_session_id)?
-            .ok_or_else(|| SessionManagerError::SessionNotFound(caller_session_id.to_owned()))?;
-        if !self
-            .storage
-            .list_projects()?
-            .iter()
-            .any(|project| project.path == caller.project_key())
-        {
-            return Err(SessionManagerError::SessionNotFound(format!(
-                "registered project for session {caller_session_id}"
-            )));
+        let projects = self.storage.list_projects()?;
+        for (label, session_id) in [("caller", caller_session_id), ("target", target_session_id)] {
+            let meta = self
+                .storage
+                .session_metadata(session_id)?
+                .ok_or_else(|| SessionManagerError::SessionNotFound(session_id.to_owned()))?;
+            if !projects
+                .iter()
+                .any(|project| project.path == meta.project_key())
+            {
+                return Err(SessionManagerError::SessionNotFound(format!(
+                    "registered project for {label} session {session_id}"
+                )));
+            }
         }
         Ok(relation)
     }
@@ -2964,7 +3064,8 @@ impl SessionManager {
 
     /// Remove a project. Sessions are retained; they are associated by
     /// `repository_root` and reappear if the project is added again.
-    pub fn remove_project(&self, project_id: &str) -> Result<()> {
+    pub async fn remove_project(&self, project_id: &str) -> Result<()> {
+        let _lifecycle = self.lifecycle.lock().await;
         self.storage.remove_project(project_id)?;
         Ok(())
     }
@@ -4631,6 +4732,20 @@ fn bounded_text(value: &str, max_chars: usize) -> String {
     bounded
 }
 
+fn project_tool_id(project_id: &str) -> String {
+    format!(
+        "project-{}",
+        Uuid::new_v5(&Uuid::NAMESPACE_URL, project_id.as_bytes())
+    )
+}
+
+fn repository_label(project: &ProjectMetadata) -> &str {
+    Path::new(&project.path)
+        .file_name()
+        .and_then(|name| name.to_str())
+        .unwrap_or(&project.name)
+}
+
 fn pending_plan_summary(snapshot: &SessionSnapshot) -> Option<PendingPlanToolSummary> {
     snapshot
         .pending_interactions
@@ -5227,6 +5342,52 @@ mod tests {
         ));
         assert!(storage.list_sessions().unwrap().is_empty());
         assert_eq!(storage.list_archived_sessions().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn project_removal_wins_a_racing_agent_launch() {
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        storage
+            .upsert_session(&tree_metadata("root", None))
+            .unwrap();
+        let manager = Arc::new(SessionManager::new(
+            Arc::new(FakeProvider::default()),
+            storage.clone(),
+            Arc::new(MemoryDiagnostics::default()),
+        ));
+        manager
+            .register_project(&ProjectMetadata {
+                id: "target".to_owned(),
+                path: "/tmp/target".to_owned(),
+                name: "Target".to_owned(),
+                default_branch: Some("main".to_owned()),
+                last_opened_at: "1".to_owned(),
+            })
+            .unwrap();
+        let lifecycle = manager.lifecycle.lock().await;
+        let removal_manager = manager.clone();
+        let removal = tokio::spawn(async move { removal_manager.remove_project("target").await });
+        tokio::task::yield_now().await;
+
+        let launch_manager = manager.clone();
+        let launch = tokio::spawn(async move {
+            let mut request = request(PathBuf::from("/tmp/target"));
+            request.repository_root = Some("/tmp/target".to_owned());
+            request.parent_session_id = Some("root".to_owned());
+            request.launch_origin = SessionLaunchOrigin::AgentTool;
+            request.host_tool_call_id = Some("racing-project-launch".to_owned());
+            launch_manager.create_session(request).await
+        });
+        drop(lifecycle);
+
+        removal.await.unwrap().unwrap();
+        assert!(matches!(
+            launch.await.unwrap(),
+            Err(SessionManagerError::SessionNotFound(project))
+                if project.contains("registered project for agent-created session")
+        ));
+        assert_eq!(storage.list_sessions().unwrap().len(), 1);
+        assert!(storage.list_projects().unwrap().is_empty());
     }
 
     #[tokio::test]

@@ -3,18 +3,22 @@
 Evidence for what GCABB inherits from the Copilot CLI runtime, what the
 application adds, and how that compares to other coding-agent harnesses. Most
 tools belong to the runtime; GCABB adds a narrow app-session coordination
-gateway for `create_session`, `fork_session`, `get_session`,
+gateway for `list_projects`, `create_session`, `fork_session`, `get_session`,
 `send_session_message`, and `respond_to_session_plan`.
 
 ## Host-provided app-session coordination
 
-Every new and resumed project session receives five typed custom SDK tools.
+Every new and resumed project session receives six typed custom SDK tools.
 They coordinate durable GCABB app sessions, not Copilot CLI `task` subagents:
 
 - `task` runs nested agent activity inside the calling CLI/session runtime.
+- `list_projects` returns a bounded catalog of registered local repository
+  projects: opaque project id, human-friendly name, repository label, and
+  default branch. It does not expose credentials or unrelated filesystem paths.
 - `create_session` creates another durable app session with its own provider,
   client, CLI process, SDK session, managed worktree, sidebar row, and restart
-  lifecycle.
+  lifecycle. An optional registered-project id targets another local repository;
+  omitting it uses the caller's project.
 - `fork_session` asks the SDK to fork the caller's own persisted history, then
   resumes the returned SDK session id in a new isolated GCABB runtime and
   worktree. The optional event boundary is exclusive and must be an exact event
@@ -25,8 +29,9 @@ They coordinate durable GCABB app sessions, not Copilot CLI `task` subagents:
   one capped completed assistant result, a pending plan summary when present,
   and a capped change summary. It never returns raw tool output or an unbounded
   transcript.
-- `send_session_message` sends an auditable durable message between an ancestor
-  and descendant in the same registered project. `immediate` maps to steering
+- `send_session_message` sends an auditable durable message between a linked
+  ancestor and descendant, including across registered local projects.
+  `immediate` maps to steering
   delivery and may bypass older when-idle work while the recipient is busy;
   `queued` waits for idle. Ordering stays stable within each delivery mode, and
   child notifications all use the ordered when-idle path.
@@ -38,11 +43,12 @@ They coordinate durable GCABB app sessions, not Copilot CLI `task` subagents:
 The model supplies a kickoff prompt and may override the title, model, mode,
 agent, reasoning effort, and context tier. `notify_on_idle: "once"` requests one
 durable completion notification after the child's kickoff or current turn.
-The host binds the caller app-session identity and derives the registered
-project, repository, base branch, and configured worktree root; no path,
-project, parent, or spoofable sender input is accepted. SDK `toolCallId` is
-persisted so retries return the original child or message without duplicating
-work.
+The host binds the caller app-session identity and resolves an optional target
+only from GCABB's registered-project catalog at execution time. It derives the
+repository, base branch, configured worktree root, and every filesystem
+location; no raw path, clone URL, repository root, parent, or spoofable sender
+input is accepted. SDK `toolCallId` is persisted so retries return the original
+child or message without duplicating work.
 
 Forks record their source and optional exclusive event boundary separately from
 parent/child orchestration. They remain project-root sessions in navigation and
@@ -76,8 +82,8 @@ for a developer-driven interaction.
 
 `get_session.pending_plan` returns a bounded summary, the exact interaction id,
 the advertised actions, and the recommended action. The responder must echo that
-interaction id. GCABB requires the caller to be an ancestor in the same
-registered project, validates the action against the live interaction, records
+interaction id. GCABB requires the caller to be a linked ancestor, validates the action against
+the live interaction, records
 the response in a durable audit/dedupe row, and then answers the provider's
 typed interaction through `SessionHandle`. It never synthesizes transcript
 events. A retry of the same tool call, or a race with another authorized
@@ -113,15 +119,18 @@ notification delivery is neither lost nor repeated.
 
 Authorization is ancestry-based: a caller may inspect itself, its ancestors,
 and its descendants, may message only an ancestor or descendant, and may approve
-plans only for descendants. Any ancestor may approve, not only the direct
-parent. Siblings, unrelated sessions, self-approval, descendant-to-ancestor
-approval, different projects, archived sessions, deleted sessions, stale plans,
-and sessions outside the registered project are rejected.
+plans only for descendants. A deliberately linked relationship may cross local
+registered projects; project equality is not authority. Any ancestor may
+approve, not only the direct parent. Siblings, unrelated sessions,
+self-approval, descendant-to-ancestor approval, archived sessions, deleted
+sessions, stale plans, and sessions whose target project is no longer registered
+are rejected.
 
 Current limits are three child levels and five active direct children per
-parent. This surface is local-only and same-project-only. Cloud sessions,
-cross-repository launches, and `notify_on_idle: "always"` are intentionally
-outside this version. If the app crashes in the narrow interval
+parent. This surface is local-only. Targets must already be registered local
+repository projects. Cloud sessions, cloning, folder-only targets,
+arbitrary-path launches, cross-repository forks, and `notify_on_idle: "always"`
+are intentionally outside this version. If the app crashes in the narrow interval
 after recording a child but before confirming kickoff delivery, a retry
 returns an explicit interrupted-launch error with the child id rather than
 risking duplicate work.
@@ -131,13 +140,14 @@ selects the recursive checkbox in the confirmation dialog. The checkbox starts
 unchecked every time. A single parent operation leaves children intact; they
 render as deterministic root-level sessions while their parent is unavailable.
 
-A recursive operation snapshots persisted ancestry while session launch and
-restoration are serialized, then processes the deepest descendants before
-their parents. Archive keeps session records and captures recoverable
-worktree changes. Delete removes records and best-effort runtime data, but
-preserves every dirty managed worktree and reports preserved paths and cleanup
-failures. Unarchive is intentionally single-session only and never brings back
-descendants implicitly.
+A recursive operation snapshots persisted ancestry across linked projects while
+session launch, project removal, and restoration are serialized, then processes
+the deepest descendants before their parents. Each cleanup uses the
+descendant's own registered repository and managed worktree root. Archive keeps
+session records and captures recoverable worktree changes. Delete removes
+records and best-effort runtime data, but preserves every dirty managed
+worktree and reports preserved paths and cleanup failures. Unarchive is
+intentionally single-session only and never brings back descendants implicitly.
 
 ### Messages versus CLI subagent events
 

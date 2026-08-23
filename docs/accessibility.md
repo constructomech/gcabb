@@ -15,6 +15,8 @@ The initial session shell exposes:
 
 - An application root and projects/sessions navigation region.
 - Project and session lists with selected state.
+- Cross-project child rows with the target project named visually and in their
+  accessible label while nested beneath a visible parent.
 - Fork provenance in session-row names and a keyboard-accessible **Fork
   session** menu action.
 - Headings, status messages, and alerts.

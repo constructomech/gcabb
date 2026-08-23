@@ -320,6 +320,7 @@ async fn agent_child_launch_persists_ownership_and_keeps_parent_selected() {
     let factory = FakeProviderFactory::default();
     let (manager, orchestrator, storage) =
         harness_with_storage(factory.clone(), worktrees.path().to_owned());
+    register_project(&manager, &repository);
     let mut parent_request =
         project_request(&repository, worktrees.path(), LaunchOrigin::UserActivation);
     parent_request.title = LaunchTitle::Provided {
@@ -665,8 +666,9 @@ async fn failed_agent_child_launch_compensates_session_and_idempotency_record() 
     let (_guard, repository) = repository();
     let worktrees = tempfile::tempdir().expect("worktrees");
     let factory = FakeProviderFactory::default();
-    let (_manager, orchestrator, storage) =
+    let (manager, orchestrator, storage) =
         harness_with_storage(factory.clone(), worktrees.path().to_owned());
+    register_project(&manager, &repository);
     let mut parent_request =
         project_request(&repository, worktrees.path(), LaunchOrigin::UserActivation);
     parent_request.title = LaunchTitle::Provided {
