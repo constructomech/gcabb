@@ -56,6 +56,7 @@ pub struct GitService {
 pub struct WorktreeSnapshot {
     pub staged_patch: Option<String>,
     pub unstaged_patch: Option<String>,
+    pub tracked_worktree: Vec<SnapshotFile>,
     pub untracked: Vec<SnapshotFile>,
 }
 
@@ -436,32 +437,46 @@ impl GitService {
         if let Some(patch) = snapshot.unstaged_patch.as_deref() {
             self.run_with_stdin(&["apply", "--binary", "--whitespace=nowarn", "-"], patch)?;
         }
+        for file in &snapshot.tracked_worktree {
+            self.apply_snapshot_file(file)?;
+        }
         for file in &snapshot.untracked {
-            validate_snapshot_path(&file.path)?;
-            let destination = self.worktree.join(&file.path);
-            if !destination.starts_with(&self.worktree) {
-                return Err(GitError::UnsafeRepositoryPath(
-                    file.path.display().to_string(),
-                ));
+            self.apply_snapshot_file(file)?;
+        }
+        Ok(())
+    }
+
+    fn apply_snapshot_file(&self, file: &SnapshotFile) -> Result<()> {
+        validate_snapshot_path(&file.path)?;
+        let destination = self.worktree.join(&file.path);
+        if !destination.starts_with(&self.worktree) {
+            return Err(GitError::UnsafeRepositoryPath(
+                file.path.display().to_string(),
+            ));
+        }
+        if let Some(parent) = destination.parent() {
+            std::fs::create_dir_all(parent)?;
+        }
+        if let Some(target) = &file.symlink_target {
+            if destination.exists() || destination.is_symlink() {
+                std::fs::remove_file(&destination)?;
             }
-            if let Some(parent) = destination.parent() {
-                std::fs::create_dir_all(parent)?;
+            #[cfg(unix)]
+            std::os::unix::fs::symlink(target, &destination)?;
+            #[cfg(not(unix))]
+            return Err(GitError::UnsupportedSnapshotState(
+                "symlink snapshots require Unix".to_owned(),
+            ));
+        } else {
+            if destination.is_symlink() {
+                std::fs::remove_file(&destination)?;
             }
-            if let Some(target) = &file.symlink_target {
-                #[cfg(unix)]
-                std::os::unix::fs::symlink(target, &destination)?;
-                #[cfg(not(unix))]
-                return Err(GitError::UnsupportedSnapshotState(
-                    "symlink snapshots require Unix".to_owned(),
-                ));
-            } else {
-                std::fs::write(&destination, &file.contents)?;
-                #[cfg(unix)]
-                {
-                    use std::os::unix::fs::PermissionsExt as _;
-                    let mode = if file.executable { 0o755 } else { 0o644 };
-                    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(mode))?;
-                }
+            std::fs::write(&destination, &file.contents)?;
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::PermissionsExt as _;
+                let mode = if file.executable { 0o755 } else { 0o644 };
+                std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(mode))?;
             }
         }
         Ok(())
@@ -500,14 +515,31 @@ impl GitService {
         }
         let staged = self.run(&["diff", "--binary", "--cached", "HEAD"])?;
         let unstaged = self.run(&["diff", "--binary"])?;
-        let output = self.run_raw(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        let tracked_worktree =
+            self.capture_snapshot_files(&["diff", "--name-only", "-z", "HEAD"], false)?;
+        let untracked = self
+            .capture_snapshot_files(&["ls-files", "--others", "--exclude-standard", "-z"], true)?;
+        Ok(WorktreeSnapshot {
+            staged_patch: (!staged.is_empty()).then_some(staged),
+            unstaged_patch: (!unstaged.is_empty()).then_some(unstaged),
+            tracked_worktree,
+            untracked,
+        })
+    }
+
+    fn capture_snapshot_files(
+        &self,
+        arguments: &[&str],
+        reject_credentials: bool,
+    ) -> Result<Vec<SnapshotFile>> {
+        let output = self.run_raw(arguments)?;
         if !output.status.success() {
             return Err(GitError::Command {
-                command: "ls-files --others --exclude-standard -z".to_owned(),
+                command: arguments.join(" "),
                 stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
             });
         }
-        let mut untracked = Vec::new();
+        let mut files = Vec::new();
         for path in output
             .stdout
             .split(|byte| *byte == 0)
@@ -515,14 +547,18 @@ impl GitService {
         {
             let path = PathBuf::from(String::from_utf8_lossy(path).into_owned());
             validate_snapshot_path(&path)?;
-            if is_sensitive_untracked_path(&path) {
+            if reject_credentials && is_sensitive_untracked_path(&path) {
                 return Err(GitError::UnsupportedSnapshotState(format!(
                     "refusing to copy possible credential file {}",
                     path.display()
                 )));
             }
             let source = self.worktree.join(&path);
-            let metadata = std::fs::symlink_metadata(&source)?;
+            let metadata = match std::fs::symlink_metadata(&source) {
+                Ok(metadata) => metadata,
+                Err(error) if error.kind() == std::io::ErrorKind::NotFound => continue,
+                Err(error) => return Err(error.into()),
+            };
             let file_type = metadata.file_type();
             if file_type.is_symlink() {
                 let target = std::fs::read_link(source)?;
@@ -541,7 +577,7 @@ impl GitService {
                         path.display()
                     )));
                 }
-                untracked.push(SnapshotFile {
+                files.push(SnapshotFile {
                     path,
                     contents: Vec::new(),
                     symlink_target: Some(target),
@@ -555,7 +591,7 @@ impl GitService {
                 };
                 #[cfg(not(unix))]
                 let executable = false;
-                untracked.push(SnapshotFile {
+                files.push(SnapshotFile {
                     path,
                     contents: std::fs::read(source)?,
                     symlink_target: None,
@@ -567,11 +603,7 @@ impl GitService {
                 ));
             }
         }
-        Ok(WorktreeSnapshot {
-            staged_patch: (!staged.is_empty()).then_some(staged),
-            unstaged_patch: (!unstaged.is_empty()).then_some(unstaged),
-            untracked,
-        })
+        Ok(files)
     }
 
     /// Delete a branch only when it has been merged into `base_ref`.
@@ -1152,6 +1184,10 @@ mod tests {
         assert_eq!(
             target_git.run(&["diff", "--binary"]).unwrap(),
             before_worktree
+        );
+        assert_eq!(
+            fs::read(target.join("base.txt")).unwrap(),
+            fs::read(source.join("base.txt")).unwrap()
         );
         assert_eq!(
             fs::read(target.join("untracked.bin")).unwrap(),
