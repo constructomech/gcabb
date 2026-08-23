@@ -242,6 +242,7 @@ fn diff_lines(
 ) -> Vec<DiffLine> {
     let mut line_start = 0;
     let mut highlight_index = 0;
+    let mut in_hunk = false;
 
     source
         .split_inclusive('\n')
@@ -266,9 +267,22 @@ fn diff_lines(
                 index += 1;
             }
 
-            let background = if text.starts_with('+') && !text.starts_with("+++ ") {
+            if text.starts_with("diff ")
+                || text.starts_with("*** Update File: ")
+                || text.starts_with("*** Add File: ")
+                || text.starts_with("*** Delete File: ")
+            {
+                in_hunk = false;
+            }
+            let file_header = !in_hunk && (text.starts_with("--- ") || text.starts_with("+++ "));
+            if text.starts_with("@@") {
+                in_hunk = true;
+            }
+            let background = if text.starts_with('+') && !file_header {
+                in_hunk = true;
                 Some(DIFF_ADDED_BACKGROUND)
-            } else if text.starts_with('-') && !text.starts_with("--- ") {
+            } else if text.starts_with('-') && !file_header {
+                in_hunk = true;
                 Some(DIFF_DELETED_BACKGROUND)
             } else {
                 None
@@ -297,6 +311,49 @@ mod diff_line_tests {
         assert_eq!(lines[3].background, Some(DIFF_ADDED_BACKGROUND));
         assert_eq!(lines[4].background, None);
         assert!(lines.iter().all(|line| line.highlights.is_empty()));
+    }
+
+    #[test]
+    fn syntax_highlights_preserve_diff_row_backgrounds() {
+        let source = "*** Update File: src/lib.rs\n@@\n-pub fn old() {}\n+pub fn new() {}\n";
+        let highlights = syntax::diff_highlights(Path::new(""), source).unwrap();
+        let lines = diff_lines(source, &highlights);
+        let added = lines
+            .iter()
+            .find(|line| line.source.starts_with("+pub"))
+            .unwrap();
+        let deleted = lines
+            .iter()
+            .find(|line| line.source.starts_with("-pub"))
+            .unwrap();
+
+        assert_eq!(added.background, Some(DIFF_ADDED_BACKGROUND));
+        assert_eq!(deleted.background, Some(DIFF_DELETED_BACKGROUND));
+        assert!(added.highlights.iter().any(|(range, _)| {
+            added
+                .source
+                .get(range.clone())
+                .is_some_and(|text| text == "fn")
+        }));
+        assert!(deleted.highlights.iter().any(|(range, _)| {
+            deleted
+                .source
+                .get(range.clone())
+                .is_some_and(|text| text == "fn")
+        }));
+    }
+
+    #[test]
+    fn header_like_source_lines_keep_their_diff_backgrounds() {
+        let lines = diff_lines(
+            "--- a/query.sql\n+++ b/query.sql\n@@ -1 +1 @@\n--- old comment\n+++ new comment\n",
+            &[],
+        );
+
+        assert_eq!(lines[0].background, None);
+        assert_eq!(lines[1].background, None);
+        assert_eq!(lines[3].background, Some(DIFF_DELETED_BACKGROUND));
+        assert_eq!(lines[4].background, Some(DIFF_ADDED_BACKGROUND));
     }
 }
 
@@ -6968,7 +7025,19 @@ impl SessionMvpView {
         content: String,
         max_height: f32,
         cx: &mut Context<Self>,
-    ) -> impl IntoElement {
+    ) -> gpui::AnyElement {
+        let content_len = content.len();
+        self.detail_block_content(id, content_len, content, max_height, cx)
+    }
+
+    fn detail_block_content(
+        &self,
+        id: &str,
+        content_len: usize,
+        content: impl IntoElement,
+        max_height: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
         let handle = self
             .detail_scrolls
             .borrow_mut()
@@ -6978,9 +7047,9 @@ impl SessionMvpView {
         let previous_extent = self
             .detail_extents
             .borrow_mut()
-            .insert(id.to_owned(), content.len());
+            .insert(id.to_owned(), content_len);
         let at_tail = f32::from(handle.max_offset().y) + f32::from(handle.offset().y) <= 1.0;
-        if previous_extent.is_none_or(|previous| content.len() > previous) && at_tail {
+        if previous_extent.is_none_or(|previous| content_len > previous) && at_tail {
             handle.scroll_to_bottom();
         }
 
@@ -7019,6 +7088,42 @@ impl SessionMvpView {
                     .child(content),
             )
             .children(scrollbar)
+            .into_any_element()
+    }
+
+    fn tool_diff_block(
+        &self,
+        invocation: &app_model::ToolInvocation,
+        diff: String,
+        max_height: f32,
+        cx: &mut Context<Self>,
+    ) -> gpui::AnyElement {
+        let session_id = self.selected_session.as_deref().unwrap_or_default();
+        let key = format!("tool\u{1f}{session_id}\u{1f}{}", invocation.call_id);
+        let path = invocation
+            .file_path()
+            .or_else(|| invocation.possible_paths.first().map(String::as_str))
+            .unwrap_or_default();
+        let document = self.diff_document(&key, Path::new(path), diff, false);
+        let content = div()
+            .flex()
+            .flex_col()
+            .min_w_full()
+            .children(document.lines.iter().map(|line| {
+                let text =
+                    StyledText::new(line.source.clone()).with_highlights(line.highlights.clone());
+                div()
+                    .min_w_full()
+                    .when_some(line.background, |row, color| row.bg(gpui::rgba(color)))
+                    .child(text)
+            }));
+        self.detail_block_content(
+            &format!("tool-diff-{}", invocation.call_id),
+            document.source.len(),
+            content,
+            max_height,
+            cx,
+        )
     }
 
     fn tool_expanded(&self, call_id: &str) -> bool {
@@ -7296,6 +7401,7 @@ impl SessionMvpView {
             .map(|code| format!("exit {code}"));
         let argument_detail = Self::tool_argument_detail(invocation);
         let expanded = self.tool_expanded(&invocation.call_id);
+        let detail_diff = if expanded { diff.clone() } else { None };
         let call_id = invocation.call_id.clone();
         let selector_call_id = invocation.call_id.clone();
         let disclosure_label = if expanded {
@@ -7363,9 +7469,9 @@ impl SessionMvpView {
                         cx,
                     ))
             })
-            .when_some(diff, |entry, diff| {
-                entry.child(self.detail_block(
-                    &format!("tool-diff-{}", invocation.call_id),
+            .when_some(detail_diff, |entry, diff| {
+                entry.child(self.tool_diff_block(
+                    invocation,
                     diff,
                     ENTRY_DETAIL_BUDGET - COMMAND_BLOCK_HEIGHT,
                     cx,
@@ -9568,9 +9674,19 @@ impl SessionMvpView {
     fn change_diff_document(&self, session_id: &str, file: &ChangedFile) -> Arc<DiffDocument> {
         let key = format!("{session_id}\u{1f}{}", file.path);
         let (body, muted) = Self::change_diff_text(file);
+        self.diff_document(&key, Path::new(&file.path), body, muted)
+    }
+
+    fn diff_document(
+        &self,
+        key: &str,
+        path: &Path,
+        body: String,
+        muted: bool,
+    ) -> Arc<DiffDocument> {
         let mut cache = self.diff_cache.borrow_mut();
 
-        if let Some(document) = cache.documents.get(&key)
+        if let Some(document) = cache.documents.get(key)
             && document.source.as_ref() == body
             && document.muted == muted
         {
@@ -9580,9 +9696,9 @@ impl SessionMvpView {
         let highlights = if muted {
             Vec::new()
         } else {
-            syntax::diff_highlights(Path::new(&file.path), &body).unwrap_or_else(|error| {
+            syntax::diff_highlights(path, &body).unwrap_or_else(|error| {
                 tracing::warn!(
-                    path = %file.path,
+                    path = %path.display(),
                     %error,
                     "failed to syntax-highlight diff"
                 );
@@ -9596,15 +9712,17 @@ impl SessionMvpView {
             muted,
         });
 
-        if !cache.documents.contains_key(&key) {
+        if !cache.documents.contains_key(key) {
             if cache.documents.len() == DIFF_CACHE_CAPACITY
                 && let Some(evicted) = cache.order.pop_front()
             {
                 cache.documents.remove(&evicted);
             }
-            cache.order.push_back(key.clone());
+            cache.order.push_back(key.to_owned());
         }
-        cache.documents.insert(key, Arc::clone(&document));
+        cache
+            .documents
+            .insert(key.to_owned(), Arc::clone(&document));
         document
     }
 
