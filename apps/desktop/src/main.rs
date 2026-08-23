@@ -12747,6 +12747,45 @@ impl SessionMvpView {
             )
     }
 
+    fn fork_progress_notice(&self) -> Option<gpui::AnyElement> {
+        let source_session_id = self.selected_session.as_deref()?;
+        let progress = self.fork_progress.get(source_session_id)?;
+        let detail = match progress {
+            SessionLaunchProgress::CreatingWorktree => "Creating an isolated worktree…",
+            SessionLaunchProgress::WorktreeReady(_) => "Worktree ready. Starting Copilot…",
+        };
+        Some(
+            div()
+                .id("fork-progress-notice")
+                .debug_selector(|| "fork-progress-notice".to_owned())
+                .accessibility_id("fork-progress-notice")
+                .role(Role::Status)
+                .aria_label(format!("Fork requested. {detail}"))
+                .mx_auto()
+                .mb_2()
+                .w_full()
+                .max_w(px(CONVERSATION_COLUMN_WIDTH))
+                .flex()
+                .items_center()
+                .gap_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(PANEL))
+                .px_3()
+                .py_2()
+                .child(progress_spinner("fork-progress-spinner".into()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child("Fork requested")
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(detail)),
+                )
+                .into_any_element(),
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
     fn interaction_prompt(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let session = self.selected()?;
@@ -13356,6 +13395,9 @@ impl Render for SessionMvpView {
                                                     .text_color(rgb(RED))
                                                     .child(error),
                                             )
+                                        })
+                                        .when_some(self.fork_progress_notice(), |column, notice| {
+                                            column.child(notice)
                                         })
                                         .when_some(self.action_error.clone(), |column, error| {
                                             column.child(
@@ -17936,6 +17978,10 @@ pub(crate) mod tests {
                 assert_eq!(view.selected_session.as_deref(), Some("source"));
                 assert!(view.fork_progress.contains_key("source"));
             });
+            assert!(
+                cx.debug_bounds("fork-progress-notice").is_some(),
+                "fork submission must show immediate progress beside the composer"
+            );
 
             let mut fork = snapshot("fork", "Fork of Source");
             fork.metadata.forked_from_session_id = Some("source".to_owned());
