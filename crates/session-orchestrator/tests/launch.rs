@@ -45,6 +45,7 @@ fn harness(
 ) -> (Arc<SessionManager>, SessionOrchestrator) {
     let roots = SessionRoots {
         worktrees: Some(worktrees_root),
+        managed_worktrees: Vec::new(),
         attachments: None,
         runtime_state: None,
     };
@@ -66,6 +67,7 @@ fn harness_with_storage(
 ) -> (Arc<SessionManager>, SessionOrchestrator, Arc<Storage>) {
     let roots = SessionRoots {
         worktrees: Some(worktrees_root),
+        managed_worktrees: Vec::new(),
         attachments: None,
         runtime_state: None,
     };

@@ -11,7 +11,7 @@ use app_model::{
     SessionSnapshot, TitleSource, ToolActivity, rebuild,
 };
 use diagnostics::DiagnosticEvent;
-use rusqlite::{Connection, OptionalExtension, params};
+use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use thiserror::Error;
 
 const SCHEMA_VERSION: i64 = 13;
@@ -124,6 +124,23 @@ pub struct SessionArchiveRecord {
 pub struct ArchivedSession {
     pub metadata: SessionMetadata,
     pub archive: SessionArchiveRecord,
+}
+
+/// Which sessions a lifecycle operation (archive or delete) should touch.
+///
+/// Kept as an explicit type rather than a `bool` so every layer that
+/// forwards a caller's choice says what it means at the call site instead of
+/// leaving a bare `true`/`false` to be interpreted by whoever reads it.
+#[derive(Clone, Copy, Debug, Eq, PartialEq, Hash)]
+pub enum LifecycleScope {
+    /// Only the named session. Any children keep their own rows and, if the
+    /// operation removed their parent, become orphans -- exactly as they did
+    /// before this scope existed.
+    Single,
+    /// The named session and every descendant reachable through persisted
+    /// `parent_session_id` links, recomputed fresh each time the operation
+    /// runs.
+    Recursive,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -489,6 +506,31 @@ impl Storage {
         Ok(())
     }
 
+    /// Retire pending durable work and delete one session in the same metadata
+    /// transaction, so a failed delete never retires a session that remains.
+    pub fn delete_session_with_coordination_retirement(
+        &self,
+        session_id: &str,
+        reason: &str,
+        retired_at: &str,
+    ) -> Result<()> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        Self::retire_pending_coordination_transaction(
+            &transaction,
+            &[session_id.to_owned()],
+            reason,
+            retired_at,
+        )?;
+        transaction.execute(
+            "DELETE FROM diagnostics WHERE session_id = ?1",
+            [session_id],
+        )?;
+        transaction.execute("DELETE FROM app_sessions WHERE id = ?1", [session_id])?;
+        transaction.commit()?;
+        Ok(())
+    }
+
     /// Remove a project row. Sessions are unaffected; they are associated by
     /// `repository_root`, not by a foreign key.
     pub fn remove_project(&self, project_id: &str) -> Result<()> {
@@ -771,6 +813,58 @@ impl Storage {
                 |row| row.get(0),
             )
             .map_err(Into::into)
+    }
+
+    /// Sessions a lifecycle operation at `scope` should touch, ordered
+    /// deepest descendant first with the requested session last.
+    ///
+    /// Descendants are read straight from the persisted `parent_session_id`
+    /// links -- not from any in-memory tree -- so the set reflects exactly
+    /// what is durable, including descendants that are themselves archived.
+    /// The walk is breadth-first with a visited set, so it is safe even if
+    /// the data were ever corrupted into a cycle: every id is queued at most
+    /// once, so it always terminates. Each level is sorted before being
+    /// flattened deepest-first, so the same tree always produces the same
+    /// order, which is what lets callers disconnect, archive, or delete
+    /// children before the parent that named them.
+    pub fn lifecycle_targets(
+        &self,
+        session_id: &str,
+        scope: LifecycleScope,
+    ) -> Result<Vec<String>> {
+        if scope == LifecycleScope::Single {
+            return Ok(vec![session_id.to_owned()]);
+        }
+        let connection = self.connection()?;
+        let mut visited: HashSet<String> = HashSet::from([session_id.to_owned()]);
+        let mut levels: Vec<Vec<String>> = Vec::new();
+        let mut frontier = vec![session_id.to_owned()];
+        while !frontier.is_empty() {
+            let mut next_level = Vec::new();
+            for parent in &frontier {
+                let mut statement = connection
+                    .prepare("SELECT id FROM app_sessions WHERE parent_session_id = ?1")?;
+                let rows = statement.query_map([parent], |row| row.get::<_, String>(0))?;
+                for row in rows {
+                    let id = row?;
+                    if visited.insert(id.clone()) {
+                        next_level.push(id);
+                    }
+                }
+            }
+            if next_level.is_empty() {
+                break;
+            }
+            next_level.sort();
+            levels.push(next_level.clone());
+            frontier = next_level;
+        }
+        let mut ordered = Vec::with_capacity(levels.iter().map(Vec::len).sum::<usize>() + 1);
+        for level in levels.into_iter().rev() {
+            ordered.extend(level);
+        }
+        ordered.push(session_id.to_owned());
+        Ok(ordered)
     }
 
     pub fn append_event(&self, event: &DomainEvent) -> Result<bool> {
@@ -1534,6 +1628,128 @@ impl Storage {
             params![retired_at],
         )?;
         transaction.commit()?;
+        Ok(retired)
+    }
+
+    /// Retire durable coordination and plan work tied to any of
+    /// `session_ids`, all in one transaction.
+    ///
+    /// A recursive lifecycle operation can remove or archive a session that
+    /// other rows are still waiting on: a coordination item still addressed
+    /// to it, a queue item it will never deliver, or a plan response it never
+    /// submitted. None of those can resolve once the session is out of live
+    /// use, so this fails them the same way
+    /// [`Self::retire_stale_plan_waiting_notifications`] fails a restart's
+    /// stale plan waits, rather than leaving them pending forever. Coordination
+    /// rows and plan responses stay behind as audit history; only their live
+    /// state changes. A no-op session id list is a no-op call. Returns the
+    /// number of coordination rows retired.
+    pub fn retire_pending_coordination_for_sessions(
+        &self,
+        session_ids: &[String],
+        reason: &str,
+        retired_at: &str,
+    ) -> Result<usize> {
+        if session_ids.is_empty() {
+            return Ok(0);
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let retired = Self::retire_pending_coordination_transaction(
+            &transaction,
+            session_ids,
+            reason,
+            retired_at,
+        )?;
+        transaction.commit()?;
+        Ok(retired)
+    }
+
+    fn retire_pending_coordination_transaction(
+        transaction: &rusqlite::Transaction<'_>,
+        session_ids: &[String],
+        reason: &str,
+        retired_at: &str,
+    ) -> Result<usize> {
+        let placeholders = vec!["?"; session_ids.len()].join(",");
+
+        let delete_queue_sql = format!(
+            "DELETE FROM queue_items
+             WHERE state = 'pending'
+               AND id IN (
+                   SELECT queue_item_id FROM coordination_items
+                   WHERE queue_item_id IS NOT NULL
+                     AND state IN ('pending', 'dispatched')
+                     AND (sender_session_id IN ({placeholders})
+                          OR recipient_session_id IN ({placeholders}))
+               )"
+        );
+        transaction.execute(
+            &delete_queue_sql,
+            params_from_iter(session_ids.iter().chain(session_ids.iter())),
+        )?;
+
+        let fail_dispatched_queue_sql = format!(
+            "UPDATE queue_items
+             SET state = 'failed', error = ?, updated_at = ?
+             WHERE state = 'dispatched'
+               AND id IN (
+                   SELECT queue_item_id FROM coordination_items
+                   WHERE queue_item_id IS NOT NULL
+                     AND state = 'dispatched'
+                     AND recipient_session_id IN ({placeholders})
+               )"
+        );
+        transaction.execute(
+            &fail_dispatched_queue_sql,
+            params_from_iter(
+                [reason.to_owned(), retired_at.to_owned()]
+                    .into_iter()
+                    .chain(session_ids.iter().cloned()),
+            ),
+        )?;
+
+        let update_coordination_sql = format!(
+            "UPDATE coordination_items
+             SET state = 'failed', error = ?, queue_item_id = NULL, read_at = ?, updated_at = ?
+             WHERE (state = 'pending'
+                    AND (sender_session_id IN ({placeholders})
+                         OR recipient_session_id IN ({placeholders})))
+                OR (state = 'dispatched'
+                    AND recipient_session_id IN ({placeholders}))"
+        );
+        let retired = transaction.execute(
+            &update_coordination_sql,
+            params_from_iter(
+                [
+                    reason.to_owned(),
+                    retired_at.to_owned(),
+                    retired_at.to_owned(),
+                ]
+                .into_iter()
+                .chain(session_ids.iter().cloned())
+                .chain(session_ids.iter().cloned())
+                .chain(session_ids.iter().cloned()),
+            ),
+        )?;
+
+        let update_plan_sql = format!(
+            "UPDATE plan_responses
+             SET state = 'failed', error = ?, updated_at = ?
+             WHERE state = 'submitting'
+               AND (caller_session_id IN ({placeholders})
+                    OR target_session_id IN ({placeholders}))"
+        );
+        transaction.execute(
+            &update_plan_sql,
+            params_from_iter(
+                [reason.to_owned(), retired_at.to_owned()]
+                    .into_iter()
+                    .chain(session_ids.iter().cloned())
+                    .chain(session_ids.iter().cloned()),
+            ),
+        )?;
+
         Ok(retired)
     }
 
@@ -3995,6 +4211,323 @@ mod tests {
                 .retire_stale_plan_waiting_notifications("restart-again")
                 .unwrap(),
             0
+        );
+    }
+
+    #[test]
+    fn lifecycle_targets_single_scope_returns_only_the_requested_session() {
+        let storage = Storage::open_in_memory().unwrap();
+        let root = distinct_root("root", "/tmp/project");
+        let child = child_metadata(&root, 1);
+        storage.upsert_session(&root).unwrap();
+        storage.upsert_session(&child).unwrap();
+
+        assert_eq!(
+            storage
+                .lifecycle_targets(&root.id, LifecycleScope::Single)
+                .unwrap(),
+            vec![root.id.clone()]
+        );
+        // Even a session that does not exist returns itself under `Single`;
+        // the low-level delete this feeds is already tolerant of that.
+        assert_eq!(
+            storage
+                .lifecycle_targets("missing", LifecycleScope::Single)
+                .unwrap(),
+            vec!["missing".to_owned()]
+        );
+    }
+
+    #[test]
+    fn lifecycle_targets_recursive_orders_deepest_descendant_first() {
+        let storage = Storage::open_in_memory().unwrap();
+        let root = distinct_root("root", "/tmp/project");
+        let child_1 = child_metadata(&root, 1);
+        let grandchild = child_metadata(&child_1, 2);
+        let great_grandchild = child_metadata(&grandchild, 3);
+        let child_4 = child_metadata(&root, 4);
+        for session in [&root, &child_1, &grandchild, &great_grandchild, &child_4] {
+            storage.upsert_session(session).unwrap();
+        }
+
+        let targets = storage
+            .lifecycle_targets(&root.id, LifecycleScope::Recursive)
+            .unwrap();
+        assert_eq!(
+            targets,
+            vec![
+                "child-3".to_owned(), // great-grandchild, deepest
+                "child-2".to_owned(), // grandchild
+                "child-1".to_owned(), // child, sorted before its sibling
+                "child-4".to_owned(), // sibling child, same level
+                "root".to_owned(),    // the requested session, last
+            ]
+        );
+    }
+
+    #[test]
+    fn lifecycle_targets_recursive_includes_already_archived_descendants() {
+        let storage = Storage::open_in_memory().unwrap();
+        let root = distinct_root("root", "/tmp/project");
+        let child = child_metadata(&root, 1);
+        let grandchild = child_metadata(&child, 2);
+        storage.upsert_session(&root).unwrap();
+        storage.upsert_session(&child).unwrap();
+        storage.upsert_session(&grandchild).unwrap();
+        storage.archive_session(&archive_record(&child.id)).unwrap();
+
+        // An archived link in the middle of the chain must not stop the walk
+        // from reaching what is still parented underneath it.
+        let targets = storage
+            .lifecycle_targets(&root.id, LifecycleScope::Recursive)
+            .unwrap();
+        assert_eq!(
+            targets,
+            vec![
+                "child-2".to_owned(),
+                "child-1".to_owned(),
+                "root".to_owned()
+            ]
+        );
+
+        // Calling it again is exactly as safe: nothing was mutated.
+        assert_eq!(
+            storage
+                .lifecycle_targets(&root.id, LifecycleScope::Recursive)
+                .unwrap(),
+            targets
+        );
+    }
+
+    #[test]
+    fn lifecycle_targets_recursive_excludes_descendants_already_deleted() {
+        let storage = Storage::open_in_memory().unwrap();
+        let root = distinct_root("root", "/tmp/project");
+        let child = child_metadata(&root, 1);
+        let grandchild = child_metadata(&child, 2);
+        storage.upsert_session(&root).unwrap();
+        storage.upsert_session(&child).unwrap();
+        storage.upsert_session(&grandchild).unwrap();
+
+        // Simulate a descendant that vanished (e.g. a prior partial run).
+        storage.delete_session(&grandchild.id).unwrap();
+
+        let targets = storage
+            .lifecycle_targets(&root.id, LifecycleScope::Recursive)
+            .unwrap();
+        assert_eq!(targets, vec!["child-1".to_owned(), "root".to_owned()]);
+    }
+
+    #[test]
+    fn lifecycle_targets_recursive_is_cycle_safe() {
+        let storage = Storage::open_in_memory().unwrap();
+        let cycle_a = distinct_root("cycle-a", "/tmp/project");
+        let cycle_b = distinct_root("cycle-b", "/tmp/project");
+        storage.upsert_session(&cycle_a).unwrap();
+        storage.upsert_session(&cycle_b).unwrap();
+        // `upsert_session` refuses to create a cycle; corrupt the link
+        // directly, as if the data had been damaged some other way, and prove
+        // the walk still terminates instead of looping forever.
+        storage
+            .connection()
+            .unwrap()
+            .execute(
+                "UPDATE app_sessions SET parent_session_id = CASE id
+                    WHEN 'cycle-a' THEN 'cycle-b' ELSE 'cycle-a' END
+                 WHERE id IN ('cycle-a', 'cycle-b')",
+                [],
+            )
+            .unwrap();
+
+        let targets = storage
+            .lifecycle_targets("cycle-a", LifecycleScope::Recursive)
+            .unwrap();
+        assert_eq!(targets.len(), 2, "each id must appear exactly once");
+        assert!(targets.contains(&"cycle-a".to_owned()));
+        assert!(targets.contains(&"cycle-b".to_owned()));
+        assert_eq!(targets.last(), Some(&"cycle-a".to_owned()));
+    }
+
+    #[test]
+    fn retire_pending_coordination_for_sessions_fails_live_work_and_drops_dangling_queue_items() {
+        let storage = Storage::open_in_memory().unwrap();
+        let keep = distinct_root("keep", "/tmp/project");
+        let gone = distinct_root("gone", "/tmp/project");
+        storage.upsert_session(&keep).unwrap();
+        storage.upsert_session(&gone).unwrap();
+
+        // A message from the session about to be retired, still sitting in
+        // the surviving session's queue -- this queue item is not owned by
+        // `gone`, so nothing cascades it away on its own.
+        let mut inbound_queue = queue_item("inbound-queue", 1024);
+        inbound_queue.session_id = keep.id.clone();
+        let inbound = coordination_record(
+            "inbound",
+            &gone.id,
+            &keep.id,
+            CoordinationKind::Message,
+            Some(&inbound_queue.id),
+        );
+        storage
+            .create_coordination_item(&inbound, Some(&inbound_queue))
+            .unwrap();
+
+        // A message the other way, already dispatched, addressed to `gone`.
+        let mut outbound_queue = queue_item("outbound-queue", 2048);
+        outbound_queue.session_id = gone.id.clone();
+        outbound_queue.state = QueueItemState::Dispatched;
+        let outbound = coordination_record(
+            "outbound",
+            &keep.id,
+            &gone.id,
+            CoordinationKind::Message,
+            Some(&outbound_queue.id),
+        );
+        storage
+            .create_coordination_item(&outbound, Some(&outbound_queue))
+            .unwrap();
+
+        // Once a surviving recipient has started a message, retiring only the
+        // sender cannot recall that in-flight turn.
+        let mut dispatched_from_gone_queue = queue_item("sender-dispatched-queue", 3072);
+        dispatched_from_gone_queue.session_id = keep.id.clone();
+        dispatched_from_gone_queue.state = QueueItemState::Dispatched;
+        let dispatched_from_gone = coordination_record(
+            "sender-dispatched",
+            &gone.id,
+            &keep.id,
+            CoordinationKind::Message,
+            Some(&dispatched_from_gone_queue.id),
+        );
+        storage
+            .create_coordination_item(&dispatched_from_gone, Some(&dispatched_from_gone_queue))
+            .unwrap();
+
+        // Already resolved work must be left exactly as it was.
+        let mut delivered_queue = queue_item("delivered-queue", 4096);
+        delivered_queue.session_id = keep.id.clone();
+        delivered_queue.state = QueueItemState::Completed;
+        let mut delivered = coordination_record(
+            "delivered",
+            &gone.id,
+            &keep.id,
+            CoordinationKind::Message,
+            Some(&delivered_queue.id),
+        );
+        delivered.state = CoordinationState::Delivered;
+        storage
+            .create_coordination_item(&delivered, Some(&delivered_queue))
+            .unwrap();
+
+        let plan_response = PlanResponseRecord {
+            id: "plan-response-1".to_owned(),
+            caller_session_id: gone.id.clone(),
+            tool_call_id: "tool-call-1".to_owned(),
+            target_session_id: keep.id.clone(),
+            interaction_id: "interaction-1".to_owned(),
+            approved: true,
+            feedback: None,
+            selected_action: None,
+            state: PlanResponseState::Submitting,
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+            error: None,
+        };
+        storage.create_plan_response(&plan_response).unwrap();
+
+        let retired = storage
+            .retire_pending_coordination_for_sessions(
+                std::slice::from_ref(&gone.id),
+                "an ancestor session was archived",
+                "2026-01-01T00:00:00Z",
+            )
+            .unwrap();
+        assert_eq!(retired, 2, "the pending and dispatched rows were retired");
+        assert_retired_coordination(&storage, &keep, &gone);
+
+        // An empty session list is a no-op, not an error.
+        assert_eq!(
+            storage
+                .retire_pending_coordination_for_sessions(&[], "unused", "unused")
+                .unwrap(),
+            0
+        );
+    }
+
+    fn assert_retired_coordination(
+        storage: &Storage,
+        keep: &SessionMetadata,
+        gone: &SessionMetadata,
+    ) {
+        let keep_items = storage.list_coordination_items(&keep.id, 10).unwrap();
+        let inbound_after = keep_items.iter().find(|item| item.id == "inbound").unwrap();
+        assert_eq!(inbound_after.state, CoordinationState::Failed);
+        assert_eq!(
+            inbound_after.error.as_deref(),
+            Some("an ancestor session was archived")
+        );
+        assert_eq!(
+            inbound_after.read_at.as_deref(),
+            Some("2026-01-01T00:00:00Z")
+        );
+        assert!(inbound_after.queue_item_id.is_none());
+        assert!(
+            storage
+                .queue_view(&keep.id)
+                .unwrap()
+                .items
+                .iter()
+                .all(|item| item.id != "inbound-queue")
+        );
+        let sender_dispatched_after = keep_items
+            .iter()
+            .find(|item| item.id == "sender-dispatched")
+            .unwrap();
+        assert_eq!(sender_dispatched_after.state, CoordinationState::Dispatched);
+        assert_eq!(
+            storage
+                .queue_view(&keep.id)
+                .unwrap()
+                .items
+                .into_iter()
+                .find(|item| item.id == "sender-dispatched-queue")
+                .unwrap()
+                .state,
+            QueueItemState::Dispatched
+        );
+
+        let gone_items = storage.list_coordination_items(&gone.id, 10).unwrap();
+        let outbound_after = gone_items
+            .iter()
+            .find(|item| item.id == "outbound")
+            .unwrap();
+        assert_eq!(outbound_after.state, CoordinationState::Failed);
+        let outbound_queue_after = storage
+            .queue_view(&gone.id)
+            .unwrap()
+            .items
+            .into_iter()
+            .find(|item| item.id == "outbound-queue")
+            .unwrap();
+        assert_eq!(outbound_queue_after.state, QueueItemState::Failed);
+        assert_eq!(
+            outbound_queue_after.error.as_deref(),
+            Some("an ancestor session was archived")
+        );
+
+        let delivered_after = keep_items
+            .iter()
+            .find(|item| item.id == "delivered")
+            .unwrap();
+        assert_eq!(delivered_after.state, CoordinationState::Delivered);
+        let response_after = storage
+            .plan_response_for_interaction(&keep.id, "interaction-1")
+            .unwrap()
+            .unwrap();
+        assert_eq!(response_after.state, PlanResponseState::Failed);
+        assert_eq!(
+            response_after.error.as_deref(),
+            Some("an ancestor session was archived")
         );
     }
 

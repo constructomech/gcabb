@@ -95,11 +95,24 @@ and sessions outside the registered project are rejected.
 
 Current limits are three child levels and five active direct children per
 parent. This surface is local-only and same-project-only. Cloud sessions,
-cross-repository launches, recursive archive/delete, forking, and
-`notify_on_idle: "always"` are intentionally outside this version. If the
-app crashes in the narrow interval after recording a child but before
-confirming kickoff delivery, a retry returns an explicit interrupted-launch
-error with the child id rather than risking duplicate work.
+cross-repository launches, forking, and `notify_on_idle: "always"` are
+intentionally outside this version. If the app crashes in the narrow interval
+after recording a child but before confirming kickoff delivery, a retry
+returns an explicit interrupted-launch error with the child id rather than
+risking duplicate work.
+
+Archive and delete remain single-session operations unless the user explicitly
+selects the recursive checkbox in the confirmation dialog. The checkbox starts
+unchecked every time. A single parent operation leaves children intact; they
+render as deterministic root-level sessions while their parent is unavailable.
+
+A recursive operation snapshots persisted ancestry while session launch and
+restoration are serialized, then processes the deepest descendants before
+their parents. Archive keeps session records and captures recoverable
+worktree changes. Delete removes records and best-effort runtime data, but
+preserves every dirty managed worktree and reports preserved paths and cleanup
+failures. Unarchive is intentionally single-session only and never brings back
+descendants implicitly.
 
 ### Messages versus CLI subagent events
 

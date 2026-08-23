@@ -489,12 +489,17 @@ impl SessionOrchestrator {
             }
             let roots_without_worktrees = SessionRoots {
                 worktrees: None,
+                managed_worktrees: Vec::new(),
                 attachments: self.roots.attachments.clone(),
                 runtime_state: self.roots.runtime_state.clone(),
             };
             if let Err(error) = self
                 .manager
-                .delete_session(id, &roots_without_worktrees)
+                .delete_session_scoped(
+                    id,
+                    &roots_without_worktrees,
+                    session_manager::LifecycleScope::Single,
+                )
                 .await
             {
                 failures.push(CleanupFailure {
