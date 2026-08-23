@@ -2563,6 +2563,10 @@ struct SessionMvpView {
     commands: Sender<ServiceCommand>,
     branch: String,
     composer: Entity<TextInput>,
+    /// Search query for narrowing the new-session base branch menu.
+    base_filter_input: Entity<TextInput>,
+    /// Branches snapshotted when the new-session base branch menu opens.
+    draft_base_ref_options: Vec<String>,
     /// Incomplete prompt entered before a session is selected.
     home_draft: String,
     /// Incomplete prompts keyed by the session they belong to.
@@ -2706,6 +2710,10 @@ impl SessionMvpView {
         })
         .detach();
         cx.observe(&composer, |_, _, cx| cx.notify()).detach();
+        let base_filter_input =
+            cx.new(|cx| TextInput::new(cx, "base-branch-filter", "Filter branches..."));
+        cx.subscribe(&base_filter_input, |_, _, _: &InputChanged, cx| cx.notify())
+            .detach();
         let interaction_input =
             cx.new(|cx| TextInput::new(cx, "interaction-input", "Type your response..."));
         cx.subscribe(&interaction_input, |view, _, event: &InputSubmitted, cx| {
@@ -2870,6 +2878,8 @@ impl SessionMvpView {
             commands,
             branch,
             composer,
+            base_filter_input,
+            draft_base_ref_options: Vec::new(),
             home_draft: String::new(),
             session_drafts: HashMap::new(),
             interaction_input,
@@ -4189,27 +4199,31 @@ impl SessionMvpView {
     /// record it once so later movement on that branch does not silently
     /// change what the changes view reports. Falls back to resolving it
     /// directly when the project has none recorded.
+    fn project_default_base_ref(&self) -> Option<String> {
+        self.projects
+            .iter()
+            .find(|project| Path::new(&project.path) == self.selected_project)
+            .and_then(|project| project.default_branch.clone())
+            .or_else(|| default_branch(&self.selected_project))
+    }
+
     fn selected_project_base_ref(&self) -> Option<String> {
-        self.draft_base_ref.clone().or_else(|| {
-            self.projects
-                .iter()
-                .find(|project| Path::new(&project.path) == self.selected_project)
-                .and_then(|project| project.default_branch.clone())
-                .or_else(|| default_branch(&self.selected_project))
-        })
+        self.draft_base_ref
+            .clone()
+            .or_else(|| self.project_default_base_ref())
     }
 
     /// Branches available for the new-session base-branch picker.
     ///
     /// Reuses the same discovery as the existing-session Changes base
     /// selector so both pickers agree on what counts as a base.
-    fn base_ref_menu_options(&self) -> Vec<(String, String, String)> {
-        GitService::new(&self.selected_project)
-            .base_refs()
-            .unwrap_or_default()
-            .into_iter()
-            .map(|reference| (reference.clone(), reference, String::new()))
-            .collect()
+    fn base_ref_menu_options(&self, query: &str) -> Vec<(String, String, String)> {
+        prioritized_base_refs(
+            self.draft_base_ref_options.clone(),
+            self.project_default_base_ref().as_deref(),
+            self.selected_project_base_ref().as_deref(),
+            query,
+        )
     }
 
     /// Queue a follow-up for the selected session.
@@ -5344,8 +5358,14 @@ impl SessionMvpView {
         });
     }
 
-    fn toggle_control_menu(&mut self, menu: ControlMenu) {
+    fn toggle_control_menu(&mut self, menu: ControlMenu, cx: &mut Context<Self>) {
         self.base_menu_visibility = SettingsVisibility::Closed;
+        if menu == ControlMenu::Base && self.open_control_menu != Some(ControlMenu::Base) {
+            self.base_filter_input.update(cx, TextInput::clear);
+            self.draft_base_ref_options = GitService::new(&self.selected_project)
+                .base_refs()
+                .unwrap_or_default();
+        }
         self.open_control_menu = toggled_menu(self.open_control_menu, menu);
     }
 
@@ -5420,6 +5440,7 @@ impl SessionMvpView {
 
     fn dismiss_control_menu(&mut self, cx: &mut Context<Self>) {
         if self.open_control_menu.take().is_some() {
+            self.base_filter_input.update(cx, TextInput::clear);
             cx.notify();
         }
     }
@@ -5509,6 +5530,9 @@ impl SessionMvpView {
             }
         }
         self.open_control_menu = None;
+        if menu == ControlMenu::Base {
+            self.base_filter_input.update(cx, TextInput::clear);
+        }
     }
 
     fn provider_status(&self) -> (String, u32) {
@@ -5853,7 +5877,8 @@ impl SessionMvpView {
                 .collect(),
             ),
             ControlMenu::Base => {
-                let options = self.base_ref_menu_options();
+                let query = self.base_filter_input.read(cx).value();
+                let options = self.base_ref_menu_options(&query);
                 let selected = self
                     .draft_base_ref
                     .clone()
@@ -5895,7 +5920,11 @@ impl SessionMvpView {
                 ("Context length", selected, options)
             }
         };
-        let width = if matches!(menu, ControlMenu::Agent | ControlMenu::Model) {
+        let no_options = options.is_empty();
+        let width = if matches!(
+            menu,
+            ControlMenu::Agent | ControlMenu::Model | ControlMenu::Base
+        ) {
             px(340.0)
         } else {
             px(260.0)
@@ -5932,6 +5961,18 @@ impl SessionMvpView {
                         .text_color(rgb(MUTED))
                         .child(title),
                 )
+                .when(menu == ControlMenu::Base, |popup| {
+                    popup.child(
+                        div()
+                            .mx_2()
+                            .mb_2()
+                            .rounded_md()
+                            .border_1()
+                            .border_color(rgb(BORDER))
+                            .bg(rgb(BACKGROUND))
+                            .child(self.base_filter_input.clone()),
+                    )
+                })
                 .children(options.into_iter().enumerate().map(
                     |(index, (value, label, description))| {
                         let is_selected = value == selected;
@@ -5970,19 +6011,39 @@ impl SessionMvpView {
                             .child(
                                 div()
                                     .w(px(16.0))
+                                    .flex_none()
                                     .text_color(rgb(MUTED))
                                     .child(if is_selected { "✓" } else { "" }),
                             )
-                            .child(div().flex().flex_col().min_w_0().child(label).when(
-                                has_description,
-                                |content| {
-                                    content.child(
-                                        div().text_xs().text_color(rgb(MUTED)).child(description),
-                                    )
-                                },
-                            ))
+                            .child(
+                                div()
+                                    .flex()
+                                    .flex_col()
+                                    .min_w_0()
+                                    .child(div().w_full().truncate().child(label))
+                                    .when(has_description, |content| {
+                                        content.child(
+                                            div()
+                                                .text_xs()
+                                                .text_color(rgb(MUTED))
+                                                .child(description),
+                                        )
+                                    }),
+                            )
                     },
                 ))
+                .when(menu == ControlMenu::Base && no_options, |popup| {
+                    popup.child(
+                        div()
+                            .id("base-branch-no-results")
+                            .px_2()
+                            .py_3()
+                            .role(Role::Status)
+                            .text_sm()
+                            .text_color(rgb(MUTED))
+                            .child("No matching branches"),
+                    )
+                })
                 .when(menu == ControlMenu::Agent, |popup| {
                     popup.child(self.workspace_configuration_summary())
                 }),
@@ -10863,7 +10924,7 @@ impl SessionMvpView {
                             .child(format!("▱ {project_name}"))
                             .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                             .on_click(cx.listener(|view, _, _, cx| {
-                                view.toggle_control_menu(ControlMenu::Project);
+                                view.toggle_control_menu(ControlMenu::Project, cx);
                                 cx.notify();
                             })),
                     )
@@ -10892,7 +10953,7 @@ impl SessionMvpView {
                                     .child(format!("↗ {location_label}"))
                                     .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                                     .on_click(cx.listener(|view, _, _, cx| {
-                                        view.toggle_control_menu(ControlMenu::Location);
+                                        view.toggle_control_menu(ControlMenu::Location, cx);
                                         cx.notify();
                                     })),
                             )
@@ -10921,7 +10982,7 @@ impl SessionMvpView {
                                             .child(format!("⌁ {branch}"))
                                             .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                                             .on_click(cx.listener(|view, _, _, cx| {
-                                                view.toggle_control_menu(ControlMenu::Base);
+                                                view.toggle_control_menu(ControlMenu::Base, cx);
                                                 cx.notify();
                                             })),
                                     )
@@ -12064,7 +12125,7 @@ fn control_pill(
         .child(value)
         .hover(|style| style.text_color(rgb(PRIMARY)).cursor_pointer())
         .on_click(cx.listener(move |view, _, _, cx| {
-            view.toggle_control_menu(menu);
+            view.toggle_control_menu(menu, cx);
             cx.notify();
         }))
 }
@@ -12131,6 +12192,42 @@ fn control_menu_offset(menu: ControlMenu) -> u16 {
         ControlMenu::Effort => 304,
         ControlMenu::Context => 392,
     }
+}
+
+fn prioritized_base_refs(
+    refs: Vec<String>,
+    default: Option<&str>,
+    selected: Option<&str>,
+    query: &str,
+) -> Vec<(String, String, String)> {
+    let mut seen = HashSet::new();
+    let ordered = selected
+        .into_iter()
+        .chain(default)
+        .map(str::to_owned)
+        .chain(refs)
+        .filter(|reference| !reference.is_empty() && seen.insert(reference.clone()));
+    let terms = query
+        .split_whitespace()
+        .map(str::to_lowercase)
+        .collect::<Vec<_>>();
+
+    ordered
+        .filter(|reference| {
+            let lowercase = reference.to_lowercase();
+            terms.iter().all(|term| lowercase.contains(term))
+        })
+        .map(|reference| {
+            let description = if Some(reference.as_str()) == default {
+                "Project default".to_owned()
+            } else if Some(reference.as_str()) == selected {
+                "Selected branch".to_owned()
+            } else {
+                String::new()
+            };
+            (reference.clone(), reference, description)
+        })
+        .collect()
 }
 
 fn toggled_menu(current: Option<ControlMenu>, requested: ControlMenu) -> Option<ControlMenu> {
@@ -12758,8 +12855,8 @@ pub(crate) mod tests {
         compact_layout, context_window_label, control_menu_id, control_menu_offset, default_branch,
         default_context_tier, effort_label, format_terminal_auto_expand_delay,
         migrate_persistent_data, parse_terminal_auto_expand_delay, permission_scope_description,
-        reasoning_effort_for_model, repository_root, toggled_menu, token_label,
-        update_poll_delay_for,
+        prioritized_base_refs, reasoning_effort_for_model, repository_root, toggled_menu,
+        token_label, update_poll_delay_for,
     };
     use app_model::SessionLocation;
     use std::fmt::Write as _;
@@ -13144,6 +13241,45 @@ pub(crate) mod tests {
             toggled_menu(Some(ControlMenu::Model), ControlMenu::Model),
             None
         );
+    }
+
+    #[test]
+    fn base_refs_prioritize_selection_and_default_without_duplicates() {
+        let options = prioritized_base_refs(
+            vec![
+                "feature/local".to_owned(),
+                "main".to_owned(),
+                "origin/release".to_owned(),
+            ],
+            Some("main"),
+            Some("origin/release"),
+            "",
+        );
+        assert_eq!(
+            options
+                .iter()
+                .map(|(value, _, _)| value.as_str())
+                .collect::<Vec<_>>(),
+            ["origin/release", "main", "feature/local"]
+        );
+        assert_eq!(options[0].2, "Selected branch");
+        assert_eq!(options[1].2, "Project default");
+    }
+
+    #[test]
+    fn base_ref_filter_is_case_insensitive_and_matches_all_terms() {
+        let options = prioritized_base_refs(
+            vec![
+                "origin/feature/Branch-Picker".to_owned(),
+                "origin/feature/other".to_owned(),
+                "main".to_owned(),
+            ],
+            Some("main"),
+            None,
+            "FEATURE picker",
+        );
+        assert_eq!(options.len(), 1);
+        assert_eq!(options[0].0, "origin/feature/Branch-Picker");
     }
 
     #[test]
@@ -16154,7 +16290,7 @@ pub(crate) mod tests {
                     super::super::CHAT_OPTION.to_owned(),
                     cx,
                 );
-                view.toggle_control_menu(super::super::ControlMenu::Project);
+                view.toggle_control_menu(super::super::ControlMenu::Project, cx);
             });
             view.read_with(cx, |view, _| {
                 assert!(view.targets_chat());

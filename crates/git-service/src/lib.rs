@@ -10,6 +10,7 @@
 //! reports committed, staged, unstaged, and untracked changes in one view.
 //! Selectable bases and merge-base discovery arrive in Phase 6.
 
+use std::collections::HashSet;
 use std::io::Write as _;
 use std::path::{Path, PathBuf};
 use std::process::{Command, Output, Stdio};
@@ -169,19 +170,37 @@ impl GitService {
     pub fn base_refs(&self) -> Result<Vec<String>> {
         let output = self.run(&[
             "for-each-ref",
-            "--format=%(refname:short)",
+            "--format=%(refname)%09%(refname:short)%09%(upstream:short)",
             "refs/heads",
             "refs/remotes",
         ])?;
-        let mut refs = output
-            .lines()
-            .map(str::trim)
-            .filter(|reference| !reference.is_empty() && !reference.ends_with("/HEAD"))
-            .map(str::to_owned)
-            .collect::<Vec<_>>();
-        refs.sort_by_key(|reference| (reference.contains('/'), reference.clone()));
-        refs.dedup();
-        Ok(refs)
+        let mut local_refs = Vec::new();
+        let mut remote_refs = Vec::new();
+        let mut local_upstreams = HashSet::new();
+        for line in output.lines() {
+            let mut fields = line.splitn(3, '\t');
+            let full_ref = fields.next().unwrap_or_default();
+            let short_ref = fields.next().unwrap_or_default().trim();
+            let upstream = fields.next().unwrap_or_default().trim();
+            if short_ref.is_empty() || short_ref.ends_with("/HEAD") {
+                continue;
+            }
+            if full_ref.starts_with("refs/heads/") {
+                local_refs.push(short_ref.to_owned());
+                if !upstream.is_empty() {
+                    local_upstreams.insert(upstream.to_owned());
+                }
+            } else if full_ref.starts_with("refs/remotes/") {
+                remote_refs.push(short_ref.to_owned());
+            }
+        }
+        local_refs.sort();
+        local_refs.dedup();
+        remote_refs.retain(|reference| !local_upstreams.contains(reference));
+        remote_refs.sort();
+        remote_refs.dedup();
+        local_refs.extend(remote_refs);
+        Ok(local_refs)
     }
 
     /// Fetch the remote-tracking ref backing a logical base branch.
@@ -766,6 +785,29 @@ mod tests {
             .expect("worktree from tracked base");
         assert!(worktree.join("upstream.txt").exists());
         assert!(!worktree.join("session.txt").exists());
+    }
+
+    #[test]
+    fn base_refs_put_locals_first_and_hide_their_tracking_refs() {
+        let dir = repo();
+        let path = dir.path();
+        let remote = tempfile::tempdir().expect("remote");
+        git(remote.path(), &["init", "--bare"]);
+        git(
+            path,
+            &["remote", "add", "origin", &remote.path().to_string_lossy()],
+        );
+        git(path, &["push", "-u", "origin", "main"]);
+        git(path, &["branch", "feature/local"]);
+        git(path, &["push", "-u", "origin", "feature/local"]);
+        git(path, &["branch", "z-local"]);
+        git(path, &["push", "origin", "main:refs/heads/remote-only"]);
+        git(path, &["fetch", "origin"]);
+
+        assert_eq!(
+            GitService::new(path).base_refs().expect("base refs"),
+            ["feature/local", "main", "z-local", "origin/remote-only"]
+        );
     }
 
     #[test]
