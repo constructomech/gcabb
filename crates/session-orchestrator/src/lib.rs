@@ -21,6 +21,8 @@ use session_manager::{CreateSessionRequest, SessionHandle, SessionManager, Sessi
 use thiserror::Error;
 use tokio::sync::Mutex;
 
+const MAX_SESSION_TITLE_BYTES: usize = 256;
+
 /// Whether a launch is visible navigation or background orchestration.
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
 pub enum LaunchOrigin {
@@ -209,6 +211,7 @@ impl SessionOrchestrator {
         request: LaunchRequest,
         mut on_progress: impl FnMut(LaunchProgress),
     ) -> Result<LaunchResult, LaunchError> {
+        let _allocation = self.workspace_lock.lock().await;
         let previous_selection = self.previous_selection(request.origin)?;
         let repository = request
             .repository_root
@@ -217,17 +220,16 @@ impl SessionOrchestrator {
         let creates_worktree = request.kind == SessionKind::Project
             && request.location == SessionLocation::NewWorktree
             && GitService::new(&repository).is_worktree();
-        let (title, title_source, refine_title) = self
+        let (requested_title, title_source, refine_title) = self
             .select_title(&request, creates_worktree, &repository)
             .await;
+        let title = self.unique_title(&requested_title)?;
 
         if creates_worktree {
             on_progress(LaunchProgress::CreatingWorktree);
         }
 
-        let workspace = self
-            .allocate_workspace(&request, &title, &repository)
-            .await?;
+        let workspace = Self::allocate_workspace(&request, &title, &repository)?;
         if workspace.created.is_some() {
             on_progress(LaunchProgress::WorktreeReady(workspace.path.clone()));
         }
@@ -287,7 +289,7 @@ impl SessionOrchestrator {
         self.finalize_host_launch(host_launch, &handle, &workspace, &previous_selection)
             .await?;
 
-        if refine_title {
+        if refine_title && request.host_tool_call_id.is_none() {
             let manager = self.manager.clone();
             let session_id = handle.id().to_owned();
             let prompt = request.prompt.clone();
@@ -451,10 +453,11 @@ impl SessionOrchestrator {
         let head = source_git
             .head_commit()
             .map_err(|error| LaunchError::new(LaunchStage::Worktree, error.to_string()))?;
-        let title = request
+        let requested_title = request
             .name
             .clone()
             .unwrap_or_else(|| format!("Fork of {}", source.title));
+        let title = self.unique_title(&requested_title)?;
         let repository_path = PathBuf::from(repository);
         let namespace = repository_worktree_namespace(&request.worktrees_root, &repository_path)
             .map_err(|error| LaunchError::new(LaunchStage::Worktree, error))?;
@@ -492,15 +495,31 @@ impl SessionOrchestrator {
             .map_err(|error| LaunchError::new(LaunchStage::Activation, error.to_string()))
     }
 
-    async fn allocate_workspace(
-        &self,
+    fn allocate_workspace(
         request: &LaunchRequest,
         title: &str,
         repository: &Path,
     ) -> Result<Workspace, LaunchError> {
-        let _workspace_allocation = self.workspace_lock.lock().await;
         resolve_workspace(request, title, repository)
             .map_err(|error| LaunchError::new(LaunchStage::Worktree, error))
+    }
+
+    fn unique_title(&self, requested: &str) -> Result<String, LaunchError> {
+        let mut titles = self
+            .manager
+            .session_metadata()
+            .map_err(|error| LaunchError::new(LaunchStage::Worktree, error.to_string()))?
+            .into_iter()
+            .map(|metadata| metadata.title)
+            .collect::<Vec<_>>();
+        titles.extend(
+            self.manager
+                .archived_sessions()
+                .map_err(|error| LaunchError::new(LaunchStage::Worktree, error.to_string()))?
+                .into_iter()
+                .map(|archived| archived.metadata.title),
+        );
+        Ok(unique_session_title(requested, &titles))
     }
 
     async fn configure_notification(
@@ -800,6 +819,44 @@ fn cleanup_worktree(worktree: &CreatedWorktree) -> Vec<CleanupFailure> {
         }),
     }
     failures
+}
+
+fn unique_session_title(requested: &str, existing: &[String]) -> String {
+    let requested = requested.trim();
+    let requested = if requested.is_empty() {
+        "Session"
+    } else {
+        requested
+    };
+    let base = truncate_title(requested, MAX_SESSION_TITLE_BYTES);
+    if !existing.iter().any(|title| title == &base) {
+        return base;
+    }
+    for number in 2_u64.. {
+        let suffix = format!(" ({number})");
+        let stem = truncate_title(
+            requested,
+            MAX_SESSION_TITLE_BYTES.saturating_sub(suffix.len()),
+        );
+        let candidate = format!("{stem}{suffix}");
+        if !existing.iter().any(|title| title == &candidate) {
+            return candidate;
+        }
+    }
+    unreachable!("the numeric title suffix space is unbounded")
+}
+
+fn truncate_title(title: &str, max_bytes: usize) -> String {
+    if title.len() <= max_bytes {
+        return title.to_owned();
+    }
+    let boundary = title
+        .char_indices()
+        .map(|(index, _)| index)
+        .take_while(|index| *index <= max_bytes)
+        .last()
+        .unwrap_or(0);
+    title[..boundary].to_owned()
 }
 
 /// A branch name derived from the semantic session title, made unique in both

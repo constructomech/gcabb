@@ -18,12 +18,14 @@ They coordinate durable GCABB app sessions, not Copilot CLI `task` subagents:
 - `create_session` creates another durable app session with its own provider,
   client, CLI process, SDK session, managed worktree, sidebar row, and restart
   lifecycle. An optional registered-project id targets another local repository;
-  omitting it uses the caller's project.
+  omitting it uses the caller's project. Its result includes the final allocated
+  title.
 - `fork_session` asks the SDK to fork the caller's own persisted history, then
   resumes the returned SDK session id in a new isolated GCABB runtime and
   worktree. The optional event boundary is exclusive and must be an exact event
   id from the caller. An optional prompt steers the already-created fork; it is
-  never pasted in place of SDK history.
+  never pasted in place of SDK history. Forking is a separate host tool rather
+  than a `create_session` mode, and its result also includes the final title.
 - `get_session` returns bounded status and work metadata for the caller, an
   ancestor, or a descendant. It includes at most four capped transcript entries,
   one capped completed assistant result, a pending plan summary when present,
@@ -49,6 +51,13 @@ repository, base branch, configured worktree root, and every filesystem
 location; no raw path, clone URL, repository root, parent, or spoofable sender
 input is accepted. SDK `toolCallId` is persisted so retries return the original
 child or message without duplicating work.
+
+New launches reserve their visible title while allocating the worktree. The
+first session keeps the requested or generated title; later collisions receive
+`(2)`, `(3)`, and so on. The same rule covers interactive launches,
+`create_session`, and `fork_session`, including concurrent requests and
+archived sessions, so the title returned to a host-tool caller matches the
+persisted session row.
 
 Forks record their source and optional exclusive event boundary separately from
 parent/child orchestration. They remain project-root sessions in navigation and

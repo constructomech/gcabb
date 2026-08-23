@@ -481,6 +481,46 @@ async fn native_fork_preserves_history_filesystem_provenance_and_retry_identity(
 }
 
 #[tokio::test]
+async fn repeated_forks_receive_numbered_titles_and_return_the_final_name() {
+    let (_guard, repository) = repository();
+    let worktrees = tempfile::tempdir().expect("worktrees");
+    let factory = FakeProviderFactory::default();
+    let (manager, orchestrator) = harness(factory.clone(), worktrees.path().to_owned());
+    let source = source_with_history_and_changes(
+        &manager,
+        &orchestrator,
+        &factory,
+        &repository,
+        worktrees.path(),
+    )
+    .await;
+    let request = ForkRequest {
+        source_session_id: source.handle.id().to_owned(),
+        worktrees_root: worktrees.path().to_owned(),
+        to_event_id: None,
+        name: None,
+        kickoff_prompt: None,
+        origin: LaunchOrigin::Headless,
+        fork_tool_call_id: None,
+    };
+
+    let first = orchestrator
+        .fork(request.clone(), |_| {})
+        .await
+        .expect("first fork");
+    let second = orchestrator
+        .fork(request, |_| {})
+        .await
+        .expect("second fork");
+    let expected = format!("Fork of {}", source.title);
+
+    assert_eq!(first.title, expected);
+    assert_eq!(second.title, format!("{expected} (2)"));
+    assert_eq!(first.handle.snapshot().metadata.title, first.title);
+    assert_eq!(second.handle.snapshot().metadata.title, second.title);
+}
+
+#[tokio::test]
 async fn full_history_user_fork_selects_the_new_root_session() {
     let (_guard, repository) = repository();
     let worktrees = tempfile::tempdir().expect("worktrees");
@@ -657,6 +697,13 @@ async fn concurrent_launches_allocate_distinct_worktrees() {
     let first = first.expect("first launch");
     let second = second.expect("second launch");
 
+    assert_eq!(
+        std::collections::HashSet::from([first.title.clone(), second.title.clone()]),
+        std::collections::HashSet::from([
+            "Concurrent child".to_owned(),
+            "Concurrent child (2)".to_owned(),
+        ])
+    );
     assert_ne!(first.project_path, second.project_path);
     assert_ne!(first.branch, second.branch);
 }
@@ -722,6 +769,8 @@ async fn branch_collisions_use_predictable_suffixes() {
         .await
         .expect("second launch");
 
+    assert_eq!(first.title, "Same title");
+    assert_eq!(second.title, "Same title (2)");
     assert_eq!(first.branch.as_deref(), Some("gcabb/same-title"));
     assert_eq!(second.branch.as_deref(), Some("gcabb/same-title-2"));
     assert_ne!(first.project_path, second.project_path);
