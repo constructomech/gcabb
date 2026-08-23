@@ -38,6 +38,53 @@ fn syntax_for_path<'a>(syntaxes: &'a SyntaxSet, path: &Path) -> &'a SyntaxRefere
         .unwrap_or_else(|| syntaxes.find_syntax_plain_text())
 }
 
+#[derive(Clone, Copy)]
+enum DiffSide {
+    Old,
+    New,
+    Both,
+}
+
+fn diff_header_path(line: &str, in_hunk: bool) -> Option<(DiffSide, &Path)> {
+    let mut headers = [
+        ("*** Update File: ", DiffSide::Both),
+        ("*** Add File: ", DiffSide::Both),
+        ("*** Delete File: ", DiffSide::Both),
+        ("*** Move to: ", DiffSide::New),
+        ("--- ", DiffSide::Old),
+        ("+++ ", DiffSide::New),
+    ]
+    .into_iter();
+    let (side, path) = headers.find_map(|(prefix, side)| {
+        (!in_hunk || !matches!(side, DiffSide::Old | DiffSide::New))
+            .then(|| line.strip_prefix(prefix).map(|path| (side, path)))
+            .flatten()
+    })?;
+    let path = path.split_once('\t').map_or(path, |(path, _)| path);
+    if path == "/dev/null" {
+        return None;
+    }
+    let path = path
+        .strip_prefix("a/")
+        .or_else(|| path.strip_prefix("b/"))
+        .unwrap_or(path)
+        .trim_matches('"');
+    Some((side, Path::new(path)))
+}
+
+fn is_diff_metadata(line: &str, in_hunk: bool) -> bool {
+    line.starts_with("diff ")
+        || line.starts_with("index ")
+        || (!in_hunk && (line.starts_with("--- ") || line.starts_with("+++ ")))
+        || line.starts_with("*** Begin Patch")
+        || line.starts_with("*** End Patch")
+        || line.starts_with("*** Update File: ")
+        || line.starts_with("*** Add File: ")
+        || line.starts_with("*** Delete File: ")
+        || line.starts_with("*** Move to: ")
+        || line.starts_with("\\ No newline")
+}
+
 fn gpui_style(style: SyntectStyle) -> HighlightStyle {
     let foreground = style.foreground;
     let mut highlight = HighlightStyle {
@@ -110,28 +157,55 @@ pub(crate) fn diff_highlights(
     diff: &str,
 ) -> Result<Vec<(std::ops::Range<usize>, HighlightStyle)>, String> {
     let assets = &*ASSETS;
-    let syntax = syntax_for_path(&assets.syntaxes, path);
-    let mut old = HighlightLines::new(syntax, &assets.theme);
-    let mut new = HighlightLines::new(syntax, &assets.theme);
+    let fallback_syntax = syntax_for_path(&assets.syntaxes, path);
+    let mut old_syntax = fallback_syntax;
+    let mut new_syntax = fallback_syntax;
+    let mut old = HighlightLines::new(old_syntax, &assets.theme);
+    let mut new = HighlightLines::new(new_syntax, &assets.theme);
     let mut highlights = Vec::new();
     let mut line_offset = 0;
+    let mut in_hunk = false;
 
     for line in diff.split_inclusive('\n') {
         let line_end = line_offset + line.len();
         let content = line.strip_suffix('\n').unwrap_or(line);
 
-        if content.starts_with("@@") {
-            old = HighlightLines::new(syntax, &assets.theme);
-            new = HighlightLines::new(syntax, &assets.theme);
-            highlights.push((line_offset..line_end, line_highlight(BLUE)));
-        } else if content.starts_with("diff ")
-            || content.starts_with("index ")
-            || content.starts_with("--- ")
-            || content.starts_with("+++ ")
-            || content.starts_with("\\ No newline")
+        if content.starts_with("diff ")
+            || content.starts_with("*** Update File: ")
+            || content.starts_with("*** Add File: ")
+            || content.starts_with("*** Delete File: ")
         {
+            in_hunk = false;
+        }
+        if let Some((side, header_path)) = diff_header_path(content, in_hunk) {
+            let header_syntax = syntax_for_path(&assets.syntaxes, header_path);
+            match side {
+                DiffSide::Old => {
+                    old_syntax = header_syntax;
+                    old = HighlightLines::new(old_syntax, &assets.theme);
+                }
+                DiffSide::New => {
+                    new_syntax = header_syntax;
+                    new = HighlightLines::new(new_syntax, &assets.theme);
+                }
+                DiffSide::Both => {
+                    old_syntax = header_syntax;
+                    new_syntax = header_syntax;
+                    old = HighlightLines::new(old_syntax, &assets.theme);
+                    new = HighlightLines::new(new_syntax, &assets.theme);
+                }
+            }
+        }
+
+        if content.starts_with("@@") {
+            in_hunk = true;
+            old = HighlightLines::new(old_syntax, &assets.theme);
+            new = HighlightLines::new(new_syntax, &assets.theme);
+            highlights.push((line_offset..line_end, line_highlight(BLUE)));
+        } else if is_diff_metadata(content, in_hunk) {
             highlights.push((line_offset..line_end, line_highlight(MUTED)));
         } else if let Some(source) = line.strip_prefix('+') {
+            in_hunk = true;
             highlights.push((line_offset..line_offset + 1, line_highlight(GREEN)));
             push_syntax_highlights(
                 &mut new,
@@ -141,6 +215,7 @@ pub(crate) fn diff_highlights(
                 &mut highlights,
             )?;
         } else if let Some(source) = line.strip_prefix('-') {
+            in_hunk = true;
             highlights.push((line_offset..line_offset + 1, line_highlight(RED)));
             push_syntax_highlights(
                 &mut old,
@@ -210,5 +285,53 @@ mod tests {
                 .iter()
                 .all(|(_, style)| style.background_color.is_none())
         );
+    }
+
+    #[test]
+    fn apply_patch_headers_select_the_affected_file_language() {
+        let diff = "*** Begin Patch\n*** Update File: src/lib.rs\n@@\n-pub fn old() {}\n+pub fn new() {}\n*** End Patch\n";
+        let highlights = diff_highlights(Path::new(""), diff).unwrap();
+
+        assert!(
+            highlights
+                .iter()
+                .any(|(range, _)| &diff[range.clone()] == "fn"),
+            "the path in an apply_patch header should select Rust syntax"
+        );
+        let header_start = diff.find("*** Update File").unwrap();
+        assert!(highlights.iter().any(|(range, _)| {
+            range.start == header_start && &diff[range.clone()] == "*** Update File: src/lib.rs\n"
+        }));
+    }
+
+    #[test]
+    fn switches_languages_between_files_in_one_patch() {
+        let diff = "*** Update File: src/lib.rs\n@@\n+pub fn run() {}\n*** Update File: web/app.js\n@@\n+const ready = true;\n";
+        let highlights = diff_highlights(Path::new(""), diff).unwrap();
+
+        for token in ["fn", "const"] {
+            assert!(
+                highlights
+                    .iter()
+                    .any(|(range, _)| &diff[range.clone()] == token),
+                "{token} should be highlighted using its file's syntax"
+            );
+        }
+    }
+
+    #[test]
+    fn header_like_source_lines_remain_code_inside_hunks() {
+        let diff =
+            "--- a/query.sql\n+++ b/query.sql\n@@ -1 +1 @@\n--- old comment\n+++ new comment\n";
+        let highlights = diff_highlights(Path::new(""), diff).unwrap();
+
+        for source_line in ["--- old comment", "+++ new comment"] {
+            let start = diff.find(source_line).unwrap();
+            assert!(
+                highlights
+                    .iter()
+                    .any(|(range, _)| { range.start == start && range.end == start + 1 })
+            );
+        }
     }
 }
