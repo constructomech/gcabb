@@ -12,7 +12,10 @@ use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{SystemTime, UNIX_EPOCH};
 
-use app_model::{PromptAttachment, SessionKind, SessionLaunchOrigin, SessionLocation, TitleSource};
+use app_model::{
+    PromptAttachment, SessionKind, SessionLaunchOrigin, SessionLocation, SessionMetadata,
+    TitleSource,
+};
 use git_service::GitService;
 use session_manager::{CreateSessionRequest, SessionHandle, SessionManager, SessionRoots};
 use thiserror::Error;
@@ -79,6 +82,19 @@ pub struct LaunchResult {
     pub branch: Option<String>,
     pub message_id: String,
     pub origin: LaunchOrigin,
+}
+
+/// Typed native-history fork request. A kickoff is delivered only after the
+/// forked SDK session has been resumed in its own worktree.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct ForkRequest {
+    pub source_session_id: String,
+    pub worktrees_root: PathBuf,
+    pub to_event_id: Option<String>,
+    pub name: Option<String>,
+    pub kickoff_prompt: Option<String>,
+    pub origin: LaunchOrigin,
+    pub fork_tool_call_id: Option<String>,
 }
 
 /// A compensation action that could not safely finish.
@@ -208,6 +224,7 @@ impl SessionOrchestrator {
         if creates_worktree {
             on_progress(LaunchProgress::CreatingWorktree);
         }
+
         let workspace = self
             .allocate_workspace(&request, &title, &repository)
             .await?;
@@ -291,6 +308,178 @@ impl SessionOrchestrator {
             message_id,
             origin: request.origin,
         })
+    }
+
+    /// Fork live SDK history and an exact source checkout state into a new
+    /// managed worktree. This intentionally does not route through `launch`:
+    /// `launch` creates a fresh transcript while this workflow resumes the
+    /// returned native fork id.
+    pub async fn fork(
+        &self,
+        request: ForkRequest,
+        mut on_progress: impl FnMut(LaunchProgress),
+    ) -> Result<LaunchResult, LaunchError> {
+        let _allocation = self.workspace_lock.lock().await;
+        if let Some(existing) = self.existing_fork_launch(&request).await? {
+            return Ok(existing);
+        }
+        let (source, title, created) = self.create_fork_worktree(&request, &mut on_progress)?;
+        let path = created.path.clone();
+        let branch = created.branch.clone();
+        let fork = match self
+            .manager
+            .fork_session(session_manager::ForkSessionRequest {
+                source_session_id: request.source_session_id.clone(),
+                target_project_path: path.clone(),
+                title: title.clone(),
+                to_event_id: request.to_event_id.clone(),
+                fork_tool_call_id: request.fork_tool_call_id.clone(),
+                kickoff_pending: request.fork_tool_call_id.is_some()
+                    && request
+                        .kickoff_prompt
+                        .as_deref()
+                        .is_some_and(|prompt| !prompt.trim().is_empty()),
+            })
+            .await
+        {
+            Ok(fork) => fork,
+            Err(error) => {
+                let _ = GitService::new(&path).discard_snapshot_state();
+                let cleanup = cleanup_worktree(&created);
+                return Err(
+                    LaunchError::new(LaunchStage::Runtime, error.to_string()).with_cleanup(cleanup)
+                );
+            }
+        };
+        let kickoff_requested = request
+            .kickoff_prompt
+            .as_deref()
+            .is_some_and(|prompt| !prompt.trim().is_empty());
+        if let Some(prompt) = request
+            .kickoff_prompt
+            .filter(|prompt| !prompt.trim().is_empty())
+            && let Err(error) = fork.handle.send(prompt).await
+        {
+            // The provider may have created files before reporting failure;
+            // preserve that worktree rather than force-cleaning it.
+            return Err(LaunchError::new(LaunchStage::Kickoff, error.to_string()));
+        }
+        if request.fork_tool_call_id.is_some()
+            && kickoff_requested
+            && let Err(error) = self.manager.complete_fork_kickoff(fork.handle.id())
+        {
+            return Err(LaunchError::new(
+                LaunchStage::Finalization,
+                error.to_string(),
+            ));
+        }
+        if request.origin == LaunchOrigin::UserActivation
+            && let Err(error) = self.manager.set_selected_session(Some(fork.handle.id()))
+        {
+            return Err(LaunchError::new(LaunchStage::Activation, error.to_string()));
+        }
+        Ok(LaunchResult {
+            handle: fork.handle,
+            project_path: path,
+            repository_root: source.repository_root.map(PathBuf::from),
+            title: fork.title,
+            title_source: TitleSource::Manual,
+            branch: Some(branch),
+            message_id: String::new(),
+            origin: request.origin,
+        })
+    }
+
+    async fn existing_fork_launch(
+        &self,
+        request: &ForkRequest,
+    ) -> Result<Option<LaunchResult>, LaunchError> {
+        let Some(tool_call_id) = request.fork_tool_call_id.as_deref() else {
+            return Ok(None);
+        };
+        let Some(existing) = self
+            .manager
+            .fork_for_tool_call(&request.source_session_id, tool_call_id)
+            .await
+            .map_err(|error| LaunchError::new(LaunchStage::Runtime, error.to_string()))?
+        else {
+            return Ok(None);
+        };
+        let metadata = existing.handle.snapshot().metadata.clone();
+        let project_path = PathBuf::from(&metadata.project_path);
+        Ok(Some(LaunchResult {
+            handle: existing.handle,
+            repository_root: metadata.repository_root.map(PathBuf::from),
+            branch: GitService::new(&project_path).current_branch().ok(),
+            project_path,
+            title: existing.title,
+            title_source: metadata.title_source,
+            message_id: String::new(),
+            origin: request.origin,
+        }))
+    }
+
+    fn create_fork_worktree(
+        &self,
+        request: &ForkRequest,
+        on_progress: &mut impl FnMut(LaunchProgress),
+    ) -> Result<(SessionMetadata, String, CreatedWorktree), LaunchError> {
+        let source = self
+            .manager
+            .session_metadata_by_id(&request.source_session_id)
+            .map_err(|error| LaunchError::new(LaunchStage::Worktree, error.to_string()))?
+            .ok_or_else(|| LaunchError::new(LaunchStage::Worktree, "source session not found"))?;
+        let repository = source.repository_root.clone().ok_or_else(|| {
+            LaunchError::new(LaunchStage::Worktree, "source is not a project session")
+        })?;
+        if source.kind != SessionKind::Project {
+            return Err(LaunchError::new(
+                LaunchStage::Worktree,
+                "only project sessions can be forked",
+            ));
+        }
+        let source_git = GitService::new(&source.project_path);
+        if !source_git.is_worktree() {
+            return Err(LaunchError::new(
+                LaunchStage::Worktree,
+                "source worktree is unavailable",
+            ));
+        }
+        let snapshot = source_git
+            .capture_worktree_snapshot()
+            .map_err(|error| LaunchError::new(LaunchStage::Worktree, error.to_string()))?;
+        let head = source_git
+            .head_commit()
+            .map_err(|error| LaunchError::new(LaunchStage::Worktree, error.to_string()))?;
+        let title = request
+            .name
+            .clone()
+            .unwrap_or_else(|| format!("Fork of {}", source.title));
+        let repository_path = PathBuf::from(repository);
+        let namespace = repository_worktree_namespace(&request.worktrees_root, &repository_path)
+            .map_err(|error| LaunchError::new(LaunchStage::Worktree, error))?;
+        let repository_git = GitService::new(&repository_path);
+        let branch = unique_worktree_branch(&repository_git, &title, &namespace);
+        let path = worktree_path(&namespace, &branch)
+            .map_err(|error| LaunchError::new(LaunchStage::Worktree, error))?;
+        on_progress(LaunchProgress::CreatingWorktree);
+        repository_git
+            .create_worktree_at(&path, &branch, &head)
+            .map_err(|error| LaunchError::new(LaunchStage::Worktree, error.to_string()))?;
+        let created = CreatedWorktree {
+            repository: repository_path,
+            path,
+            branch,
+        };
+        if let Err(error) = GitService::new(&created.path).apply_worktree_snapshot(&snapshot) {
+            let _ = GitService::new(&created.path).discard_snapshot_state();
+            let cleanup = cleanup_worktree(&created);
+            return Err(
+                LaunchError::new(LaunchStage::Worktree, error.to_string()).with_cleanup(cleanup)
+            );
+        }
+        on_progress(LaunchProgress::WorktreeReady(created.path.clone()));
+        Ok((source, title, created))
     }
 
     fn previous_selection(&self, origin: LaunchOrigin) -> Result<SelectionRollback, LaunchError> {

@@ -40,6 +40,8 @@ pub enum Argument {
 /// than matching on strings.
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 pub enum Kind {
+    /// Create a new isolated session from the selected session's durable history.
+    Fork,
     /// Line the argument up behind the session's current turn.
     QueueFollowUp,
 }
@@ -91,17 +93,28 @@ impl SlashCommand {
 }
 
 /// Every command the composer understands.
-pub const COMMANDS: &[SlashCommand] = &[SlashCommand {
-    name: "next",
-    summary: "Queue what the agent should do after the current turn",
-    argument: Argument::Required("instructions"),
-    scope: Scope::Session,
-    kind: Kind::QueueFollowUp,
-}];
+pub const COMMANDS: &[SlashCommand] = &[
+    SlashCommand {
+        name: "fork",
+        summary: "Fork this session's durable history into a new worktree",
+        argument: Argument::None,
+        scope: Scope::Session,
+        kind: Kind::Fork,
+    },
+    SlashCommand {
+        name: "next",
+        summary: "Queue what the agent should do after the current turn",
+        argument: Argument::Required("instructions"),
+        scope: Scope::Session,
+        kind: Kind::QueueFollowUp,
+    },
+];
 
 /// A command that is ready to run, with its argument already taken apart.
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Command {
+    /// Fork the selected session at its latest durable SDK event.
+    Fork,
     /// Queue `prompt` behind the selected session's current turn.
     QueueFollowUp(String),
 }
@@ -151,7 +164,15 @@ pub fn resolve(content: &str, session_selected: bool) -> Resolution {
             command.usage()
         ));
     }
+    if command.argument == Argument::None && !argument.is_empty() {
+        return Resolution::Rejected(format!(
+            "/{} does not take an argument. Use {}.",
+            command.name,
+            command.usage()
+        ));
+    }
     Resolution::Run(match command.kind {
+        Kind::Fork => Command::Fork,
         Kind::QueueFollowUp => Command::QueueFollowUp(argument.to_owned()),
     })
 }
@@ -234,6 +255,21 @@ mod tests {
             resolve("/next run the tests", true),
             Resolution::Run(Command::QueueFollowUp("run the tests".to_owned()))
         );
+    }
+
+    #[test]
+    fn fork_requires_a_session_and_takes_no_argument() {
+        assert_eq!(resolve("/fork", true), Resolution::Run(Command::Fork));
+
+        let Resolution::Rejected(homeless) = resolve("/fork", false) else {
+            panic!("/fork is rejected without a session");
+        };
+        assert!(homeless.contains("session"), "{homeless}");
+
+        let Resolution::Rejected(argument) = resolve("/fork rename me", true) else {
+            panic!("/fork arguments are rejected until their meaning is unambiguous");
+        };
+        assert!(argument.contains("does not take"), "{argument}");
     }
 
     #[test]

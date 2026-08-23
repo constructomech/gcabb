@@ -3,18 +3,23 @@
 Evidence for what GCABB inherits from the Copilot CLI runtime, what the
 application adds, and how that compares to other coding-agent harnesses. Most
 tools belong to the runtime; GCABB adds a narrow app-session coordination
-gateway for `create_session`, `get_session`, `send_session_message`, and
-`respond_to_session_plan`.
+gateway for `create_session`, `fork_session`, `get_session`,
+`send_session_message`, and `respond_to_session_plan`.
 
 ## Host-provided app-session coordination
 
-Every new and resumed project session receives four typed custom SDK tools.
+Every new and resumed project session receives five typed custom SDK tools.
 They coordinate durable GCABB app sessions, not Copilot CLI `task` subagents:
 
 - `task` runs nested agent activity inside the calling CLI/session runtime.
 - `create_session` creates another durable app session with its own provider,
   client, CLI process, SDK session, managed worktree, sidebar row, and restart
   lifecycle.
+- `fork_session` asks the SDK to fork the caller's own persisted history, then
+  resumes the returned SDK session id in a new isolated GCABB runtime and
+  worktree. The optional event boundary is exclusive and must be an exact event
+  id from the caller. An optional prompt steers the already-created fork; it is
+  never pasted in place of SDK history.
 - `get_session` returns bounded status and work metadata for the caller, an
   ancestor, or a descendant. It includes at most four capped transcript entries,
   one capped completed assistant result, a pending plan summary when present,
@@ -38,6 +43,26 @@ project, repository, base branch, and configured worktree root; no path,
 project, parent, or spoofable sender input is accepted. SDK `toolCallId` is
 persisted so retries return the original child or message without duplicating
 work.
+
+Forks record their source and optional exclusive event boundary separately from
+parent/child orchestration. They remain project-root sessions in navigation and
+do not gain ancestry-based coordination permissions solely from provenance.
+Agent-created forks are headless; user-created forks are selected only after
+history, worktree state, runtime startup, and any kickoff steering all succeed.
+If optional kickoff delivery fails or the app exits before confirming it, the
+fork and any dirty results are preserved and a retry reports the delivery as
+indeterminate. GCABB never silently drops or risks submitting the steering
+prompt twice.
+
+The fork branch starts at the source session's exact `HEAD`, not the registered
+project's default branch. GCABB non-destructively reproduces the source index,
+tracked working tree, renames, deletions, and non-ignored untracked files.
+Ignored files and runtime state are excluded. Credential-like untracked files,
+escaping symlinks, conflicts, submodules, special files, paths outside the
+repository, and concurrently changing filesystem state fail explicitly rather
+than yielding a partial fork. Untracked executable bits are preserved on Unix;
+untracked symlinks are unsupported where the platform cannot recreate them
+safely.
 
 ### Parent plan approval
 
@@ -95,8 +120,8 @@ and sessions outside the registered project are rejected.
 
 Current limits are three child levels and five active direct children per
 parent. This surface is local-only and same-project-only. Cloud sessions,
-cross-repository launches, forking, and `notify_on_idle: "always"` are
-intentionally outside this version. If the app crashes in the narrow interval
+cross-repository launches, and `notify_on_idle: "always"` are intentionally
+outside this version. If the app crashes in the narrow interval
 after recording a child but before confirming kickoff delivery, a retry
 returns an explicit interrupted-launch error with the child id rather than
 risking duplicate work.

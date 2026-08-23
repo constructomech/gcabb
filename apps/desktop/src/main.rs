@@ -15,9 +15,10 @@ use app_model::{
 };
 use chrono::DateTime;
 use copilot_provider::{
-    CopilotProviderFactory, CreateSessionToolInput, CreateSessionToolResult, HostGatewayEvent,
-    HostToolCall, HostToolGateway, HostToolRequest, HostToolResult, NotifyOnIdle,
-    PlanContinuationAction, PlanInvalidatedEvent, PlanWaitingEvent, ProviderCompatibility,
+    CopilotProviderFactory, CreateSessionToolInput, CreateSessionToolResult, ForkSessionToolInput,
+    ForkSessionToolResult, HostGatewayEvent, HostToolCall, HostToolGateway, HostToolRequest,
+    HostToolResult, NotifyOnIdle, PlanContinuationAction, PlanInvalidatedEvent, PlanWaitingEvent,
+    ProviderCompatibility,
 };
 use diagnostics::{DiagnosticEvent, DiagnosticsSink, TracingDiagnostics, init_tracing};
 use git_service::GitService;
@@ -37,7 +38,7 @@ use session_manager::{
     SessionRoots, UnarchiveScope,
 };
 use session_orchestrator::{
-    LaunchOrigin, LaunchProgress, LaunchRequest, LaunchTitle, SessionOrchestrator,
+    ForkRequest, LaunchOrigin, LaunchProgress, LaunchRequest, LaunchTitle, SessionOrchestrator,
 };
 use storage::Storage;
 use tokio::sync::watch;
@@ -990,6 +991,18 @@ enum ServiceUpdate {
     AutomationsChanged(Vec<Automation>),
     AutomationRunsChanged(Vec<AutomationRun>),
     SessionLaunchProgress(SessionLaunchProgress),
+    SessionForkProgress {
+        source_session_id: String,
+        progress: SessionLaunchProgress,
+    },
+    SessionForked {
+        source_session_id: String,
+        handle: SessionHandle,
+    },
+    SessionForkFailed {
+        source_session_id: String,
+        error: String,
+    },
     PromptAccepted(Option<String>),
     InteractionResponseFailed {
         app_session_id: String,
@@ -1026,6 +1039,10 @@ enum ServiceCommand {
         /// Where a new project session should run.
         location: SessionLocation,
         /// Root under which a new worktree should be created.
+        worktrees_root: PathBuf,
+    },
+    ForkSession {
+        source_session_id: String,
         worktrees_root: PathBuf,
     },
     Cancel {
@@ -1612,6 +1629,12 @@ impl AppService {
                                 } => Some((app_session_id.clone(), interaction_id.clone())),
                                 _ => None,
                             };
+                            let fork_source = match &command {
+                                ServiceCommand::ForkSession {
+                                    source_session_id, ..
+                                } => Some(source_session_id.clone()),
+                                _ => None,
+                            };
                             match runtime.block_on(handle_service_command(
                                 &manager,
                                 &orchestrator,
@@ -1619,7 +1642,14 @@ impl AppService {
                                 &update_tx,
                             )) {
                                 Ok(Some(handle)) => {
-                                    let _ = update_tx.send(ServiceUpdate::SessionAdded(handle));
+                                    if let Some(source_session_id) = fork_source {
+                                        let _ = update_tx.send(ServiceUpdate::SessionForked {
+                                            source_session_id,
+                                            handle,
+                                        });
+                                    } else {
+                                        let _ = update_tx.send(ServiceUpdate::SessionAdded(handle));
+                                    }
                                     if let Some(origin) = submit_origin {
                                         let _ =
                                             update_tx.send(ServiceUpdate::PromptAccepted(origin));
@@ -1632,7 +1662,12 @@ impl AppService {
                                     }
                                 }
                                 Err(error) => {
-                                    if let Some((app_session_id, interaction_id)) =
+                                    if let Some(source_session_id) = fork_source {
+                                        let _ = update_tx.send(ServiceUpdate::SessionForkFailed {
+                                            source_session_id,
+                                            error,
+                                        });
+                                    } else if let Some((app_session_id, interaction_id)) =
                                         interaction_origin
                                     {
                                         let _ = update_tx.send(
@@ -1715,6 +1750,41 @@ async fn handle_service_command(
 ) -> Result<Option<SessionHandle>, String> {
     let mut created = None;
     match command {
+        ServiceCommand::ForkSession {
+            source_session_id,
+            worktrees_root,
+        } => {
+            let progress_source = source_session_id.clone();
+            let result = orchestrator
+                .fork(
+                    ForkRequest {
+                        source_session_id,
+                        worktrees_root,
+                        to_event_id: None,
+                        name: None,
+                        kickoff_prompt: None,
+                        origin: LaunchOrigin::UserActivation,
+                        fork_tool_call_id: None,
+                    },
+                    |progress| {
+                        let progress = match progress {
+                            LaunchProgress::CreatingWorktree => {
+                                SessionLaunchProgress::CreatingWorktree
+                            }
+                            LaunchProgress::WorktreeReady(path) => {
+                                SessionLaunchProgress::WorktreeReady(path)
+                            }
+                        };
+                        let _ = updates.send(ServiceUpdate::SessionForkProgress {
+                            source_session_id: progress_source.clone(),
+                            progress,
+                        });
+                    },
+                )
+                .await
+                .map_err(|error| error.to_string())?;
+            created = Some(result.handle);
+        }
         ServiceCommand::Submit {
             app_session_id,
             prompt,
@@ -2041,6 +2111,15 @@ async fn run_host_tool_gateway(
                     )
                     .await
                     .map(HostToolResult::CreateSession),
+                    HostToolCall::ForkSession(input) => fork_agent_session(
+                        &orchestrator,
+                        &worktrees_root,
+                        &updates,
+                        &request,
+                        input,
+                    )
+                    .await
+                    .map(HostToolResult::ForkSession),
                     HostToolCall::GetSession(input) => manager
                         .get_session_for_coordination(&request.caller_session_id, &input.session_id)
                         .await
@@ -2180,6 +2259,7 @@ async fn create_agent_child(
                 existing_metadata.id
             ));
         }
+
         if manager
             .is_session_archived(&existing_metadata.id)
             .map_err(|error| error.to_string())?
@@ -2219,6 +2299,43 @@ async fn create_agent_child(
             .unwrap_or(&result.project_path)
             .to_string_lossy()
             .into_owned(),
+        worktree: result.project_path.to_string_lossy().into_owned(),
+        branch: result.branch,
+    };
+    let _ = updates.send(ServiceUpdate::SessionHydrated(result.handle));
+    Ok(response)
+}
+
+async fn fork_agent_session(
+    orchestrator: &SessionOrchestrator,
+    worktrees_root: &Mutex<PathBuf>,
+    updates: &Sender<ServiceUpdate>,
+    request: &HostToolRequest,
+    input: &ForkSessionToolInput,
+) -> Result<ForkSessionToolResult, String> {
+    let worktrees_root = worktrees_root
+        .lock()
+        .map_err(|_| "worktree configuration is unavailable".to_owned())?
+        .clone();
+    let result = orchestrator
+        .fork(
+            ForkRequest {
+                source_session_id: request.caller_session_id.clone(),
+                worktrees_root,
+                to_event_id: input.to_event_id.clone(),
+                name: input.name.clone(),
+                kickoff_prompt: input.kickoff_prompt.clone(),
+                origin: LaunchOrigin::Headless,
+                fork_tool_call_id: Some(request.tool_call_id.clone()),
+            },
+            |_| {},
+        )
+        .await
+        .map_err(|error| error.to_string())?;
+    let response = ForkSessionToolResult {
+        fork_app_session_id: result.handle.id().to_owned(),
+        title: result.title,
+        status: "running".to_owned(),
         worktree: result.project_path.to_string_lossy().into_owned(),
         branch: result.branch,
     };
@@ -2493,8 +2610,12 @@ fn session_row_accessible_label(
     orphaned: bool,
     unread_status: Option<&str>,
     needs_plan_approval: bool,
+    forked_from_title: Option<&str>,
+    forking: bool,
 ) -> String {
-    let label = if orphaned {
+    let label = if let Some(source) = forked_from_title {
+        format!("Forked session {title}, from {source}")
+    } else if orphaned {
         format!("Agent-created session {title}, parent unavailable")
     } else if depth > 0 {
         format!("Agent-created child session {title}, level {depth}")
@@ -2506,6 +2627,9 @@ fn session_row_accessible_label(
     });
     if needs_plan_approval {
         label.push_str(", descendant plan needs approval");
+    }
+    if forking {
+        label.push_str(", forking");
     }
     label
 }
@@ -2967,6 +3091,8 @@ struct SessionMvpView {
     /// Sessions with an archive or unarchive in flight, treated like a delete
     /// so the row cannot be acted on twice.
     archiving_sessions: HashSet<String>,
+    /// Source sessions with a user-requested fork in flight.
+    fork_progress: HashMap<String, SessionLaunchProgress>,
     /// Sessions removed by a lifecycle operation in this app run. Late
     /// hydration updates for these ids must never recreate sidebar rows.
     lifecycle_hidden_sessions: HashSet<String>,
@@ -3271,6 +3397,7 @@ impl SessionMvpView {
             lifecycle_confirmation_focus: cx.focus_handle(),
             deleting_sessions: HashSet::new(),
             archiving_sessions: HashSet::new(),
+            fork_progress: HashMap::new(),
             lifecycle_hidden_sessions: HashSet::new(),
             unread_children: HashMap::new(),
             pending_child_plans: HashMap::new(),
@@ -4134,6 +4261,10 @@ impl SessionMvpView {
                 ServiceUpdate::SessionAdded(handle) => {
                     self.apply_session_added(handle, cx);
                 }
+                ServiceUpdate::SessionForked {
+                    source_session_id,
+                    handle,
+                } => self.apply_session_forked(&source_session_id, handle, cx),
                 ServiceUpdate::SessionsDiscovered(handles) => {
                     for handle in handles {
                         self.upsert_hydrated_session(handle, cx);
@@ -4152,6 +4283,14 @@ impl SessionMvpView {
                 ServiceUpdate::SessionLaunchProgress(progress) => {
                     self.session_launch = Some(progress);
                 }
+                ServiceUpdate::SessionForkProgress {
+                    source_session_id,
+                    progress,
+                } => self.apply_session_fork_progress(source_session_id, progress),
+                ServiceUpdate::SessionForkFailed {
+                    source_session_id,
+                    error,
+                } => self.apply_session_fork_failed(&source_session_id, error),
                 ServiceUpdate::SessionsDeleted(deletion) => {
                     self.apply_sessions_deleted(deletion, cx);
                 }
@@ -4215,11 +4354,36 @@ impl SessionMvpView {
         self.request_agent_discovery();
     }
 
+    fn apply_session_forked(
+        &mut self,
+        source_session_id: &str,
+        handle: SessionHandle,
+        cx: &mut Context<Self>,
+    ) {
+        self.fork_progress.remove(source_session_id);
+        let id = handle.id().to_owned();
+        self.upsert_hydrated_session(handle, cx);
+        self.switch_composer_draft(Some(id), cx);
+    }
+
     fn apply_session_added(&mut self, handle: SessionHandle, cx: &mut Context<Self>) {
         let id = handle.id().to_owned();
         self.session_launch = None;
         self.upsert_hydrated_session(handle, cx);
         self.switch_composer_draft(Some(id), cx);
+    }
+
+    fn apply_session_fork_progress(
+        &mut self,
+        source_session_id: String,
+        progress: SessionLaunchProgress,
+    ) {
+        self.fork_progress.insert(source_session_id, progress);
+    }
+
+    fn apply_session_fork_failed(&mut self, source_session_id: &str, error: String) {
+        self.fork_progress.remove(source_session_id);
+        self.action_error = Some(error);
     }
 
     fn apply_coordination_update(&mut self, update: ServiceUpdate) {
@@ -5255,6 +5419,48 @@ impl SessionMvpView {
         cx.notify();
     }
 
+    fn fork_session(&mut self, source_session_id: &str, cx: &mut Context<Self>) {
+        self.session_menu = None;
+        self.action_error = None;
+        let Some(session) = self
+            .sessions
+            .iter()
+            .find(|session| session.id() == source_session_id)
+        else {
+            self.action_error = Some("source session is no longer available".to_owned());
+            cx.notify();
+            return;
+        };
+        if session.snapshot.metadata.is_chat() {
+            self.action_error = Some("only project sessions can be forked".to_owned());
+            cx.notify();
+            return;
+        }
+        if self.fork_progress.contains_key(source_session_id)
+            || self.deleting_sessions.contains(source_session_id)
+            || self.archiving_sessions.contains(source_session_id)
+        {
+            cx.notify();
+            return;
+        }
+        self.fork_progress.insert(
+            source_session_id.to_owned(),
+            SessionLaunchProgress::CreatingWorktree,
+        );
+        if self
+            .commands
+            .send(ServiceCommand::ForkSession {
+                source_session_id: source_session_id.to_owned(),
+                worktrees_root: self.current_worktrees_root(),
+            })
+            .is_err()
+        {
+            self.fork_progress.remove(source_session_id);
+            self.action_error = Some("session service is unavailable".to_owned());
+        }
+        cx.notify();
+    }
+
     fn commit_rename(&mut self, title: &str, cx: &mut Context<Self>) {
         let Some(app_session_id) = self.renaming_session.take() else {
             return;
@@ -5579,6 +5785,7 @@ impl SessionMvpView {
         let rename_id = menu.id.clone();
         let rename_title = menu.title.clone();
         let reveal_id = menu.id.clone();
+        let fork_id = menu.id.clone();
         let archive_id = menu.id.clone();
         let delete_id = menu.id.clone();
         let label = menu.title.clone();
@@ -5608,6 +5815,14 @@ impl SessionMvpView {
                     move |view, window, cx| {
                         view.begin_rename(rename_id.clone(), rename_title.clone(), window, cx);
                     },
+                    cx,
+                ))
+                .child(Self::session_menu_item(
+                    "session-menu-fork",
+                    "Fork session",
+                    "Fork session into a new worktree",
+                    PRIMARY,
+                    move |view, _, cx| view.fork_session(&fork_id, cx),
                     cx,
                 ))
                 .child(Self::session_menu_item(
@@ -6356,6 +6571,11 @@ impl SessionMvpView {
             slash_commands::Resolution::Run(command) => {
                 self.action_error = None;
                 match command {
+                    slash_commands::Command::Fork => {
+                        if let Some(id) = self.selected_session.clone() {
+                            self.fork_session(&id, cx);
+                        }
+                    }
                     slash_commands::Command::QueueFollowUp(prompt) => {
                         self.submit_follow_up(&prompt, cx);
                     }
@@ -7110,17 +7330,35 @@ impl SessionMvpView {
                     .pending_child_plans
                     .values()
                     .any(|(parent_session_id, _)| parent_session_id == &id);
+                let fork_source_label = session
+                    .snapshot
+                    .metadata
+                    .forked_from_session_id
+                    .as_ref()
+                    .map(|source_id| {
+                        self.sessions
+                            .iter()
+                            .find(|candidate| candidate.id() == source_id)
+                            .map_or_else(
+                                || source_id.clone(),
+                                |source| source.snapshot.metadata.title.clone(),
+                            )
+                    });
                 let accessible_label = session_row_accessible_label(
                     &label,
                     depth,
                     orphaned,
                     unread_status.map(String::as_str),
                     needs_plan_approval,
+                    fork_source_label.as_deref(),
+                    self.fork_progress.contains_key(&id),
                 );
                 let menu_id = id.clone();
                 let menu_label = label.clone();
                 let selected = self.selected_session.as_deref() == Some(id.as_str());
-                let is_deleting = self.deleting_sessions.contains(&id);
+                let is_deleting =
+                    self.deleting_sessions.contains(&id) || self.fork_progress.contains_key(&id);
+                let is_fork = session.snapshot.metadata.forked_from_session_id.is_some();
                 let spinner_id = SharedString::from(format!("session-spinner-{id}"));
                 div()
                     .id(SharedString::from(format!("session-{id}")))
@@ -7173,16 +7411,22 @@ impl SessionMvpView {
                             );
                         }),
                     )
-                    .when(depth > 0 || orphaned || has_children, |row| {
-                        row.child(div().w(px(12.0)).text_xs().text_color(rgb(MUTED)).child(
-                            if orphaned {
-                                "!"
-                            } else if depth > 0 {
-                                "↳"
-                            } else {
-                                "▾"
-                            },
-                        ))
+                    .when(depth > 0 || orphaned || has_children || is_fork, |row| {
+                        row.child(
+                            div()
+                                .w(px(if is_fork { 28.0 } else { 12.0 }))
+                                .text_xs()
+                                .text_color(rgb(MUTED))
+                                .child(if is_fork {
+                                    "Fork"
+                                } else if orphaned {
+                                    "!"
+                                } else if depth > 0 {
+                                    "↳"
+                                } else {
+                                    "▾"
+                                }),
+                        )
                     })
                     .when(unread_status.is_some(), |row| {
                         row.child(
@@ -14762,6 +15006,10 @@ pub(crate) mod tests {
                 parent_session_id: None,
                 launch_origin: app_model::SessionLaunchOrigin::User,
                 host_tool_call_id: None,
+                forked_from_session_id: None,
+                forked_at_event_id: None,
+                fork_tool_call_id: None,
+                fork_kickoff_pending: false,
                 model: None,
                 mode: None,
                 base_ref: None,
@@ -15111,12 +15359,28 @@ pub(crate) mod tests {
             assert!(cx.debug_bounds("orphan-agent-session-row").is_some());
             assert!(cx.debug_bounds("child-notification-unread").is_some());
             assert_eq!(
-                super::super::session_row_accessible_label("Child", 1, false, None, false),
+                super::super::session_row_accessible_label(
+                    "Child", 1, false, None, false, None, false,
+                ),
                 "Agent-created child session Child, level 1"
             );
             assert_eq!(
-                super::super::session_row_accessible_label("Orphan", 0, true, None, false),
+                super::super::session_row_accessible_label(
+                    "Orphan", 0, true, None, false, None, false,
+                ),
                 "Agent-created session Orphan, parent unavailable"
+            );
+            assert_eq!(
+                super::super::session_row_accessible_label(
+                    "Alternative",
+                    0,
+                    false,
+                    None,
+                    false,
+                    Some("Original"),
+                    true,
+                ),
+                "Forked session Alternative, from Original, forking"
             );
         }
 
@@ -15231,6 +15495,8 @@ pub(crate) mod tests {
                     1,
                     false,
                     Some("failed"),
+                    false,
+                    None,
                     false,
                 )
                 .contains("unread child failed notification")
@@ -15889,8 +16155,16 @@ pub(crate) mod tests {
             assert!(cx.debug_bounds("Request changes").is_some());
             assert!(cx.debug_bounds("descendant-plan-needs-approval").is_some());
             assert!(
-                super::super::session_row_accessible_label("Parent session", 0, false, None, true,)
-                    .contains("descendant plan needs approval")
+                super::super::session_row_accessible_label(
+                    "Parent session",
+                    0,
+                    false,
+                    None,
+                    true,
+                    None,
+                    false,
+                )
+                .contains("descendant plan needs approval")
             );
             view.read_with(cx, |view, _| {
                 assert_eq!(view.selected_session.as_deref(), Some("child"));
@@ -16466,8 +16740,34 @@ pub(crate) mod tests {
                     assert_eq!(app_session_id, "session-1");
                     assert_eq!(scope, storage::LifecycleScope::Single);
                 }
+
                 _ => panic!("expected a DeleteSession command"),
             }
+        }
+
+        #[gpui::test]
+        fn session_menu_forks_without_submitting_a_prompt(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            click_session_menu_item(cx, "session-menu-fork");
+
+            let command = commands
+                .try_iter()
+                .find(|command| matches!(command, ServiceCommand::ForkSession { .. }))
+                .expect("a fork command was sent");
+            match command {
+                ServiceCommand::ForkSession {
+                    source_session_id,
+                    worktrees_root,
+                } => {
+                    assert_eq!(source_session_id, "session-1");
+                    assert_eq!(worktrees_root, std::path::PathBuf::from("/tmp/worktrees"));
+                }
+                _ => panic!("expected a ForkSession command"),
+            }
+            view.read_with(cx, |view, _| {
+                assert!(view.session_menu.is_none());
+                assert!(view.fork_progress.contains_key("session-1"));
+            });
         }
 
         #[gpui::test]
@@ -17388,6 +17688,62 @@ pub(crate) mod tests {
             view.read_with(cx, |view, cx| {
                 assert!(view.composer.read(cx).value().is_empty());
                 assert!(view.action_error.is_none());
+            });
+        }
+
+        #[gpui::test]
+        fn fork_command_waits_for_success_before_selecting_the_fork(cx: &mut TestAppContext) {
+            let (view, cx, commands, updates) = setup_for_bootstrap(cx);
+            view.update(cx, |view, cx| {
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
+                    snapshot("source", "Source"),
+                ))];
+                view.select_session("source".to_owned(), cx);
+                view.composer
+                    .update(cx, |input, cx| input.set_value("/fork", cx));
+                view.submit_composer(cx);
+            });
+            cx.run_until_parked();
+
+            assert!(commands.try_iter().any(|command| matches!(
+                command,
+                ServiceCommand::ForkSession {
+                    source_session_id,
+                    ..
+                } if source_session_id == "source"
+            )));
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected_session.as_deref(), Some("source"));
+                assert!(view.fork_progress.contains_key("source"));
+            });
+
+            let mut fork = snapshot("fork", "Fork of Source");
+            fork.metadata.forked_from_session_id = Some("source".to_owned());
+            updates
+                .send(ServiceUpdate::SessionForked {
+                    source_session_id: "source".to_owned(),
+                    handle: SessionHandle::for_test(fork),
+                })
+                .unwrap();
+            view.update(cx, |view, cx| {
+                view.apply_service_updates(cx);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected_session.as_deref(), Some("fork"));
+                assert!(!view.fork_progress.contains_key("source"));
+                assert_eq!(
+                    view.sessions
+                        .iter()
+                        .find(|session| session.id() == "fork")
+                        .unwrap()
+                        .snapshot
+                        .metadata
+                        .parent_session_id,
+                    None
+                );
             });
         }
 

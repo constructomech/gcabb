@@ -593,6 +593,21 @@ pub struct SessionMetadata {
     /// SDK identity used to deduplicate retries of an agent host-tool call.
     #[serde(default)]
     pub host_tool_call_id: Option<String>,
+    /// App session whose SDK history this session was forked from.
+    ///
+    /// This is provenance, not a parent/child relationship: forks do not take
+    /// part in launch depth, child limits, or coordination authorization.
+    #[serde(default)]
+    pub forked_from_session_id: Option<String>,
+    /// Exclusive SDK event boundary used when the history was forked.
+    #[serde(default)]
+    pub forked_at_event_id: Option<String>,
+    /// Host tool call which initiated this fork, used only for retry recovery.
+    #[serde(default)]
+    pub fork_tool_call_id: Option<String>,
+    /// A host-tool steering prompt was attempted but not durably confirmed.
+    #[serde(default)]
+    pub fork_kickoff_pending: bool,
     pub model: Option<String>,
     pub mode: Option<String>,
     /// Git ref the changes view compares against.
@@ -1483,6 +1498,10 @@ mod tests {
             parent_session_id: None,
             launch_origin: SessionLaunchOrigin::User,
             host_tool_call_id: None,
+            forked_from_session_id: None,
+            forked_at_event_id: None,
+            fork_tool_call_id: None,
+            fork_kickoff_pending: false,
             model: None,
             mode: None,
             base_ref: None,

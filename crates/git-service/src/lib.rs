@@ -31,6 +31,12 @@ pub enum GitError {
     NotAWorktree(PathBuf),
     #[error("worktree path already exists: {0}")]
     WorktreePathExists(PathBuf),
+    #[error("unsupported worktree state: {0}")]
+    UnsupportedSnapshotState(String),
+    #[error("worktree changed while its fork snapshot was being captured")]
+    SnapshotChangedDuringCapture,
+    #[error("unsafe repository-relative path: {0}")]
+    UnsafeRepositoryPath(String),
 }
 
 pub type Result<T> = std::result::Result<T, GitError>;
@@ -39,6 +45,26 @@ pub type Result<T> = std::result::Result<T, GitError>;
 #[derive(Clone, Debug)]
 pub struct GitService {
     worktree: PathBuf,
+}
+
+/// A non-mutating representation of the state not contained in `HEAD`.
+///
+/// Staged and unstaged patches remain separate so applying a fork preserves
+/// the source index distinction. Untracked entries intentionally exclude
+/// ignored paths.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct WorktreeSnapshot {
+    pub staged_patch: Option<String>,
+    pub unstaged_patch: Option<String>,
+    pub untracked: Vec<SnapshotFile>,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotFile {
+    pub path: PathBuf,
+    pub contents: Vec<u8>,
+    pub symlink_target: Option<PathBuf>,
+    pub executable: bool,
 }
 
 impl GitService {
@@ -267,6 +293,22 @@ impl GitService {
         Ok(branch.to_owned())
     }
 
+    /// Create a new branch/worktree at an already-resolved source commit.
+    ///
+    /// Unlike [`Self::create_worktree`], this does not merge-base or fetch;
+    /// forks must start from the exact source `HEAD`.
+    pub fn create_worktree_at(
+        &self,
+        path: &Path,
+        branch: &str,
+        source_head: &str,
+    ) -> Result<String> {
+        self.run(&["rev-parse", "--verify", source_head])?;
+        let path_string = path.to_string_lossy().into_owned();
+        self.run(&["worktree", "add", "-b", branch, &path_string, source_head])?;
+        Ok(branch.to_owned())
+    }
+
     /// Recreate a missing linked worktree from an existing local branch.
     ///
     /// This never creates a branch or overwrites a path. It is intended for
@@ -367,6 +409,169 @@ impl GitService {
             patch,
         )?;
         Ok(())
+    }
+
+    /// Capture a forkable working tree without changing its index or files.
+    ///
+    /// The capture is made twice and compared before it is returned. This
+    /// converts a concurrent source mutation into a clear failure instead of
+    /// silently exposing a half-old fork.
+    pub fn capture_worktree_snapshot(&self) -> Result<WorktreeSnapshot> {
+        let first = self.capture_worktree_snapshot_once()?;
+        let second = self.capture_worktree_snapshot_once()?;
+        if first != second {
+            return Err(GitError::SnapshotChangedDuringCapture);
+        }
+        Ok(first)
+    }
+
+    /// Apply a snapshot produced by [`Self::capture_worktree_snapshot`].
+    pub fn apply_worktree_snapshot(&self, snapshot: &WorktreeSnapshot) -> Result<()> {
+        if let Some(patch) = snapshot.staged_patch.as_deref() {
+            self.run_with_stdin(
+                &["apply", "--binary", "--index", "--whitespace=nowarn", "-"],
+                patch,
+            )?;
+        }
+        if let Some(patch) = snapshot.unstaged_patch.as_deref() {
+            self.run_with_stdin(&["apply", "--binary", "--whitespace=nowarn", "-"], patch)?;
+        }
+        for file in &snapshot.untracked {
+            validate_snapshot_path(&file.path)?;
+            let destination = self.worktree.join(&file.path);
+            if !destination.starts_with(&self.worktree) {
+                return Err(GitError::UnsafeRepositoryPath(
+                    file.path.display().to_string(),
+                ));
+            }
+            if let Some(parent) = destination.parent() {
+                std::fs::create_dir_all(parent)?;
+            }
+            if let Some(target) = &file.symlink_target {
+                #[cfg(unix)]
+                std::os::unix::fs::symlink(target, &destination)?;
+                #[cfg(not(unix))]
+                return Err(GitError::UnsupportedSnapshotState(
+                    "symlink snapshots require Unix".to_owned(),
+                ));
+            } else {
+                std::fs::write(&destination, &file.contents)?;
+                #[cfg(unix)]
+                {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    let mode = if file.executable { 0o755 } else { 0o644 };
+                    std::fs::set_permissions(&destination, std::fs::Permissions::from_mode(mode))?;
+                }
+            }
+        }
+        Ok(())
+    }
+
+    /// Remove only tracked/untracked state represented by a just-applied
+    /// snapshot. Callers must use this only before an agent has run in the
+    /// target; it deliberately leaves ignored files alone.
+    pub fn discard_snapshot_state(&self) -> Result<()> {
+        self.run(&["reset", "--hard", "HEAD"])?;
+        self.run(&["clean", "-fd"])?;
+        Ok(())
+    }
+
+    fn capture_worktree_snapshot_once(&self) -> Result<WorktreeSnapshot> {
+        if !self.is_worktree() {
+            return Err(GitError::NotAWorktree(self.worktree.clone()));
+        }
+        if !self
+            .run(&["diff", "--name-only", "--diff-filter=U"])?
+            .trim()
+            .is_empty()
+        {
+            return Err(GitError::UnsupportedSnapshotState(
+                "conflicted index entries cannot be forked".to_owned(),
+            ));
+        }
+        let index = self.run(&["ls-files", "--stage"])?;
+        if index
+            .lines()
+            .any(|line| line.split_whitespace().next() == Some("160000"))
+        {
+            return Err(GitError::UnsupportedSnapshotState(
+                "submodules cannot be forked with a working-tree snapshot".to_owned(),
+            ));
+        }
+        let staged = self.run(&["diff", "--binary", "--cached", "HEAD"])?;
+        let unstaged = self.run(&["diff", "--binary"])?;
+        let output = self.run_raw(&["ls-files", "--others", "--exclude-standard", "-z"])?;
+        if !output.status.success() {
+            return Err(GitError::Command {
+                command: "ls-files --others --exclude-standard -z".to_owned(),
+                stderr: String::from_utf8_lossy(&output.stderr).trim().to_owned(),
+            });
+        }
+        let mut untracked = Vec::new();
+        for path in output
+            .stdout
+            .split(|byte| *byte == 0)
+            .filter(|path| !path.is_empty())
+        {
+            let path = PathBuf::from(String::from_utf8_lossy(path).into_owned());
+            validate_snapshot_path(&path)?;
+            if is_sensitive_untracked_path(&path) {
+                return Err(GitError::UnsupportedSnapshotState(format!(
+                    "refusing to copy possible credential file {}",
+                    path.display()
+                )));
+            }
+            let source = self.worktree.join(&path);
+            let metadata = std::fs::symlink_metadata(&source)?;
+            let file_type = metadata.file_type();
+            if file_type.is_symlink() {
+                let target = std::fs::read_link(source)?;
+                if target.is_absolute()
+                    || target.components().any(|component| {
+                        matches!(
+                            component,
+                            std::path::Component::ParentDir
+                                | std::path::Component::RootDir
+                                | std::path::Component::Prefix(_)
+                        )
+                    })
+                {
+                    return Err(GitError::UnsupportedSnapshotState(format!(
+                        "untracked symlink {} points outside its repository directory",
+                        path.display()
+                    )));
+                }
+                untracked.push(SnapshotFile {
+                    path,
+                    contents: Vec::new(),
+                    symlink_target: Some(target),
+                    executable: false,
+                });
+            } else if file_type.is_file() {
+                #[cfg(unix)]
+                let executable = {
+                    use std::os::unix::fs::PermissionsExt as _;
+                    metadata.permissions().mode() & 0o111 != 0
+                };
+                #[cfg(not(unix))]
+                let executable = false;
+                untracked.push(SnapshotFile {
+                    path,
+                    contents: std::fs::read(source)?,
+                    symlink_target: None,
+                    executable,
+                });
+            } else {
+                return Err(GitError::UnsupportedSnapshotState(
+                    "untracked directories or special files cannot be forked".to_owned(),
+                ));
+            }
+        }
+        Ok(WorktreeSnapshot {
+            staged_patch: (!staged.is_empty()).then_some(staged),
+            unstaged_patch: (!unstaged.is_empty()).then_some(unstaged),
+            untracked,
+        })
     }
 
     /// Delete a branch only when it has been merged into `base_ref`.
@@ -660,6 +865,55 @@ fn unquote(path: &str) -> String {
     }
 }
 
+fn validate_snapshot_path(path: &Path) -> Result<()> {
+    if path.as_os_str().is_empty()
+        || path.is_absolute()
+        || path.components().any(|component| {
+            matches!(
+                component,
+                std::path::Component::ParentDir
+                    | std::path::Component::RootDir
+                    | std::path::Component::Prefix(_)
+            )
+        })
+    {
+        return Err(GitError::UnsafeRepositoryPath(path.display().to_string()));
+    }
+
+    Ok(())
+}
+
+fn is_sensitive_untracked_path(path: &Path) -> bool {
+    let normalized = path.to_string_lossy().replace('\\', "/");
+    let sensitive_extension = path
+        .extension()
+        .and_then(std::ffi::OsStr::to_str)
+        .is_some_and(|extension| {
+            extension.eq_ignore_ascii_case("key") || extension.eq_ignore_ascii_case("pem")
+        });
+    let file_name = path
+        .file_name()
+        .and_then(std::ffi::OsStr::to_str)
+        .unwrap_or_default()
+        .to_ascii_lowercase();
+    matches!(
+        file_name.as_str(),
+        ".git-credentials"
+            | ".netrc"
+            | ".npmrc"
+            | ".pypirc"
+            | "_netrc"
+            | "credentials"
+            | "id_dsa"
+            | "id_ecdsa"
+            | "id_ed25519"
+            | "id_rsa"
+    ) || file_name.starts_with(".env")
+        || sensitive_extension
+        || normalized.starts_with(".aws/")
+        || normalized.starts_with(".ssh/")
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -844,6 +1098,111 @@ mod tests {
         let session = GitService::new(&worktree);
         assert_eq!(session.current_branch().unwrap(), "session/one");
         assert_eq!(GitService::new(path).current_branch().unwrap(), "main");
+    }
+
+    #[test]
+    fn nonmutating_snapshot_preserves_index_worktree_and_untracked_state() {
+        let dir = repo();
+        let source = dir.path();
+        fs::write(source.join(".gitignore"), "ignored.txt\n").expect("ignore");
+        git(source, &["add", ".gitignore"]);
+        git(source, &["commit", "-m", "ignore"]);
+        fs::write(source.join("base.txt"), "staged\n").expect("staged");
+        git(source, &["add", "base.txt"]);
+        fs::write(source.join("base.txt"), "unstaged after staged\n").expect("unstaged");
+        fs::write(source.join("untracked.bin"), [0, 1, 2, 255]).expect("untracked");
+        fs::write(source.join("run.sh"), "#!/bin/sh\n").expect("executable");
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            fs::set_permissions(source.join("run.sh"), fs::Permissions::from_mode(0o755))
+                .expect("mark executable");
+        }
+        fs::write(source.join("ignored.txt"), "never copy").expect("ignored");
+
+        let service = GitService::new(source);
+        let before_index = service
+            .run(&["diff", "--cached", "--binary", "HEAD"])
+            .unwrap();
+        let before_worktree = service.run(&["diff", "--binary"]).unwrap();
+        let snapshot = service.capture_worktree_snapshot().expect("snapshot");
+        assert_eq!(
+            service
+                .run(&["diff", "--cached", "--binary", "HEAD"])
+                .unwrap(),
+            before_index
+        );
+        assert_eq!(service.run(&["diff", "--binary"]).unwrap(), before_worktree);
+
+        let outside = tempfile::tempdir().expect("target root");
+        let target = outside.path().join("fork");
+        service
+            .create_worktree_at(&target, "session/fork", &service.head_commit().unwrap())
+            .expect("target");
+        let target_git = GitService::new(&target);
+        target_git
+            .apply_worktree_snapshot(&snapshot)
+            .expect("apply");
+        assert_eq!(
+            target_git
+                .run(&["diff", "--cached", "--binary", "HEAD"])
+                .unwrap(),
+            before_index
+        );
+        assert_eq!(
+            target_git.run(&["diff", "--binary"]).unwrap(),
+            before_worktree
+        );
+        assert_eq!(
+            fs::read(target.join("untracked.bin")).unwrap(),
+            [0, 1, 2, 255]
+        );
+        assert!(!target.join("ignored.txt").exists());
+        #[cfg(unix)]
+        {
+            use std::os::unix::fs::PermissionsExt as _;
+            assert_ne!(
+                fs::metadata(target.join("run.sh"))
+                    .unwrap()
+                    .permissions()
+                    .mode()
+                    & 0o111,
+                0
+            );
+        }
+    }
+
+    #[test]
+    fn snapshot_rejects_untracked_credentials() {
+        let dir = repo();
+        for name in [".env.production", ".git-credentials", ".netrc"] {
+            fs::write(dir.path().join(name), "TOKEN=secret\n").expect("credential fixture");
+            let error = GitService::new(dir.path())
+                .capture_worktree_snapshot()
+                .expect_err("credential-like untracked file must not be copied");
+            assert!(error.to_string().contains("credential"), "{error}");
+            assert!(dir.path().join(name).is_file(), "source was mutated");
+            fs::remove_file(dir.path().join(name)).expect("remove fixture");
+        }
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn snapshot_rejects_untracked_symlinks_that_escape_the_repository() {
+        let dir = repo();
+        std::os::unix::fs::symlink("../outside", dir.path().join("escape"))
+            .expect("symlink fixture");
+        let error = GitService::new(dir.path())
+            .capture_worktree_snapshot()
+            .expect_err("escaping symlink must not be copied");
+        assert!(error.to_string().contains("outside"), "{error}");
+        assert!(
+            fs::symlink_metadata(dir.path().join("escape"))
+                .unwrap()
+                .file_type()
+                .is_symlink(),
+            "source was mutated"
+        );
     }
 
     #[test]

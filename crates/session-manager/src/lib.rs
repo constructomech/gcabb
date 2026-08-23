@@ -69,6 +69,8 @@ pub enum SessionManagerError {
     ArchiveRestoreFailed { id: String, error: String },
     #[error("session is already being restored: {0}")]
     SessionRestoreInProgress(String),
+    #[error("session cannot be forked: {0}")]
+    InvalidFork(String),
     #[error(
         "saved session working directory does not exist or cannot be accessed: {0}. \
          Restore the directory or delete this session."
@@ -445,6 +447,24 @@ pub struct CreateSessionRequest {
     /// caller's timeout expires. Unattended sessions approve tool use up front
     /// instead of stalling on a question nobody can see.
     pub unattended: bool,
+}
+
+/// Inputs for resuming an SDK-native fork into a distinct app runtime.
+#[derive(Clone, Debug)]
+pub struct ForkSessionRequest {
+    pub source_session_id: String,
+    pub target_project_path: PathBuf,
+    pub title: String,
+    pub to_event_id: Option<String>,
+    pub fork_tool_call_id: Option<String>,
+    pub kickoff_pending: bool,
+}
+
+#[derive(Clone)]
+pub struct ForkSessionResult {
+    pub handle: SessionHandle,
+    pub sdk_session_id: String,
+    pub title: String,
 }
 
 #[derive(Clone, Copy, Debug)]
@@ -1027,6 +1047,7 @@ impl SessionManager {
                         cleanup_error: cleanup_error.to_string(),
                     });
                 }
+
                 return Err(error.into());
             }
         };
@@ -1101,6 +1122,193 @@ impl SessionManager {
                 Err(error)
             }
         }
+    }
+
+    /// Create an SDK-native fork from a live project runtime and resume it in a
+    /// new isolated provider. The source runtime is never disconnected or
+    /// mutated; the lifecycle lock serializes this with archive/delete/restore.
+    pub async fn fork_session(&self, request: ForkSessionRequest) -> Result<ForkSessionResult> {
+        if let Some(tool_call_id) = request.fork_tool_call_id.as_deref()
+            && let Some(existing) = self
+                .existing_fork_for_tool_call(&request.source_session_id, tool_call_id)
+                .await?
+        {
+            return Ok(existing);
+        }
+        let _lifecycle = self.lifecycle.lock().await;
+        let source_metadata = self
+            .storage
+            .session_metadata(&request.source_session_id)?
+            .ok_or_else(|| {
+                SessionManagerError::SessionNotFound(request.source_session_id.clone())
+            })?;
+        let repository = source_metadata.repository_root.clone().ok_or_else(|| {
+            SessionManagerError::InvalidFork(
+                "source is not a registered project session".to_owned(),
+            )
+        })?;
+        if source_metadata.kind != SessionKind::Project
+            || !self
+                .projects()?
+                .iter()
+                .any(|project| project.path == repository)
+        {
+            return Err(SessionManagerError::InvalidFork(
+                "source is not a project session in a registered repository".to_owned(),
+            ));
+        }
+        let source = self
+            .sessions
+            .lock()
+            .await
+            .get(&request.source_session_id)
+            .cloned()
+            .ok_or_else(|| {
+                SessionManagerError::InvalidFork(
+                    "source must be live before it can be forked".to_owned(),
+                )
+            })?;
+        let source_provider = source.provider.ok_or_else(|| {
+            SessionManagerError::InvalidFork("source has no live provider runtime".to_owned())
+        })?;
+        let fork = source_provider
+            .fork_session(copilot_provider::ForkSessionRequest {
+                source_sdk_session_id: source_metadata.sdk_session_id.clone(),
+                to_event_id: request.to_event_id.clone(),
+                name: Some(request.title.clone()),
+            })
+            .await?;
+        self.install_fork_runtime(&request, source_metadata, source_provider, fork)
+            .await
+    }
+
+    async fn install_fork_runtime(
+        &self,
+        request: &ForkSessionRequest,
+        mut metadata: SessionMetadata,
+        source_provider: Arc<dyn AgentProvider>,
+        fork: copilot_provider::ForkSessionResult,
+    ) -> Result<ForkSessionResult> {
+        metadata.id = Uuid::new_v4().to_string();
+        metadata.sdk_session_id = fork.sdk_session_id.clone();
+        metadata.project_path = request.target_project_path.to_string_lossy().into_owned();
+        metadata.title = fork.name.clone().unwrap_or_else(|| request.title.clone());
+        metadata.title_source = TitleSource::Manual;
+        metadata.parent_session_id = None;
+        metadata.launch_origin = SessionLaunchOrigin::User;
+        metadata.host_tool_call_id = None;
+        metadata.forked_from_session_id = Some(request.source_session_id.clone());
+        metadata.forked_at_event_id = request.to_event_id.clone();
+        metadata.fork_tool_call_id = request.fork_tool_call_id.clone();
+        metadata.fork_kickoff_pending = request.kickoff_pending;
+        metadata.created_at = timestamp();
+        metadata.updated_at = metadata.created_at.clone();
+        if let Err(error) = self.storage.upsert_session(&metadata) {
+            return match source_provider
+                .delete_session_history(&fork.sdk_session_id)
+                .await
+            {
+                Ok(()) => Err(error.into()),
+                Err(cleanup_error) => Err(SessionManagerError::RuntimeCleanup {
+                    error: error.to_string(),
+                    cleanup_error: cleanup_error.to_string(),
+                }),
+            };
+        }
+        let provider = self.provider_factory.create(&request.target_project_path);
+        let isolated = self.provider_factory.isolates_session_runtimes();
+        let result = async {
+            let compatibility = provider.start().await?;
+            self.record_runtime_start(&metadata.id, &compatibility);
+            let runtime = self
+                .restore_with_provider(
+                    &metadata,
+                    request.target_project_path.clone(),
+                    SessionSnapshot::new(metadata.clone()),
+                    provider.clone(),
+                    isolated,
+                    RestoreTiming {
+                        started: Instant::now(),
+                        recovery_ms: 0,
+                        replayed_events: 0,
+                    },
+                )
+                .await?;
+            let handle = runtime.handle.clone();
+            self.sessions
+                .lock()
+                .await
+                .insert(metadata.id.clone(), runtime);
+            Ok::<_, SessionManagerError>(handle)
+        }
+        .await;
+        match result {
+            Ok(handle) => Ok(ForkSessionResult {
+                handle,
+                sdk_session_id: fork.sdk_session_id,
+                title: metadata.title,
+            }),
+            Err(error) => {
+                let _ = provider.disconnect(&fork.sdk_session_id).await;
+                if isolated {
+                    let _ = provider.stop().await;
+                }
+                let _ = self.storage.delete_session(&metadata.id);
+                match source_provider
+                    .delete_session_history(&fork.sdk_session_id)
+                    .await
+                {
+                    Ok(()) => Err(error),
+                    Err(cleanup_error) => Err(SessionManagerError::RuntimeCleanup {
+                        error: error.to_string(),
+                        cleanup_error: cleanup_error.to_string(),
+                    }),
+                }
+            }
+        }
+    }
+
+    /// Resolve an idempotent host-tool retry before the orchestrator allocates
+    /// another worktree for it.
+    pub async fn fork_for_tool_call(
+        &self,
+        source_session_id: &str,
+        tool_call_id: &str,
+    ) -> Result<Option<ForkSessionResult>> {
+        self.existing_fork_for_tool_call(source_session_id, tool_call_id)
+            .await
+    }
+
+    async fn existing_fork_for_tool_call(
+        &self,
+        source_session_id: &str,
+        tool_call_id: &str,
+    ) -> Result<Option<ForkSessionResult>> {
+        let Some(existing) = self
+            .storage
+            .session_for_fork_tool_call(source_session_id, tool_call_id)?
+        else {
+            return Ok(None);
+        };
+        if existing.fork_kickoff_pending {
+            return Err(SessionManagerError::InvalidFork(format!(
+                "the earlier fork_session call created fork {}, but kickoff delivery is \
+                 indeterminate; inspect that session before retrying",
+                existing.id
+            )));
+        }
+        let handle = self.resume_closed_session(&existing.id).await?;
+        Ok(Some(ForkSessionResult {
+            handle,
+            sdk_session_id: existing.sdk_session_id,
+            title: existing.title,
+        }))
+    }
+
+    pub fn complete_fork_kickoff(&self, app_session_id: &str) -> Result<()> {
+        self.storage
+            .set_fork_kickoff_pending(app_session_id, false)?;
+        Ok(())
     }
 
     pub async fn session(&self, app_session_id: &str) -> Result<SessionHandle> {
@@ -4626,6 +4834,10 @@ fn metadata_from_create_request(
         parent_session_id: request.parent_session_id.clone(),
         launch_origin: request.launch_origin,
         host_tool_call_id: request.host_tool_call_id.clone(),
+        forked_from_session_id: None,
+        forked_at_event_id: None,
+        fork_tool_call_id: None,
+        fork_kickoff_pending: false,
         model: request.model.clone(),
         mode: request.mode.clone(),
         base_ref: request.base_ref.clone(),
@@ -4782,6 +4994,10 @@ mod tests {
                 SessionLaunchOrigin::User
             },
             host_tool_call_id: parent_session_id.map(|_| format!("tool-{id}")),
+            forked_from_session_id: None,
+            forked_at_event_id: None,
+            fork_tool_call_id: None,
+            fork_kickoff_pending: false,
             model: None,
             mode: None,
             base_ref: None,
@@ -4814,6 +5030,10 @@ mod tests {
                 SessionLaunchOrigin::User
             },
             host_tool_call_id: parent_session_id.map(|_| format!("tool-{id}")),
+            forked_from_session_id: None,
+            forked_at_event_id: None,
+            fork_tool_call_id: None,
+            fork_kickoff_pending: false,
             model: None,
             mode: None,
             base_ref: Some(branch.to_owned()),
@@ -5413,6 +5633,10 @@ mod tests {
             parent_session_id: None,
             launch_origin: SessionLaunchOrigin::User,
             host_tool_call_id: None,
+            forked_from_session_id: None,
+            forked_at_event_id: None,
+            fork_tool_call_id: None,
+            fork_kickoff_pending: false,
             model: None,
             mode: None,
             base_ref: None,
@@ -5473,6 +5697,10 @@ mod tests {
             parent_session_id: None,
             launch_origin: SessionLaunchOrigin::User,
             host_tool_call_id: None,
+            forked_from_session_id: None,
+            forked_at_event_id: None,
+            fork_tool_call_id: None,
+            fork_kickoff_pending: false,
             model: None,
             mode: None,
             base_ref: None,
@@ -5545,23 +5773,13 @@ mod tests {
         std::fs::write(worktree.join("base.txt"), "modified\n").unwrap();
         std::fs::write(worktree.join("scratch.txt"), "untracked\n").unwrap();
 
-        let metadata = SessionMetadata {
-            id: "archivable-session".to_owned(),
-            sdk_session_id: "sdk-archivable".to_owned(),
-            project_path: worktree.to_string_lossy().into_owned(),
-            repository_root: Some(repository.to_string_lossy().into_owned()),
-            title: "Archive me".to_owned(),
-            title_source: TitleSource::Manual,
-            kind: SessionKind::Project,
-            parent_session_id: None,
-            launch_origin: SessionLaunchOrigin::User,
-            host_tool_call_id: None,
-            model: None,
-            mode: None,
-            base_ref: Some("main".to_owned()),
-            created_at: "1".to_owned(),
-            updated_at: "1".to_owned(),
-        };
+        let mut metadata = tree_metadata("archivable-session", None);
+        metadata.sdk_session_id = "sdk-archivable".to_owned();
+        metadata.project_path = worktree.to_string_lossy().into_owned();
+        metadata.repository_root = Some(repository.to_string_lossy().into_owned());
+        metadata.title = "Archive me".to_owned();
+        metadata.kind = SessionKind::Project;
+        metadata.base_ref = Some("main".to_owned());
         let storage = Arc::new(Storage::open_in_memory().unwrap());
         storage.upsert_session(&metadata).unwrap();
         let manager = SessionManager::new(
@@ -5662,6 +5880,10 @@ mod tests {
             parent_session_id: None,
             launch_origin: SessionLaunchOrigin::User,
             host_tool_call_id: None,
+            forked_from_session_id: None,
+            forked_at_event_id: None,
+            fork_tool_call_id: None,
+            fork_kickoff_pending: false,
             model: None,
             mode: None,
             base_ref: Some("main".to_owned()),
@@ -5726,6 +5948,10 @@ mod tests {
             parent_session_id: None,
             launch_origin: SessionLaunchOrigin::User,
             host_tool_call_id: None,
+            forked_from_session_id: None,
+            forked_at_event_id: None,
+            fork_tool_call_id: None,
+            fork_kickoff_pending: false,
             model: None,
             mode: None,
             base_ref: Some("main".to_owned()),
@@ -5786,6 +6012,10 @@ mod tests {
             parent_session_id: None,
             launch_origin: SessionLaunchOrigin::User,
             host_tool_call_id: None,
+            forked_from_session_id: None,
+            forked_at_event_id: None,
+            fork_tool_call_id: None,
+            fork_kickoff_pending: false,
             model: None,
             mode: None,
             base_ref: None,
@@ -5828,6 +6058,10 @@ mod tests {
             parent_session_id: None,
             launch_origin: SessionLaunchOrigin::User,
             host_tool_call_id: None,
+            forked_from_session_id: None,
+            forked_at_event_id: None,
+            fork_tool_call_id: None,
+            fork_kickoff_pending: false,
             model: None,
             mode: None,
             base_ref: None,
@@ -5891,6 +6125,10 @@ mod tests {
             parent_session_id: None,
             launch_origin: SessionLaunchOrigin::User,
             host_tool_call_id: None,
+            forked_from_session_id: None,
+            forked_at_event_id: None,
+            fork_tool_call_id: None,
+            fork_kickoff_pending: false,
             model: None,
             mode: None,
             base_ref: Some("main".to_owned()),
@@ -6297,6 +6535,10 @@ mod tests {
                     parent_session_id: None,
                     launch_origin: SessionLaunchOrigin::User,
                     host_tool_call_id: None,
+                    forked_from_session_id: None,
+                    forked_at_event_id: None,
+                    fork_tool_call_id: None,
+                    fork_kickoff_pending: false,
                     model: None,
                     mode: None,
                     base_ref: None,
@@ -6369,6 +6611,10 @@ mod tests {
                 parent_session_id: None,
                 launch_origin: SessionLaunchOrigin::User,
                 host_tool_call_id: None,
+                forked_from_session_id: None,
+                forked_at_event_id: None,
+                fork_tool_call_id: None,
+                fork_kickoff_pending: false,
                 model: None,
                 mode: None,
                 base_ref: None,
