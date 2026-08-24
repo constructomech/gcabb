@@ -13,17 +13,18 @@ use app_model::{
 };
 use copilot_provider::{
     AgentProvider, AgentProviderFactory, ChildLifecycleEvent, ChildLifecycleStatus,
-    GetSessionToolResult, HostToolBinding, HostToolGateway, ProviderCompatibility, ProviderError,
-    ProviderEvent, ProviderInteraction, ProviderSession, QueueDeliveryRequest,
-    SendSessionMessageToolResult, SessionChangeSummary, SessionMessageDelivery, SessionRequest,
-    SessionTranscriptEntry,
+    GetSessionToolResult, HostToolBinding, HostToolGateway, PendingPlanToolSummary,
+    PlanContinuationAction, PlanInvalidatedEvent, PlanWaitingEvent, ProviderCompatibility,
+    ProviderError, ProviderEvent, ProviderInteraction, ProviderSession, QueueDeliveryRequest,
+    RespondToSessionPlanToolResult, SendSessionMessageToolResult, SessionChangeSummary,
+    SessionMessageDelivery, SessionRequest, SessionTranscriptEntry,
 };
 use diagnostics::{DiagnosticEvent, DiagnosticsSink};
 use git_service::GitService;
 use serde_json::{Value, json};
 use storage::{
     CoordinationDelivery, CoordinationKind, CoordinationRecord, CoordinationRelation,
-    CoordinationState, OutputRange, Storage, StorageError,
+    CoordinationState, OutputRange, PlanResponseRecord, PlanResponseState, Storage, StorageError,
 };
 use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
@@ -31,6 +32,7 @@ use uuid::Uuid;
 
 const SNAPSHOT_INTERVAL: u64 = 50;
 const BASE_REF_REFRESH_TTL: Duration = Duration::from_mins(5);
+const MAX_PLAN_FEEDBACK_BYTES: usize = 4 * 1024;
 /// Where an archived patch is dropped when it cannot be re-applied, so
 /// unarchiving never destroys the work it was holding.
 const ARCHIVED_PATCH_FILE: &str = "gcabb-archived-changes.patch";
@@ -49,6 +51,8 @@ pub enum SessionManagerError {
     BackgroundTask(String),
     #[error("session not found: {0}")]
     SessionNotFound(String),
+    #[error("plan response is invalid: {0}")]
+    InvalidPlanResponse(String),
     #[error(
         "archived session {id} could not be restored: {error}. \
          It is still archived, and its saved work is intact."
@@ -249,6 +253,17 @@ pub struct CreateSessionRequest {
     /// caller's timeout expires. Unattended sessions approve tool use up front
     /// instead of stalling on a question nobody can see.
     pub unattended: bool,
+}
+
+#[derive(Clone, Copy, Debug)]
+pub struct SessionPlanResponseRequest<'a> {
+    pub caller_session_id: &'a str,
+    pub tool_call_id: &'a str,
+    pub target_session_id: &'a str,
+    pub interaction_id: &'a str,
+    pub approved: bool,
+    pub feedback: Option<&'a str>,
+    pub selected_action: Option<PlanContinuationAction>,
 }
 
 #[derive(Clone)]
@@ -657,6 +672,7 @@ impl SessionManager {
         mut on_restored: impl FnMut(SessionHandle),
     ) -> Result<(ProviderCompatibility, RestoreReport)> {
         let started = Instant::now();
+        self.retire_stale_plan_notifications()?;
         let provider_started = Instant::now();
         let compatibility = self.provider_factory.compatibility().await?;
         let provider_ms = elapsed_ms(provider_started);
@@ -692,6 +708,7 @@ impl SessionManager {
         preferred_session: Option<&str>,
         mut on_restored: impl FnMut(SessionHandle),
     ) -> Result<(ProviderCompatibility, RestoreReport, Vec<SessionMetadata>)> {
+        self.retire_stale_plan_notifications()?;
         let compatibility = self.provider_factory.compatibility().await?;
         let mut sessions = self.storage.list_sessions()?;
         let preferred = preferred_session.and_then(|id| {
@@ -708,6 +725,12 @@ impl SessionManager {
             None => RestoreReport::default(),
         };
         Ok((compatibility, report, sessions))
+    }
+
+    fn retire_stale_plan_notifications(&self) -> Result<()> {
+        self.storage
+            .retire_stale_plan_waiting_notifications(&timestamp())?;
+        Ok(())
     }
 
     /// Restore a known metadata set, publishing each usable handle immediately.
@@ -1136,21 +1159,8 @@ impl SessionManager {
                     && message.state == app_model::TranscriptState::Complete
             })
             .map(|message| bounded_text(&message.content, 4_000));
-        let pending_plan_summary = snapshot
-            .pending_interactions
-            .iter()
-            .find(|interaction| interaction.kind == InteractionKind::ExitPlanMode)
-            .map(|interaction| {
-                interaction
-                    .details
-                    .get("plan")
-                    .or_else(|| interaction.details.get("summary"))
-                    .and_then(Value::as_str)
-                    .map_or_else(
-                        || bounded_text(&interaction.message, 2_000),
-                        |plan| bounded_text(plan, 2_000),
-                    )
-            });
+        let pending_plan = pending_plan_summary(&snapshot);
+        let pending_plan_summary = pending_plan.as_ref().map(|plan| plan.summary.clone());
         let totals = snapshot.changes.totals();
         let changes = SessionChangeSummary {
             branch: snapshot
@@ -1200,8 +1210,144 @@ impl SessionManager {
             latest_assistant_result,
             transcript_tail,
             pending_plan_summary,
+            pending_plan,
             changes,
         })
+    }
+
+    /// Resolve the exact live plan reviewed by an authorized ancestor.
+    ///
+    /// Any ancestor in the same registered project may respond. The interaction
+    /// token prevents a delayed response from applying to a newer plan.
+    pub async fn respond_to_session_plan(
+        &self,
+        request: SessionPlanResponseRequest<'_>,
+    ) -> Result<RespondToSessionPlanToolResult> {
+        if let Some(existing) = self.authorize_plan_response(request)? {
+            return Ok(existing);
+        }
+        let handle = self.validate_live_plan(request).await?;
+        let response = new_plan_response_record(request);
+        let (stored, inserted) = self.storage.create_plan_response(&response)?;
+        if !inserted {
+            return Ok(plan_response_result(&stored, "already_resolved"));
+        }
+        self.submit_claimed_plan_response(request, &handle, &stored)
+            .await
+    }
+
+    fn authorize_plan_response(
+        &self,
+        request: SessionPlanResponseRequest<'_>,
+    ) -> Result<Option<RespondToSessionPlanToolResult>> {
+        let relation = self.authorize_registered_coordination(
+            request.caller_session_id,
+            request.target_session_id,
+        )?;
+        if relation != CoordinationRelation::Ancestor {
+            return Err(StorageError::CoordinationUnrelated {
+                caller: request.caller_session_id.to_owned(),
+                target: request.target_session_id.to_owned(),
+            }
+            .into());
+        }
+        if let Some(existing) = self
+            .storage
+            .plan_response_for_tool_call(request.caller_session_id, request.tool_call_id)?
+        {
+            return Ok(Some(plan_response_result(&existing, "already_resolved")));
+        }
+        if let Some(existing) = self
+            .storage
+            .plan_response_for_interaction(request.target_session_id, request.interaction_id)?
+        {
+            return Ok(Some(plan_response_result(&existing, "already_resolved")));
+        }
+        Ok(None)
+    }
+
+    async fn validate_live_plan(
+        &self,
+        request: SessionPlanResponseRequest<'_>,
+    ) -> Result<SessionHandle> {
+        let handle = self.session(request.target_session_id).await.map_err(|_| {
+            SessionManagerError::InvalidPlanResponse(
+                "target session is not active; plan interactions cannot survive restart".to_owned(),
+            )
+        })?;
+        let snapshot = handle.snapshot();
+        let interaction = snapshot
+            .pending_interactions
+            .iter()
+            .find(|pending| {
+                pending.kind == InteractionKind::ExitPlanMode
+                    && pending.id == request.interaction_id
+            })
+            .ok_or_else(|| {
+                SessionManagerError::InvalidPlanResponse(
+                    "the reviewed plan is stale or no longer waiting".to_owned(),
+                )
+            })?;
+        if !request.approved && request.selected_action.is_some() {
+            return Err(SessionManagerError::InvalidPlanResponse(
+                "selected_action is only valid for an approved plan".to_owned(),
+            ));
+        }
+        if request
+            .feedback
+            .is_some_and(|value| value.len() > MAX_PLAN_FEEDBACK_BYTES)
+        {
+            return Err(SessionManagerError::InvalidPlanResponse(format!(
+                "feedback exceeds the {MAX_PLAN_FEEDBACK_BYTES}-byte limit"
+            )));
+        }
+        if let Some(action) = request.selected_action
+            && !interaction
+                .choices
+                .iter()
+                .any(|choice| choice == action.as_str())
+        {
+            return Err(SessionManagerError::InvalidPlanResponse(format!(
+                "selected action {} is not offered by this plan",
+                action.as_str()
+            )));
+        }
+        Ok(handle)
+    }
+
+    async fn submit_claimed_plan_response(
+        &self,
+        request: SessionPlanResponseRequest<'_>,
+        handle: &SessionHandle,
+        stored: &PlanResponseRecord,
+    ) -> Result<RespondToSessionPlanToolResult> {
+        if let Err(error) = handle
+            .respond(request.interaction_id, plan_interaction_response(request))
+            .await
+        {
+            self.storage.set_plan_response_state(
+                &stored.id,
+                &PlanResponseState::Failed,
+                Some(&error.to_string()),
+                &timestamp(),
+            )?;
+            return Err(error);
+        }
+        let resolved_at = timestamp();
+        self.storage.set_plan_response_state(
+            &stored.id,
+            &PlanResponseState::Submitted,
+            None,
+            &resolved_at,
+        )?;
+        if let Some(parent_session_id) = self.storage.mark_plan_waiting_notification_read(
+            request.target_session_id,
+            request.interaction_id,
+            &resolved_at,
+        )? {
+            self.sync_live_queue(&parent_session_id).await?;
+        }
+        Ok(plan_response_result(stored, "submitted"))
     }
 
     /// Persist and schedule an idempotent parent/descendant message.
@@ -1355,6 +1501,95 @@ impl SessionManager {
         }
         self.sync_live_queue(&parent_session_id).await?;
         Ok(Some(stored))
+    }
+
+    /// Persist a once-only plan-ready notification and queue it for the direct parent.
+    pub async fn handle_plan_waiting(
+        &self,
+        event: &PlanWaitingEvent,
+    ) -> Result<Option<CoordinationRecord>> {
+        let child = self
+            .storage
+            .session_metadata(&event.child_session_id)?
+            .ok_or_else(|| SessionManagerError::SessionNotFound(event.child_session_id.clone()))?;
+        let parent_session_id = child.parent_session_id.clone().ok_or_else(|| {
+            SessionManagerError::SessionNotFound(format!(
+                "parent for child {}",
+                event.child_session_id
+            ))
+        })?;
+        self.authorize_registered_coordination(&event.child_session_id, &parent_session_id)?;
+        let Ok(handle) = self.session(&event.child_session_id).await else {
+            return Ok(None);
+        };
+        if !handle
+            .snapshot()
+            .pending_interactions
+            .iter()
+            .any(|pending| {
+                pending.kind == InteractionKind::ExitPlanMode && pending.id == event.interaction_id
+            })
+        {
+            return Ok(None);
+        }
+        let coordination_id = Uuid::new_v4().to_string();
+        let summary = bounded_text(&event.summary, 2_000);
+        let prompt = format!(
+            "Child session \"{}\" ({}) has a plan ready for approval. Call get_session with session_id \"{}\" to inspect the bounded plan, then respond_to_session_plan with its exact interaction_id.\n\nPlan summary:\n{}\n\n[GCABB coordination id: {coordination_id}]",
+            event.title, event.child_session_id, event.child_session_id, summary,
+        );
+        let now = timestamp();
+        let queue_item_id = Uuid::new_v4().to_string();
+        let record = CoordinationRecord {
+            id: coordination_id.clone(),
+            sender_session_id: event.child_session_id.clone(),
+            recipient_session_id: parent_session_id.clone(),
+            kind: CoordinationKind::PlanWaiting,
+            delivery: CoordinationDelivery::WhenIdle,
+            state: CoordinationState::Pending,
+            body: json!({
+                "child_session_id": event.child_session_id,
+                "title": event.title,
+                "interaction_id": event.interaction_id,
+                "summary": summary,
+            })
+            .to_string(),
+            queue_item_id: Some(queue_item_id.clone()),
+            dedupe_id: format!("plan-waiting:{}", event.interaction_id),
+            created_at: now.clone(),
+            updated_at: now.clone(),
+            delivered_at: None,
+            read_at: None,
+            error: None,
+        };
+        let queue_item = QueueItem {
+            id: queue_item_id,
+            session_id: parent_session_id.clone(),
+            position: self.storage.next_queue_position(&parent_session_id)?,
+            prompt,
+            display_prompt: Some(format!("Plan ready: {}", event.title)),
+            state: QueueItemState::Pending,
+            delivery: QueueDelivery::WhenIdle,
+            agent_mode: None,
+            created_at: now.clone(),
+            updated_at: now,
+            error: None,
+        };
+        let Some(stored) =
+            self.storage
+                .create_plan_waiting_item(&record, &queue_item, &event.interaction_id)?
+        else {
+            return Ok(None);
+        };
+        if stored.id != coordination_id {
+            return Ok(None);
+        }
+        self.sync_live_queue(&parent_session_id).await?;
+        Ok(Some(stored))
+    }
+
+    pub async fn handle_plan_invalidated(&self, event: &PlanInvalidatedEvent) -> Result<()> {
+        self.sync_live_queue(&event.parent_session_id).await
     }
 
     pub fn unread_child_notifications(&self) -> Result<Vec<(String, String, String)>> {
@@ -2686,7 +2921,7 @@ impl SessionActor {
                     }
                 }
                 Some(interaction) = self.provider_interactions.recv() => {
-                    self.receive_interaction(interaction);
+                    self.receive_provider_interaction(interaction).await;
                 }
                 command = self.commands.recv() => {
                     match command {
@@ -2708,7 +2943,7 @@ impl SessionActor {
                             // Resolve outstanding requests first: a session parked on an
                             // unanswered permission prompt never sees the abort until the
                             // runtime is unblocked.
-                            self.cancel_pending_interactions();
+                            self.cancel_pending_interactions().await;
                             let result = self.provider
                                 .cancel(&self.sdk_session_id)
                                 .await
@@ -2805,6 +3040,14 @@ impl SessionActor {
                 tracing::debug!(event_id = event.id, "duplicate event ignored");
             }
             Err(error) => self.record_actor_error("append_event", &error.to_string()),
+        }
+    }
+
+    async fn receive_provider_interaction(&mut self, interaction: ProviderInteraction) {
+        if let Some(event) = self.receive_interaction(interaction)
+            && let Some(gateway) = &self.host_tool_gateway
+        {
+            gateway.notify_plan_waiting(event).await;
         }
     }
 
@@ -2919,16 +3162,29 @@ impl SessionActor {
         Ok(())
     }
 
-    fn receive_interaction(&mut self, mut interaction: ProviderInteraction) {
+    fn receive_interaction(
+        &mut self,
+        mut interaction: ProviderInteraction,
+    ) -> Option<PlanWaitingEvent> {
         interaction
             .request
             .session_id
             .clone_from(&self.state.metadata.id);
+        let notification = (interaction.request.kind == InteractionKind::ExitPlanMode
+            && self.state.metadata.launch_origin == SessionLaunchOrigin::AgentTool
+            && self.state.metadata.parent_session_id.is_some())
+        .then(|| PlanWaitingEvent {
+            child_session_id: self.state.metadata.id.clone(),
+            title: self.state.metadata.title.clone(),
+            interaction_id: interaction.request.id.clone(),
+            summary: interaction.request.message.clone(),
+        });
         let interaction_id = interaction.request.id.clone();
         self.pending_responses
             .insert(interaction_id, interaction.response);
         self.state.add_interaction(interaction.request);
         self.publish(true);
+        notification
     }
 
     fn respond(&mut self, interaction_id: &str, answer: InteractionResponse) -> Result<()> {
@@ -3039,7 +3295,7 @@ impl SessionActor {
     }
 
     async fn disconnect(&mut self) -> Result<()> {
-        self.cancel_pending_interactions();
+        self.cancel_pending_interactions().await;
         let persistence_result = self
             .storage
             .write_snapshot(&self.state)
@@ -3066,7 +3322,7 @@ impl SessionActor {
         let message = "provider event stream closed unexpectedly";
         self.state.status = SessionStatus::Disconnected;
         self.state.last_error = Some(message.to_owned());
-        self.cancel_pending_interactions();
+        self.cancel_pending_interactions().await;
         self.record_actor_error("provider_stream_closed", message);
         if let Err(error) = self.provider.disconnect(&self.sdk_session_id).await {
             self.record_actor_error("provider_stream_cleanup", &error.to_string());
@@ -3079,11 +3335,51 @@ impl SessionActor {
         self.publish(true);
     }
 
-    fn cancel_pending_interactions(&mut self) {
+    async fn cancel_pending_interactions(&mut self) {
+        let plan_interactions = self
+            .state
+            .pending_interactions
+            .iter()
+            .filter(|pending| pending.kind == InteractionKind::ExitPlanMode)
+            .map(|pending| pending.id.clone())
+            .collect::<Vec<_>>();
+        for interaction_id in &plan_interactions {
+            let invalidation =
+                new_plan_invalidation_record(&self.state.metadata.id, interaction_id);
+            if let Err(error) = self.storage.create_plan_response(&invalidation) {
+                self.record_actor_error("claim_plan_invalidation", &error.to_string());
+            }
+        }
         for (_, response) in self.pending_responses.drain() {
             let _ = response.send(InteractionResponse::Cancel);
         }
         self.state.cancel_pending_interactions();
+        for interaction_id in plan_interactions {
+            let retired_parent = match self.storage.mark_plan_waiting_notification_read(
+                &self.state.metadata.id,
+                &interaction_id,
+                &timestamp(),
+            ) {
+                Ok(parent_session_id) => parent_session_id,
+                Err(error) => {
+                    self.record_actor_error("retire_plan_notification", &error.to_string());
+                    None
+                }
+            };
+            let parent_session_id =
+                retired_parent.or_else(|| self.state.metadata.parent_session_id.clone());
+            if let (Some(gateway), Some(parent_session_id)) =
+                (&self.host_tool_gateway, parent_session_id)
+            {
+                gateway
+                    .notify_plan_invalidated(PlanInvalidatedEvent {
+                        parent_session_id,
+                        child_session_id: self.state.metadata.id.clone(),
+                        interaction_id,
+                    })
+                    .await;
+            }
+        }
     }
 
     fn publish(&self, persist: bool) {
@@ -3545,6 +3841,128 @@ fn bounded_text(value: &str, max_chars: usize) -> String {
         .collect::<String>();
     bounded.push('…');
     bounded
+}
+
+fn pending_plan_summary(snapshot: &SessionSnapshot) -> Option<PendingPlanToolSummary> {
+    snapshot
+        .pending_interactions
+        .iter()
+        .find(|interaction| interaction.kind == InteractionKind::ExitPlanMode)
+        .map(|interaction| {
+            let summary = interaction
+                .details
+                .get("planContent")
+                .or_else(|| interaction.details.get("plan"))
+                .or_else(|| interaction.details.get("summary"))
+                .and_then(Value::as_str)
+                .map_or_else(
+                    || bounded_text(&interaction.message, 2_000),
+                    |plan| bounded_text(plan, 2_000),
+                );
+            PendingPlanToolSummary {
+                interaction_id: interaction.id.clone(),
+                summary,
+                actions: interaction
+                    .choices
+                    .iter()
+                    .take(8)
+                    .map(|action| bounded_text(action, 64))
+                    .collect(),
+                recommended_action: interaction
+                    .details
+                    .get("recommendedAction")
+                    .and_then(Value::as_str)
+                    .map(|action| bounded_text(action, 64)),
+            }
+        })
+}
+
+fn new_plan_response_record(request: SessionPlanResponseRequest<'_>) -> PlanResponseRecord {
+    let now = timestamp();
+    PlanResponseRecord {
+        id: Uuid::new_v4().to_string(),
+        caller_session_id: request.caller_session_id.to_owned(),
+        tool_call_id: request.tool_call_id.to_owned(),
+        target_session_id: request.target_session_id.to_owned(),
+        interaction_id: request.interaction_id.to_owned(),
+        approved: request.approved,
+        feedback: request.feedback.map(str::to_owned),
+        selected_action: request
+            .selected_action
+            .map(|action| action.as_str().to_owned()),
+        state: PlanResponseState::Submitting,
+        created_at: now.clone(),
+        updated_at: now,
+        error: None,
+    }
+}
+
+fn new_plan_invalidation_record(
+    child_session_id: &str,
+    interaction_id: &str,
+) -> PlanResponseRecord {
+    let now = timestamp();
+    PlanResponseRecord {
+        id: Uuid::new_v4().to_string(),
+        caller_session_id: child_session_id.to_owned(),
+        tool_call_id: format!("invalidation:{interaction_id}"),
+        target_session_id: child_session_id.to_owned(),
+        interaction_id: interaction_id.to_owned(),
+        approved: false,
+        feedback: None,
+        selected_action: None,
+        state: PlanResponseState::Failed,
+        created_at: now.clone(),
+        updated_at: now,
+        error: Some("plan interaction was cancelled".to_owned()),
+    }
+}
+
+fn plan_interaction_response(request: SessionPlanResponseRequest<'_>) -> InteractionResponse {
+    if request.approved {
+        request
+            .selected_action
+            .map_or(InteractionResponse::Approve, |action| {
+                InteractionResponse::Submit {
+                    value: Value::String(action.as_str().to_owned()),
+                    freeform: false,
+                }
+            })
+    } else {
+        InteractionResponse::Reject {
+            feedback: request.feedback.map(str::to_owned),
+        }
+    }
+}
+
+fn plan_response_result(
+    record: &PlanResponseRecord,
+    status: &str,
+) -> RespondToSessionPlanToolResult {
+    RespondToSessionPlanToolResult {
+        target_app_session_id: record.target_session_id.clone(),
+        interaction_id: record.interaction_id.clone(),
+        approved: record.approved,
+        selected_action: record
+            .selected_action
+            .as_deref()
+            .and_then(plan_continuation_action),
+        status: if record.state == PlanResponseState::Failed {
+            "failed".to_owned()
+        } else {
+            status.to_owned()
+        },
+    }
+}
+
+const fn plan_continuation_action(value: &str) -> Option<PlanContinuationAction> {
+    match value.as_bytes() {
+        b"interactive" => Some(PlanContinuationAction::Interactive),
+        b"autopilot" => Some(PlanContinuationAction::Autopilot),
+        b"autopilot_fleet" => Some(PlanContinuationAction::AutopilotFleet),
+        b"exit_only" => Some(PlanContinuationAction::ExitOnly),
+        _ => None,
+    }
 }
 
 const fn coordination_relation_label(relation: &CoordinationRelation) -> &'static str {

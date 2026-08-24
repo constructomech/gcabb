@@ -3,11 +3,12 @@
 Evidence for what GCABB inherits from the Copilot CLI runtime, what the
 application adds, and how that compares to other coding-agent harnesses. Most
 tools belong to the runtime; GCABB adds a narrow app-session coordination
-gateway for `create_session`, `get_session`, and `send_session_message`.
+gateway for `create_session`, `get_session`, `send_session_message`, and
+`respond_to_session_plan`.
 
 ## Host-provided app-session coordination
 
-Every new and resumed project session receives three typed custom SDK tools.
+Every new and resumed project session receives four typed custom SDK tools.
 They coordinate durable GCABB app sessions, not Copilot CLI `task` subagents:
 
 - `task` runs nested agent activity inside the calling CLI/session runtime.
@@ -24,6 +25,10 @@ They coordinate durable GCABB app sessions, not Copilot CLI `task` subagents:
   delivery and may bypass older when-idle work while the recipient is busy;
   `queued` waits for idle. Ordering stays stable within each delivery mode, and
   child notifications all use the ordered when-idle path.
+- `respond_to_session_plan` lets any authorized ancestor approve or reject the
+  exact pending plan interaction returned by `get_session`. Approval can select
+  one of the runtime-advertised `interactive`, `autopilot`, `autopilot_fleet`,
+  or `exit_only` actions; rejection can carry bounded feedback.
 
 The model supplies a kickoff prompt and may override the title, model, mode,
 agent, reasoning effort, and context tier. `notify_on_idle: "once"` requests one
@@ -33,6 +38,39 @@ project, repository, base branch, and configured worktree root; no path,
 project, parent, or spoofable sender input is accepted. SDK `toolCallId` is
 persisted so retries return the original child or message without duplicating
 work.
+
+### Parent plan approval
+
+When an agent-created child enters the runtime's `ExitPlanMode` interaction,
+GCABB records one durable `plan_waiting` coordination item for that interaction
+and queues a distinct plan-ready notification to the direct parent. This is
+separate from the once-only idle/failure/cancellation completion notification.
+The sidebar marks a parent with a descendant awaiting approval without changing
+selection or focus. Selecting the child shows the same native plan controls used
+for a developer-driven interaction.
+
+`get_session.pending_plan` returns a bounded summary, the exact interaction id,
+the advertised actions, and the recommended action. The responder must echo that
+interaction id. GCABB requires the caller to be an ancestor in the same
+registered project, validates the action against the live interaction, records
+the response in a durable audit/dedupe row, and then answers the provider's
+typed interaction through `SessionHandle`. It never synthesizes transcript
+events. A retry of the same tool call, or a race with another authorized
+responder, returns the recorded result without submitting twice. An old token
+cannot approve a newer plan.
+
+Plan interactions themselves are live SDK RPCs and do not survive a runtime
+restart. GCABB therefore rejects approval of a closed, restarted, or no-longer-
+pending interaction as stale; the child must produce a new plan interaction.
+Before restored runtimes drain their queues, startup retires any pending
+plan-ready delivery while retaining its coordination audit row. The durable
+record preserves notification and response history, not the underlying
+in-flight RPC. Cancelling, disconnecting, or losing the child runtime performs
+the same retirement immediately and clears the parent indicator. There is an
+unavoidable narrow crash window after an
+audit row is claimed but before the provider receives the response; retries
+remain deduplicated rather than risking a double response, and startup marks a
+leftover `submitting` audit as failed/indeterminate.
 
 Children are started headlessly and do not change selection or focus. The
 sidebar nests them under a live parent and keeps them at the project root with
@@ -49,14 +87,16 @@ re-emits eligible child terminal state through the same deduplicated ledger, so
 notification delivery is neither lost nor repeated.
 
 Authorization is ancestry-based: a caller may inspect itself, its ancestors,
-and its descendants, and may message only an ancestor or descendant. Siblings,
-unrelated sessions, different projects, archived sessions, deleted sessions,
+and its descendants, may message only an ancestor or descendant, and may approve
+plans only for descendants. Any ancestor may approve, not only the direct
+parent. Siblings, unrelated sessions, self-approval, descendant-to-ancestor
+approval, different projects, archived sessions, deleted sessions, stale plans,
 and sessions outside the registered project are rejected.
 
 Current limits are three child levels and five active direct children per
 parent. This surface is local-only and same-project-only. Cloud sessions,
-cross-repository launches, recursive archive/delete, plan approval, forking,
-and `notify_on_idle: "always"` are intentionally outside this version. If the
+cross-repository launches, recursive archive/delete, forking, and
+`notify_on_idle: "always"` are intentionally outside this version. If the
 app crashes in the narrow interval after recording a child but before
 confirming kickoff delivery, a retry returns an explicit interrupted-launch
 error with the child id rather than risking duplicate work.

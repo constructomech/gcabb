@@ -8,12 +8,14 @@ use app_model::{
 };
 use copilot_provider::{
     ChildLifecycleEvent, ChildLifecycleStatus, HostGatewayEvent, HostToolGateway,
-    SessionMessageDelivery,
+    PlanContinuationAction, SessionMessageDelivery,
 };
 use diagnostics::MemoryDiagnostics;
 use serde_json::json;
-use session_manager::{CreateSessionRequest, SessionHandle, SessionManager};
-use storage::{CoordinationKind, Storage};
+use session_manager::{
+    CreateSessionRequest, SessionHandle, SessionManager, SessionPlanResponseRequest,
+};
+use storage::{CoordinationKind, PlanResponseRecord, PlanResponseState, Storage};
 use tempfile::TempDir;
 use test_harness::FakeProvider;
 use tokio::sync::mpsc;
@@ -603,4 +605,539 @@ async fn completion_notification_is_exactly_once_across_storage_reopen() {
     assert_eq!(records.len(), 1);
     assert_eq!(records[0].kind, CoordinationKind::ChildCompletion);
     assert_eq!(storage.queue_view("parent").unwrap().items.len(), 1);
+}
+
+fn plan_request(id: &str) -> InteractionRequest {
+    InteractionRequest {
+        id: id.to_owned(),
+        session_id: String::new(),
+        kind: InteractionKind::ExitPlanMode,
+        title: "Plan ready".to_owned(),
+        message: format!("Implementation plan {id}"),
+        choices: vec![
+            "interactive".to_owned(),
+            "autopilot".to_owned(),
+            "exit_only".to_owned(),
+        ],
+        allow_freeform: true,
+        details: json!({
+            "summary": format!("Summary {id}"),
+            "recommendedAction": "autopilot"
+        }),
+    }
+}
+
+struct PlanFamily {
+    harness: Harness,
+    child: SessionHandle,
+    grandchild: SessionHandle,
+    sibling: SessionHandle,
+}
+
+async fn plan_family() -> PlanFamily {
+    let (harness, _) = harness(false).await;
+    let child = harness
+        .manager
+        .create_session(child_request(
+            harness.directory.path(),
+            harness.parent.id(),
+            "Child",
+            "child",
+        ))
+        .await
+        .expect("create child");
+    let grandchild = harness
+        .manager
+        .create_session(child_request(
+            harness.directory.path(),
+            child.id(),
+            "Grandchild",
+            "grandchild",
+        ))
+        .await
+        .expect("create grandchild");
+    let sibling = harness
+        .manager
+        .create_session(child_request(
+            harness.directory.path(),
+            harness.parent.id(),
+            "Sibling",
+            "sibling",
+        ))
+        .await
+        .expect("create sibling");
+    PlanFamily {
+        harness,
+        child,
+        grandchild,
+        sibling,
+    }
+}
+
+#[tokio::test]
+async fn ancestors_resolve_exact_live_plan_with_actions_feedback_and_dedupe() {
+    let family = plan_family().await;
+    let harness = &family.harness;
+    let grandchild = &family.grandchild;
+    let sibling = &family.sibling;
+    let sdk_id = grandchild.snapshot().metadata.sdk_session_id.clone();
+    let first_response = harness
+        .provider
+        .request_interaction(&sdk_id, plan_request("plan-a"))
+        .await
+        .expect("request first plan");
+    wait_for(grandchild, |snapshot| {
+        snapshot
+            .pending_interactions
+            .iter()
+            .any(|interaction| interaction.id == "plan-a")
+    })
+    .await;
+    let inspected = harness
+        .manager
+        .get_session_for_coordination(harness.parent.id(), grandchild.id())
+        .await
+        .expect("inspect plan");
+    assert_eq!(
+        inspected
+            .pending_plan
+            .as_ref()
+            .map(|plan| plan.interaction_id.as_str()),
+        Some("plan-a")
+    );
+    assert!(
+        harness
+            .manager
+            .respond_to_session_plan(SessionPlanResponseRequest {
+                caller_session_id: sibling.id(),
+                tool_call_id: "sibling-attempt",
+                target_session_id: grandchild.id(),
+                interaction_id: "plan-a",
+                approved: true,
+                feedback: None,
+                selected_action: Some(PlanContinuationAction::Interactive),
+            },)
+            .await
+            .is_err()
+    );
+    assert!(
+        harness
+            .manager
+            .respond_to_session_plan(SessionPlanResponseRequest {
+                caller_session_id: grandchild.id(),
+                tool_call_id: "self-attempt",
+                target_session_id: grandchild.id(),
+                interaction_id: "plan-a",
+                approved: true,
+                feedback: None,
+                selected_action: None,
+            },)
+            .await
+            .is_err()
+    );
+    let submitted = harness
+        .manager
+        .respond_to_session_plan(SessionPlanResponseRequest {
+            caller_session_id: harness.parent.id(),
+            tool_call_id: "approve-plan-a",
+            target_session_id: grandchild.id(),
+            interaction_id: "plan-a",
+            approved: true,
+            feedback: None,
+            selected_action: Some(PlanContinuationAction::Autopilot),
+        })
+        .await
+        .expect("ancestor approves plan");
+    assert_eq!(submitted.status, "submitted");
+    assert_eq!(
+        first_response.await.expect("typed provider response"),
+        app_model::InteractionResponse::Submit {
+            value: json!("autopilot"),
+            freeform: false,
+        }
+    );
+    let retry = harness
+        .manager
+        .respond_to_session_plan(SessionPlanResponseRequest {
+            caller_session_id: harness.parent.id(),
+            tool_call_id: "approve-plan-a",
+            target_session_id: grandchild.id(),
+            interaction_id: "plan-a",
+            approved: false,
+            feedback: Some("changed retry"),
+            selected_action: None,
+        })
+        .await
+        .expect("retry returns prior result");
+    assert_eq!(retry.status, "already_resolved");
+    assert!(retry.approved);
+}
+
+#[tokio::test]
+async fn old_or_unsupported_plan_responses_cannot_resolve_a_newer_plan() {
+    let family = plan_family().await;
+    let harness = &family.harness;
+    let grandchild = &family.grandchild;
+    let sdk_id = grandchild.snapshot().metadata.sdk_session_id.clone();
+    let first_response = harness
+        .provider
+        .request_interaction(&sdk_id, plan_request("plan-a"))
+        .await
+        .expect("request first plan");
+    wait_for(grandchild, |snapshot| {
+        snapshot
+            .pending_interactions
+            .iter()
+            .any(|interaction| interaction.id == "plan-a")
+    })
+    .await;
+    harness
+        .manager
+        .respond_to_session_plan(SessionPlanResponseRequest {
+            caller_session_id: harness.parent.id(),
+            tool_call_id: "approve-plan-a",
+            target_session_id: grandchild.id(),
+            interaction_id: "plan-a",
+            approved: true,
+            feedback: None,
+            selected_action: Some(PlanContinuationAction::Autopilot),
+        })
+        .await
+        .expect("resolve first plan");
+    first_response.await.expect("first response");
+    let second_response = harness
+        .provider
+        .request_interaction(&sdk_id, plan_request("plan-b"))
+        .await
+        .expect("request newer plan");
+    wait_for(grandchild, |snapshot| {
+        snapshot
+            .pending_interactions
+            .iter()
+            .any(|interaction| interaction.id == "plan-b")
+    })
+    .await;
+    assert!(
+        harness
+            .manager
+            .respond_to_session_plan(SessionPlanResponseRequest {
+                caller_session_id: harness.parent.id(),
+                tool_call_id: "stale-unknown-plan",
+                target_session_id: grandchild.id(),
+                interaction_id: "plan-that-was-never-current",
+                approved: true,
+                feedback: None,
+                selected_action: Some(PlanContinuationAction::Interactive),
+            },)
+            .await
+            .is_err()
+    );
+    assert!(
+        harness
+            .manager
+            .respond_to_session_plan(SessionPlanResponseRequest {
+                caller_session_id: harness.parent.id(),
+                tool_call_id: "unsupported-action",
+                target_session_id: grandchild.id(),
+                interaction_id: "plan-b",
+                approved: true,
+                feedback: None,
+                selected_action: Some(PlanContinuationAction::AutopilotFleet),
+            },)
+            .await
+            .is_err()
+    );
+    let stale = harness
+        .manager
+        .respond_to_session_plan(SessionPlanResponseRequest {
+            caller_session_id: harness.parent.id(),
+            tool_call_id: "late-plan-a",
+            target_session_id: grandchild.id(),
+            interaction_id: "plan-a",
+            approved: true,
+            feedback: None,
+            selected_action: Some(PlanContinuationAction::Interactive),
+        })
+        .await
+        .expect("old plan is already resolved");
+    assert_eq!(stale.interaction_id, "plan-a");
+    assert_eq!(stale.status, "already_resolved");
+    assert!(
+        tokio::time::timeout(Duration::from_millis(50), second_response)
+            .await
+            .is_err(),
+        "old approval must not resolve the newer plan"
+    );
+}
+
+#[tokio::test]
+async fn direct_parent_rejection_round_trips_feedback() {
+    let family = plan_family().await;
+    let harness = &family.harness;
+    let child = &family.child;
+    let grandchild = &family.grandchild;
+    let sdk_id = grandchild.snapshot().metadata.sdk_session_id.clone();
+    let second_response = harness
+        .provider
+        .request_interaction(&sdk_id, plan_request("plan-c"))
+        .await
+        .expect("request rejection plan");
+    wait_for(grandchild, |snapshot| {
+        snapshot
+            .pending_interactions
+            .iter()
+            .any(|interaction| interaction.id == "plan-c")
+    })
+    .await;
+    harness
+        .manager
+        .respond_to_session_plan(SessionPlanResponseRequest {
+            caller_session_id: child.id(),
+            tool_call_id: "reject-plan-c",
+            target_session_id: grandchild.id(),
+            interaction_id: "plan-c",
+            approved: false,
+            feedback: Some("Add rollback coverage"),
+            selected_action: None,
+        })
+        .await
+        .expect("direct parent rejects plan");
+    assert_eq!(
+        second_response.await.expect("typed rejection"),
+        app_model::InteractionResponse::Reject {
+            feedback: Some("Add rollback coverage".to_owned())
+        }
+    );
+}
+
+#[tokio::test]
+async fn plan_waiting_notification_is_distinct_and_exactly_once_per_interaction() {
+    let (harness, mut events) = harness(true).await;
+    let mut events = events.take().expect("gateway receiver");
+    let child = harness
+        .manager
+        .create_session(child_request(
+            harness.directory.path(),
+            harness.parent.id(),
+            "Planning child",
+            "planning-child",
+        ))
+        .await
+        .expect("create child");
+    let sdk_id = child.snapshot().metadata.sdk_session_id.clone();
+    let response = harness
+        .provider
+        .request_interaction(&sdk_id, plan_request("plan-notification"))
+        .await
+        .expect("request plan");
+    let received = tokio::time::timeout(Duration::from_secs(5), events.recv())
+        .await
+        .expect("plan event timeout")
+        .expect("plan event");
+    let HostGatewayEvent::PlanWaiting(event) = received else {
+        panic!("expected plan-waiting event");
+    };
+    assert_eq!(event.interaction_id, "plan-notification");
+    assert!(
+        harness
+            .manager
+            .handle_plan_waiting(&event)
+            .await
+            .expect("first notification")
+            .is_some()
+    );
+    assert!(
+        harness
+            .manager
+            .handle_plan_waiting(&event)
+            .await
+            .expect("retry notification")
+            .is_none()
+    );
+    harness
+        .manager
+        .respond_to_session_plan(SessionPlanResponseRequest {
+            caller_session_id: harness.parent.id(),
+            tool_call_id: "approve-notified-plan",
+            target_session_id: child.id(),
+            interaction_id: "plan-notification",
+            approved: true,
+            feedback: None,
+            selected_action: Some(PlanContinuationAction::Autopilot),
+        })
+        .await
+        .expect("resolve notified plan");
+    response.await.expect("provider response");
+    assert!(
+        harness
+            .manager
+            .handle_plan_waiting(&event)
+            .await
+            .expect("delayed retry")
+            .is_none(),
+        "a delayed gateway event must not recreate a resolved notification"
+    );
+    let records = harness
+        .storage
+        .list_coordination_items(harness.parent.id(), 100)
+        .expect("coordination records");
+    assert_eq!(
+        records
+            .iter()
+            .filter(|record| record.kind == CoordinationKind::PlanWaiting)
+            .count(),
+        1
+    );
+    assert!(
+        harness
+            .storage
+            .queue_view(harness.parent.id())
+            .unwrap()
+            .items
+            .is_empty()
+    );
+}
+
+#[tokio::test]
+async fn cancelling_a_plan_retires_parent_queue_work_and_emits_ui_invalidation() {
+    let (harness, mut events) = harness(true).await;
+    let mut events = events.take().expect("gateway receiver");
+    let child = harness
+        .manager
+        .create_session(child_request(
+            harness.directory.path(),
+            harness.parent.id(),
+            "Cancelled planner",
+            "cancelled-planner",
+        ))
+        .await
+        .expect("create child");
+    let sdk_id = child.snapshot().metadata.sdk_session_id.clone();
+    let response = harness
+        .provider
+        .request_interaction(&sdk_id, plan_request("cancelled-plan"))
+        .await
+        .expect("request plan");
+    let HostGatewayEvent::PlanWaiting(waiting) = events.recv().await.expect("plan event") else {
+        panic!("expected plan-waiting event");
+    };
+    harness
+        .manager
+        .handle_plan_waiting(&waiting)
+        .await
+        .expect("persist notification");
+    child.cancel().await.expect("cancel child");
+    assert_eq!(
+        response.await.expect("cancelled provider response"),
+        app_model::InteractionResponse::Cancel
+    );
+    let HostGatewayEvent::PlanInvalidated(invalidated) =
+        events.recv().await.expect("invalidation event")
+    else {
+        panic!("expected plan invalidation");
+    };
+    assert_eq!(invalidated.child_session_id, child.id());
+    assert_eq!(invalidated.interaction_id, "cancelled-plan");
+    harness
+        .manager
+        .handle_plan_invalidated(&invalidated)
+        .await
+        .expect("synchronize parent queue");
+    assert!(
+        harness
+            .manager
+            .handle_plan_waiting(&waiting)
+            .await
+            .expect("delayed plan-waiting event")
+            .is_none(),
+        "the invalidation claim must suppress notification creation races"
+    );
+    assert!(
+        harness
+            .storage
+            .queue_view(harness.parent.id())
+            .unwrap()
+            .items
+            .is_empty()
+    );
+    let audit = harness
+        .storage
+        .list_coordination_items(harness.parent.id(), 10)
+        .unwrap();
+    assert!(audit[0].read_at.is_some());
+}
+
+#[test]
+fn plan_response_dedupe_and_audit_survive_storage_reopen() {
+    let directory = tempfile::tempdir().expect("temporary project");
+    let database = directory.path().join("plan-responses.db");
+    let record = PlanResponseRecord {
+        id: "response-1".to_owned(),
+        caller_session_id: "parent".to_owned(),
+        tool_call_id: "tool-plan".to_owned(),
+        target_session_id: "child".to_owned(),
+        interaction_id: "plan-1".to_owned(),
+        approved: true,
+        feedback: None,
+        selected_action: Some("autopilot".to_owned()),
+        state: PlanResponseState::Submitted,
+        created_at: "1".to_owned(),
+        updated_at: "2".to_owned(),
+        error: None,
+    };
+    {
+        let storage = Storage::open(&database).expect("storage");
+        let parent = root_metadata(directory.path());
+        let mut child = root_metadata(directory.path());
+        child.id = "child".to_owned();
+        child.sdk_session_id = "sdk-child".to_owned();
+        child.parent_session_id = Some(parent.id.clone());
+        child.launch_origin = SessionLaunchOrigin::AgentTool;
+        child.host_tool_call_id = Some("create-child".to_owned());
+        storage.upsert_project(&project(directory.path())).unwrap();
+        storage.upsert_session(&parent).unwrap();
+        storage.upsert_session(&child).unwrap();
+        let (stored, inserted) = storage.create_plan_response(&record).unwrap();
+        assert!(inserted);
+        assert_eq!(stored, record);
+        let (_, inserted) = storage
+            .create_plan_response(&PlanResponseRecord {
+                id: "response-interrupted".to_owned(),
+                tool_call_id: "tool-interrupted".to_owned(),
+                interaction_id: "plan-interrupted".to_owned(),
+                state: PlanResponseState::Submitting,
+                updated_at: "1".to_owned(),
+                ..record.clone()
+            })
+            .unwrap();
+        assert!(inserted);
+    }
+    let storage = Storage::open(&database).expect("reopen storage");
+    assert_eq!(
+        storage
+            .plan_response_for_tool_call("parent", "tool-plan")
+            .unwrap(),
+        Some(record.clone())
+    );
+    let (stored, inserted) = storage
+        .create_plan_response(&PlanResponseRecord {
+            approved: false,
+            feedback: Some("retry must not replace".to_owned()),
+            ..record.clone()
+        })
+        .unwrap();
+    assert!(!inserted);
+    assert_eq!(stored, record);
+    storage
+        .retire_stale_plan_waiting_notifications("restart")
+        .unwrap();
+    let interrupted = storage
+        .plan_response_for_tool_call("parent", "tool-interrupted")
+        .unwrap()
+        .expect("interrupted response audit");
+    assert_eq!(interrupted.state, PlanResponseState::Failed);
+    assert_eq!(
+        interrupted.error.as_deref(),
+        Some("plan response interrupted during restart")
+    );
 }

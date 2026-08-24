@@ -17,7 +17,7 @@ use chrono::DateTime;
 use copilot_provider::{
     CopilotProviderFactory, CreateSessionToolInput, CreateSessionToolResult, HostGatewayEvent,
     HostToolCall, HostToolGateway, HostToolRequest, HostToolResult, NotifyOnIdle,
-    ProviderCompatibility,
+    PlanContinuationAction, PlanInvalidatedEvent, PlanWaitingEvent, ProviderCompatibility,
 };
 use diagnostics::{DiagnosticEvent, DiagnosticsSink, TracingDiagnostics, init_tracing};
 use git_service::GitService;
@@ -32,8 +32,8 @@ use gpui::{
     list, px, relative, rgb, size,
 };
 use session_manager::{
-    ArchiveOutcome, RestoreFailure, RestoreOutcome, SessionHandle, SessionManager, SessionRoots,
-    WorktreeOutcome,
+    ArchiveOutcome, RestoreFailure, RestoreOutcome, SessionHandle, SessionManager,
+    SessionPlanResponseRequest, SessionRoots, WorktreeOutcome,
 };
 use session_orchestrator::{
     LaunchOrigin, LaunchProgress, LaunchRequest, LaunchTitle, SessionOrchestrator,
@@ -973,6 +973,15 @@ enum ServiceUpdate {
     ChildNotificationRead {
         child_session_id: String,
     },
+    PlanApprovalNeeded {
+        parent_session_id: String,
+        child_session_id: String,
+        interaction_id: String,
+    },
+    PlanApprovalResolved {
+        child_session_id: String,
+        interaction_id: String,
+    },
     /// The configured project list changed, with the project to select next.
     ProjectsChanged {
         projects: Vec<ProjectMetadata>,
@@ -1036,6 +1045,14 @@ enum ServiceCommand {
         app_session_id: String,
         interaction_id: String,
         response: InteractionResponse,
+    },
+    RespondToSessionPlan {
+        caller_session_id: String,
+        target_session_id: String,
+        interaction_id: String,
+        approved: bool,
+        feedback: Option<String>,
+        selected_action: Option<PlanContinuationAction>,
     },
     LoadEarlierOutput {
         app_session_id: String,
@@ -1823,6 +1840,31 @@ async fn handle_service_command(
             .respond(interaction_id, response)
             .await
             .map_err(|error| error.to_string())?,
+        ServiceCommand::RespondToSessionPlan {
+            caller_session_id,
+            target_session_id,
+            interaction_id,
+            approved,
+            feedback,
+            selected_action,
+        } => {
+            manager
+                .respond_to_session_plan(SessionPlanResponseRequest {
+                    caller_session_id: &caller_session_id,
+                    tool_call_id: &format!("ui:{interaction_id}"),
+                    target_session_id: &target_session_id,
+                    interaction_id: &interaction_id,
+                    approved,
+                    feedback: feedback.as_deref(),
+                    selected_action,
+                })
+                .await
+                .map_err(|error| error.to_string())?;
+            let _ = updates.send(ServiceUpdate::PlanApprovalResolved {
+                child_session_id: target_session_id,
+                interaction_id,
+            });
+        }
         ServiceCommand::LoadEarlierOutput {
             app_session_id,
             identity,
@@ -1988,6 +2030,25 @@ async fn run_host_tool_gateway(
                         .await
                         .map(HostToolResult::SendSessionMessage)
                         .map_err(|error| error.to_string()),
+                    HostToolCall::RespondToSessionPlan(input) => manager
+                        .respond_to_session_plan(SessionPlanResponseRequest {
+                            caller_session_id: &request.caller_session_id,
+                            tool_call_id: &request.tool_call_id,
+                            target_session_id: &input.session_id,
+                            interaction_id: &input.interaction_id,
+                            approved: input.approved,
+                            feedback: input.feedback.as_deref(),
+                            selected_action: input.selected_action,
+                        })
+                        .await
+                        .map(|result| {
+                            let _ = updates.send(ServiceUpdate::PlanApprovalResolved {
+                                child_session_id: result.target_app_session_id.clone(),
+                                interaction_id: result.interaction_id.clone(),
+                            });
+                            HostToolResult::RespondToSessionPlan(result)
+                        })
+                        .map_err(|error| error.to_string()),
                 };
                 let _ = request.response.send(result);
             }
@@ -2009,8 +2070,58 @@ async fn run_host_tool_gateway(
                     }
                 }
             }
+            HostGatewayEvent::PlanWaiting(event) => {
+                handle_plan_waiting_gateway(manager.as_ref(), &updates, event).await;
+            }
+            HostGatewayEvent::PlanInvalidated(event) => {
+                handle_plan_invalidated_gateway(manager.as_ref(), &updates, event).await;
+            }
         }
     }
+}
+
+async fn handle_plan_waiting_gateway(
+    manager: &SessionManager,
+    updates: &Sender<ServiceUpdate>,
+    event: PlanWaitingEvent,
+) {
+    match manager.handle_plan_waiting(&event).await {
+        Ok(Some(record)) => {
+            let _ = updates.send(ServiceUpdate::PlanApprovalNeeded {
+                parent_session_id: record.recipient_session_id,
+                child_session_id: event.child_session_id,
+                interaction_id: event.interaction_id,
+            });
+        }
+        Ok(None) => {}
+        Err(error) => {
+            tracing::error!(
+                %error,
+                child_session_id = %event.child_session_id,
+                interaction_id = %event.interaction_id,
+                "failed to persist plan-waiting notification"
+            );
+        }
+    }
+}
+
+async fn handle_plan_invalidated_gateway(
+    manager: &SessionManager,
+    updates: &Sender<ServiceUpdate>,
+    event: PlanInvalidatedEvent,
+) {
+    if let Err(error) = manager.handle_plan_invalidated(&event).await {
+        tracing::error!(
+            %error,
+            child_session_id = %event.child_session_id,
+            interaction_id = %event.interaction_id,
+            "failed to synchronize invalidated plan notification"
+        );
+    }
+    let _ = updates.send(ServiceUpdate::PlanApprovalResolved {
+        child_session_id: event.child_session_id,
+        interaction_id: event.interaction_id,
+    });
 }
 
 async fn create_agent_child(
@@ -2353,6 +2464,7 @@ fn session_row_accessible_label(
     depth: usize,
     orphaned: bool,
     unread_status: Option<&str>,
+    needs_plan_approval: bool,
 ) -> String {
     let label = if orphaned {
         format!("Agent-created session {title}, parent unavailable")
@@ -2361,9 +2473,13 @@ fn session_row_accessible_label(
     } else {
         title.to_owned()
     };
-    unread_status.map_or(label.clone(), |status| {
+    let mut label = unread_status.map_or(label.clone(), |status| {
         format!("{label}, unread child {status} notification")
-    })
+    });
+    if needs_plan_approval {
+        label.push_str(", descendant plan needs approval");
+    }
+    label
 }
 
 const fn session_row_margin(depth: usize) -> f32 {
@@ -2823,6 +2939,8 @@ struct SessionMvpView {
     /// Agent-created children with a durable completion notification that has
     /// not been inspected yet.
     unread_children: HashMap<String, String>,
+    /// Live child plan interactions waiting on their direct parent.
+    pending_child_plans: HashMap<String, (String, String)>,
     /// Archived sessions, newest first, offered for unarchiving in settings.
     archived_sessions: Vec<ArchivedSessionRow>,
     /// Startup progress shown before the new session has an id or transcript.
@@ -3118,6 +3236,7 @@ impl SessionMvpView {
             deleting_sessions: HashSet::new(),
             archiving_sessions: HashSet::new(),
             unread_children: HashMap::new(),
+            pending_child_plans: HashMap::new(),
             archived_sessions: Vec::new(),
             session_launch: None,
             action_error: None,
@@ -3912,14 +4031,11 @@ impl SessionMvpView {
                 ServiceUpdate::SessionUnarchived(session) => {
                     self.apply_session_unarchived(session);
                 }
-                ServiceUpdate::ChildNotification {
-                    child_session_id,
-                    status,
-                } => {
-                    self.apply_child_notification(child_session_id, status);
-                }
-                ServiceUpdate::ChildNotificationRead { child_session_id } => {
-                    self.unread_children.remove(&child_session_id);
+                update @ (ServiceUpdate::ChildNotification { .. }
+                | ServiceUpdate::ChildNotificationRead { .. }
+                | ServiceUpdate::PlanApprovalNeeded { .. }
+                | ServiceUpdate::PlanApprovalResolved { .. }) => {
+                    self.apply_coordination_update(update);
                 }
                 ServiceUpdate::PromptAccepted(origin) => {
                     self.apply_prompt_accepted(origin.as_deref(), cx);
@@ -3960,6 +4076,54 @@ impl SessionMvpView {
         self.session_launch = None;
         self.upsert_hydrated_session(handle, cx);
         self.switch_composer_draft(Some(id), cx);
+    }
+
+    fn apply_coordination_update(&mut self, update: ServiceUpdate) {
+        match update {
+            ServiceUpdate::ChildNotification {
+                child_session_id,
+                status,
+            } => self.apply_child_notification(child_session_id, status),
+            ServiceUpdate::ChildNotificationRead { child_session_id } => {
+                self.unread_children.remove(&child_session_id);
+            }
+            ServiceUpdate::PlanApprovalNeeded {
+                parent_session_id,
+                child_session_id,
+                interaction_id,
+            } => {
+                self.apply_plan_approval_needed(
+                    parent_session_id,
+                    child_session_id,
+                    interaction_id,
+                );
+            }
+            ServiceUpdate::PlanApprovalResolved {
+                child_session_id,
+                interaction_id,
+            } => self.apply_plan_approval_resolved(&child_session_id, &interaction_id),
+            _ => unreachable!("only coordination updates are routed here"),
+        }
+    }
+
+    fn apply_plan_approval_needed(
+        &mut self,
+        parent_session_id: String,
+        child_session_id: String,
+        interaction_id: String,
+    ) {
+        self.pending_child_plans
+            .insert(child_session_id, (parent_session_id, interaction_id));
+    }
+
+    fn apply_plan_approval_resolved(&mut self, child_session_id: &str, interaction_id: &str) {
+        if self
+            .pending_child_plans
+            .get(child_session_id)
+            .is_some_and(|(_, pending)| pending == interaction_id)
+        {
+            self.pending_child_plans.remove(child_session_id);
+        }
     }
 
     fn apply_child_notification(&mut self, child_session_id: String, status: String) {
@@ -4630,6 +4794,28 @@ impl SessionMvpView {
         else {
             return;
         };
+        if interaction.kind == InteractionKind::ExitPlanMode {
+            let feedback = (!value.trim().is_empty()).then_some(value);
+            let command =
+                if let Some(caller_session_id) = &session.snapshot.metadata.parent_session_id {
+                    ServiceCommand::RespondToSessionPlan {
+                        caller_session_id: caller_session_id.clone(),
+                        target_session_id: session.id().to_owned(),
+                        interaction_id: interaction.id.clone(),
+                        approved: false,
+                        feedback,
+                        selected_action: None,
+                    }
+                } else {
+                    ServiceCommand::Respond {
+                        app_session_id: session.id().to_owned(),
+                        interaction_id: interaction.id.clone(),
+                        response: InteractionResponse::Reject { feedback },
+                    }
+                };
+            let _ = self.commands.send(command);
+            return;
+        }
         let _ = self.commands.send(ServiceCommand::Respond {
             app_session_id: session.id().to_owned(),
             interaction_id: interaction.id.clone(),
@@ -5056,6 +5242,8 @@ impl SessionMvpView {
         }
         self.session_drafts.remove(id);
         self.unread_children.remove(id);
+        self.pending_child_plans
+            .retain(|child, (parent, _)| child != id && parent != id);
         self.expanded_changes.remove(id);
         self.expanded_tools.remove(id);
         self.auto_expanded_tools.remove(id);
@@ -6398,11 +6586,16 @@ impl SessionMvpView {
                 let accessible_id = id.clone();
                 let label = session.snapshot.metadata.title.clone();
                 let unread_status = self.unread_children.get(&id);
+                let needs_plan_approval = self
+                    .pending_child_plans
+                    .values()
+                    .any(|(parent_session_id, _)| parent_session_id == &id);
                 let accessible_label = session_row_accessible_label(
                     &label,
                     depth,
                     orphaned,
                     unread_status.map(String::as_str),
+                    needs_plan_approval,
                 );
                 let menu_id = id.clone();
                 let menu_label = label.clone();
@@ -6479,6 +6672,19 @@ impl SessionMvpView {
                                 .h(px(8.0))
                                 .rounded_full()
                                 .bg(rgb(BLUE)),
+                        )
+                    })
+                    .when(needs_plan_approval, |row| {
+                        row.child(
+                            div()
+                                .id("descendant-plan-needs-approval")
+                                .debug_selector(|| "descendant-plan-needs-approval".to_owned())
+                                .accessibility_id("descendant-plan-needs-approval")
+                                .role(Role::Status)
+                                .aria_label("Descendant plan needs approval")
+                                .text_xs()
+                                .text_color(rgb(AMBER))
+                                .child("!"),
                         )
                     })
                     .child(if is_deleting {
@@ -11632,16 +11838,22 @@ impl SessionMvpView {
         let interaction_id = interaction.id.clone();
         let reject = interaction_id.clone();
         let cancel_session = app_session_id.clone();
+        let plan_caller_id = session.snapshot.metadata.parent_session_id.clone();
         let choices = interaction
             .choices
             .iter()
             .enumerate()
             .filter(|_| interaction.kind != InteractionKind::Permission)
+            .filter(|(_, choice)| {
+                interaction.kind != InteractionKind::ExitPlanMode
+                    || plan_continuation_action(choice).is_some()
+            })
             .map(|(index, choice)| {
                 let choice = choice.clone();
                 let kind = interaction.kind;
                 let id = interaction_id.clone();
                 let session_id = app_session_id.clone();
+                let plan_caller_id = plan_caller_id.clone();
                 let selector = format!("interaction-choice-{index}");
                 div()
                     .id(("interaction-choice", index))
@@ -11672,11 +11884,25 @@ impl SessionMvpView {
                     .child(div().flex_1().min_w_0().child(choice.clone()))
                     .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                     .on_click(cx.listener(move |view, _, _, _| {
-                        let _ = view.commands.send(ServiceCommand::Respond {
-                            app_session_id: session_id.clone(),
-                            interaction_id: id.clone(),
-                            response: choice_response(kind, &choice),
-                        });
+                        if kind == InteractionKind::ExitPlanMode
+                            && let Some(caller_session_id) = &plan_caller_id
+                            && let Some(selected_action) = plan_continuation_action(&choice)
+                        {
+                            let _ = view.commands.send(ServiceCommand::RespondToSessionPlan {
+                                caller_session_id: caller_session_id.clone(),
+                                target_session_id: session_id.clone(),
+                                interaction_id: id.clone(),
+                                approved: true,
+                                feedback: None,
+                                selected_action: Some(selected_action),
+                            });
+                        } else {
+                            let _ = view.commands.send(ServiceCommand::Respond {
+                                app_session_id: session_id.clone(),
+                                interaction_id: id.clone(),
+                                response: choice_response(kind, &choice),
+                            });
+                        }
                     }))
             });
         let permission_choices = interaction
@@ -11888,20 +12114,62 @@ impl SessionMvpView {
                                         })),
                                 )
                         })
-                        .when(interaction.kind != InteractionKind::Permission, |dialog| {
-                            dialog.child(div().flex().justify_end().child(action_button(
-                                "Cancel",
-                                RED,
-                                cx,
-                                move |view, _| {
-                                    let _ = view.commands.send(ServiceCommand::Respond {
-                                        app_session_id: cancel_session.clone(),
-                                        interaction_id: interaction_id.clone(),
-                                        response: InteractionResponse::Cancel,
-                                    });
-                                },
-                            )))
-                        }),
+                        .when(
+                            interaction.kind == InteractionKind::ExitPlanMode,
+                            |dialog| {
+                                let caller_session_id = plan_caller_id.clone();
+                                let target_session_id = app_session_id.clone();
+                                let interaction_id = interaction_id.clone();
+                                let input = self.interaction_input.clone();
+                                dialog.child(div().flex().justify_end().child(action_button(
+                                    "Request changes",
+                                    RED,
+                                    cx,
+                                    move |view, cx| {
+                                        let value = input.read(cx).value();
+                                        let feedback = (!value.trim().is_empty()).then_some(value);
+                                        let command = if let Some(caller_session_id) =
+                                            &caller_session_id
+                                        {
+                                            ServiceCommand::RespondToSessionPlan {
+                                                caller_session_id: caller_session_id.to_owned(),
+                                                target_session_id: target_session_id.clone(),
+                                                interaction_id: interaction_id.clone(),
+                                                approved: false,
+                                                feedback,
+                                                selected_action: None,
+                                            }
+                                        } else {
+                                            ServiceCommand::Respond {
+                                                app_session_id: target_session_id.clone(),
+                                                interaction_id: interaction_id.clone(),
+                                                response: InteractionResponse::Reject { feedback },
+                                            }
+                                        };
+                                        let _ = view.commands.send(command);
+                                        view.interaction_input.update(cx, TextInput::clear);
+                                    },
+                                )))
+                            },
+                        )
+                        .when(
+                            interaction.kind != InteractionKind::Permission
+                                && interaction.kind != InteractionKind::ExitPlanMode,
+                            |dialog| {
+                                dialog.child(div().flex().justify_end().child(action_button(
+                                    "Cancel",
+                                    RED,
+                                    cx,
+                                    move |view, _| {
+                                        let _ = view.commands.send(ServiceCommand::Respond {
+                                            app_session_id: cancel_session.clone(),
+                                            interaction_id: interaction_id.clone(),
+                                            response: InteractionResponse::Cancel,
+                                        });
+                                    },
+                                )))
+                            },
+                        ),
                 ),
         )
     }
@@ -12879,6 +13147,16 @@ fn choice_response(kind: InteractionKind, choice: &str) -> InteractionResponse {
             value: choice.to_owned().into(),
             freeform: false,
         },
+    }
+}
+
+fn plan_continuation_action(choice: &str) -> Option<PlanContinuationAction> {
+    match choice {
+        "interactive" => Some(PlanContinuationAction::Interactive),
+        "autopilot" => Some(PlanContinuationAction::Autopilot),
+        "autopilot_fleet" => Some(PlanContinuationAction::AutopilotFleet),
+        "exit_only" => Some(PlanContinuationAction::ExitOnly),
+        _ => None,
     }
 }
 
@@ -14288,11 +14566,11 @@ pub(crate) mod tests {
             assert!(cx.debug_bounds("orphan-agent-session-row").is_some());
             assert!(cx.debug_bounds("child-notification-unread").is_some());
             assert_eq!(
-                super::super::session_row_accessible_label("Child", 1, false, None),
+                super::super::session_row_accessible_label("Child", 1, false, None, false),
                 "Agent-created child session Child, level 1"
             );
             assert_eq!(
-                super::super::session_row_accessible_label("Orphan", 0, true, None),
+                super::super::session_row_accessible_label("Orphan", 0, true, None, false),
                 "Agent-created session Orphan, parent unavailable"
             );
         }
@@ -14393,8 +14671,14 @@ pub(crate) mod tests {
 
             assert!(cx.debug_bounds("child-notification-unread").is_some());
             assert!(
-                super::super::session_row_accessible_label("Agent child", 1, false, Some("failed"))
-                    .contains("unread child failed notification")
+                super::super::session_row_accessible_label(
+                    "Agent child",
+                    1,
+                    false,
+                    Some("failed"),
+                    false,
+                )
+                .contains("unread child failed notification")
             );
 
             let child = cx
@@ -15008,6 +15292,108 @@ pub(crate) mod tests {
                 }
                 _ => panic!("expected an interaction response"),
             }
+        }
+
+        #[gpui::test]
+        fn child_plan_controls_and_parent_indicator_are_accessible_without_focus_theft(
+            cx: &mut TestAppContext,
+        ) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                let parent = SessionProjection::for_test(SessionHandle::for_test(snapshot(
+                    "parent",
+                    "Parent session",
+                )));
+                let mut child = child_snapshot("child", "Planning child", "parent");
+                child.add_interaction(interaction(
+                    InteractionKind::ExitPlanMode,
+                    "Plan ready",
+                    "Implement the reviewed architecture.",
+                    &["interactive", "autopilot", "autopilot_fleet", "exit_only"],
+                    true,
+                ));
+                view.sessions = vec![
+                    parent,
+                    SessionProjection::for_test(SessionHandle::for_test(child)),
+                ];
+                view.selected_session = Some("child".to_owned());
+                view.pending_child_plans.insert(
+                    "child".to_owned(),
+                    ("parent".to_owned(), "interaction-1".to_owned()),
+                );
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("interaction-prompt").is_some());
+            assert!(cx.debug_bounds("Request changes").is_some());
+            assert!(cx.debug_bounds("descendant-plan-needs-approval").is_some());
+            assert!(
+                super::super::session_row_accessible_label("Parent session", 0, false, None, true,)
+                    .contains("descendant plan needs approval")
+            );
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected_session.as_deref(), Some("child"));
+            });
+
+            let approve = cx
+                .debug_bounds("interaction-choice-1")
+                .expect("autopilot approval action");
+            cx.simulate_click(approve.center(), Modifiers::none());
+            match commands.try_recv().expect("plan response command") {
+                ServiceCommand::RespondToSessionPlan {
+                    caller_session_id,
+                    target_session_id,
+                    interaction_id,
+                    approved,
+                    feedback,
+                    selected_action,
+                } => {
+                    assert_eq!(caller_session_id, "parent");
+                    assert_eq!(target_session_id, "child");
+                    assert_eq!(interaction_id, "interaction-1");
+                    assert!(approved);
+                    assert_eq!(feedback, None);
+                    assert_eq!(
+                        selected_action,
+                        Some(copilot_provider::PlanContinuationAction::Autopilot)
+                    );
+                }
+                _ => panic!("expected a typed plan response"),
+            }
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected_session.as_deref(), Some("child"));
+            });
+        }
+
+        #[gpui::test]
+        fn root_plan_keeps_a_direct_rejection_path(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.selected_session = Some("session-1".to_owned());
+                Arc::make_mut(&mut view.sessions[0].snapshot).add_interaction(interaction(
+                    InteractionKind::ExitPlanMode,
+                    "Plan ready",
+                    "Implement the root plan.",
+                    &["interactive", "autopilot"],
+                    true,
+                ));
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            let reject = cx
+                .debug_bounds("Request changes")
+                .expect("root plan rejection action");
+            cx.simulate_click(reject.center(), Modifiers::none());
+            assert!(matches!(
+                commands.try_recv().expect("root plan response"),
+                ServiceCommand::Respond {
+                    app_session_id,
+                    interaction_id,
+                    response: InteractionResponse::Reject { feedback: None },
+                } if app_session_id == "session-1" && interaction_id == "interaction-1"
+            ));
         }
 
         /// Regression: long option labels in the user-input dialog ran past the

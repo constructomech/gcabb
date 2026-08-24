@@ -14,7 +14,7 @@ use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 12;
+const SCHEMA_VERSION: i64 = 13;
 /// Gap left between queue positions so an item can be moved between two
 /// neighbours without renumbering the rest of the queue.
 const QUEUE_POSITION_STRIDE: i64 = 1024;
@@ -130,6 +130,7 @@ pub struct ArchivedSession {
 pub enum CoordinationKind {
     Message,
     ChildCompletion,
+    PlanWaiting,
 }
 
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -171,12 +172,46 @@ pub struct CoordinationRecord {
     pub error: Option<String>,
 }
 
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum PlanResponseState {
+    Submitting,
+    Submitted,
+    Failed,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PlanResponseRecord {
+    pub id: String,
+    pub caller_session_id: String,
+    pub tool_call_id: String,
+    pub target_session_id: String,
+    pub interaction_id: String,
+    pub approved: bool,
+    pub feedback: Option<String>,
+    pub selected_action: Option<String>,
+    pub state: PlanResponseState,
+    pub created_at: String,
+    pub updated_at: String,
+    pub error: Option<String>,
+}
+
 macro_rules! coordination_select {
     ($suffix:literal) => {
         concat!(
             "SELECT id, sender_session_id, recipient_session_id, kind, delivery, state, body,
                     queue_item_id, dedupe_id, created_at, updated_at, delivered_at, read_at, error
              FROM coordination_items ",
+            $suffix
+        )
+    };
+}
+
+macro_rules! plan_response_select {
+    ($suffix:literal) => {
+        concat!(
+            "SELECT id, caller_session_id, tool_call_id, target_session_id, interaction_id,
+                    approved, feedback, selected_action, state, created_at, updated_at, error
+             FROM plan_responses ",
             $suffix
         )
     };
@@ -1046,6 +1081,113 @@ impl Storage {
         })
     }
 
+    pub fn plan_response_for_tool_call(
+        &self,
+        caller_session_id: &str,
+        tool_call_id: &str,
+    ) -> Result<Option<PlanResponseRecord>> {
+        self.connection()?
+            .query_row(
+                plan_response_select!("WHERE caller_session_id = ?1 AND tool_call_id = ?2"),
+                params![caller_session_id, tool_call_id],
+                plan_response_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn plan_response_for_interaction(
+        &self,
+        target_session_id: &str,
+        interaction_id: &str,
+    ) -> Result<Option<PlanResponseRecord>> {
+        self.connection()?
+            .query_row(
+                plan_response_select!("WHERE target_session_id = ?1 AND interaction_id = ?2"),
+                params![target_session_id, interaction_id],
+                plan_response_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    /// Claim one live plan interaction for a response.
+    ///
+    /// A repeated caller/tool identity returns its original row. A different
+    /// responder racing for the same target interaction returns the winning row.
+    pub fn create_plan_response(
+        &self,
+        record: &PlanResponseRecord,
+    ) -> Result<(PlanResponseRecord, bool)> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        if let Some(existing) = transaction
+            .query_row(
+                plan_response_select!("WHERE caller_session_id = ?1 AND tool_call_id = ?2"),
+                params![record.caller_session_id, record.tool_call_id],
+                plan_response_from_row,
+            )
+            .optional()?
+        {
+            transaction.commit()?;
+            return Ok((existing, false));
+        }
+        if let Some(existing) = transaction
+            .query_row(
+                plan_response_select!("WHERE target_session_id = ?1 AND interaction_id = ?2"),
+                params![record.target_session_id, record.interaction_id],
+                plan_response_from_row,
+            )
+            .optional()?
+        {
+            transaction.commit()?;
+            return Ok((existing, false));
+        }
+        transaction.execute(
+            "INSERT INTO plan_responses (
+                id, caller_session_id, tool_call_id, target_session_id, interaction_id,
+                approved, feedback, selected_action, state, created_at, updated_at, error
+             ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+            params![
+                record.id,
+                record.caller_session_id,
+                record.tool_call_id,
+                record.target_session_id,
+                record.interaction_id,
+                record.approved,
+                record.feedback,
+                record.selected_action,
+                plan_response_state_to_str(&record.state),
+                record.created_at,
+                record.updated_at,
+                record.error,
+            ],
+        )?;
+        let stored = transaction.query_row(
+            plan_response_select!("WHERE id = ?1"),
+            params![record.id],
+            plan_response_from_row,
+        )?;
+        transaction.commit()?;
+        Ok((stored, true))
+    }
+
+    pub fn set_plan_response_state(
+        &self,
+        id: &str,
+        state: &PlanResponseState,
+        error: Option<&str>,
+        updated_at: &str,
+    ) -> Result<()> {
+        self.connection()?.execute(
+            "UPDATE plan_responses
+             SET state = ?1, error = ?2, updated_at = ?3
+             WHERE id = ?4",
+            params![plan_response_state_to_str(state), error, updated_at, id],
+        )?;
+        Ok(())
+    }
+
     /// Atomically create a coordination ledger row and its optional queue work.
     ///
     /// Retrying the same sender/dedupe identity returns the original row and
@@ -1104,6 +1246,73 @@ impl Storage {
         Ok(stored)
     }
 
+    /// Atomically create a plan-waiting notification only while no responder
+    /// has claimed that exact interaction.
+    pub fn create_plan_waiting_item(
+        &self,
+        record: &CoordinationRecord,
+        queue_item: &QueueItem,
+        interaction_id: &str,
+    ) -> Result<Option<CoordinationRecord>> {
+        if record.kind != CoordinationKind::PlanWaiting
+            || queue_item.session_id != record.recipient_session_id
+            || record.queue_item_id.as_deref() != Some(queue_item.id.as_str())
+        {
+            return Err(StorageError::CoordinationQueueMismatch);
+        }
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let response_exists = transaction
+            .query_row(
+                "SELECT 1 FROM plan_responses
+                 WHERE target_session_id = ?1 AND interaction_id = ?2",
+                params![record.sender_session_id, interaction_id],
+                |_| Ok(()),
+            )
+            .optional()?
+            .is_some();
+        if response_exists {
+            transaction.commit()?;
+            return Ok(None);
+        }
+        let inserted = transaction.execute(
+            "INSERT INTO coordination_items (
+                id, sender_session_id, recipient_session_id, kind, delivery, state, body,
+                queue_item_id, dedupe_id, created_at, updated_at, delivered_at, read_at, error
+             ) VALUES (
+                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14
+             )
+             ON CONFLICT(sender_session_id, dedupe_id) DO NOTHING",
+            params![
+                record.id,
+                record.sender_session_id,
+                record.recipient_session_id,
+                coordination_kind_to_str(&record.kind),
+                coordination_delivery_to_str(&record.delivery),
+                coordination_state_to_str(&record.state),
+                record.body,
+                record.queue_item_id,
+                record.dedupe_id,
+                record.created_at,
+                record.updated_at,
+                record.delivered_at,
+                record.read_at,
+                record.error,
+            ],
+        )?;
+        if inserted > 0 {
+            insert_queue_item(&transaction, queue_item)?;
+            synchronize_coordination_for_queue(&transaction, queue_item)?;
+        }
+        let stored = transaction.query_row(
+            coordination_select!("WHERE sender_session_id = ?1 AND dedupe_id = ?2"),
+            params![record.sender_session_id, record.dedupe_id],
+            coordination_from_row,
+        )?;
+        transaction.commit()?;
+        Ok(Some(stored))
+    }
+
     /// List recipient ledger rows in stable creation order.
     pub fn list_coordination_items(
         &self,
@@ -1132,6 +1341,29 @@ impl Storage {
         let mut statement = connection.prepare(coordination_select!(
             "WHERE recipient_session_id = ?1
                AND kind = 'child_completion'
+               AND read_at IS NULL
+             ORDER BY created_at, id LIMIT ?2"
+        ))?;
+        let bounded_limit =
+            i64::try_from(limit.min(MAX_COORDINATION_LIST_LIMIT)).unwrap_or(i64::MAX);
+        let rows = statement.query_map(
+            params![recipient_session_id, bounded_limit],
+            coordination_from_row,
+        )?;
+        rows.collect::<rusqlite::Result<Vec<_>>>()
+            .map_err(Into::into)
+    }
+
+    /// List unresolved plan approvals without other coordination rows consuming the bound.
+    pub fn list_unread_plan_waiting_items(
+        &self,
+        recipient_session_id: &str,
+        limit: usize,
+    ) -> Result<Vec<CoordinationRecord>> {
+        let connection = self.connection()?;
+        let mut statement = connection.prepare(coordination_select!(
+            "WHERE recipient_session_id = ?1
+               AND kind = 'plan_waiting'
                AND read_at IS NULL
              ORDER BY created_at, id LIMIT ?2"
         ))?;
@@ -1208,6 +1440,101 @@ impl Storage {
                 params![read_at, recipient_session_id, child_session_id],
             )
             .map_err(Into::into)
+    }
+
+    pub fn mark_plan_waiting_notification_read(
+        &self,
+        child_session_id: &str,
+        interaction_id: &str,
+        read_at: &str,
+    ) -> Result<Option<String>> {
+        let dedupe_id = format!("plan-waiting:{interaction_id}");
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        let notification = transaction
+            .query_row(
+                "SELECT recipient_session_id, queue_item_id
+                 FROM coordination_items
+                 WHERE sender_session_id = ?1
+                   AND kind = 'plan_waiting'
+                   AND dedupe_id = ?2",
+                params![child_session_id, dedupe_id],
+                |row| Ok((row.get::<_, String>(0)?, row.get::<_, Option<String>>(1)?)),
+            )
+            .optional()?;
+        let Some((recipient_session_id, queue_item_id)) = notification else {
+            transaction.commit()?;
+            return Ok(None);
+        };
+        transaction.execute(
+            "UPDATE coordination_items
+             SET read_at = ?1, updated_at = ?1
+             WHERE sender_session_id = ?2
+               AND kind = 'plan_waiting'
+               AND dedupe_id = ?3
+               AND read_at IS NULL",
+            params![read_at, child_session_id, dedupe_id],
+        )?;
+        if let Some(queue_item_id) = queue_item_id {
+            transaction.execute(
+                "UPDATE coordination_items
+                 SET state = 'failed',
+                     error = 'plan resolved before notification delivery',
+                     queue_item_id = NULL,
+                     updated_at = ?1
+                 WHERE sender_session_id = ?2
+                   AND kind = 'plan_waiting'
+                   AND dedupe_id = ?3
+                   AND EXISTS (
+                       SELECT 1 FROM queue_items
+                       WHERE id = ?4 AND state = 'pending'
+                   )",
+                params![read_at, child_session_id, dedupe_id, queue_item_id],
+            )?;
+            transaction.execute(
+                "DELETE FROM queue_items WHERE id = ?1 AND state = 'pending'",
+                params![queue_item_id],
+            )?;
+        }
+        transaction.commit()?;
+        Ok(Some(recipient_session_id))
+    }
+
+    /// Retire live-only plan notifications before restored runtimes can drain
+    /// their queues. The coordination rows remain as audit history.
+    pub fn retire_stale_plan_waiting_notifications(&self, retired_at: &str) -> Result<usize> {
+        let mut connection = self.connection()?;
+        let transaction = connection.transaction()?;
+        transaction.execute(
+            "DELETE FROM queue_items
+             WHERE state = 'pending'
+               AND id IN (
+                   SELECT queue_item_id
+                   FROM coordination_items
+                   WHERE kind = 'plan_waiting' AND read_at IS NULL
+               )",
+            [],
+        )?;
+        let retired = transaction.execute(
+            "UPDATE coordination_items
+             SET state = 'failed',
+                 error = 'plan interaction expired during restart',
+                 queue_item_id = NULL,
+                 read_at = ?1,
+                 updated_at = ?1
+             WHERE kind = 'plan_waiting' AND read_at IS NULL",
+            params![retired_at],
+        )?;
+        transaction.execute(
+            "UPDATE plan_responses
+             SET state = 'failed',
+                 error = 'plan response interrupted during restart',
+                 updated_at = ?1
+             WHERE state = 'submitting'",
+            params![retired_at],
+        )?;
+        transaction.commit()?;
+        Ok(retired)
     }
 
     /// Read the durable queue for a session, ordered by position.
@@ -1585,6 +1912,26 @@ impl Storage {
              CREATE INDEX IF NOT EXISTS coordination_items_recipient_unread
                 ON coordination_items(recipient_session_id, created_at, id)
                 WHERE read_at IS NULL;
+             CREATE TABLE IF NOT EXISTS plan_responses (
+                id TEXT PRIMARY KEY,
+                caller_session_id TEXT NOT NULL
+                   REFERENCES app_sessions(id) ON DELETE CASCADE,
+                tool_call_id TEXT NOT NULL,
+                target_session_id TEXT NOT NULL
+                   REFERENCES app_sessions(id) ON DELETE CASCADE,
+                interaction_id TEXT NOT NULL,
+                approved INTEGER NOT NULL,
+                feedback TEXT,
+                selected_action TEXT,
+                state TEXT NOT NULL,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                error TEXT,
+                UNIQUE(caller_session_id, tool_call_id),
+                UNIQUE(target_session_id, interaction_id)
+             );
+             CREATE INDEX IF NOT EXISTS plan_responses_target
+                ON plan_responses(target_session_id, created_at);
              CREATE TABLE IF NOT EXISTS queue_state (
                 session_id TEXT PRIMARY KEY REFERENCES app_sessions(id) ON DELETE CASCADE,
                 paused INTEGER NOT NULL DEFAULT 0
@@ -1815,13 +2162,31 @@ const fn coordination_kind_to_str(kind: &CoordinationKind) -> &'static str {
     match kind {
         CoordinationKind::Message => "message",
         CoordinationKind::ChildCompletion => "child_completion",
+        CoordinationKind::PlanWaiting => "plan_waiting",
     }
 }
 
 fn coordination_kind_from_str(value: &str) -> CoordinationKind {
     match value {
         "child_completion" => CoordinationKind::ChildCompletion,
+        "plan_waiting" => CoordinationKind::PlanWaiting,
         _ => CoordinationKind::Message,
+    }
+}
+
+const fn plan_response_state_to_str(state: &PlanResponseState) -> &'static str {
+    match state {
+        PlanResponseState::Submitting => "submitting",
+        PlanResponseState::Submitted => "submitted",
+        PlanResponseState::Failed => "failed",
+    }
+}
+
+fn plan_response_state_from_str(value: &str) -> PlanResponseState {
+    match value {
+        "submitted" => PlanResponseState::Submitted,
+        "failed" => PlanResponseState::Failed,
+        _ => PlanResponseState::Submitting,
     }
 }
 
@@ -1873,6 +2238,23 @@ fn coordination_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<Coordinati
         delivered_at: row.get(11)?,
         read_at: row.get(12)?,
         error: row.get(13)?,
+    })
+}
+
+fn plan_response_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<PlanResponseRecord> {
+    Ok(PlanResponseRecord {
+        id: row.get(0)?,
+        caller_session_id: row.get(1)?,
+        tool_call_id: row.get(2)?,
+        target_session_id: row.get(3)?,
+        interaction_id: row.get(4)?,
+        approved: row.get(5)?,
+        feedback: row.get(6)?,
+        selected_action: row.get(7)?,
+        state: plan_response_state_from_str(&row.get::<_, String>(8)?),
+        created_at: row.get(9)?,
+        updated_at: row.get(10)?,
+        error: row.get(11)?,
     })
 }
 
@@ -3523,7 +3905,7 @@ mod tests {
                 storage.create_coordination_item(&expected, None).unwrap(),
                 expected
             );
-            assert_eq!(storage.schema_version().unwrap(), 12);
+            assert_eq!(storage.schema_version().unwrap(), 13);
 
             let connection = storage.connection().unwrap();
             let foreign_keys: HashSet<String> = connection
@@ -3562,6 +3944,57 @@ mod tests {
                 .list_coordination_items(&root.id, 10)
                 .unwrap()
                 .is_empty()
+        );
+    }
+
+    #[test]
+    fn restart_retires_unanswerable_plan_notifications_without_losing_audit() {
+        let directory = tempfile::tempdir().unwrap();
+        let database = directory.path().join("plan-restart.db");
+        {
+            let storage = Storage::open(&database).unwrap();
+            let parent = distinct_root("parent", "/tmp/project");
+            let mut child = child_metadata(&parent, 1);
+            child.id = "child".to_owned();
+            child.sdk_session_id = "sdk-child".to_owned();
+            storage.upsert_session(&parent).unwrap();
+            storage.upsert_session(&child).unwrap();
+            let mut queued = queue_item("plan-queue", 1024);
+            queued.session_id = parent.id.clone();
+            let mut record = coordination_record(
+                "plan-waiting",
+                &child.id,
+                &parent.id,
+                CoordinationKind::PlanWaiting,
+                Some(&queued.id),
+            );
+            record.dedupe_id = "plan-waiting:interaction-1".to_owned();
+            storage
+                .create_plan_waiting_item(&record, &queued, "interaction-1")
+                .unwrap()
+                .expect("create notification");
+        }
+
+        let storage = Storage::open(&database).unwrap();
+        assert_eq!(
+            storage
+                .retire_stale_plan_waiting_notifications("restart")
+                .unwrap(),
+            1
+        );
+        assert!(storage.queue_view("parent").unwrap().items.is_empty());
+        let audit = storage.list_coordination_items("parent", 10).unwrap();
+        assert_eq!(audit.len(), 1);
+        assert_eq!(audit[0].read_at.as_deref(), Some("restart"));
+        assert_eq!(
+            audit[0].error.as_deref(),
+            Some("plan interaction expired during restart")
+        );
+        assert_eq!(
+            storage
+                .retire_stale_plan_waiting_notifications("restart-again")
+                .unwrap(),
+            0
         );
     }
 
