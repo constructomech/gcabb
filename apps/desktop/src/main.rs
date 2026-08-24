@@ -3853,21 +3853,19 @@ impl SessionMvpView {
                     automations,
                     automation_runs,
                 } => {
-                    self.startup = StartupState::Ready(compatibility);
-                    self.projects = projects;
-                    self.automations_panel.automations = automations;
-                    self.automations_panel.runs = automation_runs;
-                    self.apply_restore_failures(failures);
-                    self.request_agent_discovery();
+                    self.apply_ready(
+                        compatibility,
+                        projects,
+                        failures,
+                        automations,
+                        automation_runs,
+                    );
                 }
                 ServiceUpdate::SessionHydrated(handle) => {
                     self.upsert_hydrated_session(handle, cx);
                 }
                 ServiceUpdate::SessionAdded(handle) => {
-                    let id = handle.id().to_owned();
-                    self.session_launch = None;
-                    self.upsert_hydrated_session(handle, cx);
-                    self.switch_composer_draft(Some(id), cx);
+                    self.apply_session_added(handle, cx);
                 }
                 ServiceUpdate::SessionsDiscovered(handles) => {
                     for handle in handles {
@@ -3883,9 +3881,7 @@ impl SessionMvpView {
                 ServiceUpdate::AutomationsChanged(automations) => {
                     self.apply_automations_changed(automations, cx);
                 }
-                ServiceUpdate::AutomationRunsChanged(runs) => {
-                    self.automations_panel.runs = runs;
-                }
+                ServiceUpdate::AutomationRunsChanged(runs) => self.automations_panel.runs = runs,
                 ServiceUpdate::SessionLaunchProgress(progress) => {
                     self.session_launch = Some(progress);
                 }
@@ -3943,6 +3939,29 @@ impl SessionMvpView {
         changed
     }
 
+    fn apply_ready(
+        &mut self,
+        compatibility: ProviderCompatibility,
+        projects: Vec<ProjectMetadata>,
+        failures: Vec<RestoreFailure>,
+        automations: Vec<Automation>,
+        automation_runs: Vec<AutomationRun>,
+    ) {
+        self.startup = StartupState::Ready(compatibility);
+        self.projects = projects;
+        self.automations_panel.automations = automations;
+        self.automations_panel.runs = automation_runs;
+        self.apply_restore_failures(failures);
+        self.request_agent_discovery();
+    }
+
+    fn apply_session_added(&mut self, handle: SessionHandle, cx: &mut Context<Self>) {
+        let id = handle.id().to_owned();
+        self.session_launch = None;
+        self.upsert_hydrated_session(handle, cx);
+        self.switch_composer_draft(Some(id), cx);
+    }
+
     fn apply_child_notification(&mut self, child_session_id: String, status: String) {
         self.unread_children
             .insert(child_session_id.clone(), status);
@@ -3963,17 +3982,6 @@ impl SessionMvpView {
                 parent_session_id,
                 child_session_id,
             });
-    }
-
-    fn apply_prompt_accepted(&mut self, origin: Option<&str>, cx: &mut Context<Self>) {
-        if let Some(id) = origin {
-            self.session_drafts.remove(id);
-        } else {
-            self.home_draft.clear();
-        }
-        if self.selected_session.as_deref() == origin {
-            self.composer.update(cx, TextInput::clear);
-        }
     }
 
     fn apply_bootstrap(&mut self, bootstrap: BootstrapState) {
