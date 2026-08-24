@@ -128,6 +128,15 @@ impl CompletionMenu {
     }
 }
 
+fn completion_matches_content(content: &str, menu: &CompletionMenu) -> bool {
+    let Some(item) = menu.selected_item() else {
+        return false;
+    };
+    content
+        .get(menu.range.clone())
+        .is_some_and(|text| text == item.replacement.as_ref())
+}
+
 pub struct TextInput {
     accessibility_id: SharedString,
     focus_handle: FocusHandle,
@@ -315,6 +324,13 @@ impl TextInput {
         selected.is_some_and(|index| self.accept_completion(index, window, cx))
     }
 
+    fn selected_completion_matches_content(&self) -> bool {
+        let Some(menu) = self.completions.as_ref() else {
+            return false;
+        };
+        completion_matches_content(self.content.as_ref(), menu)
+    }
+
     /// Move the highlight by `delta`, wrapping at both ends.
     ///
     /// Returns whether a menu was open to move through, so caret movement can
@@ -424,8 +440,11 @@ impl TextInput {
 
     fn submit(&mut self, _: &Submit, window: &mut Window, cx: &mut Context<Self>) {
         // A half-typed command is not a message, so an open menu takes the key
-        // and finishes the word instead.
-        if self.accept_selected_completion(window, cx) {
+        // and finishes the word instead. An exact completion is already ready
+        // to run, so Enter closes the menu and submits it in the same keypress.
+        if self.selected_completion_matches_content() {
+            self.clear_completions(cx);
+        } else if self.accept_selected_completion(window, cx) {
             return;
         }
         let text = self.content.trim().to_owned();
@@ -435,7 +454,9 @@ impl TextInput {
     }
 
     fn submit_queued(&mut self, _: &SubmitQueued, window: &mut Window, cx: &mut Context<Self>) {
-        if self.accept_selected_completion(window, cx) {
+        if self.selected_completion_matches_content() {
+            self.clear_completions(cx);
+        } else if self.accept_selected_completion(window, cx) {
             return;
         }
         let text = self.content.trim().to_owned();
@@ -1116,7 +1137,10 @@ pub fn bind_text_input_keys(cx: &mut App) {
 
 #[cfg(test)]
 mod tests {
-    use super::{line_range, offset_from_utf16, word_range};
+    use super::{
+        CompletionItem, CompletionMenu, SharedString, completion_matches_content, line_range,
+        offset_from_utf16, word_range,
+    };
 
     #[test]
     fn word_selection_uses_unicode_boundaries() {
@@ -1135,5 +1159,23 @@ mod tests {
     #[test]
     fn composition_offsets_convert_from_utf16() {
         assert_eq!(offset_from_utf16("a😀b", 3), 5);
+    }
+
+    #[test]
+    fn exact_completion_is_ready_to_submit() {
+        let menu = CompletionMenu {
+            range: 0..5,
+            items: vec![CompletionItem {
+                id: SharedString::from("fork"),
+                label: SharedString::from("/fork"),
+                detail: SharedString::from("Fork session"),
+                replacement: SharedString::from("/fork"),
+                enabled: true,
+            }],
+            selected: 0,
+        };
+
+        assert!(completion_matches_content("/fork", &menu));
+        assert!(!completion_matches_content("/for", &menu));
     }
 }

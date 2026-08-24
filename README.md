@@ -26,6 +26,8 @@ activity, commands, and changes visible as they happen.
 - Discover repository and user agents, skills, and instructions for each workspace.
 - Save app-open automations with natural-language schedules, optional conditions, and run history.
 - Use complete agent rosters for delegated subagent work.
+- Let an agent launch a child session in another local repository already
+  registered in GCABB, with its own managed worktree and runtime.
 - Inspect committed, staged, unstaged, and untracked changes.
 - Follow commands and output in session terminals.
 - Restore your selected session after restarting GCABB.
@@ -73,6 +75,22 @@ source snapshot, or other state GCABB cannot reproduce exactly causes the fork
 to fail before it is exposed. Untracked executable bits are preserved on Unix;
 untracked symlinks are deliberately unsupported on platforms where they cannot
 be recreated safely.
+
+### Local cross-project child sessions
+
+An agent may discover GCABB's registered projects and choose one as the target
+for a child session. Omitting the target keeps the child in the parent's
+project. A cross-project child is still linked beneath its parent for
+coordination and optional recursive lifecycle actions, but it runs in a managed
+worktree and isolated Copilot runtime derived from the target repository's
+registered configuration.
+
+The host binds the calling session identity and resolves project identifiers at
+execution time. Models cannot provide repository roots, worktree roots, clone
+URLs, or arbitrary filesystem paths. Removed, missing, folder-only, and
+non-repository projects are rejected without deleting session history. Cloud
+provisioning, repository cloning, arbitrary-path launches, and cross-repository
+forks are not supported.
 
 ## Install
 

@@ -1571,7 +1571,9 @@ impl AppService {
                             }
                         }
                         ServiceCommand::RemoveProject { project_id } => {
-                            if let Err(error) = manager.remove_project(&project_id) {
+                            if let Err(error) =
+                                runtime.block_on(manager.remove_project(&project_id))
+                            {
                                 let _ =
                                     update_tx.send(ServiceUpdate::ActionFailed(error.to_string()));
                             } else {
@@ -2101,6 +2103,10 @@ async fn run_host_tool_gateway(
         match request {
             HostGatewayEvent::Tool(request) => {
                 let result = match &request.call {
+                    HostToolCall::ListProjects => manager
+                        .list_projects_for_tool(&request.caller_session_id)
+                        .map(HostToolResult::ListProjects)
+                        .map_err(|error| error.to_string()),
                     HostToolCall::CreateSession(input) => create_agent_child(
                         manager.as_ref(),
                         &orchestrator,
@@ -2357,11 +2363,8 @@ async fn agent_child_launch_request(
         return Err("create_session is only available to project sessions".to_owned());
     }
     let project = manager
-        .projects()
-        .map_err(|error| error.to_string())?
-        .into_iter()
-        .find(|project| project.path == parent.project_key())
-        .ok_or_else(|| "calling session does not belong to a registered project".to_owned())?;
+        .resolve_target_project(input.project_id.as_deref(), &request.caller_session_id)
+        .map_err(|error| error.to_string())?;
     let repository = PathBuf::from(&project.path);
     if !repository.is_dir() || !GitService::new(&repository).is_worktree() {
         return Err("calling session's registered repository is unavailable".to_owned());
@@ -2411,7 +2414,11 @@ async fn agent_child_launch_request(
             .context_tier
             .clone()
             .or_else(|| controls.context_tier.clone()),
-        base_ref: parent.base_ref.clone().or(project.default_branch),
+        base_ref: if project.path == parent.project_key() {
+            parent.base_ref.clone().or(project.default_branch)
+        } else {
+            project.default_branch
+        },
         title,
         origin: LaunchOrigin::Headless,
         parent_session_id: Some(parent.id),
@@ -2500,38 +2507,53 @@ struct SessionProjection {
     running_since: Option<Instant>,
 }
 
-type SessionTreeRow = (usize, usize, bool, bool);
+#[derive(Clone, Copy)]
+struct SessionTreeRow {
+    index: usize,
+    depth: usize,
+    orphaned: bool,
+    has_children: bool,
+    cross_project: bool,
+}
 
 struct SessionTreeTraversal {
     visited: HashSet<String>,
     ordered: Vec<SessionTreeRow>,
 }
 
-fn append_project_children(
+fn append_session_children(
     sessions: &[SessionProjection],
-    project_indices: &[usize],
     parent_ids: &HashMap<String, String>,
     parent_set: &HashSet<String>,
     parent: &str,
+    parent_project: &str,
     depth: usize,
     traversal: &mut SessionTreeTraversal,
 ) {
-    for index in project_indices {
-        let id = sessions[*index].id();
+    for (index, session) in sessions.iter().enumerate() {
+        if session.snapshot.metadata.is_chat() {
+            continue;
+        }
+        let id = session.id();
         if parent_ids
             .get(id)
             .is_some_and(|candidate| candidate == parent)
             && traversal.visited.insert(id.to_owned())
         {
-            traversal
-                .ordered
-                .push((*index, depth, false, parent_set.contains(id)));
-            append_project_children(
+            let project = session.snapshot.metadata.project_key();
+            traversal.ordered.push(SessionTreeRow {
+                index,
+                depth,
+                orphaned: false,
+                has_children: parent_set.contains(id),
+                cross_project: project != parent_project,
+            });
+            append_session_children(
                 sessions,
-                project_indices,
                 parent_ids,
                 parent_set,
                 id,
+                project,
                 depth + 1,
                 traversal,
             );
@@ -2543,20 +2565,22 @@ fn ordered_project_sessions(
     sessions: &[SessionProjection],
     project_key: &str,
 ) -> Vec<SessionTreeRow> {
-    let project_indices = sessions
+    let active_indices = sessions
         .iter()
         .enumerate()
-        .filter(|(_, session)| {
-            !session.snapshot.metadata.is_chat()
-                && session.snapshot.metadata.project_key() == project_key
-        })
+        .filter(|(_, session)| !session.snapshot.metadata.is_chat())
         .map(|(index, _)| index)
         .collect::<Vec<_>>();
-    let active_ids = project_indices
+    let project_indices = active_indices
+        .iter()
+        .copied()
+        .filter(|index| sessions[*index].snapshot.metadata.project_key() == project_key)
+        .collect::<Vec<_>>();
+    let active_ids = active_indices
         .iter()
         .map(|index| sessions[*index].id().to_owned())
         .collect::<HashSet<_>>();
-    let parent_ids = project_indices
+    let parent_ids = active_indices
         .iter()
         .filter_map(|index| {
             sessions[*index]
@@ -2571,24 +2595,58 @@ fn ordered_project_sessions(
     let parent_set = parent_ids.values().cloned().collect::<HashSet<_>>();
     let mut traversal = SessionTreeTraversal {
         visited: HashSet::new(),
-        ordered: Vec::with_capacity(project_indices.len()),
+        ordered: Vec::with_capacity(active_indices.len()),
     };
 
     for index in &project_indices {
         let metadata = &sessions[*index].snapshot.metadata;
-        if parent_ids.contains_key(&metadata.id) || !traversal.visited.insert(metadata.id.clone()) {
+        let has_project_ancestor = {
+            let mut ancestor = parent_ids.get(&metadata.id);
+            let mut seen = HashSet::new();
+            let mut found = false;
+            while let Some(ancestor_id) = ancestor {
+                if !seen.insert(ancestor_id.as_str()) {
+                    break;
+                }
+                let Some(ancestor_session) =
+                    sessions.iter().find(|session| session.id() == ancestor_id)
+                else {
+                    break;
+                };
+                if ancestor_session.snapshot.metadata.project_key() == project_key {
+                    found = true;
+                    break;
+                }
+                ancestor = parent_ids.get(ancestor_id);
+            }
+            found
+        };
+        if has_project_ancestor || !traversal.visited.insert(metadata.id.clone()) {
             continue;
         }
-        let orphaned = metadata.parent_session_id.is_some();
-        traversal
-            .ordered
-            .push((*index, 0, orphaned, parent_set.contains(&metadata.id)));
-        append_project_children(
+        let orphaned =
+            metadata.parent_session_id.is_some() && !parent_ids.contains_key(&metadata.id);
+        let cross_project = parent_ids.get(&metadata.id).is_some_and(|parent_id| {
+            sessions
+                .iter()
+                .find(|session| session.id() == parent_id)
+                .is_some_and(|parent| {
+                    parent.snapshot.metadata.project_key() != metadata.project_key()
+                })
+        });
+        traversal.ordered.push(SessionTreeRow {
+            index: *index,
+            depth: 0,
+            orphaned,
+            has_children: parent_set.contains(&metadata.id),
+            cross_project,
+        });
+        append_session_children(
             sessions,
-            &project_indices,
             &parent_ids,
             &parent_set,
             &metadata.id,
+            metadata.project_key(),
             1,
             &mut traversal,
         );
@@ -2596,39 +2654,73 @@ fn ordered_project_sessions(
     for index in project_indices {
         let metadata = &sessions[index].snapshot.metadata;
         if traversal.visited.insert(metadata.id.clone()) {
-            traversal
-                .ordered
-                .push((index, 0, metadata.parent_session_id.is_some(), false));
+            traversal.ordered.push(SessionTreeRow {
+                index,
+                depth: 0,
+                orphaned: metadata.parent_session_id.is_some(),
+                has_children: false,
+                cross_project: false,
+            });
         }
     }
     traversal.ordered
 }
 
-fn session_row_accessible_label(
-    title: &str,
+#[derive(Clone, Copy)]
+enum CrossProjectRelation {
+    Target,
+    Parent,
+}
+
+fn project_navigation_label(projects: &[ProjectMetadata], project_key: &str) -> String {
+    projects
+        .iter()
+        .find(|project| project.path == project_key)
+        .map(|project| project.name.clone())
+        .or_else(|| {
+            Path::new(project_key)
+                .file_name()
+                .and_then(|name| name.to_str())
+                .map(ToOwned::to_owned)
+        })
+        .unwrap_or_else(|| "Unavailable project".to_owned())
+}
+
+#[derive(Clone, Copy, Default)]
+struct SessionRowAccessibility<'a> {
     depth: usize,
     orphaned: bool,
-    unread_status: Option<&str>,
+    unread_status: Option<&'a str>,
     needs_plan_approval: bool,
-    forked_from_title: Option<&str>,
+    forked_from_title: Option<&'a str>,
     forking: bool,
-) -> String {
-    let label = if let Some(source) = forked_from_title {
+    cross_project: Option<(CrossProjectRelation, &'a str)>,
+}
+
+fn session_row_accessible_label(title: &str, row: SessionRowAccessibility<'_>) -> String {
+    let label = if let Some(source) = row.forked_from_title {
         format!("Forked session {title}, from {source}")
-    } else if orphaned {
+    } else if row.orphaned {
         format!("Agent-created session {title}, parent unavailable")
-    } else if depth > 0 {
-        format!("Agent-created child session {title}, level {depth}")
+    } else if let Some((CrossProjectRelation::Target, project)) = row.cross_project {
+        format!(
+            "Agent-created child session {title}, level {}, target project {project}",
+            row.depth
+        )
+    } else if let Some((CrossProjectRelation::Parent, project)) = row.cross_project {
+        format!("Agent-created session {title}, parent in project {project}")
+    } else if row.depth > 0 {
+        format!("Agent-created child session {title}, level {}", row.depth)
     } else {
         title.to_owned()
     };
-    let mut label = unread_status.map_or(label.clone(), |status| {
+    let mut label = row.unread_status.map_or(label.clone(), |status| {
         format!("{label}, unread child {status} notification")
     });
-    if needs_plan_approval {
+    if row.needs_plan_approval {
         label.push_str(", descendant plan needs approval");
     }
-    if forking {
+    if row.forking {
         label.push_str(", forking");
     }
     label
@@ -7331,11 +7423,54 @@ impl SessionMvpView {
         let selected_path = self.selected_project.to_string_lossy();
         let sessions = ordered_project_sessions(&self.sessions, &selected_path)
             .into_iter()
-            .map(|(index, depth, orphaned, has_children)| {
+            .map(|row| {
+                let SessionTreeRow {
+                    index,
+                    depth,
+                    orphaned,
+                    has_children,
+                    cross_project,
+                } = row;
                 let session = &self.sessions[index];
                 let id = session.id().to_owned();
                 let accessible_id = id.clone();
                 let label = session.snapshot.metadata.title.clone();
+                let cross_project_label = cross_project.then(|| {
+                    if depth > 0 {
+                        (
+                            CrossProjectRelation::Target,
+                            project_navigation_label(
+                                &self.projects,
+                                session.snapshot.metadata.project_key(),
+                            ),
+                        )
+                    } else {
+                        let parent_project = session
+                            .snapshot
+                            .metadata
+                            .parent_session_id
+                            .as_deref()
+                            .and_then(|parent_id| {
+                                self.sessions
+                                    .iter()
+                                    .find(|candidate| candidate.id() == parent_id)
+                            })
+                            .map_or("Unavailable project", |parent| {
+                                parent.snapshot.metadata.project_key()
+                            });
+                        (
+                            CrossProjectRelation::Parent,
+                            project_navigation_label(&self.projects, parent_project),
+                        )
+                    }
+                });
+                let cross_project_badge =
+                    cross_project_label
+                        .as_ref()
+                        .map(|(relation, project)| match relation {
+                            CrossProjectRelation::Target => format!("Project: {project}"),
+                            CrossProjectRelation::Parent => format!("Parent: {project}"),
+                        });
                 let unread_status = self.unread_children.get(&id);
                 let needs_plan_approval = self
                     .pending_child_plans
@@ -7357,12 +7492,17 @@ impl SessionMvpView {
                     });
                 let accessible_label = session_row_accessible_label(
                     &label,
-                    depth,
-                    orphaned,
-                    unread_status.map(String::as_str),
-                    needs_plan_approval,
-                    fork_source_label.as_deref(),
-                    self.fork_progress.contains_key(&id),
+                    SessionRowAccessibility {
+                        depth,
+                        orphaned,
+                        unread_status: unread_status.map(String::as_str),
+                        needs_plan_approval,
+                        forked_from_title: fork_source_label.as_deref(),
+                        forking: self.fork_progress.contains_key(&id),
+                        cross_project: cross_project_label
+                            .as_ref()
+                            .map(|(relation, project)| (*relation, project.as_str())),
+                    },
                 );
                 let menu_id = id.clone();
                 let menu_label = label.clone();
@@ -7376,6 +7516,8 @@ impl SessionMvpView {
                     .debug_selector(move || {
                         if orphaned {
                             "orphan-agent-session-row".to_owned()
+                        } else if cross_project {
+                            "cross-project-child-session-row".to_owned()
                         } else if depth > 0 {
                             "agent-child-session-row".to_owned()
                         } else {
@@ -7476,10 +7618,15 @@ impl SessionMvpView {
                         div()
                             .min_w_0()
                             .flex_1()
+                            .flex()
+                            .flex_col()
                             .text_sm()
                             .text_color(rgb(PRIMARY))
                             .overflow_hidden()
-                            .child(session.snapshot.metadata.title.clone()),
+                            .child(session.snapshot.metadata.title.clone())
+                            .when_some(cross_project_badge, |content, badge| {
+                                content.child(div().text_xs().text_color(rgb(MUTED)).child(badge))
+                            }),
                     )
             });
         let chats = self
@@ -12600,6 +12747,45 @@ impl SessionMvpView {
             )
     }
 
+    fn fork_progress_notice(&self) -> Option<gpui::AnyElement> {
+        let source_session_id = self.selected_session.as_deref()?;
+        let progress = self.fork_progress.get(source_session_id)?;
+        let detail = match progress {
+            SessionLaunchProgress::CreatingWorktree => "Creating an isolated worktree…",
+            SessionLaunchProgress::WorktreeReady(_) => "Worktree ready. Starting Copilot…",
+        };
+        Some(
+            div()
+                .id("fork-progress-notice")
+                .debug_selector(|| "fork-progress-notice".to_owned())
+                .accessibility_id("fork-progress-notice")
+                .role(Role::Status)
+                .aria_label(format!("Fork requested. {detail}"))
+                .mx_auto()
+                .mb_2()
+                .w_full()
+                .max_w(px(CONVERSATION_COLUMN_WIDTH))
+                .flex()
+                .items_center()
+                .gap_3()
+                .rounded_lg()
+                .border_1()
+                .border_color(rgb(BORDER))
+                .bg(rgb(PANEL))
+                .px_3()
+                .py_2()
+                .child(progress_spinner("fork-progress-spinner".into()))
+                .child(
+                    div()
+                        .flex()
+                        .flex_col()
+                        .child("Fork requested")
+                        .child(div().text_xs().text_color(rgb(MUTED)).child(detail)),
+                )
+                .into_any_element(),
+        )
+    }
+
     #[allow(clippy::too_many_lines)]
     fn interaction_prompt(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
         let session = self.selected()?;
@@ -13209,6 +13395,9 @@ impl Render for SessionMvpView {
                                                     .text_color(rgb(RED))
                                                     .child(error),
                                             )
+                                        })
+                                        .when_some(self.fork_progress_notice(), |column, notice| {
+                                            column.child(notice)
                                         })
                                         .when_some(self.action_error.clone(), |column, error| {
                                             column.child(
@@ -15371,32 +15560,39 @@ pub(crate) mod tests {
             assert!(cx.debug_bounds("child-notification-unread").is_some());
             assert_eq!(
                 super::super::session_row_accessible_label(
-                    "Child", 1, false, None, false, None, false,
+                    "Child",
+                    super::super::SessionRowAccessibility {
+                        depth: 1,
+                        ..Default::default()
+                    },
                 ),
                 "Agent-created child session Child, level 1"
             );
             assert_eq!(
                 super::super::session_row_accessible_label(
-                    "Orphan", 0, true, None, false, None, false,
+                    "Orphan",
+                    super::super::SessionRowAccessibility {
+                        orphaned: true,
+                        ..Default::default()
+                    },
                 ),
                 "Agent-created session Orphan, parent unavailable"
             );
             assert_eq!(
                 super::super::session_row_accessible_label(
                     "Alternative",
-                    0,
-                    false,
-                    None,
-                    false,
-                    Some("Original"),
-                    true,
+                    super::super::SessionRowAccessibility {
+                        forked_from_title: Some("Original"),
+                        forking: true,
+                        ..Default::default()
+                    },
                 ),
                 "Forked session Alternative, from Original, forking"
             );
         }
 
         #[gpui::test]
-        fn agent_children_nest_navigate_and_become_orphans_without_focus_theft(
+        fn cross_project_children_nest_navigate_and_become_orphans_without_focus_theft(
             cx: &mut TestAppContext,
         ) {
             let (view, cx, commands, updates) = setup_for_bootstrap(cx);
@@ -15404,25 +15600,49 @@ pub(crate) mod tests {
                 view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
                     snapshot("parent", "Parent session"),
                 ))];
+                view.projects = vec![
+                    app_model::ProjectMetadata {
+                        id: "parent-project".to_owned(),
+                        path: "/tmp/project".to_owned(),
+                        name: "Parent project".to_owned(),
+                        default_branch: Some("main".to_owned()),
+                        last_opened_at: "1".to_owned(),
+                    },
+                    app_model::ProjectMetadata {
+                        id: "target-project".to_owned(),
+                        path: "/tmp/target-project".to_owned(),
+                        name: "Target project".to_owned(),
+                        default_branch: Some("trunk".to_owned()),
+                        last_opened_at: "1".to_owned(),
+                    },
+                ];
                 view.selected_session = Some("parent".to_owned());
                 cx.notify();
             });
+            let mut child_snapshot = child_snapshot("child", "Agent child", "parent");
+            child_snapshot.metadata.repository_root = Some("/tmp/target-project".to_owned());
             updates
                 .send(ServiceUpdate::SessionHydrated(SessionHandle::for_test(
-                    child_snapshot("child", "Agent child", "parent"),
+                    child_snapshot,
                 )))
                 .unwrap();
             view.update(cx, |view, cx| {
                 view.apply_service_updates(cx);
                 assert_eq!(view.selected_session.as_deref(), Some("parent"));
+                let rows = super::super::ordered_project_sessions(&view.sessions, "/tmp/project");
+                assert_eq!(rows.len(), 2);
+                assert_eq!(view.sessions[rows[0].index].id(), "parent");
+                assert_eq!(view.sessions[rows[1].index].id(), "child");
+                assert_eq!(rows[1].depth, 1);
+                assert!(rows[1].cross_project);
                 cx.notify();
             });
             cx.run_until_parked();
 
             let parent = cx.debug_bounds("session-row").expect("parent row");
             let child = cx
-                .debug_bounds("agent-child-session-row")
-                .expect("nested child row");
+                .debug_bounds("cross-project-child-session-row")
+                .expect("nested cross-project child row");
             assert!(child.origin.x > parent.origin.x);
             cx.simulate_click(child.center(), Modifiers::none());
             cx.run_until_parked();
@@ -15432,6 +15652,22 @@ pub(crate) mod tests {
                     app_session_id: Some(id)
                 }) if id == "child"
             ));
+            view.read_with(cx, |view, _| {
+                assert_eq!(
+                    view.selected_project,
+                    std::path::Path::new("/tmp/target-project")
+                );
+                let rows =
+                    super::super::ordered_project_sessions(&view.sessions, "/tmp/target-project");
+                assert_eq!(
+                    rows.len(),
+                    1,
+                    "the target project must not duplicate its child"
+                );
+                assert_eq!(view.sessions[rows[0].index].id(), "child");
+                assert!(rows[0].cross_project);
+                assert_eq!(rows[0].depth, 0);
+            });
 
             updates
                 .send(ServiceUpdate::SessionsArchived(
@@ -15459,6 +15695,24 @@ pub(crate) mod tests {
             assert!(
                 cx.debug_bounds("orphan-agent-session-row").is_some(),
                 "a child with an archived parent must remain visible at the root"
+            );
+        }
+
+        #[test]
+        fn cross_project_child_accessible_label_names_target_project() {
+            assert_eq!(
+                super::super::session_row_accessible_label(
+                    "Agent child",
+                    super::super::SessionRowAccessibility {
+                        depth: 1,
+                        cross_project: Some((
+                            super::super::CrossProjectRelation::Target,
+                            "Target project",
+                        )),
+                        ..Default::default()
+                    },
+                ),
+                "Agent-created child session Agent child, level 1, target project Target project"
             );
         }
 
@@ -15503,12 +15757,11 @@ pub(crate) mod tests {
             assert!(
                 super::super::session_row_accessible_label(
                     "Agent child",
-                    1,
-                    false,
-                    Some("failed"),
-                    false,
-                    None,
-                    false,
+                    super::super::SessionRowAccessibility {
+                        depth: 1,
+                        unread_status: Some("failed"),
+                        ..Default::default()
+                    },
                 )
                 .contains("unread child failed notification")
             );
@@ -16168,12 +16421,10 @@ pub(crate) mod tests {
             assert!(
                 super::super::session_row_accessible_label(
                     "Parent session",
-                    0,
-                    false,
-                    None,
-                    true,
-                    None,
-                    false,
+                    super::super::SessionRowAccessibility {
+                        needs_plan_approval: true,
+                        ..Default::default()
+                    },
                 )
                 .contains("descendant plan needs approval")
             );
@@ -17727,6 +17978,10 @@ pub(crate) mod tests {
                 assert_eq!(view.selected_session.as_deref(), Some("source"));
                 assert!(view.fork_progress.contains_key("source"));
             });
+            assert!(
+                cx.debug_bounds("fork-progress-notice").is_some(),
+                "fork submission must show immediate progress beside the composer"
+            );
 
             let mut fork = snapshot("fork", "Fork of Source");
             fork.metadata.forked_from_session_id = Some("source".to_owned());

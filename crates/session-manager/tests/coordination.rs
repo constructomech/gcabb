@@ -1145,3 +1145,424 @@ fn plan_response_dedupe_and_audit_survive_storage_reopen() {
         Some("plan response interrupted during restart")
     );
 }
+
+// ---------------------------------------------------------------------------
+// Layer 5: cross-project child sessions
+// ---------------------------------------------------------------------------
+
+fn project_b(path: &Path) -> ProjectMetadata {
+    ProjectMetadata {
+        id: "project-b".to_owned(),
+        path: path.to_string_lossy().into_owned(),
+        name: "Project B".to_owned(),
+        default_branch: Some("develop".to_owned()),
+        last_opened_at: "2".to_owned(),
+    }
+}
+
+#[tokio::test]
+async fn list_projects_returns_bounded_entries_without_raw_paths() {
+    let (harness, _) = harness(false).await;
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(harness.directory.path())
+        .output()
+        .expect("git init parent project");
+    let directory_b = tempfile::tempdir().expect("second project");
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=develop"])
+        .current_dir(directory_b.path())
+        .output()
+        .expect("git init second project");
+    harness
+        .manager
+        .register_project(&project_b(directory_b.path()))
+        .expect("register project B");
+    let result = harness
+        .manager
+        .list_projects_for_tool(harness.parent.id())
+        .expect("list projects");
+    assert_eq!(result.projects.len(), 2);
+    for entry in &result.projects {
+        assert!(entry.id.starts_with("project-"));
+        assert_ne!(entry.id, "project");
+        assert_ne!(entry.id, "project-b");
+        assert!(!entry.name.is_empty());
+        assert!(!entry.repository.is_empty());
+        assert!(
+            !entry
+                .repository
+                .contains(harness.directory.path().to_string_lossy().as_ref())
+        );
+        assert!(
+            !entry
+                .repository
+                .contains(directory_b.path().to_string_lossy().as_ref())
+        );
+    }
+    let target_id = result
+        .projects
+        .iter()
+        .find(|project| project.name == "Project B")
+        .expect("target project")
+        .id
+        .clone();
+    let resolved = harness
+        .manager
+        .resolve_target_project(Some(&target_id), harness.parent.id())
+        .expect("resolve opaque target id");
+    assert_eq!(resolved.path, directory_b.path().to_string_lossy());
+    assert_eq!(resolved.default_branch.as_deref(), Some("develop"));
+}
+
+#[tokio::test]
+async fn create_session_defaults_to_same_project() {
+    let (harness, _) = harness(false).await;
+    let child = harness
+        .manager
+        .create_session(child_request(
+            harness.directory.path(),
+            harness.parent.id(),
+            "Same project child",
+            "same-project-child",
+        ))
+        .await
+        .expect("create same project child");
+    assert_eq!(
+        child.snapshot().metadata.project_key(),
+        harness.parent.snapshot().metadata.project_key()
+    );
+}
+
+#[tokio::test]
+async fn create_session_cross_project_preserves_parent_link() {
+    let (harness, _) = harness(false).await;
+    let directory_b = tempfile::tempdir().expect("second project");
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=develop"])
+        .current_dir(directory_b.path())
+        .output()
+        .expect("git init");
+    harness
+        .manager
+        .register_project(&project_b(directory_b.path()))
+        .expect("register project B");
+    let child = harness
+        .manager
+        .create_session(CreateSessionRequest {
+            project_path: directory_b.path().to_owned(),
+            title: "Cross project child".to_owned(),
+            title_source: TitleSource::Manual,
+            model: None,
+            mode: Some("autopilot".to_owned()),
+            agent: None,
+            reasoning_effort: None,
+            context_tier: None,
+            base_ref: Some("develop".to_owned()),
+            repository_root: Some(directory_b.path().to_string_lossy().into_owned()),
+            kind: SessionKind::Project,
+            parent_session_id: Some(harness.parent.id().to_owned()),
+            launch_origin: SessionLaunchOrigin::AgentTool,
+            host_tool_call_id: Some("cross-project-child".to_owned()),
+            unattended: true,
+        })
+        .await
+        .expect("cross project child");
+    let child_meta = child.snapshot().metadata.clone();
+    assert_eq!(
+        child_meta.parent_session_id.as_deref(),
+        Some(harness.parent.id())
+    );
+    assert_ne!(
+        child_meta.project_key(),
+        harness.parent.snapshot().metadata.project_key()
+    );
+    let launch = harness
+        .storage
+        .session_for_tool_call(harness.parent.id(), "cross-project-child")
+        .expect("load durable launch")
+        .expect("launch ledger row");
+    assert_eq!(launch.source_project_id.as_deref(), Some("project"));
+    assert_eq!(launch.target_project_id.as_deref(), Some("project-b"));
+}
+
+#[tokio::test]
+async fn resolve_target_project_rejects_unknown_id() {
+    let (harness, _) = harness(false).await;
+    let result = harness
+        .manager
+        .resolve_target_project(Some("nonexistent"), harness.parent.id());
+    assert!(result.is_err());
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("nonexistent"),
+        "error should mention the unknown id: {error}"
+    );
+}
+
+#[tokio::test]
+async fn resolve_target_project_rejects_folder_without_git() {
+    let (harness, _) = harness(false).await;
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(harness.directory.path())
+        .output()
+        .expect("git init parent project");
+    let bare_dir = tempfile::tempdir().expect("bare folder");
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=main"])
+        .current_dir(bare_dir.path())
+        .output()
+        .expect("git init target project");
+    harness
+        .manager
+        .register_project(&ProjectMetadata {
+            id: "folder-only".to_owned(),
+            path: bare_dir.path().to_string_lossy().into_owned(),
+            name: "Folder Only".to_owned(),
+            default_branch: None,
+            last_opened_at: "1".to_owned(),
+        })
+        .expect("register folder");
+    let target_id = harness
+        .manager
+        .list_projects_for_tool(harness.parent.id())
+        .expect("list projects")
+        .projects
+        .into_iter()
+        .find(|project| project.name == "Folder Only")
+        .expect("target project")
+        .id;
+    std::fs::rename(
+        bare_dir.path().join(".git"),
+        bare_dir.path().join(".git-removed"),
+    )
+    .expect("make target unavailable as git");
+    let result = harness
+        .manager
+        .resolve_target_project(Some(&target_id), harness.parent.id());
+    assert!(result.is_err());
+    let error = result.unwrap_err().to_string();
+    assert!(
+        error.contains("not available"),
+        "error should explain the project is not a git repo: {error}"
+    );
+}
+
+#[tokio::test]
+async fn cross_project_ancestry_coordination_is_authorized() {
+    let (harness, _) = harness(false).await;
+    let directory_b = tempfile::tempdir().expect("second project");
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=develop"])
+        .current_dir(directory_b.path())
+        .output()
+        .expect("git init");
+    harness
+        .manager
+        .register_project(&project_b(directory_b.path()))
+        .expect("register project B");
+    let child = harness
+        .manager
+        .create_session(CreateSessionRequest {
+            project_path: directory_b.path().to_owned(),
+            repository_root: Some(directory_b.path().to_string_lossy().into_owned()),
+            parent_session_id: Some(harness.parent.id().to_owned()),
+            launch_origin: SessionLaunchOrigin::AgentTool,
+            host_tool_call_id: Some("cross-coord".to_owned()),
+            ..request(directory_b.path(), "Cross coord child")
+        })
+        .await
+        .expect("create cross project child");
+    let result = harness
+        .manager
+        .get_session_for_coordination(harness.parent.id(), child.id())
+        .await
+        .expect("cross-project get_session");
+    assert_eq!(result.relationship, "ancestor");
+    let result = harness
+        .manager
+        .get_session_for_coordination(child.id(), harness.parent.id())
+        .await
+        .expect("cross-project get_session reverse");
+    assert_eq!(result.relationship, "descendant");
+}
+
+#[tokio::test]
+async fn unrelated_sessions_across_projects_are_denied() {
+    let (harness, _) = harness(false).await;
+    let directory_b = tempfile::tempdir().expect("second project");
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=develop"])
+        .current_dir(directory_b.path())
+        .output()
+        .expect("git init");
+    harness
+        .manager
+        .register_project(&project_b(directory_b.path()))
+        .expect("register project B");
+    let unrelated = harness
+        .manager
+        .create_session(CreateSessionRequest {
+            project_path: directory_b.path().to_owned(),
+            repository_root: Some(directory_b.path().to_string_lossy().into_owned()),
+            kind: SessionKind::Project,
+            launch_origin: SessionLaunchOrigin::User,
+            host_tool_call_id: None,
+            parent_session_id: None,
+            ..request(directory_b.path(), "Unrelated")
+        })
+        .await
+        .expect("create unrelated session in project B");
+    let result = harness
+        .manager
+        .get_session_for_coordination(harness.parent.id(), unrelated.id())
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn removed_project_blocks_coordination() {
+    let (harness, _) = harness(false).await;
+    let directory_b = tempfile::tempdir().expect("second project");
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=develop"])
+        .current_dir(directory_b.path())
+        .output()
+        .expect("git init");
+    harness
+        .manager
+        .register_project(&project_b(directory_b.path()))
+        .expect("register project B");
+    let child = harness
+        .manager
+        .create_session(CreateSessionRequest {
+            project_path: directory_b.path().to_owned(),
+            repository_root: Some(directory_b.path().to_string_lossy().into_owned()),
+            parent_session_id: Some(harness.parent.id().to_owned()),
+            launch_origin: SessionLaunchOrigin::AgentTool,
+            host_tool_call_id: Some("removal-race".to_owned()),
+            ..request(directory_b.path(), "Removed project child")
+        })
+        .await
+        .expect("create cross project child");
+    harness
+        .manager
+        .remove_project("project-b")
+        .await
+        .expect("remove project B");
+    let launch = harness
+        .storage
+        .session_for_tool_call(harness.parent.id(), "removal-race")
+        .expect("load durable launch")
+        .expect("launch ledger row");
+    assert_eq!(launch.source_project_id.as_deref(), Some("project"));
+    assert_eq!(launch.target_project_id.as_deref(), Some("project-b"));
+    let result = harness
+        .manager
+        .get_session_for_coordination(harness.parent.id(), child.id())
+        .await;
+    assert!(result.is_err());
+}
+
+#[tokio::test]
+async fn cross_project_send_and_notification() {
+    let (harness, _) = harness(false).await;
+    let directory_b = tempfile::tempdir().expect("second project");
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=develop"])
+        .current_dir(directory_b.path())
+        .output()
+        .expect("git init");
+    harness
+        .manager
+        .register_project(&project_b(directory_b.path()))
+        .expect("register project B");
+    let child = harness
+        .manager
+        .create_session(CreateSessionRequest {
+            project_path: directory_b.path().to_owned(),
+            repository_root: Some(directory_b.path().to_string_lossy().into_owned()),
+            parent_session_id: Some(harness.parent.id().to_owned()),
+            launch_origin: SessionLaunchOrigin::AgentTool,
+            host_tool_call_id: Some("send-cross".to_owned()),
+            ..request(directory_b.path(), "Cross msg child")
+        })
+        .await
+        .expect("cross project child");
+    let result = harness
+        .manager
+        .send_session_message(
+            harness.parent.id(),
+            "send-cross-msg",
+            child.id(),
+            "Hello across projects.",
+            SessionMessageDelivery::Queued,
+        )
+        .await
+        .expect("cross-project message");
+    assert_eq!(result.state, "pending");
+    harness
+        .manager
+        .complete_host_tool_launch(child.id())
+        .unwrap();
+    harness
+        .manager
+        .set_host_tool_notify_on_idle(child.id(), Some("once"))
+        .unwrap();
+    let notification = harness
+        .manager
+        .handle_child_lifecycle(&ChildLifecycleEvent {
+            child_session_id: child.id().to_owned(),
+            title: "Cross msg child".to_owned(),
+            status: ChildLifecycleStatus::Idle,
+        })
+        .await
+        .expect("cross-project notification");
+    assert!(notification.is_some());
+}
+
+#[tokio::test]
+async fn recursive_delete_crosses_project_boundary() {
+    let (harness, _) = harness(false).await;
+    let directory_b = tempfile::tempdir().expect("second project");
+    std::process::Command::new("git")
+        .args(["init", "--initial-branch=develop"])
+        .current_dir(directory_b.path())
+        .output()
+        .expect("git init");
+    harness
+        .manager
+        .register_project(&project_b(directory_b.path()))
+        .expect("register project B");
+    let child = harness
+        .manager
+        .create_session(CreateSessionRequest {
+            project_path: directory_b.path().to_owned(),
+            repository_root: Some(directory_b.path().to_string_lossy().into_owned()),
+            parent_session_id: Some(harness.parent.id().to_owned()),
+            launch_origin: SessionLaunchOrigin::AgentTool,
+            host_tool_call_id: Some("recursive-delete".to_owned()),
+            ..request(directory_b.path(), "Delete cross child")
+        })
+        .await
+        .expect("cross project child");
+    let child_id = child.id().to_owned();
+    let deletion = harness
+        .manager
+        .delete_session_scoped(
+            harness.parent.id(),
+            &session_manager::SessionRoots::default(),
+            session_manager::LifecycleScope::Recursive,
+        )
+        .await
+        .expect("recursive delete");
+    assert!(
+        deletion.affected.contains(&child_id),
+        "cross-project child should be included in recursive delete"
+    );
+    assert!(
+        deletion.affected.contains(&harness.parent.id().to_owned()),
+        "parent should be included"
+    );
+}

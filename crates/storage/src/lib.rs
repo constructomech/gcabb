@@ -14,7 +14,7 @@ use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 15;
+const SCHEMA_VERSION: i64 = 16;
 /// Gap left between queue positions so an item can be moved between two
 /// neighbours without renumbering the rest of the queue.
 const QUEUE_POSITION_STRIDE: i64 = 1024;
@@ -86,6 +86,8 @@ pub struct RecoveredSession {
 pub struct HostToolSession {
     pub metadata: Option<SessionMetadata>,
     pub launch_completed: bool,
+    pub source_project_id: Option<String>,
+    pub target_project_id: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, Eq, PartialEq)]
@@ -319,6 +321,8 @@ impl Storage {
             metadata.parent_session_id.as_deref(),
             metadata.host_tool_call_id.as_deref(),
         ) {
+            let (source_project_id, target_project_id) =
+                project_provenance(&transaction, parent_session_id, metadata)?;
             let existing_child = transaction
                 .query_row(
                     "SELECT child_session_id FROM host_tool_launches
@@ -338,12 +342,21 @@ impl Storage {
             }
             transaction.execute(
                 "INSERT INTO host_tool_launches (
-                    parent_session_id, tool_call_id, child_session_id, completed
-                 ) VALUES (?1, ?2, ?3, 0)
+                    parent_session_id, tool_call_id, child_session_id, completed,
+                    source_project_id, target_project_id
+                 ) VALUES (?1, ?2, ?3, 0, ?4, ?5)
                  ON CONFLICT(parent_session_id, tool_call_id) DO UPDATE SET
-                    child_session_id = excluded.child_session_id
+                    child_session_id = excluded.child_session_id,
+                    source_project_id = excluded.source_project_id,
+                    target_project_id = excluded.target_project_id
                  WHERE host_tool_launches.child_session_id = excluded.child_session_id",
-                params![parent_session_id, tool_call_id, metadata.id],
+                params![
+                    parent_session_id,
+                    tool_call_id,
+                    metadata.id,
+                    source_project_id,
+                    target_project_id
+                ],
             )?;
         }
         transaction.commit()?;
@@ -390,7 +403,8 @@ impl Storage {
                         session.host_tool_call_id, session.forked_from_session_id,
                         session.forked_at_event_id, session.fork_tool_call_id,
                         session.fork_kickoff_pending, session.model, session.mode, session.base_ref,
-                        session.created_at, session.updated_at, launch.completed
+                        session.created_at, session.updated_at, launch.completed,
+                        launch.source_project_id, launch.target_project_id
                  FROM host_tool_launches launch
                  LEFT JOIN app_sessions session ON session.id = launch.child_session_id
                  WHERE launch.parent_session_id = ?1 AND launch.tool_call_id = ?2",
@@ -402,6 +416,8 @@ impl Storage {
                             .map(|_| metadata_from_row(row))
                             .transpose()?,
                         launch_completed: row.get(19)?,
+                        source_project_id: row.get(20)?,
+                        target_project_id: row.get(21)?,
                     })
                 },
             )
@@ -1176,6 +1192,11 @@ impl Storage {
     }
 
     /// Authorize model-visible coordination between sessions in one ancestry chain.
+    ///
+    /// Relationship is ancestry-based: callers in the same ancestry chain are
+    /// authorized regardless of which project each session belongs to. Both
+    /// sessions' projects must still be registered, but they need not be the
+    /// same project.
     pub fn authorize_coordination(
         &self,
         caller_session_id: &str,
@@ -1193,12 +1214,6 @@ impl Storage {
         }
         if target.archived {
             return Err(StorageError::CoordinationSessionArchived(
-                target_session_id.to_owned(),
-            ));
-        }
-        if caller.project_key != target.project_key {
-            return Err(StorageError::CoordinationProjectMismatch(
-                caller_session_id.to_owned(),
                 target_session_id.to_owned(),
             ));
         }
@@ -2053,6 +2068,8 @@ impl Storage {
                     REFERENCES app_sessions(id) ON DELETE SET NULL,
                 completed INTEGER NOT NULL DEFAULT 0,
                 notify_on_idle TEXT,
+                source_project_id TEXT,
+                target_project_id TEXT,
                 PRIMARY KEY(parent_session_id, tool_call_id)
              );
              CREATE TABLE IF NOT EXISTS domain_events (
@@ -2246,6 +2263,18 @@ impl Storage {
             "TEXT NOT NULL DEFAULT 'user'",
         )?;
         add_column_if_missing(&transaction, "host_tool_launches", "notify_on_idle", "TEXT")?;
+        add_column_if_missing(
+            &transaction,
+            "host_tool_launches",
+            "source_project_id",
+            "TEXT",
+        )?;
+        add_column_if_missing(
+            &transaction,
+            "host_tool_launches",
+            "target_project_id",
+            "TEXT",
+        )?;
         transaction.execute(
             "INSERT OR IGNORE INTO host_tool_launches (
                 parent_session_id, tool_call_id, child_session_id, completed
@@ -2254,6 +2283,25 @@ impl Storage {
              FROM app_sessions
              WHERE parent_session_id IS NOT NULL AND host_tool_call_id IS NOT NULL",
             [],
+        )?;
+        transaction.execute_batch(
+            "UPDATE host_tool_launches
+             SET source_project_id = COALESCE(
+                    source_project_id,
+                    (SELECT project.id
+                     FROM app_sessions parent
+                     JOIN projects project
+                       ON project.path = COALESCE(parent.repository_root, parent.project_path)
+                     WHERE parent.id = host_tool_launches.parent_session_id)
+                 ),
+                 target_project_id = COALESCE(
+                    target_project_id,
+                    (SELECT project.id
+                     FROM app_sessions child
+                     JOIN projects project
+                       ON project.path = COALESCE(child.repository_root, child.project_path)
+                     WHERE child.id = host_tool_launches.child_session_id)
+                 );",
         )?;
         add_column_if_missing(
             &transaction,
@@ -2598,7 +2646,6 @@ fn synchronize_coordination_for_queue(
 }
 
 struct CoordinationSession {
-    project_key: String,
     parent_session_id: Option<String>,
     archived: bool,
 }
@@ -2609,7 +2656,7 @@ fn coordination_session(
 ) -> Result<Option<CoordinationSession>> {
     connection
         .query_row(
-            "SELECT COALESCE(s.repository_root, s.project_path), s.parent_session_id,
+            "SELECT s.parent_session_id,
                     a.session_id IS NOT NULL
              FROM app_sessions s
              LEFT JOIN session_archives a ON a.session_id = s.id
@@ -2617,9 +2664,8 @@ fn coordination_session(
             [session_id],
             |row| {
                 Ok(CoordinationSession {
-                    project_key: row.get(0)?,
-                    parent_session_id: row.get(1)?,
-                    archived: row.get(2)?,
+                    parent_session_id: row.get(0)?,
+                    archived: row.get(1)?,
                 })
             },
         )
@@ -2650,6 +2696,36 @@ fn ancestry_contains(
             .flatten();
     }
     Ok(false)
+}
+
+fn project_provenance(
+    connection: &Connection,
+    parent_session_id: &str,
+    metadata: &SessionMetadata,
+) -> Result<(Option<String>, Option<String>)> {
+    let source_project_id = connection
+        .query_row(
+            "SELECT project.id
+             FROM app_sessions session
+             JOIN projects project
+               ON project.path = COALESCE(session.repository_root, session.project_path)
+             WHERE session.id = ?1",
+            [parent_session_id],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    let target_project_key = metadata
+        .repository_root
+        .as_deref()
+        .unwrap_or(&metadata.project_path);
+    let target_project_id = connection
+        .query_row(
+            "SELECT id FROM projects WHERE path = ?1",
+            [target_project_key],
+            |row| row.get::<_, String>(0),
+        )
+        .optional()?;
+    Ok((source_project_id, target_project_id))
 }
 
 /// Add a column to an existing table unless it is already present.
@@ -2715,7 +2791,7 @@ fn validate_parent(connection: &Connection, metadata: &SessionMetadata) -> Resul
         return Err(StorageError::InvalidChildProvenance);
     }
 
-    let (parent_project, parent_depth) = connection
+    let (_parent_project, parent_depth) = connection
         .query_row(
             "SELECT COALESCE(repository_root, project_path), launch_depth
              FROM app_sessions
@@ -2725,13 +2801,6 @@ fn validate_parent(connection: &Connection, metadata: &SessionMetadata) -> Resul
         )
         .optional()?
         .ok_or_else(|| StorageError::ParentSessionNotFound(parent_id.to_owned()))?;
-    let child_project = metadata
-        .repository_root
-        .as_deref()
-        .unwrap_or(&metadata.project_path);
-    if parent_project != child_project {
-        return Err(StorageError::ParentProjectMismatch(parent_id.to_owned()));
-    }
 
     let direct_children: usize = connection.query_row(
         "SELECT COUNT(*)
@@ -3940,12 +4009,13 @@ mod tests {
         root.repository_root = Some("/tmp/project".to_owned());
         storage.upsert_session(&root).unwrap();
 
-        let mut wrong_project = child_metadata(&root, 90);
-        wrong_project.repository_root = Some("/tmp/other".to_owned());
-        assert!(matches!(
-            storage.upsert_session(&wrong_project),
-            Err(StorageError::ParentProjectMismatch(_))
-        ));
+        let mut cross_project = child_metadata(&root, 90);
+        cross_project.repository_root = Some("/tmp/other".to_owned());
+        storage
+            .upsert_session(&cross_project)
+            .expect("cross-project child is allowed");
+        // Clean up so child limit tests below are accurate.
+        storage.delete_session(&cross_project.id).unwrap();
 
         for index in 0..MAX_ACTIVE_DIRECT_CHILDREN {
             storage
@@ -4695,7 +4765,7 @@ mod tests {
         ));
         assert!(matches!(
             storage.authorize_coordination(&root.id, &other_project.id),
-            Err(StorageError::CoordinationProjectMismatch(_, _))
+            Err(StorageError::CoordinationUnrelated { .. })
         ));
 
         storage.archive_session(&archive_record(&child.id)).unwrap();

@@ -111,6 +111,7 @@ fn provider_fork_result(result: SessionsForkResult) -> ForkSessionResult {
     }
 }
 
+const LIST_PROJECTS_TOOL_NAME: &str = "list_projects";
 const CREATE_SESSION_TOOL_NAME: &str = "create_session";
 const FORK_SESSION_TOOL_NAME: &str = "fork_session";
 const GET_SESSION_TOOL_NAME: &str = "get_session";
@@ -147,6 +148,10 @@ pub struct CreateSessionToolInput {
     pub context_tier: Option<String>,
     #[serde(default)]
     pub notify_on_idle: Option<NotifyOnIdle>,
+    /// Registered project id to create the child in. Omit for the current
+    /// parent's project.
+    #[serde(default)]
+    pub project_id: Option<String>,
 }
 
 impl CreateSessionToolInput {
@@ -179,6 +184,11 @@ impl CreateSessionToolInput {
         {
             return Err(format!("unsupported context tier: {tier}"));
         }
+        validate_optional(
+            "project_id",
+            self.project_id.as_deref(),
+            MAX_SESSION_ID_BYTES,
+        )?;
         Ok(())
     }
 }
@@ -207,6 +217,19 @@ pub struct CreateSessionToolResult {
     pub project: String,
     pub worktree: String,
     pub branch: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ListProjectsToolEntry {
+    pub id: String,
+    pub name: String,
+    pub repository: String,
+    pub default_branch: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ListProjectsToolResult {
+    pub projects: Vec<ListProjectsToolEntry>,
 }
 
 #[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
@@ -411,6 +434,7 @@ pub struct RespondToSessionPlanToolResult {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostToolCall {
+    ListProjects,
     CreateSession(CreateSessionToolInput),
     ForkSession(ForkSessionToolInput),
     GetSession(GetSessionToolInput),
@@ -420,6 +444,7 @@ pub enum HostToolCall {
 
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostToolResult {
+    ListProjects(ListProjectsToolResult),
     CreateSession(CreateSessionToolResult),
     ForkSession(ForkSessionToolResult),
     GetSession(Box<GetSessionToolResult>),
@@ -526,6 +551,36 @@ impl HostToolBinding {
             gateway,
             caller_session_id: caller_session_id.into(),
         }
+    }
+}
+
+struct ListProjectsToolHandler {
+    binding: HostToolBinding,
+}
+
+#[async_trait]
+impl ToolHandler for ListProjectsToolHandler {
+    async fn call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> std::result::Result<ToolResult, github_copilot_sdk::Error> {
+        let (response, receiver) = oneshot::channel();
+        let result = call_host_tool(
+            &self.binding,
+            invocation.tool_call_id,
+            HostToolCall::ListProjects,
+            response,
+            receiver,
+        )
+        .await;
+        Ok(tool_response(
+            "projects",
+            result.and_then(|result| match result {
+                HostToolResult::ListProjects(result) => serde_json::to_value(result)
+                    .map_err(|error| format!("failed to encode list_projects response: {error}")),
+                _ => Err("list_projects host service returned the wrong response type".to_owned()),
+            }),
+        ))
     }
 }
 
@@ -717,6 +772,7 @@ async fn call_host_tool(
     receiver: oneshot::Receiver<std::result::Result<HostToolResult, String>>,
 ) -> std::result::Result<HostToolResult, String> {
     let tool_name = match &call {
+        HostToolCall::ListProjects => LIST_PROJECTS_TOOL_NAME,
         HostToolCall::CreateSession(_) => CREATE_SESSION_TOOL_NAME,
         HostToolCall::ForkSession(_) => FORK_SESSION_TOOL_NAME,
         HostToolCall::GetSession(_) => GET_SESSION_TOOL_NAME,
@@ -758,10 +814,26 @@ fn tool_response(key: &str, result: std::result::Result<Value, String>) -> ToolR
     }
 }
 
+fn list_projects_tool(binding: HostToolBinding) -> Tool {
+    Tool::new(LIST_PROJECTS_TOOL_NAME)
+        .with_description(
+            "List registered local GCABB projects. Returns bounded project identifiers needed for cross-project create_session.",
+        )
+        .with_parameters(
+            serde_json::from_value(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {}
+            }))
+            .expect("list_projects tool schema is an object"),
+        )
+        .with_handler(Arc::new(ListProjectsToolHandler { binding }))
+}
+
 fn create_session_tool(binding: HostToolBinding) -> Tool {
     Tool::new(CREATE_SESSION_TOOL_NAME)
         .with_description(
-            "Create an independent local GCABB child session in a new worktree for this project.",
+            "Create an independent local GCABB child session in a new worktree. Defaults to the current project; pass project_id for a different registered project.",
         )
         .with_parameters(
             serde_json::from_value(json!({
@@ -794,6 +866,12 @@ fn create_session_tool(binding: HostToolBinding) -> Tool {
                     "context_tier": {
                         "type": "string",
                         "enum": ["default", "long_context"]
+                    },
+                    "project_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SESSION_ID_BYTES,
+                        "description": "Registered project id from list_projects. Omit for the current project."
                     },
                     "notify_on_idle": {
                         "type": "string",
@@ -942,8 +1020,9 @@ fn respond_to_session_plan_tool(binding: HostToolBinding) -> Tool {
         .with_handler(Arc::new(RespondToSessionPlanToolHandler { binding }))
 }
 
-fn host_tools(binding: HostToolBinding) -> [Tool; 5] {
+fn host_tools(binding: HostToolBinding) -> [Tool; 6] {
     [
+        list_projects_tool(binding.clone()),
         create_session_tool(binding.clone()),
         fork_session_tool(binding.clone()),
         get_session_tool(binding.clone()),
@@ -2769,6 +2848,7 @@ mod tests {
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
             [
+                "list_projects",
                 "create_session",
                 "fork_session",
                 "get_session",
@@ -2776,12 +2856,13 @@ mod tests {
                 "respond_to_session_plan"
             ]
         );
-        let parameters = &create.tools.as_ref().unwrap()[0].parameters;
+        let parameters = &create.tools.as_ref().unwrap()[1].parameters;
         let properties = parameters
             .get("properties")
             .and_then(Value::as_object)
             .expect("object properties");
         assert!(properties.contains_key("prompt"));
+        assert!(properties.contains_key("project_id"));
         assert!(!properties.contains_key("project_path"));
         assert!(!properties.contains_key("parent_session_id"));
         assert_eq!(
@@ -2793,6 +2874,7 @@ mod tests {
                 .map(|tool| tool.name.as_str())
                 .collect::<Vec<_>>(),
             [
+                "list_projects",
                 "create_session",
                 "fork_session",
                 "get_session",
@@ -2803,11 +2885,47 @@ mod tests {
 
         let create_tools = create.tools.unwrap();
         let resume_tools = resume.tools.unwrap();
-        let handler = create_tools[0].handler().expect("create handler").clone();
-        let get_handler = resume_tools[2].handler().expect("get handler").clone();
-        let send_handler = resume_tools[3].handler().expect("send handler").clone();
-        let plan_handler = create_tools[4].handler().expect("plan handler").clone();
-        let failure_handler = resume_tools[0].handler().expect("create handler").clone();
+        let list_handler = resume_tools[0].handler().expect("list handler").clone();
+        let handler = create_tools[1].handler().expect("create handler").clone();
+        let get_handler = resume_tools[3].handler().expect("get handler").clone();
+        let send_handler = resume_tools[4].handler().expect("send handler").clone();
+        let plan_handler = create_tools[5].handler().expect("plan handler").clone();
+        let failure_handler = resume_tools[1].handler().expect("create handler").clone();
+        let invocation: ToolInvocation = serde_json::from_value(json!({
+            "sessionId": "sdk-parent",
+            "toolCallId": "tool-call-list",
+            "toolName": "list_projects",
+            "arguments": {}
+        }))
+        .expect("tool invocation");
+        let call = tokio::spawn(async move { list_handler.call(invocation).await });
+        let HostGatewayEvent::Tool(request) = requests.recv().await.expect("host request") else {
+            panic!("expected tool request");
+        };
+        assert_eq!(request.caller_session_id, "app-parent");
+        assert_eq!(request.tool_call_id, "tool-call-list");
+        assert!(matches!(&request.call, HostToolCall::ListProjects));
+        request
+            .response
+            .send(Ok(HostToolResult::ListProjects(
+                super::ListProjectsToolResult {
+                    projects: vec![super::ListProjectsToolEntry {
+                        id: "project-opaque".to_owned(),
+                        name: "GCABB".to_owned(),
+                        repository: "gcabb".to_owned(),
+                        default_branch: Some("main".to_owned()),
+                    }],
+                },
+            )))
+            .expect("respond");
+        let result = call.await.expect("handler task").expect("tool result");
+        assert!(matches!(
+            result,
+            ToolResult::Expanded(result)
+                if result.result_type == "success"
+                    && result.text_result_for_llm.contains("\"id\":\"project-opaque\"")
+        ));
+
         let invocation: ToolInvocation = serde_json::from_value(json!({
             "sessionId": "sdk-parent",
             "toolCallId": "tool-call-1",
