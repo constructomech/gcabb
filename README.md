@@ -15,6 +15,8 @@ activity, commands, and changes visible as they happen.
 - Optionally archive or delete an entire descendant session tree. Recursive
   lifecycle actions are always opt-in; the confirmation checkbox starts
   unchecked so the default continues to affect only the selected session.
+- Fork a project session with `/fork`, preserving its durable Copilot history
+  and safe repository state in a new isolated worktree.
 - Work in isolated project worktrees without blocking other sessions.
 - Stream the conversation and inspect main-agent, subagent, and tool activity.
 - Respond to permission, elicitation, user-input, plan, and mode requests.
@@ -48,6 +50,29 @@ paths are shown in the app instead of being silently ignored.
 
 Unarchive affects only the selected archived session. It never silently
 unarchives descendants.
+
+## Forks, child sessions, and CLI tasks
+
+A **fork** is a new app session whose Copilot history comes from another
+session. It has its own SDK session, runtime process, branch, and worktree, and
+it is shown beside the source rather than nested below it. A **child session**
+is a separately prompted app session created for coordination and is nested
+under its parent. A CLI `task` is lighter-weight subagent activity inside one
+runtime; it does not create an app session or worktree.
+
+`/fork` copies the complete durable SDK history. Backend callers may instead
+provide an exact SDK event id; that event and everything after it are excluded.
+The boundary must belong to the source session.
+
+The fork starts at the source worktree's exact `HEAD`. GCABB reproduces staged
+and unstaged tracked changes, renames, deletions, and non-ignored untracked
+files without changing the source index or files. Ignored files, runtime state,
+credential-like untracked files, and paths outside the repository are never
+copied. A conflicted index, submodule, special file, escaping symlink, changing
+source snapshot, or other state GCABB cannot reproduce exactly causes the fork
+to fail before it is exposed. Untracked executable bits are preserved on Unix;
+untracked symlinks are deliberately unsupported on platforms where they cannot
+be recreated safely.
 
 ## Install
 

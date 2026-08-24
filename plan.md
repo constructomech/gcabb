@@ -130,6 +130,30 @@ returned as part of the launch error. `SessionManager` remains responsible for
 per-session SDK events, projections, persistence, and strong runtime isolation;
 it does not choose worktrees or UI selection.
 
+### Session fork boundary
+
+Forking is distinct from ordinary launch. `CopilotProvider` invokes the SDK's
+native `sessions.fork` RPC against the source SDK session, with an optional
+exact event-id boundary whose semantics are exclusive. `SessionManager` resumes
+the returned SDK identity in a new isolated provider runtime, while
+`SessionOrchestrator` owns the new branch/worktree, optional steering kickoff,
+progress, compensation, and post-success activation.
+
+Fork provenance (`forked_from_session_id` plus the optional boundary) is stored
+independently from `parent_session_id`. A fork therefore appears beside its
+source and does not become a coordination child. By contrast, `create_session`
+starts independently prompted app history, and the CLI's `task` tool runs a
+subagent within the existing runtime.
+
+The target worktree starts from the source session's exact branch `HEAD`.
+Staged and unstaged tracked changes, renames, deletions, and non-ignored
+untracked files are captured without modifying the source and reproduced with
+their index distinction intact. Ignored files, per-runtime state, paths outside
+the repository, conflicted indexes, unsupported file kinds, and unstable
+snapshots are never copied; an unsafe state fails the fork explicitly.
+Credential-like untracked files and symlinks that escape the repository are
+rejected rather than duplicated.
+
 ## Technology
 
 | Area | Choice |

@@ -2,12 +2,13 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 use std::sync::Arc;
 
-use app_model::{PromptAttachment, SessionKind, SessionLocation, TitleSource};
+use app_model::{ProjectMetadata, PromptAttachment, SessionKind, SessionLocation, TitleSource};
 use diagnostics::MemoryDiagnostics;
 use git_service::GitService;
 use session_manager::{SessionManager, SessionRoots};
 use session_orchestrator::{
-    LaunchOrigin, LaunchProgress, LaunchRequest, LaunchStage, LaunchTitle, SessionOrchestrator,
+    ForkRequest, LaunchOrigin, LaunchProgress, LaunchRequest, LaunchResult, LaunchStage,
+    LaunchTitle, SessionOrchestrator,
 };
 use storage::Storage;
 use test_harness::FakeProviderFactory;
@@ -112,6 +113,71 @@ fn project_request(
         host_tool_call_id: None,
         notify_on_idle: None,
     }
+}
+
+fn register_project(manager: &SessionManager, repository: &Path) {
+    manager
+        .register_project(&ProjectMetadata {
+            id: "project".to_owned(),
+            path: repository.to_string_lossy().into_owned(),
+            name: "Project".to_owned(),
+            default_branch: Some("main".to_owned()),
+            last_opened_at: "now".to_owned(),
+        })
+        .expect("register project");
+}
+
+async fn source_with_history_and_changes(
+    manager: &SessionManager,
+    orchestrator: &SessionOrchestrator,
+    factory: &FakeProviderFactory,
+    repository: &Path,
+    worktrees: &Path,
+) -> LaunchResult {
+    register_project(manager, repository);
+    let source = orchestrator
+        .launch(
+            project_request(repository, worktrees, LaunchOrigin::UserActivation),
+            |_| {},
+        )
+        .await
+        .expect("source launch");
+    let source_sdk_id = source.handle.snapshot().metadata.sdk_session_id.clone();
+    let source_provider = factory.providers().remove(0);
+    for event in [
+        serde_json::json!({
+            "id": "source-event-1",
+            "type": "user.message",
+            "data": {"content": "first"}
+        }),
+        serde_json::json!({
+            "id": "source-event-2",
+            "type": "assistant.message",
+            "data": {"content": "second"}
+        }),
+    ] {
+        source_provider
+            .emit(&source_sdk_id, event)
+            .await
+            .expect("source event");
+    }
+    let source_path = &source.project_path;
+    std::fs::write(source_path.join(".gitignore"), "ignored.secret\n").expect("ignore");
+    std::fs::write(source_path.join("renamed.txt"), "rename me\n").expect("rename fixture");
+    std::fs::write(source_path.join("deleted.txt"), "delete me\n").expect("delete fixture");
+    git(
+        source_path,
+        &["add", ".gitignore", "renamed.txt", "deleted.txt"],
+    );
+    git(source_path, &["commit", "-m", "fork fixtures"]);
+    std::fs::write(source_path.join("README.md"), "staged\n").expect("staged");
+    git(source_path, &["add", "README.md"]);
+    std::fs::write(source_path.join("README.md"), "unstaged after staged\n").expect("unstaged");
+    git(source_path, &["mv", "renamed.txt", "moved.txt"]);
+    std::fs::remove_file(source_path.join("deleted.txt")).expect("delete tracked");
+    std::fs::write(source_path.join("scratch.bin"), [0, 1, 2, 255]).expect("untracked");
+    std::fs::write(source_path.join("ignored.secret"), "do not copy\n").expect("ignored");
+    source
 }
 
 #[tokio::test]
@@ -316,6 +382,258 @@ async fn agent_child_launch_persists_ownership_and_keeps_parent_selected() {
             .unwrap()
             .launch_completed
     );
+}
+
+#[tokio::test]
+async fn native_fork_preserves_history_filesystem_provenance_and_retry_identity() {
+    let (_guard, repository) = repository();
+    let worktrees = tempfile::tempdir().expect("worktrees");
+    let factory = FakeProviderFactory::default();
+    let (manager, orchestrator, storage) =
+        harness_with_storage(factory.clone(), worktrees.path().to_owned());
+    let source = source_with_history_and_changes(
+        &manager,
+        &orchestrator,
+        &factory,
+        &repository,
+        worktrees.path(),
+    )
+    .await;
+    let source_path = &source.project_path;
+    let source_status = GitService::new(source_path).changes("main", "before".to_owned());
+
+    let request = ForkRequest {
+        source_session_id: source.handle.id().to_owned(),
+        worktrees_root: worktrees.path().to_owned(),
+        to_event_id: Some("source-event-2".to_owned()),
+        name: Some("Bounded fork".to_owned()),
+        kickoff_prompt: None,
+        origin: LaunchOrigin::Headless,
+        fork_tool_call_id: Some("fork-tool-1".to_owned()),
+    };
+    let fork = orchestrator
+        .fork(request.clone(), |_| {})
+        .await
+        .expect("fork");
+
+    assert_eq!(
+        manager.selected_session().unwrap().as_deref(),
+        Some(source.handle.id()),
+        "a headless fork changed selection"
+    );
+    let metadata = storage
+        .session_metadata(fork.handle.id())
+        .unwrap()
+        .expect("fork metadata");
+    assert_eq!(
+        metadata.forked_from_session_id.as_deref(),
+        Some(source.handle.id())
+    );
+    assert_eq!(
+        metadata.forked_at_event_id.as_deref(),
+        Some("source-event-2")
+    );
+    assert!(metadata.parent_session_id.is_none());
+    assert_eq!(
+        storage.event_ids(fork.handle.id()).unwrap(),
+        std::collections::HashSet::from(["source-event-1".to_owned()])
+    );
+    assert_eq!(
+        std::fs::read(fork.project_path.join("README.md")).unwrap(),
+        std::fs::read(source_path.join("README.md")).unwrap()
+    );
+    assert!(fork.project_path.join("moved.txt").is_file());
+    assert!(!fork.project_path.join("renamed.txt").exists());
+    assert!(!fork.project_path.join("deleted.txt").exists());
+    assert_eq!(
+        std::fs::read(fork.project_path.join("scratch.bin")).unwrap(),
+        [0, 1, 2, 255]
+    );
+    assert!(!fork.project_path.join("ignored.secret").exists());
+    assert_eq!(
+        GitService::new(source_path)
+            .changes("main", "after".to_owned())
+            .files,
+        source_status.files,
+        "forking changed the source checkout"
+    );
+
+    let providers_before_retry = factory.providers().len();
+    let retry = orchestrator
+        .fork(request.clone(), |_| {})
+        .await
+        .expect("idempotent retry");
+    assert_eq!(retry.handle.id(), fork.handle.id());
+    assert_eq!(retry.project_path, fork.project_path);
+    assert_eq!(factory.providers().len(), providers_before_retry);
+    manager
+        .close_session(fork.handle.id())
+        .await
+        .expect("close fork runtime");
+    let recovered = orchestrator
+        .fork(request, |_| {})
+        .await
+        .expect("retry after runtime restart");
+    assert_eq!(recovered.handle.id(), fork.handle.id());
+    assert_eq!(recovered.project_path, fork.project_path);
+    assert_eq!(storage.list_sessions().unwrap().len(), 2);
+}
+
+#[tokio::test]
+async fn full_history_user_fork_selects_the_new_root_session() {
+    let (_guard, repository) = repository();
+    let worktrees = tempfile::tempdir().expect("worktrees");
+    let factory = FakeProviderFactory::default();
+    let (manager, orchestrator, storage) =
+        harness_with_storage(factory.clone(), worktrees.path().to_owned());
+    let source = source_with_history_and_changes(
+        &manager,
+        &orchestrator,
+        &factory,
+        &repository,
+        worktrees.path(),
+    )
+    .await;
+    let full = orchestrator
+        .fork(
+            ForkRequest {
+                source_session_id: source.handle.id().to_owned(),
+                worktrees_root: worktrees.path().to_owned(),
+                to_event_id: None,
+                name: Some("Full fork".to_owned()),
+                kickoff_prompt: None,
+                origin: LaunchOrigin::UserActivation,
+                fork_tool_call_id: None,
+            },
+            |_| {},
+        )
+        .await
+        .expect("full fork");
+    assert_eq!(
+        storage.event_ids(full.handle.id()).unwrap(),
+        std::collections::HashSet::from(
+            ["source-event-1".to_owned(), "source-event-2".to_owned(),]
+        )
+    );
+    assert_eq!(
+        manager.selected_session().unwrap().as_deref(),
+        Some(full.handle.id())
+    );
+    assert!(full.handle.snapshot().metadata.parent_session_id.is_none());
+}
+
+#[tokio::test]
+async fn invalid_fork_boundary_cleans_the_target_and_leaves_source_unchanged() {
+    let (_guard, repository) = repository();
+    let worktrees = tempfile::tempdir().expect("worktrees");
+    let factory = FakeProviderFactory::default();
+    let (manager, orchestrator, storage) =
+        harness_with_storage(factory, worktrees.path().to_owned());
+    register_project(&manager, &repository);
+    let source = orchestrator
+        .launch(
+            project_request(&repository, worktrees.path(), LaunchOrigin::UserActivation),
+            |_| {},
+        )
+        .await
+        .expect("source launch");
+    std::fs::write(source.project_path.join("scratch.txt"), "source only\n").expect("source work");
+    let source_status = GitService::new(&source.project_path)
+        .changes("main", "before".to_owned())
+        .files;
+
+    let result = orchestrator
+        .fork(
+            ForkRequest {
+                source_session_id: source.handle.id().to_owned(),
+                worktrees_root: worktrees.path().to_owned(),
+                to_event_id: Some("foreign-event".to_owned()),
+                name: Some("Invalid fork".to_owned()),
+                kickoff_prompt: None,
+                origin: LaunchOrigin::Headless,
+                fork_tool_call_id: None,
+            },
+            |_| {},
+        )
+        .await;
+    let Err(error) = result else {
+        panic!("foreign boundary must fail");
+    };
+    assert_eq!(error.stage, LaunchStage::Runtime);
+    assert!(error.to_string().contains("foreign-event"));
+    assert!(error.cleanup.is_empty(), "{:?}", error.cleanup);
+    assert_eq!(storage.list_sessions().unwrap().len(), 1);
+    assert_eq!(
+        GitService::new(&source.project_path)
+            .changes("main", "after".to_owned())
+            .files,
+        source_status
+    );
+    let namespace = worktrees.path().join("main");
+    let remaining = std::fs::read_dir(namespace)
+        .map(|entries| {
+            entries
+                .filter_map(|entry| {
+                    let entry = entry.unwrap();
+                    entry
+                        .file_type()
+                        .unwrap()
+                        .is_dir()
+                        .then(|| entry.file_name())
+                })
+                .collect::<Vec<_>>()
+        })
+        .unwrap_or_default();
+    assert_eq!(remaining.len(), 1, "failed fork left paths: {remaining:?}");
+}
+
+#[tokio::test]
+async fn failed_fork_kickoff_retry_is_explicitly_indeterminate() {
+    let (_guard, repository) = repository();
+    let worktrees = tempfile::tempdir().expect("worktrees");
+    let factory = FakeProviderFactory::default();
+    let (manager, orchestrator, storage) =
+        harness_with_storage(factory.clone(), worktrees.path().to_owned());
+    register_project(&manager, &repository);
+    let source = orchestrator
+        .launch(
+            project_request(&repository, worktrees.path(), LaunchOrigin::UserActivation),
+            |_| {},
+        )
+        .await
+        .expect("source launch");
+    factory.fail_sends(true);
+    let request = ForkRequest {
+        source_session_id: source.handle.id().to_owned(),
+        worktrees_root: worktrees.path().to_owned(),
+        to_event_id: None,
+        name: Some("Steered fork".to_owned()),
+        kickoff_prompt: Some("Take the alternate approach".to_owned()),
+        origin: LaunchOrigin::Headless,
+        fork_tool_call_id: Some("fork-with-kickoff".to_owned()),
+    };
+
+    let first = orchestrator.fork(request.clone(), |_| {}).await;
+    assert!(matches!(
+        first,
+        Err(ref error) if error.stage == LaunchStage::Kickoff
+    ));
+    let sessions = storage.list_sessions().unwrap();
+    assert_eq!(sessions.len(), 2);
+    assert!(
+        sessions
+            .iter()
+            .find(|metadata| metadata.id != source.handle.id())
+            .unwrap()
+            .fork_kickoff_pending
+    );
+
+    let retry = orchestrator.fork(request, |_| {}).await;
+    let Err(error) = retry else {
+        panic!("retry must not silently drop or duplicate kickoff");
+    };
+    assert!(error.to_string().contains("indeterminate"), "{error}");
+    assert_eq!(storage.list_sessions().unwrap().len(), 2);
 }
 
 #[tokio::test]

@@ -26,7 +26,8 @@ use github_copilot_sdk::rpc::{
     PermissionDecisionApproveForSession, PermissionDecisionApproveForSessionApproval,
     PermissionDecisionApproveForSessionApprovalCommands,
     PermissionDecisionApproveForSessionApprovalRead,
-    PermissionDecisionApproveForSessionApprovalWrite, SkillsDiscoverRequest, ToolsListRequest,
+    PermissionDecisionApproveForSessionApprovalWrite, SessionsForkRequest, SessionsForkResult,
+    SkillsDiscoverRequest, ToolsListRequest,
 };
 use github_copilot_sdk::session::Session;
 use github_copilot_sdk::tool::ToolHandler;
@@ -79,7 +80,39 @@ pub struct SessionRequest {
     pub host_tools: Option<HostToolBinding>,
 }
 
+/// Typed native SDK history fork request. `to_event_id` is an exclusive
+/// boundary: the named event itself is not included in the new session.
+#[derive(Clone, Debug, Default, Eq, PartialEq)]
+pub struct ForkSessionRequest {
+    pub source_sdk_session_id: String,
+    pub to_event_id: Option<String>,
+    pub name: Option<String>,
+}
+
+/// Identity assigned by the SDK to a native history fork.
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ForkSessionResult {
+    pub sdk_session_id: String,
+    pub name: Option<String>,
+}
+
+fn sdk_fork_request(request: &ForkSessionRequest) -> SessionsForkRequest {
+    SessionsForkRequest {
+        session_id: SessionId::from(request.source_sdk_session_id.clone()),
+        to_event_id: request.to_event_id.clone(),
+        name: request.name.clone(),
+    }
+}
+
+fn provider_fork_result(result: SessionsForkResult) -> ForkSessionResult {
+    ForkSessionResult {
+        sdk_session_id: result.session_id.to_string(),
+        name: result.name,
+    }
+}
+
 const CREATE_SESSION_TOOL_NAME: &str = "create_session";
+const FORK_SESSION_TOOL_NAME: &str = "fork_session";
 const GET_SESSION_TOOL_NAME: &str = "get_session";
 const SEND_SESSION_MESSAGE_TOOL_NAME: &str = "send_session_message";
 const RESPOND_TO_SESSION_PLAN_TOOL_NAME: &str = "respond_to_session_plan";
@@ -172,6 +205,43 @@ pub struct CreateSessionToolResult {
     pub title: String,
     pub status: String,
     pub project: String,
+    pub worktree: String,
+    pub branch: Option<String>,
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+#[serde(deny_unknown_fields)]
+pub struct ForkSessionToolInput {
+    #[serde(default)]
+    pub to_event_id: Option<String>,
+    #[serde(default)]
+    pub name: Option<String>,
+    #[serde(default)]
+    pub kickoff_prompt: Option<String>,
+}
+
+impl ForkSessionToolInput {
+    fn validate(&self) -> std::result::Result<(), String> {
+        validate_optional(
+            "to_event_id",
+            self.to_event_id.as_deref(),
+            MAX_SESSION_ID_BYTES,
+        )?;
+        validate_optional("name", self.name.as_deref(), MAX_SESSION_TITLE_BYTES)?;
+        validate_optional(
+            "kickoff_prompt",
+            self.kickoff_prompt.as_deref(),
+            MAX_KICKOFF_PROMPT_BYTES,
+        )?;
+        Ok(())
+    }
+}
+
+#[derive(Clone, Debug, Deserialize, Eq, PartialEq, Serialize)]
+pub struct ForkSessionToolResult {
+    pub fork_app_session_id: String,
+    pub title: String,
+    pub status: String,
     pub worktree: String,
     pub branch: Option<String>,
 }
@@ -342,6 +412,7 @@ pub struct RespondToSessionPlanToolResult {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostToolCall {
     CreateSession(CreateSessionToolInput),
+    ForkSession(ForkSessionToolInput),
     GetSession(GetSessionToolInput),
     SendSessionMessage(SendSessionMessageToolInput),
     RespondToSessionPlan(RespondToSessionPlanToolInput),
@@ -350,6 +421,7 @@ pub enum HostToolCall {
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum HostToolResult {
     CreateSession(CreateSessionToolResult),
+    ForkSession(ForkSessionToolResult),
     GetSession(Box<GetSessionToolResult>),
     SendSessionMessage(SendSessionMessageToolResult),
     RespondToSessionPlan(RespondToSessionPlanToolResult),
@@ -459,6 +531,40 @@ impl HostToolBinding {
 
 struct CreateSessionToolHandler {
     binding: HostToolBinding,
+}
+
+struct ForkSessionToolHandler {
+    binding: HostToolBinding,
+}
+
+#[async_trait]
+impl ToolHandler for ForkSessionToolHandler {
+    async fn call(
+        &self,
+        invocation: ToolInvocation,
+    ) -> std::result::Result<ToolResult, github_copilot_sdk::Error> {
+        let input = invocation.params::<ForkSessionToolInput>()?;
+        if let Err(error) = input.validate() {
+            return Ok(tool_response("session", Err(error)));
+        }
+        let (response, receiver) = oneshot::channel();
+        let result = call_host_tool(
+            &self.binding,
+            invocation.tool_call_id,
+            HostToolCall::ForkSession(input),
+            response,
+            receiver,
+        )
+        .await;
+        Ok(tool_response(
+            "session",
+            result.and_then(|result| match result {
+                HostToolResult::ForkSession(result) => serde_json::to_value(result)
+                    .map_err(|error| format!("failed to encode fork_session response: {error}")),
+                _ => Err("fork_session host service returned the wrong response type".to_owned()),
+            }),
+        ))
+    }
 }
 
 #[async_trait]
@@ -612,6 +718,7 @@ async fn call_host_tool(
 ) -> std::result::Result<HostToolResult, String> {
     let tool_name = match &call {
         HostToolCall::CreateSession(_) => CREATE_SESSION_TOOL_NAME,
+        HostToolCall::ForkSession(_) => FORK_SESSION_TOOL_NAME,
         HostToolCall::GetSession(_) => GET_SESSION_TOOL_NAME,
         HostToolCall::SendSessionMessage(_) => SEND_SESSION_MESSAGE_TOOL_NAME,
         HostToolCall::RespondToSessionPlan(_) => RESPOND_TO_SESSION_PLAN_TOOL_NAME,
@@ -693,12 +800,47 @@ fn create_session_tool(binding: HostToolBinding) -> Tool {
                         "enum": ["once"],
                         "description": "Notify this session once when the child finishes its kickoff or current turn."
                     }
+
                 },
                 "required": ["prompt"]
             }))
             .expect("create_session tool schema is an object"),
         )
         .with_handler(Arc::new(CreateSessionToolHandler { binding }))
+}
+
+fn fork_session_tool(binding: HostToolBinding) -> Tool {
+    Tool::new(FORK_SESSION_TOOL_NAME)
+        .with_description(
+            "Fork this project session's native SDK history into a new GCABB worktree. An optional event id is exclusive.",
+        )
+        .with_parameters(
+            serde_json::from_value(json!({
+                "type": "object",
+                "additionalProperties": false,
+                "properties": {
+                    "to_event_id": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SESSION_ID_BYTES,
+                        "description": "Optional exclusive source event id; it is not included in the fork."
+                    },
+                    "name": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_SESSION_TITLE_BYTES
+                    },
+                    "kickoff_prompt": {
+                        "type": "string",
+                        "minLength": 1,
+                        "maxLength": MAX_KICKOFF_PROMPT_BYTES,
+                        "description": "Optional steering prompt sent after the fork is resumed."
+                    }
+                }
+            }))
+            .expect("fork_session tool schema is an object"),
+        )
+        .with_handler(Arc::new(ForkSessionToolHandler { binding }))
 }
 
 fn get_session_tool(binding: HostToolBinding) -> Tool {
@@ -800,9 +942,10 @@ fn respond_to_session_plan_tool(binding: HostToolBinding) -> Tool {
         .with_handler(Arc::new(RespondToSessionPlanToolHandler { binding }))
 }
 
-fn host_tools(binding: HostToolBinding) -> [Tool; 4] {
+fn host_tools(binding: HostToolBinding) -> [Tool; 5] {
     [
         create_session_tool(binding.clone()),
+        fork_session_tool(binding.clone()),
         get_session_tool(binding.clone()),
         send_session_message_tool(binding.clone()),
         respond_to_session_plan_tool(binding),
@@ -859,6 +1002,11 @@ pub trait AgentProvider: Send + Sync {
         sdk_session_id: &str,
         request: SessionRequest,
     ) -> Result<ProviderSession>;
+    /// Fork a currently connected SDK session with the native sessions RPC.
+    async fn fork_session(&self, request: ForkSessionRequest) -> Result<ForkSessionResult>;
+    /// Delete persisted SDK history created for a fork that could not be
+    /// attached to an app session.
+    async fn delete_session_history(&self, sdk_session_id: &str) -> Result<()>;
     async fn send(
         &self,
         sdk_session_id: &str,
@@ -1547,6 +1695,55 @@ impl AgentProvider for CopilotProvider {
             json!({"workingDirectory": request.working_directory}),
         );
         Ok(self.register(session, interactions).await)
+    }
+
+    async fn fork_session(&self, request: ForkSessionRequest) -> Result<ForkSessionResult> {
+        let source = self.session(&request.source_sdk_session_id).await?;
+        if let Some(boundary) = request.to_event_id.as_deref() {
+            let events = source
+                .get_events()
+                .await
+                .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+            let found = events.into_iter().any(|event| {
+                serde_json::to_value(event)
+                    .ok()
+                    .and_then(|event| event.get("id").and_then(Value::as_str).map(str::to_owned))
+                    .as_deref()
+                    == Some(boundary)
+            });
+            if !found {
+                return Err(ProviderError::Sdk(format!(
+                    "fork boundary is not an exact event id in source history: {boundary}"
+                )));
+            }
+        }
+        let started = Instant::now();
+        let result = self
+            .client()
+            .await?
+            .rpc()
+            .sessions()
+            .fork(sdk_fork_request(&request))
+            .await
+            .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        let fork = provider_fork_result(result);
+        self.record(
+            "fork_session",
+            millis(started.elapsed().as_millis()),
+            Some(fork.sdk_session_id.clone()),
+            true,
+            json!({"sourceSdkSessionId": request.source_sdk_session_id, "toEventId": request.to_event_id}),
+        );
+        Ok(fork)
+    }
+
+    async fn delete_session_history(&self, sdk_session_id: &str) -> Result<()> {
+        let session_id = SessionId::from(sdk_session_id);
+        self.client()
+            .await?
+            .delete_session(&session_id)
+            .await
+            .map_err(|error| ProviderError::Sdk(error.to_string()))
     }
 
     async fn send(
@@ -2453,14 +2650,15 @@ mod tests {
 
     use super::{
         AgentProviderFactory, CopilotProvider, CopilotProviderFactory, CreateSessionToolResult,
-        GetSessionToolInput, GetSessionToolResult, HostGatewayEvent, HostToolBinding, HostToolCall,
-        HostToolGateway, HostToolResult, InteractionBroker, InteractionResponse,
-        PlanContinuationAction, ProviderInteraction, RespondToSessionPlanToolInput,
-        RespondToSessionPlanToolResult, SendSessionMessageToolInput, SendSessionMessageToolResult,
-        SessionChangeSummary, SessionMessageDelivery, SessionRequest, command_identifier,
-        message_options, model_option, permission_choices, permission_domain,
+        ForkSessionRequest, GetSessionToolInput, GetSessionToolResult, HostGatewayEvent,
+        HostToolBinding, HostToolCall, HostToolGateway, HostToolResult, InteractionBroker,
+        InteractionResponse, PlanContinuationAction, ProviderInteraction,
+        RespondToSessionPlanToolInput, RespondToSessionPlanToolResult, SendSessionMessageToolInput,
+        SendSessionMessageToolResult, SessionChangeSummary, SessionMessageDelivery, SessionRequest,
+        command_identifier, message_options, model_option, permission_choices, permission_domain,
         permission_for_domain, permission_for_location, permission_for_session,
-        permission_stays_in_worktree, resolve_root, sdk_context_windows,
+        permission_stays_in_worktree, provider_fork_result, resolve_root, sdk_context_windows,
+        sdk_fork_request,
     };
 
     fn interaction_broker() -> Arc<InteractionBroker> {
@@ -2481,6 +2679,25 @@ mod tests {
         let second = factory.create(Path::new("/tmp/second"));
 
         assert!(!Arc::ptr_eq(&first, &second));
+    }
+
+    #[test]
+    fn fork_rpc_mapping_preserves_exclusive_boundary_name_and_returned_identity() {
+        let wire = sdk_fork_request(&ForkSessionRequest {
+            source_sdk_session_id: "sdk-source".to_owned(),
+            to_event_id: Some("event-exclusive".to_owned()),
+            name: Some("Friendly fork".to_owned()),
+        });
+        assert_eq!(wire.session_id.to_string(), "sdk-source");
+        assert_eq!(wire.to_event_id.as_deref(), Some("event-exclusive"));
+        assert_eq!(wire.name.as_deref(), Some("Friendly fork"));
+
+        let mapped = provider_fork_result(github_copilot_sdk::rpc::SessionsForkResult {
+            session_id: SessionId::from("sdk-fork"),
+            name: Some("Friendly fork".to_owned()),
+        });
+        assert_eq!(mapped.sdk_session_id, "sdk-fork");
+        assert_eq!(mapped.name.as_deref(), Some("Friendly fork"));
     }
 
     #[test]
@@ -2553,6 +2770,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "create_session",
+                "fork_session",
                 "get_session",
                 "send_session_message",
                 "respond_to_session_plan"
@@ -2576,6 +2794,7 @@ mod tests {
                 .collect::<Vec<_>>(),
             [
                 "create_session",
+                "fork_session",
                 "get_session",
                 "send_session_message",
                 "respond_to_session_plan"
@@ -2585,9 +2804,9 @@ mod tests {
         let create_tools = create.tools.unwrap();
         let resume_tools = resume.tools.unwrap();
         let handler = create_tools[0].handler().expect("create handler").clone();
-        let get_handler = resume_tools[1].handler().expect("get handler").clone();
-        let send_handler = resume_tools[2].handler().expect("send handler").clone();
-        let plan_handler = create_tools[3].handler().expect("plan handler").clone();
+        let get_handler = resume_tools[2].handler().expect("get handler").clone();
+        let send_handler = resume_tools[3].handler().expect("send handler").clone();
+        let plan_handler = create_tools[4].handler().expect("plan handler").clone();
         let failure_handler = resume_tools[0].handler().expect("create handler").clone();
         let invocation: ToolInvocation = serde_json::from_value(json!({
             "sessionId": "sdk-parent",

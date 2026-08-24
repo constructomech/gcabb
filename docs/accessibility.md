@@ -15,6 +15,8 @@ The initial session shell exposes:
 
 - An application root and projects/sessions navigation region.
 - Project and session lists with selected state.
+- Fork provenance in session-row names and a keyboard-accessible **Fork
+  session** menu action.
 - Headings, status messages, and alerts.
 - A conversation list with attributed messages.
 - A labelled text input with current value and placeholder.

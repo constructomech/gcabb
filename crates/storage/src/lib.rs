@@ -14,7 +14,7 @@ use diagnostics::DiagnosticEvent;
 use rusqlite::{Connection, OptionalExtension, params, params_from_iter};
 use thiserror::Error;
 
-const SCHEMA_VERSION: i64 = 13;
+const SCHEMA_VERSION: i64 = 15;
 /// Gap left between queue positions so an item can be moved between two
 /// neighbours without renumbering the rest of the queue.
 const QUEUE_POSITION_STRIDE: i64 = 1024;
@@ -268,10 +268,11 @@ impl Storage {
         transaction.execute(
             "INSERT INTO app_sessions (
                 id, sdk_session_id, project_path, repository_root, title, title_source,
-                kind, parent_session_id, launch_origin, host_tool_call_id, model, mode, base_ref,
-                launch_depth, created_at, updated_at
+               kind, parent_session_id, launch_origin, host_tool_call_id,
+               forked_from_session_id, forked_at_event_id, fork_tool_call_id,
+               fork_kickoff_pending, model, mode, base_ref, launch_depth, created_at, updated_at
              ) VALUES (
-                ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16
+               ?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16, ?17, ?18, ?19, ?20
              )
              ON CONFLICT(id) DO UPDATE SET
                 sdk_session_id = excluded.sdk_session_id,
@@ -283,6 +284,10 @@ impl Storage {
                 parent_session_id = excluded.parent_session_id,
                 launch_origin = excluded.launch_origin,
                 host_tool_call_id = excluded.host_tool_call_id,
+                forked_from_session_id = excluded.forked_from_session_id,
+                forked_at_event_id = excluded.forked_at_event_id,
+                fork_tool_call_id = excluded.fork_tool_call_id,
+                fork_kickoff_pending = excluded.fork_kickoff_pending,
                 model = excluded.model,
                 mode = excluded.mode,
                 base_ref = excluded.base_ref,
@@ -298,6 +303,10 @@ impl Storage {
                 metadata.parent_session_id,
                 metadata.launch_origin.as_str(),
                 metadata.host_tool_call_id,
+                metadata.forked_from_session_id,
+                metadata.forked_at_event_id,
+                metadata.fork_tool_call_id,
+                metadata.fork_kickoff_pending,
                 metadata.model,
                 metadata.mode,
                 metadata.base_ref,
@@ -349,7 +358,7 @@ impl Storage {
     pub fn session_metadata(&self, app_session_id: &str) -> Result<Option<SessionMetadata>> {
         self.connection()?
             .query_row(
-                "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, parent_session_id, launch_origin, host_tool_call_id, model, mode, base_ref, created_at, updated_at
+                "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, parent_session_id, launch_origin, host_tool_call_id, forked_from_session_id, forked_at_event_id, fork_tool_call_id, fork_kickoff_pending, model, mode, base_ref, created_at, updated_at
                  FROM app_sessions WHERE id = ?1",
                 [app_session_id],
                 metadata_from_row,
@@ -378,7 +387,9 @@ impl Storage {
                 "SELECT session.id, session.sdk_session_id, session.project_path,
                         session.repository_root, session.title, session.title_source, session.kind,
                         session.parent_session_id, session.launch_origin,
-                        session.host_tool_call_id, session.model, session.mode, session.base_ref,
+                        session.host_tool_call_id, session.forked_from_session_id,
+                        session.forked_at_event_id, session.fork_tool_call_id,
+                        session.fork_kickoff_pending, session.model, session.mode, session.base_ref,
                         session.created_at, session.updated_at, launch.completed
                  FROM host_tool_launches launch
                  LEFT JOIN app_sessions session ON session.id = launch.child_session_id
@@ -390,12 +401,43 @@ impl Storage {
                             .get::<_, Option<String>>(0)?
                             .map(|_| metadata_from_row(row))
                             .transpose()?,
-                        launch_completed: row.get(15)?,
+                        launch_completed: row.get(19)?,
                     })
                 },
             )
             .optional()
             .map_err(Into::into)
+    }
+
+    /// Look up a fork created by a retried `fork_session` host-tool call.
+    /// Fork provenance deliberately remains independent from child-session
+    /// hierarchy and its coordination limits.
+    pub fn session_for_fork_tool_call(
+        &self,
+        source_session_id: &str,
+        tool_call_id: &str,
+    ) -> Result<Option<SessionMetadata>> {
+        self.connection()?
+            .query_row(
+                "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, parent_session_id, launch_origin, host_tool_call_id, forked_from_session_id, forked_at_event_id, fork_tool_call_id, fork_kickoff_pending, model, mode, base_ref, created_at, updated_at
+                 FROM app_sessions
+                 WHERE forked_from_session_id = ?1 AND fork_tool_call_id = ?2",
+                params![source_session_id, tool_call_id],
+                metadata_from_row,
+            )
+            .optional()
+            .map_err(Into::into)
+    }
+
+    pub fn set_fork_kickoff_pending(&self, app_session_id: &str, pending: bool) -> Result<()> {
+        let updated = self.connection()?.execute(
+            "UPDATE app_sessions SET fork_kickoff_pending = ?2 WHERE id = ?1",
+            params![app_session_id, pending],
+        )?;
+        if updated == 0 {
+            return Err(StorageError::SessionNotFound(app_session_id.to_owned()));
+        }
+        Ok(())
     }
 
     pub fn complete_host_tool_launch(&self, child_session_id: &str) -> Result<()> {
@@ -589,7 +631,7 @@ impl Storage {
     pub fn list_sessions(&self) -> Result<Vec<SessionMetadata>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, parent_session_id, launch_origin, host_tool_call_id, model, mode, base_ref, created_at, updated_at
+            "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, parent_session_id, launch_origin, host_tool_call_id, forked_from_session_id, forked_at_event_id, fork_tool_call_id, fork_kickoff_pending, model, mode, base_ref, created_at, updated_at
              FROM app_sessions
              WHERE id NOT IN (SELECT session_id FROM session_archives)
              ORDER BY updated_at DESC, id",
@@ -703,7 +745,7 @@ impl Storage {
     pub fn list_archived_sessions(&self) -> Result<Vec<ArchivedSession>> {
         let connection = self.connection()?;
         let mut statement = connection.prepare(
-            "SELECT s.id, s.sdk_session_id, s.project_path, s.repository_root, s.title, s.title_source, s.kind, s.parent_session_id, s.launch_origin, s.host_tool_call_id, s.model, s.mode, s.base_ref, s.created_at, s.updated_at,
+            "SELECT s.id, s.sdk_session_id, s.project_path, s.repository_root, s.title, s.title_source, s.kind, s.parent_session_id, s.launch_origin, s.host_tool_call_id, s.forked_from_session_id, s.forked_at_event_id, s.fork_tool_call_id, s.fork_kickoff_pending, s.model, s.mode, s.base_ref, s.created_at, s.updated_at,
                     a.archived_at, a.project_path, a.repository_root, a.branch, a.head_commit, a.patch
              FROM app_sessions s
              JOIN session_archives a ON a.session_id = s.id
@@ -714,12 +756,12 @@ impl Storage {
                 metadata: metadata_from_row(row)?,
                 archive: SessionArchiveRecord {
                     session_id: row.get(0)?,
-                    archived_at: row.get(15)?,
-                    project_path: row.get(16)?,
-                    repository_root: row.get(17)?,
-                    branch: row.get(18)?,
-                    head_commit: row.get(19)?,
-                    patch: row.get(20)?,
+                    archived_at: row.get(19)?,
+                    project_path: row.get(20)?,
+                    repository_root: row.get(21)?,
+                    branch: row.get(22)?,
+                    head_commit: row.get(23)?,
+                    patch: row.get(24)?,
                 },
             })
         })?;
@@ -932,7 +974,7 @@ impl Storage {
         let connection = self.connection()?;
         let metadata = connection
             .query_row(
-                "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, parent_session_id, launch_origin, host_tool_call_id, model, mode, base_ref, created_at, updated_at
+                "SELECT id, sdk_session_id, project_path, repository_root, title, title_source, kind, parent_session_id, launch_origin, host_tool_call_id, forked_from_session_id, forked_at_event_id, fork_tool_call_id, fork_kickoff_pending, model, mode, base_ref, created_at, updated_at
                  FROM app_sessions WHERE id = ?1",
                 [session_id],
                 metadata_from_row,
@@ -1996,6 +2038,10 @@ impl Storage {
                 parent_session_id TEXT,
                 launch_origin TEXT NOT NULL DEFAULT 'user',
                 host_tool_call_id TEXT,
+                forked_from_session_id TEXT,
+                forked_at_event_id TEXT,
+                fork_tool_call_id TEXT,
+                fork_kickoff_pending INTEGER NOT NULL DEFAULT 0,
                 launch_depth INTEGER NOT NULL DEFAULT 0,
                 created_at TEXT NOT NULL,
                 updated_at TEXT NOT NULL
@@ -2166,6 +2212,20 @@ impl Storage {
         add_column_if_missing(
             &transaction,
             "app_sessions",
+            "forked_from_session_id",
+            "TEXT",
+        )?;
+        add_column_if_missing(&transaction, "app_sessions", "forked_at_event_id", "TEXT")?;
+        add_column_if_missing(&transaction, "app_sessions", "fork_tool_call_id", "TEXT")?;
+        add_column_if_missing(
+            &transaction,
+            "app_sessions",
+            "fork_kickoff_pending",
+            "INTEGER NOT NULL DEFAULT 0",
+        )?;
+        add_column_if_missing(
+            &transaction,
+            "app_sessions",
             "launch_depth",
             "INTEGER NOT NULL DEFAULT 0",
         )?;
@@ -2173,6 +2233,11 @@ impl Storage {
             "CREATE UNIQUE INDEX IF NOT EXISTS app_sessions_host_tool_call
              ON app_sessions(parent_session_id, host_tool_call_id)
              WHERE parent_session_id IS NOT NULL AND host_tool_call_id IS NOT NULL;",
+        )?;
+        transaction.execute_batch(
+            "CREATE UNIQUE INDEX IF NOT EXISTS app_sessions_fork_tool_call
+             ON app_sessions(forked_from_session_id, fork_tool_call_id)
+             WHERE forked_from_session_id IS NOT NULL AND fork_tool_call_id IS NOT NULL;",
         )?;
         add_column_if_missing(
             &transaction,
@@ -2743,11 +2808,15 @@ fn metadata_from_row(row: &rusqlite::Row<'_>) -> rusqlite::Result<SessionMetadat
             row.get::<_, Option<String>>(8)?.as_deref(),
         ),
         host_tool_call_id: row.get(9)?,
-        model: row.get(10)?,
-        mode: row.get(11)?,
-        base_ref: row.get(12)?,
-        created_at: row.get(13)?,
-        updated_at: row.get(14)?,
+        forked_from_session_id: row.get(10)?,
+        forked_at_event_id: row.get(11)?,
+        fork_tool_call_id: row.get(12)?,
+        fork_kickoff_pending: row.get(13)?,
+        model: row.get(14)?,
+        mode: row.get(15)?,
+        base_ref: row.get(16)?,
+        created_at: row.get(17)?,
+        updated_at: row.get(18)?,
     })
 }
 
@@ -2772,6 +2841,10 @@ mod tests {
             parent_session_id: None,
             launch_origin: SessionLaunchOrigin::User,
             host_tool_call_id: None,
+            forked_from_session_id: None,
+            forked_at_event_id: None,
+            fork_tool_call_id: None,
+            fork_kickoff_pending: false,
             model: Some("test-model".to_owned()),
             mode: Some("interactive".to_owned()),
             base_ref: Some("main".to_owned()),
@@ -2792,12 +2865,49 @@ mod tests {
             parent_session_id: Some(parent.id.clone()),
             launch_origin: SessionLaunchOrigin::AgentTool,
             host_tool_call_id: Some(format!("tool-call-{suffix}")),
+            forked_from_session_id: None,
+            forked_at_event_id: None,
+            fork_tool_call_id: None,
+            fork_kickoff_pending: false,
             model: None,
             mode: Some("autopilot".to_owned()),
             base_ref: Some("main".to_owned()),
             created_at: suffix.to_string(),
             updated_at: suffix.to_string(),
         }
+    }
+
+    #[test]
+    fn finds_fork_by_independent_tool_provenance() {
+        let storage = Storage::open_in_memory().unwrap();
+        let mut source = metadata();
+        source.repository_root = Some("/tmp/project".to_owned());
+        storage.upsert_session(&source).unwrap();
+        let mut fork = source.clone();
+        fork.id = "fork-app".to_owned();
+        fork.sdk_session_id = "fork-sdk".to_owned();
+        fork.parent_session_id = None;
+        fork.host_tool_call_id = None;
+        fork.forked_from_session_id = Some(source.id.clone());
+        fork.forked_at_event_id = Some("event-2".to_owned());
+        fork.fork_tool_call_id = Some("tool-fork".to_owned());
+        fork.fork_kickoff_pending = true;
+        storage.upsert_session(&fork).unwrap();
+        let found = storage
+            .session_for_fork_tool_call(&source.id, "tool-fork")
+            .unwrap()
+            .unwrap();
+        assert_eq!(found.id, fork.id);
+        assert_eq!(found.forked_at_event_id.as_deref(), Some("event-2"));
+        assert!(found.fork_kickoff_pending);
+        storage.set_fork_kickoff_pending(&fork.id, false).unwrap();
+        assert!(
+            !storage
+                .session_metadata(&fork.id)
+                .unwrap()
+                .unwrap()
+                .fork_kickoff_pending
+        );
     }
 
     fn automation() -> Automation {
@@ -4121,7 +4231,7 @@ mod tests {
                 storage.create_coordination_item(&expected, None).unwrap(),
                 expected
             );
-            assert_eq!(storage.schema_version().unwrap(), 13);
+            assert_eq!(storage.schema_version().unwrap(), SCHEMA_VERSION);
 
             let connection = storage.connection().unwrap();
             let foreign_keys: HashSet<String> = connection

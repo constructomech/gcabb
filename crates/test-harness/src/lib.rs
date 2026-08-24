@@ -11,9 +11,9 @@ use app_model::{
 };
 use async_trait::async_trait;
 use copilot_provider::{
-    AgentProvider, AgentProviderFactory, DeliveryReceipt, ProviderCompatibility, ProviderError,
-    ProviderEvent, ProviderInteraction, ProviderSession, QueueDeliveryRequest, Result,
-    SDK_CRATE_VERSION, SessionRequest,
+    AgentProvider, AgentProviderFactory, DeliveryReceipt, ForkSessionRequest, ForkSessionResult,
+    ProviderCompatibility, ProviderError, ProviderEvent, ProviderInteraction, ProviderSession,
+    QueueDeliveryRequest, Result, SDK_CRATE_VERSION, SessionRequest,
 };
 use serde_json::{Value, json};
 use tokio::sync::{Mutex, mpsc, oneshot};
@@ -123,7 +123,7 @@ pub struct FakeProvider {
     process_id: AtomicU64,
     next_session: AtomicU64,
     script: Mutex<Vec<Value>>,
-    history: Mutex<HashMap<String, Vec<Value>>>,
+    history: Arc<Mutex<HashMap<String, Vec<Value>>>>,
     live: Mutex<HashMap<String, mpsc::Sender<ProviderEvent>>>,
     interactions: Mutex<HashMap<String, mpsc::Sender<ProviderInteraction>>>,
     fail_resume: AtomicBool,
@@ -400,6 +400,51 @@ impl AgentProvider for FakeProvider {
         Ok(self.connect(sdk_session_id.to_owned()).await)
     }
 
+    async fn fork_session(&self, request: ForkSessionRequest) -> Result<ForkSessionResult> {
+        let source = self
+            .history
+            .lock()
+            .await
+            .get(&request.source_sdk_session_id)
+            .cloned()
+            .ok_or_else(|| ProviderError::SessionNotFound(request.source_sdk_session_id.clone()))?;
+        let history = if let Some(boundary) = request.to_event_id.as_deref() {
+            let position = source
+                .iter()
+                .position(|event| event.get("id").and_then(Value::as_str) == Some(boundary))
+                .ok_or_else(|| {
+                    ProviderError::Sdk(format!(
+                        "fork boundary is not an exact event id in source history: {boundary}"
+                    ))
+                })?;
+            source[..position].to_vec()
+        } else {
+            source
+        };
+        let number = self.next_session.fetch_add(1, Ordering::SeqCst) + 1;
+        let sdk_session_id = format!("fake-fork-{number}");
+        self.history
+            .lock()
+            .await
+            .insert(sdk_session_id.clone(), history);
+        Ok(ForkSessionResult {
+            sdk_session_id,
+            name: request.name,
+        })
+    }
+
+    async fn delete_session_history(&self, sdk_session_id: &str) -> Result<()> {
+        self.history
+            .lock()
+            .await
+            .remove(sdk_session_id)
+            .ok_or_else(|| ProviderError::SessionNotFound(sdk_session_id.to_owned()))?;
+        self.live.lock().await.remove(sdk_session_id);
+        self.interactions.lock().await.remove(sdk_session_id);
+        self.selected_agents.lock().await.remove(sdk_session_id);
+        Ok(())
+    }
+
     async fn send(
         &self,
         sdk_session_id: &str,
@@ -585,6 +630,7 @@ struct FakeProviderFactoryState {
     fail_stop: AtomicBool,
     fail_title_generation: AtomicBool,
     generated_title: StdMutex<Option<String>>,
+    history: Arc<Mutex<HashMap<String, Vec<Value>>>>,
 }
 
 impl FakeProviderFactory {
@@ -650,10 +696,9 @@ impl AgentProviderFactory for FakeProviderFactory {
 
     fn create(&self, working_directory: &Path) -> Arc<dyn AgentProvider> {
         let process_id = self.state.next_provider.fetch_add(1, Ordering::SeqCst) + 1;
-        let provider = Arc::new(FakeProvider::with_process_id(
-            process_id,
-            working_directory.to_owned(),
-        ));
+        let mut fake = FakeProvider::with_process_id(process_id, working_directory.to_owned());
+        fake.history = self.state.history.clone();
+        let provider = Arc::new(fake);
         provider.fail_start.store(
             self.state.fail_start.load(Ordering::SeqCst),
             Ordering::SeqCst,
@@ -789,5 +834,53 @@ mod tests {
             16
         );
         assert_eq!(first.last().unwrap()["type"], "session.idle");
+    }
+
+    #[tokio::test]
+    async fn fake_provider_forks_full_and_exclusive_bounded_history() {
+        let provider = FakeProvider::default();
+        provider.start().await.unwrap();
+        let source = provider
+            .create_session(SessionRequest::default())
+            .await
+            .unwrap();
+        provider
+            .emit(
+                &source.sdk_session_id,
+                json!({"id": "one", "type": "user.message"}),
+            )
+            .await
+            .unwrap();
+        provider
+            .emit(
+                &source.sdk_session_id,
+                json!({"id": "two", "type": "assistant.message"}),
+            )
+            .await
+            .unwrap();
+        let full = provider
+            .fork_session(ForkSessionRequest {
+                source_sdk_session_id: source.sdk_session_id.clone(),
+                name: Some("Full".to_owned()),
+                ..ForkSessionRequest::default()
+            })
+            .await
+            .unwrap();
+        let bounded = provider
+            .fork_session(ForkSessionRequest {
+                source_sdk_session_id: source.sdk_session_id,
+                to_event_id: Some("two".to_owned()),
+                ..ForkSessionRequest::default()
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            provider.history(&full.sdk_session_id).await.unwrap().len(),
+            2
+        );
+        assert_eq!(
+            provider.history(&bounded.sdk_session_id).await.unwrap(),
+            vec![json!({"id": "one", "type": "user.message"})]
+        );
     }
 }
