@@ -108,6 +108,7 @@ fn project_request(
         origin,
         parent_session_id: None,
         host_tool_call_id: None,
+        notify_on_idle: None,
     }
 }
 
@@ -269,6 +270,7 @@ async fn agent_child_launch_persists_ownership_and_keeps_parent_selected() {
     };
     child_request.parent_session_id = Some(parent.handle.id().to_owned());
     child_request.host_tool_call_id = Some("tool-call-1".to_owned());
+    child_request.notify_on_idle = Some("once".to_owned());
     let child = orchestrator
         .launch(child_request, |_| {})
         .await
@@ -294,6 +296,10 @@ async fn agent_child_launch_persists_ownership_and_keeps_parent_selected() {
         app_model::SessionLaunchOrigin::AgentTool
     );
     assert_eq!(metadata.host_tool_call_id.as_deref(), Some("tool-call-1"));
+    assert_eq!(
+        storage.host_tool_notify_on_idle(child.handle.id()).unwrap(),
+        Some("once".to_owned())
+    );
     assert_eq!(
         storage
             .session_for_tool_call(parent.handle.id(), "tool-call-1")
