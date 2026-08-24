@@ -4261,10 +4261,11 @@ impl SessionMvpView {
                 ServiceUpdate::SessionAdded(handle) => {
                     self.apply_session_added(handle, cx);
                 }
-                ServiceUpdate::SessionForked {
-                    source_session_id,
-                    handle,
-                } => self.apply_session_forked(&source_session_id, handle, cx),
+                update @ (ServiceUpdate::SessionForked { .. }
+                | ServiceUpdate::SessionForkProgress { .. }
+                | ServiceUpdate::SessionForkFailed { .. }) => {
+                    self.apply_session_fork_update(update, cx);
+                }
                 ServiceUpdate::SessionsDiscovered(handles) => {
                     for handle in handles {
                         self.upsert_hydrated_session(handle, cx);
@@ -4283,14 +4284,6 @@ impl SessionMvpView {
                 ServiceUpdate::SessionLaunchProgress(progress) => {
                     self.session_launch = Some(progress);
                 }
-                ServiceUpdate::SessionForkProgress {
-                    source_session_id,
-                    progress,
-                } => self.apply_session_fork_progress(source_session_id, progress),
-                ServiceUpdate::SessionForkFailed {
-                    source_session_id,
-                    error,
-                } => self.apply_session_fork_failed(&source_session_id, error),
                 ServiceUpdate::SessionsDeleted(deletion) => {
                     self.apply_sessions_deleted(deletion, cx);
                 }
@@ -4364,6 +4357,24 @@ impl SessionMvpView {
         let id = handle.id().to_owned();
         self.upsert_hydrated_session(handle, cx);
         self.switch_composer_draft(Some(id), cx);
+    }
+
+    fn apply_session_fork_update(&mut self, update: ServiceUpdate, cx: &mut Context<Self>) {
+        match update {
+            ServiceUpdate::SessionForked {
+                source_session_id,
+                handle,
+            } => self.apply_session_forked(&source_session_id, handle, cx),
+            ServiceUpdate::SessionForkProgress {
+                source_session_id,
+                progress,
+            } => self.apply_session_fork_progress(source_session_id, progress),
+            ServiceUpdate::SessionForkFailed {
+                source_session_id,
+                error,
+            } => self.apply_session_fork_failed(&source_session_id, error),
+            _ => unreachable!("only fork updates are dispatched here"),
+        }
     }
 
     fn apply_session_added(&mut self, handle: SessionHandle, cx: &mut Context<Self>) {
