@@ -12,6 +12,9 @@ activity, commands, and changes visible as they happen.
 - Archive a session to reclaim its worktree while keeping its full history,
   and unarchive it from Settings to rebuild the worktree along with any
   tracked or untracked work that was never committed.
+- Optionally archive or delete an entire descendant session tree. Recursive
+  lifecycle actions are always opt-in; the confirmation checkbox starts
+  unchecked so the default continues to affect only the selected session.
 - Work in isolated project worktrees without blocking other sessions.
 - Stream the conversation and inspect main-agent, subagent, and tool activity.
 - Respond to permission, elicitation, user-input, plan, and mode requests.
@@ -26,6 +29,25 @@ activity, commands, and changes visible as they happen.
 - Restore your selected session after restarting GCABB.
 
 GCABB is still experimental. Keep important work committed or backed up.
+
+## Session lifecycle safety
+
+Archiving or deleting a parent does not affect its child sessions by default.
+Those children remain visible as root-level sessions when their parent is no
+longer available. To affect the full tree, explicitly select **Also archive
+descendant sessions** or **Also delete descendant sessions** in the
+confirmation dialog.
+
+Recursive operations take one persisted snapshot of the tree, then stop and
+clean up descendants before their parents. Archiving retains every session
+record and captures uncommitted tracked and untracked work before removing a
+managed worktree. Deleting removes session records, runtime state, and
+attachments, but never discards a dirty worktree: any checkout with
+uncommitted work is left on disk and reported. Cleanup failures and preserved
+paths are shown in the app instead of being silently ignored.
+
+Unarchive affects only the selected archived session. It never silently
+unarchives descendants.
 
 ## Install
 

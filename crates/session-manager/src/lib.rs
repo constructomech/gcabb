@@ -30,6 +30,15 @@ use thiserror::Error;
 use tokio::sync::{Mutex, mpsc, oneshot, watch};
 use uuid::Uuid;
 
+pub use storage::LifecycleScope;
+
+/// Unarchive is intentionally single-session-only. Keeping its scope explicit
+/// prevents a caller from assuming descendants return implicitly.
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+pub enum UnarchiveScope {
+    Single,
+}
+
 const SNAPSHOT_INTERVAL: u64 = 50;
 const BASE_REF_REFRESH_TTL: Duration = Duration::from_mins(5);
 const MAX_PLAN_FEEDBACK_BYTES: usize = 4 * 1024;
@@ -118,6 +127,82 @@ pub struct SessionDeletion {
     pub attachments_removed: usize,
     /// Whether the runtime's own state directory was removed.
     pub runtime_state_removed: bool,
+    /// Best-effort cleanup failures after metadata deletion.
+    pub warnings: Vec<String>,
+}
+
+/// What happened to one session addressed by a [`storage::LifecycleScope::Recursive`]
+/// delete.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionDeletionOutcome {
+    /// The session existed and was deleted.
+    Deleted(SessionDeletion),
+    /// The session no longer existed by the time it was reached -- a prior
+    /// partial run or a race already removed it. Not treated as a failure.
+    AlreadyGone { id: String },
+    /// This session failed while independent targets continued.
+    Failed { id: String, error: String },
+}
+
+impl SessionDeletionOutcome {
+    /// The id of the session this outcome describes.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Deleted(deletion) => &deletion.id,
+            Self::AlreadyGone { id } | Self::Failed { id, .. } => id,
+        }
+    }
+
+    /// A message worth showing the user, when there is one.
+    #[must_use]
+    pub fn notice(&self) -> Option<String> {
+        match self {
+            Self::Deleted(deletion) => {
+                let notices = deletion
+                    .worktree
+                    .as_ref()
+                    .and_then(WorktreeOutcome::notice)
+                    .into_iter()
+                    .chain(deletion.warnings.iter().cloned())
+                    .collect::<Vec<_>>();
+                (!notices.is_empty()).then(|| notices.join("\n"))
+            }
+            Self::AlreadyGone { .. } => None,
+            Self::Failed { id, error } => {
+                Some(format!("Session {id} could not be deleted: {error}"))
+            }
+        }
+    }
+}
+
+/// Result of deleting a session at an explicit [`storage::LifecycleScope`].
+///
+/// For [`storage::LifecycleScope::Single`] this always carries exactly one
+/// outcome. For [`storage::LifecycleScope::Recursive`] `affected` lists every
+/// session id the scope touched, deepest descendant first, root last, and
+/// `outcomes` carries one entry per id in that same order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionLifecycleDeletion {
+    pub scope: storage::LifecycleScope,
+    pub affected: Vec<String>,
+    pub outcomes: Vec<SessionDeletionOutcome>,
+    pub warnings: Vec<String>,
+}
+
+impl SessionLifecycleDeletion {
+    /// Messages worth showing the user, aggregated across every affected
+    /// session in the order they were processed.
+    #[must_use]
+    pub fn notices(&self) -> Vec<String> {
+        let mut notices = self
+            .outcomes
+            .iter()
+            .filter_map(SessionDeletionOutcome::notice)
+            .collect::<Vec<_>>();
+        notices.extend(self.warnings.iter().cloned());
+        notices
+    }
 }
 
 /// What happened to a session's worktree when the session was archived.
@@ -156,6 +241,85 @@ impl ArchiveOutcome {
 pub struct SessionArchival {
     pub metadata: SessionMetadata,
     pub worktree: Option<ArchiveOutcome>,
+    /// Post-archive cleanup warning. The archive itself is still successful.
+    pub warning: Option<String>,
+}
+
+/// What happened to one session addressed by a [`storage::LifecycleScope::Recursive`]
+/// archive.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum SessionArchivalOutcome {
+    /// The session existed and was archived.
+    Archived(Box<SessionArchival>),
+    /// The session was already archived. Archiving is idempotent: revisiting
+    /// an already-archived descendant is not treated as a failure.
+    AlreadyArchived { id: String },
+    /// The session no longer existed by the time it was reached -- a prior
+    /// partial run or a race already removed it. Not treated as a failure.
+    AlreadyGone { id: String },
+    /// This session failed while independent targets continued.
+    Failed { id: String, error: String },
+}
+
+impl SessionArchivalOutcome {
+    /// The id of the session this outcome describes.
+    #[must_use]
+    pub fn id(&self) -> &str {
+        match self {
+            Self::Archived(archival) => &archival.metadata.id,
+            Self::AlreadyArchived { id } | Self::AlreadyGone { id } | Self::Failed { id, .. } => id,
+        }
+    }
+
+    /// A message worth showing the user, when there is one.
+    #[must_use]
+    pub fn notice(&self) -> Option<String> {
+        match self {
+            Self::Archived(archival) => {
+                let notices = archival
+                    .worktree
+                    .as_ref()
+                    .and_then(ArchiveOutcome::notice)
+                    .into_iter()
+                    .chain(archival.warning.iter().cloned())
+                    .collect::<Vec<_>>();
+                (!notices.is_empty()).then(|| notices.join("\n"))
+            }
+            Self::AlreadyArchived { .. } | Self::AlreadyGone { .. } => None,
+            Self::Failed { id, error } => {
+                Some(format!("Session {id} could not be archived: {error}"))
+            }
+        }
+    }
+}
+
+/// Result of archiving a session at an explicit [`storage::LifecycleScope`].
+///
+/// For [`storage::LifecycleScope::Single`] this always carries exactly one
+/// outcome. For [`storage::LifecycleScope::Recursive`] `affected` lists every
+/// session id the scope touched, deepest descendant first, root last, and
+/// `outcomes` carries one entry per id in that same order.
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub struct SessionLifecycleArchival {
+    pub scope: storage::LifecycleScope,
+    pub affected: Vec<String>,
+    pub outcomes: Vec<SessionArchivalOutcome>,
+    pub warnings: Vec<String>,
+}
+
+impl SessionLifecycleArchival {
+    /// Messages worth showing the user, aggregated across every affected
+    /// session in the order they were processed.
+    #[must_use]
+    pub fn notices(&self) -> Vec<String> {
+        let mut notices = self
+            .outcomes
+            .iter()
+            .filter_map(SessionArchivalOutcome::notice)
+            .collect::<Vec<_>>();
+        notices.extend(self.warnings.iter().cloned());
+        notices
+    }
 }
 
 /// What happened to a session's worktree when the session was unarchived.
@@ -220,10 +384,38 @@ pub struct SessionRestoration {
 pub struct SessionRoots {
     /// Where GCABB creates worktrees.
     pub worktrees: Option<PathBuf>,
+    /// Other roots GCABB previously used. Recursive lifecycle cleanup checks
+    /// each affected worktree against this explicit allowlist.
+    pub managed_worktrees: Vec<PathBuf>,
     /// Where GCABB writes pasted images.
     pub attachments: Option<PathBuf>,
     /// Where the runtime keeps its per-session state.
     pub runtime_state: Option<PathBuf>,
+}
+
+impl SessionRoots {
+    fn owning_worktrees_root(&self, worktree: &Path) -> Option<&Path> {
+        if let Some(root) = self.worktrees.as_deref()
+            && worktree.starts_with(root)
+        {
+            return Some(root);
+        }
+        self.managed_worktrees
+            .iter()
+            .filter(|root| {
+                let Ok(relative) = worktree.strip_prefix(root) else {
+                    return false;
+                };
+                let components = relative.components().collect::<Vec<_>>();
+                components.len() == 2
+                    && components[1]
+                        .as_os_str()
+                        .to_str()
+                        .is_some_and(|name| name.starts_with("gcabb-"))
+            })
+            .max_by_key(|root| root.components().count())
+            .map(PathBuf::as_path)
+    }
 }
 
 #[derive(Clone, Debug)]
@@ -1223,6 +1415,7 @@ impl SessionManager {
         &self,
         request: SessionPlanResponseRequest<'_>,
     ) -> Result<RespondToSessionPlanToolResult> {
+        let _lifecycle = self.lifecycle.lock().await;
         if let Some(existing) = self.authorize_plan_response(request)? {
             return Ok(existing);
         }
@@ -1359,6 +1552,7 @@ impl SessionManager {
         message: &str,
         delivery: SessionMessageDelivery,
     ) -> Result<SendSessionMessageToolResult> {
+        let _lifecycle = self.lifecycle.lock().await;
         let relation =
             self.authorize_registered_coordination(caller_session_id, target_session_id)?;
         if relation == CoordinationRelation::SelfSession {
@@ -1746,12 +1940,174 @@ impl SessionManager {
     /// checkouts and branches behind. A worktree that still holds uncommitted
     /// work is deliberately preserved; the outcome says so rather than
     /// silently discarding it.
+    ///
+    /// This only ever touches the named session: a child of a deleted
+    /// session keeps its own row and becomes an orphan, exactly as before
+    /// [`Self::delete_session_scoped`] existed. Use that entry point instead
+    /// to also remove every descendant.
     pub async fn delete_session(
         &self,
         app_session_id: &str,
         roots: &SessionRoots,
     ) -> Result<SessionDeletion> {
+        if !self.begin_restore(app_session_id).await {
+            return Err(SessionManagerError::SessionRestoreInProgress(
+                app_session_id.to_owned(),
+            ));
+        }
+        let result = async {
+            let _lifecycle = self.lifecycle.lock().await;
+            let deletion = self
+                .delete_known_session_locked(app_session_id, roots)
+                .await?;
+            self.vacuum_after_delete(app_session_id);
+            Ok(deletion)
+        }
+        .await;
+        self.finish_restore(app_session_id).await;
+        result
+    }
+
+    /// Delete a session at an explicit [`storage::LifecycleScope`].
+    ///
+    /// `Single` behaves exactly like [`Self::delete_session`] (it delegates
+    /// to it). `Recursive` additionally removes every descendant reachable
+    /// through persisted parent links, computed once at the start under the
+    /// same lifecycle lock that guards session launches and restores, then
+    /// processed deepest descendant first so a child is always gone before
+    /// the parent that named it. A descendant that vanished earlier -- from
+    /// a prior partial run, or a race -- is reported as already gone rather
+    /// than treated as an error. Dirty worktrees are preserved per session,
+    /// the same as a single delete never discards uncommitted work.
+    pub async fn delete_session_scoped(
+        &self,
+        app_session_id: &str,
+        roots: &SessionRoots,
+        scope: storage::LifecycleScope,
+    ) -> Result<SessionLifecycleDeletion> {
+        match scope {
+            storage::LifecycleScope::Single => {
+                let deletion = self.delete_session(app_session_id, roots).await?;
+                Ok(SessionLifecycleDeletion {
+                    scope,
+                    affected: vec![deletion.id.clone()],
+                    outcomes: vec![SessionDeletionOutcome::Deleted(deletion)],
+                    warnings: Vec::new(),
+                })
+            }
+            storage::LifecycleScope::Recursive => {
+                self.delete_session_recursive(app_session_id, roots).await
+            }
+        }
+    }
+
+    async fn delete_session_recursive(
+        &self,
+        app_session_id: &str,
+        roots: &SessionRoots,
+    ) -> Result<SessionLifecycleDeletion> {
+        if !self.begin_restore(app_session_id).await {
+            return Err(SessionManagerError::SessionRestoreInProgress(
+                app_session_id.to_owned(),
+            ));
+        }
+        let result = self
+            .delete_session_recursive_guarded(app_session_id, roots)
+            .await;
+        self.finish_restore(app_session_id).await;
+        result
+    }
+
+    async fn delete_session_recursive_guarded(
+        &self,
+        app_session_id: &str,
+        roots: &SessionRoots,
+    ) -> Result<SessionLifecycleDeletion> {
         let _lifecycle = self.lifecycle.lock().await;
+        // Snapshotting the affected set under the same lock that guards
+        // `create_session` means a launch racing this delete either lands
+        // entirely before this set is computed (and is included) or entirely
+        // after every deletion below has landed (and is untouched).
+        let affected = self
+            .storage
+            .lifecycle_targets(app_session_id, storage::LifecycleScope::Recursive)?;
+        let mut guarded = Vec::with_capacity(affected.len());
+        for id in &affected {
+            if id == app_session_id {
+                continue;
+            }
+            if self.begin_restore(id).await {
+                guarded.push(id.clone());
+            } else {
+                for guarded_id in &guarded {
+                    self.finish_restore(guarded_id).await;
+                }
+                return Err(SessionManagerError::SessionRestoreInProgress(id.clone()));
+            }
+        }
+
+        let result = async {
+            let mut outcomes = Vec::with_capacity(affected.len());
+            for id in &affected {
+                match self.storage.session_exists(id) {
+                    Ok(false) => {
+                        outcomes.push(SessionDeletionOutcome::AlreadyGone { id: id.clone() });
+                    }
+                    Ok(true) => match self.delete_known_session_locked(id, roots).await {
+                        Ok(deletion) => {
+                            outcomes.push(SessionDeletionOutcome::Deleted(deletion));
+                        }
+                        Err(error) => outcomes.push(SessionDeletionOutcome::Failed {
+                            id: id.clone(),
+                            error: error.to_string(),
+                        }),
+                    },
+                    Err(error) => outcomes.push(SessionDeletionOutcome::Failed {
+                        id: id.clone(),
+                        error: error.to_string(),
+                    }),
+                }
+            }
+            self.vacuum_after_delete(app_session_id);
+            Ok(SessionLifecycleDeletion {
+                scope: storage::LifecycleScope::Recursive,
+                affected,
+                outcomes,
+                warnings: Vec::new(),
+            })
+        }
+        .await;
+        for guarded_id in &guarded {
+            self.finish_restore(guarded_id).await;
+        }
+        result
+    }
+
+    fn vacuum_after_delete(&self, app_session_id: &str) {
+        if let Err(error) = self.storage.vacuum() {
+            self.diagnostics.record(DiagnosticEvent {
+                timestamp: timestamp(),
+                category: "storage".to_owned(),
+                operation: "vacuum".to_owned(),
+                elapsed_ms: None,
+                session_id: Some(app_session_id.to_owned()),
+                success: false,
+                details: serde_json::json!({ "error": error.to_string() }),
+            });
+        }
+    }
+
+    /// Delete one session assuming the lifecycle lock is already held.
+    ///
+    /// Tolerant of a session that no longer exists: `metadata` is simply
+    /// `None` and every step downstream of it becomes a no-op, which is what
+    /// lets a recursive delete revisit an id without treating "already gone"
+    /// as a failure.
+    async fn delete_known_session_locked(
+        &self,
+        app_session_id: &str,
+        roots: &SessionRoots,
+    ) -> Result<SessionDeletion> {
         // Archived sessions are hidden from `list_sessions`, so this looks the
         // session up directly; deleting one from the archive must still work.
         let metadata = self.storage.session_metadata(app_session_id)?;
@@ -1777,34 +2133,32 @@ impl SessionManager {
         if self.selected_session()?.as_deref() == Some(app_session_id) {
             self.set_selected_session(None)?;
         }
-        self.storage.delete_session(app_session_id)?;
-        // Space is not returned to the filesystem otherwise, which is how a
-        // database of deleted sessions stays as large as it ever was.
-        if let Err(error) = self.storage.vacuum() {
-            self.diagnostics.record(DiagnosticEvent {
-                timestamp: timestamp(),
-                category: "storage".to_owned(),
-                operation: "vacuum".to_owned(),
-                elapsed_ms: None,
-                session_id: Some(app_session_id.to_owned()),
-                success: false,
-                details: serde_json::json!({ "error": error.to_string() }),
+        self.storage.delete_session_with_coordination_retirement(
+            app_session_id,
+            "the session was deleted",
+            &timestamp(),
+        )?;
+
+        let (attachments_removed, mut warnings) =
+            remove_attachments(&attachments, roots.attachments.as_deref());
+        let (runtime_state_removed, runtime_warning) =
+            metadata.as_ref().map_or((false, None), |metadata| {
+                remove_runtime_state(&metadata.sdk_session_id, roots.runtime_state.as_deref())
             });
-        }
+        warnings.extend(runtime_warning);
 
-        let attachments_removed = remove_attachments(&attachments, roots.attachments.as_deref());
-        let runtime_state_removed = metadata.as_ref().is_some_and(|metadata| {
-            remove_runtime_state(&metadata.sdk_session_id, roots.runtime_state.as_deref())
+        let worktree = metadata.as_ref().and_then(|metadata| {
+            Self::reclaim_worktree(
+                metadata,
+                roots.owning_worktrees_root(Path::new(&metadata.project_path)),
+            )
         });
-
-        let worktree = metadata
-            .as_ref()
-            .and_then(|metadata| Self::reclaim_worktree(metadata, roots.worktrees.as_deref()));
         Ok(SessionDeletion {
             id: app_session_id.to_owned(),
             worktree,
             attachments_removed,
             runtime_state_removed,
+            warnings,
         })
     }
 
@@ -1856,12 +2210,34 @@ impl SessionManager {
             return Ok(SessionArchival {
                 metadata,
                 worktree: None,
+                warning: None,
             });
         }
 
+        let mut archival = self.archive_known_session_locked(metadata, roots).await?;
+        archival.warning = self
+            .storage
+            .retire_pending_coordination_for_sessions(
+                &[app_session_id.to_owned()],
+                "the session was archived",
+                &timestamp(),
+            )
+            .err()
+            .map(|error| format!("Session archived, but coordination cleanup failed: {error}"));
+        Ok(archival)
+    }
+
+    /// Archive one session, assuming the lifecycle lock is already held, the
+    /// session is known to exist, and it is known not to already be archived.
+    async fn archive_known_session_locked(
+        &self,
+        metadata: SessionMetadata,
+        roots: &SessionRoots,
+    ) -> Result<SessionArchival> {
+        let app_session_id = metadata.id.clone();
         // Disconnect first so the agent cannot write into the worktree between
         // the patch being captured and the directory being removed.
-        let runtime = self.sessions.lock().await.remove(app_session_id);
+        let runtime = self.sessions.lock().await.remove(&app_session_id);
         if let Some(runtime) = runtime {
             let _ = runtime.handle.disconnect().await;
             if let Some(provider) = runtime.provider
@@ -1870,12 +2246,14 @@ impl SessionManager {
                 let _ = provider.stop().await;
             }
         }
-        if self.selected_session()?.as_deref() == Some(app_session_id) {
+        if self.selected_session()?.as_deref() == Some(app_session_id.as_str()) {
             self.set_selected_session(None)?;
         }
 
-        let (mut outcome, record, removable) =
-            Self::capture_worktree(&metadata, roots.worktrees.as_deref());
+        let (mut outcome, record, removable) = Self::capture_worktree(
+            &metadata,
+            roots.owning_worktrees_root(Path::new(&metadata.project_path)),
+        );
         // The record holds the only copy of work that was never committed, so
         // it is committed to storage *before* the checkout is destroyed. If
         // this fails the worktree is still there and nothing has been lost.
@@ -1912,7 +2290,179 @@ impl SessionManager {
         Ok(SessionArchival {
             metadata,
             worktree: outcome,
+            warning: None,
         })
+    }
+
+    /// Archive a session at an explicit [`storage::LifecycleScope`].
+    ///
+    /// `Single` behaves exactly like [`Self::archive_session`] (it delegates
+    /// to it). `Recursive` additionally archives every descendant reachable
+    /// through persisted parent links, computed once at the start under the
+    /// same lifecycle lock that guards session launches and restores, then
+    /// processed deepest descendant first. An already-archived descendant or
+    /// one that no longer exists is reported rather than treated as an
+    /// error, so revisiting a partially-completed recursive archive is safe.
+    ///
+    /// This never touches [`Self::unarchive_session`]: unarchiving stays
+    /// single-session-only, by design, with no scoped counterpart.
+    pub async fn archive_session_scoped(
+        &self,
+        app_session_id: &str,
+        roots: &SessionRoots,
+        scope: storage::LifecycleScope,
+    ) -> Result<SessionLifecycleArchival> {
+        match scope {
+            storage::LifecycleScope::Single => {
+                let archival = self.archive_session(app_session_id, roots).await?;
+                Ok(SessionLifecycleArchival {
+                    scope,
+                    affected: vec![archival.metadata.id.clone()],
+                    outcomes: vec![SessionArchivalOutcome::Archived(Box::new(archival))],
+                    warnings: Vec::new(),
+                })
+            }
+            storage::LifecycleScope::Recursive => {
+                self.archive_session_recursive(app_session_id, roots).await
+            }
+        }
+    }
+
+    async fn archive_session_recursive(
+        &self,
+        app_session_id: &str,
+        roots: &SessionRoots,
+    ) -> Result<SessionLifecycleArchival> {
+        // Guards the root the same way `archive_session` does: a restore
+        // racing this archive could otherwise recreate a worktree this is
+        // about to remove.
+        if !self.begin_restore(app_session_id).await {
+            return Err(SessionManagerError::SessionRestoreInProgress(
+                app_session_id.to_owned(),
+            ));
+        }
+        let result = self
+            .archive_session_recursive_guarded(app_session_id, roots)
+            .await;
+        self.finish_restore(app_session_id).await;
+        result
+    }
+
+    /// Archive a session and its descendants, assuming the root's restore
+    /// guard is already held by the caller.
+    async fn archive_session_recursive_guarded(
+        &self,
+        app_session_id: &str,
+        roots: &SessionRoots,
+    ) -> Result<SessionLifecycleArchival> {
+        let _lifecycle = self.lifecycle.lock().await;
+        // Snapshotting the affected set under the same lock that guards
+        // `create_session` means a launch racing this archive either lands
+        // entirely before this set is computed (and is included) or entirely
+        // after every archival below has landed (and is untouched).
+        let affected = self
+            .storage
+            .lifecycle_targets(app_session_id, storage::LifecycleScope::Recursive)?;
+
+        // Every descendant beyond the root needs its own restore guard so a
+        // concurrent unarchive of just that session cannot interleave with
+        // this archive. If any guard is unavailable, release everything
+        // already taken and fail without archiving anything.
+        let mut guarded = Vec::with_capacity(affected.len());
+        for id in &affected {
+            if id == app_session_id {
+                continue;
+            }
+            if self.begin_restore(id).await {
+                guarded.push(id.clone());
+            } else {
+                for guarded_id in &guarded {
+                    self.finish_restore(guarded_id).await;
+                }
+                return Err(SessionManagerError::SessionRestoreInProgress(id.clone()));
+            }
+        }
+
+        let outcomes = self.archive_affected_locked(&affected, roots).await;
+
+        for guarded_id in &guarded {
+            self.finish_restore(guarded_id).await;
+        }
+        let archived_ids = outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                SessionArchivalOutcome::Archived(archival) => Some(archival.metadata.id.clone()),
+                SessionArchivalOutcome::AlreadyArchived { id } => Some(id.clone()),
+                SessionArchivalOutcome::AlreadyGone { .. }
+                | SessionArchivalOutcome::Failed { .. } => None,
+            })
+            .collect::<Vec<_>>();
+        // Retire only sessions that are actually archived. A partial survivor
+        // must keep its messages and plan work intact.
+        let warnings = self
+            .storage
+            .retire_pending_coordination_for_sessions(
+                &archived_ids,
+                "an ancestor session was archived",
+                &timestamp(),
+            )
+            .err()
+            .map(|error| format!("Archived sessions, but coordination cleanup failed: {error}"))
+            .into_iter()
+            .collect();
+
+        Ok(SessionLifecycleArchival {
+            scope: storage::LifecycleScope::Recursive,
+            affected,
+            outcomes,
+            warnings,
+        })
+    }
+
+    /// Archive every session named in `affected`, deepest descendant first,
+    /// assuming the lifecycle lock and every session's restore guard are
+    /// already held by the caller.
+    async fn archive_affected_locked(
+        &self,
+        affected: &[String],
+        roots: &SessionRoots,
+    ) -> Vec<SessionArchivalOutcome> {
+        let mut outcomes = Vec::with_capacity(affected.len());
+        for id in affected {
+            let metadata = match self.storage.session_metadata(id) {
+                Ok(Some(metadata)) => metadata,
+                Ok(None) => {
+                    outcomes.push(SessionArchivalOutcome::AlreadyGone { id: id.clone() });
+                    continue;
+                }
+                Err(error) => {
+                    outcomes.push(SessionArchivalOutcome::Failed {
+                        id: id.clone(),
+                        error: error.to_string(),
+                    });
+                    continue;
+                }
+            };
+            match self.storage.is_session_archived(id) {
+                Ok(true) => {
+                    outcomes.push(SessionArchivalOutcome::AlreadyArchived { id: id.clone() });
+                }
+                Ok(false) => match self.archive_known_session_locked(metadata, roots).await {
+                    Ok(archival) => {
+                        outcomes.push(SessionArchivalOutcome::Archived(Box::new(archival)));
+                    }
+                    Err(error) => outcomes.push(SessionArchivalOutcome::Failed {
+                        id: id.clone(),
+                        error: error.to_string(),
+                    }),
+                },
+                Err(error) => outcomes.push(SessionArchivalOutcome::Failed {
+                    id: id.clone(),
+                    error: error.to_string(),
+                }),
+            }
+        }
+        outcomes
     }
 
     /// Decide what archiving this session's worktree entails.
@@ -2063,6 +2613,16 @@ impl SessionManager {
                 self.storage.clear_session_archive(app_session_id)?;
                 Ok(SessionRestoration { metadata, worktree })
             }
+        }
+    }
+
+    pub async fn unarchive_session_scoped(
+        &self,
+        app_session_id: &str,
+        scope: UnarchiveScope,
+    ) -> Result<SessionRestoration> {
+        match scope {
+            UnarchiveScope::Single => self.unarchive_session(app_session_id).await,
         }
     }
 
@@ -3633,33 +4193,53 @@ fn attachment_paths(state: &SessionSnapshot) -> Vec<PathBuf> {
 /// Only files inside the managed attachments directory are removed. A user who
 /// attached a picture from their own folder must still have it afterwards, so
 /// anything outside that directory is left alone.
-fn remove_attachments(paths: &[PathBuf], attachments_root: Option<&Path>) -> usize {
+fn remove_attachments(paths: &[PathBuf], attachments_root: Option<&Path>) -> (usize, Vec<String>) {
     let Some(root) = attachments_root else {
-        return 0;
+        return (0, Vec::new());
     };
-    paths
-        .iter()
-        .filter(|path| path.starts_with(root))
-        .filter(|path| std::fs::remove_file(path).is_ok())
-        .count()
+    let mut removed = 0;
+    let mut warnings = Vec::new();
+    for path in paths.iter().filter(|path| path.starts_with(root)) {
+        match std::fs::remove_file(path) {
+            Ok(()) => removed += 1,
+            Err(error) if error.kind() == std::io::ErrorKind::NotFound => {}
+            Err(error) => warnings.push(format!(
+                "Session deleted, but attachment {} could not be removed: {error}",
+                path.display()
+            )),
+        }
+    }
+    (removed, warnings)
 }
 
 /// Delete the runtime's own state directory for a session.
 ///
 /// Keyed by the id the runtime assigned, and confined to the directory the
 /// caller named, so a malformed id cannot reach outside it.
-fn remove_runtime_state(sdk_session_id: &str, runtime_state_root: Option<&Path>) -> bool {
+fn remove_runtime_state(
+    sdk_session_id: &str,
+    runtime_state_root: Option<&Path>,
+) -> (bool, Option<String>) {
     let Some(root) = runtime_state_root else {
-        return false;
+        return (false, None);
     };
     if sdk_session_id.is_empty() || sdk_session_id.contains(['/', '\\']) {
-        return false;
+        return (false, None);
     }
     let directory = root.join(sdk_session_id);
     if !directory.starts_with(root) || !directory.is_dir() {
-        return false;
+        return (false, None);
     }
-    std::fs::remove_dir_all(&directory).is_ok()
+    match std::fs::remove_dir_all(&directory) {
+        Ok(()) => (true, None),
+        Err(error) => (
+            false,
+            Some(format!(
+                "Session deleted, but runtime state {} could not be removed: {error}",
+                directory.display()
+            )),
+        ),
+    }
 }
 
 fn reconcile_history(
@@ -4184,6 +4764,279 @@ mod tests {
         }
     }
 
+    /// A chat session (no worktree) at an arbitrary spot in the parent tree,
+    /// for tests that only care about lifecycle-scope traversal and outcomes.
+    fn tree_metadata(id: &str, parent_session_id: Option<&str>) -> SessionMetadata {
+        SessionMetadata {
+            id: id.to_owned(),
+            sdk_session_id: format!("sdk-{id}"),
+            project_path: "/tmp".to_owned(),
+            repository_root: None,
+            title: id.to_owned(),
+            title_source: TitleSource::Manual,
+            kind: SessionKind::Chat,
+            parent_session_id: parent_session_id.map(str::to_owned),
+            launch_origin: if parent_session_id.is_some() {
+                SessionLaunchOrigin::AgentTool
+            } else {
+                SessionLaunchOrigin::User
+            },
+            host_tool_call_id: parent_session_id.map(|_| format!("tool-{id}")),
+            model: None,
+            mode: None,
+            base_ref: None,
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+        }
+    }
+
+    /// A project session with a real, managed worktree under `worktrees`, for
+    /// tests that need recursive lifecycle actions to actually touch git.
+    fn project_tree_metadata(
+        id: &str,
+        parent_session_id: Option<&str>,
+        worktree: &Path,
+        repository: &Path,
+        branch: &str,
+    ) -> SessionMetadata {
+        SessionMetadata {
+            id: id.to_owned(),
+            sdk_session_id: format!("sdk-{id}"),
+            project_path: worktree.to_string_lossy().into_owned(),
+            repository_root: Some(repository.to_string_lossy().into_owned()),
+            title: id.to_owned(),
+            title_source: TitleSource::Manual,
+            kind: SessionKind::Project,
+            parent_session_id: parent_session_id.map(str::to_owned),
+            launch_origin: if parent_session_id.is_some() {
+                SessionLaunchOrigin::AgentTool
+            } else {
+                SessionLaunchOrigin::User
+            },
+            host_tool_call_id: parent_session_id.map(|_| format!("tool-{id}")),
+            model: None,
+            mode: None,
+            base_ref: Some(branch.to_owned()),
+            created_at: "1".to_owned(),
+            updated_at: "1".to_owned(),
+        }
+    }
+
+    #[tokio::test]
+    async fn recursive_archive_is_deepest_first_and_persists_across_restart() {
+        let directory = tempdir().unwrap();
+        let database = directory.path().join("gcabb.db");
+        let storage = Arc::new(Storage::open(&database).unwrap());
+        for metadata in [
+            tree_metadata("root", None),
+            tree_metadata("child", Some("root")),
+            tree_metadata("grandchild", Some("child")),
+            tree_metadata("great-grandchild", Some("grandchild")),
+        ] {
+            storage.upsert_session(&metadata).unwrap();
+        }
+        let manager = SessionManager::new(
+            Arc::new(FakeProvider::default()),
+            storage,
+            Arc::new(MemoryDiagnostics::default()),
+        );
+
+        let result = manager
+            .archive_session_scoped("root", &SessionRoots::default(), LifecycleScope::Recursive)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            result.affected,
+            ["great-grandchild", "grandchild", "child", "root"]
+        );
+        assert_eq!(
+            result
+                .outcomes
+                .iter()
+                .map(SessionArchivalOutcome::id)
+                .collect::<Vec<_>>(),
+            result
+                .affected
+                .iter()
+                .map(String::as_str)
+                .collect::<Vec<_>>()
+        );
+        assert!(
+            result
+                .outcomes
+                .iter()
+                .all(|outcome| matches!(outcome, SessionArchivalOutcome::Archived(_)))
+        );
+
+        let restarted = Storage::open(&database).unwrap();
+        assert!(restarted.list_sessions().unwrap().is_empty());
+        assert_eq!(restarted.list_archived_sessions().unwrap().len(), 4);
+    }
+
+    #[tokio::test]
+    async fn recursive_delete_preserves_dirty_worktrees_and_aggregates_cleanup_failures() {
+        let directory = tempdir().unwrap();
+        let repository = directory.path().join("repository");
+        let worktrees = directory.path().join("worktrees");
+        let dirty = worktrees.join("project").join("gcabb-dirty");
+        let cleanup_failure = worktrees.join("project").join("gcabb-cleanup-failure");
+        initialise_repository(&repository);
+        let repository_git = GitService::new(&repository);
+        repository_git
+            .create_worktree(&dirty, "gcabb/dirty", "main")
+            .unwrap();
+        repository_git
+            .create_worktree(&cleanup_failure, "gcabb/cleanup-failure", "main")
+            .unwrap();
+        std::fs::write(dirty.join("dirty.txt"), "uncommitted\n").unwrap();
+
+        // The worktrees are valid and independently inspectable, but this
+        // persisted repository path is unavailable. The clean worktree must
+        // report removal failure while the dirty one is preserved by policy.
+        let unavailable_repository = directory.path().join("missing-repository");
+        let root = project_tree_metadata(
+            "root",
+            None,
+            &unavailable_repository,
+            &unavailable_repository,
+            "main",
+        );
+        let dirty_metadata = project_tree_metadata(
+            "dirty",
+            Some("root"),
+            &dirty,
+            &unavailable_repository,
+            "gcabb/dirty",
+        );
+        let failed_metadata = project_tree_metadata(
+            "cleanup-failure",
+            Some("root"),
+            &cleanup_failure,
+            &unavailable_repository,
+            "gcabb/cleanup-failure",
+        );
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        for metadata in [&root, &dirty_metadata, &failed_metadata] {
+            storage.upsert_session(metadata).unwrap();
+        }
+        let manager = SessionManager::new(
+            Arc::new(FakeProvider::default()),
+            storage.clone(),
+            Arc::new(MemoryDiagnostics::default()),
+        );
+        let roots = SessionRoots {
+            managed_worktrees: vec![worktrees],
+            ..SessionRoots::default()
+        };
+
+        let result = manager
+            .delete_session_scoped("root", &roots, LifecycleScope::Recursive)
+            .await
+            .unwrap();
+
+        assert_eq!(result.affected, ["cleanup-failure", "dirty", "root"]);
+        assert!(storage.list_sessions().unwrap().is_empty());
+        assert!(dirty.exists(), "dirty worktree must never be discarded");
+        assert!(
+            cleanup_failure.exists(),
+            "failed cleanup must leave the path intact"
+        );
+        assert!(result.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            SessionDeletionOutcome::Deleted(SessionDeletion {
+                worktree: Some(WorktreeOutcome::PreservedWithChanges { path }),
+                ..
+            }) if path == &dirty
+        )));
+        assert!(result.outcomes.iter().any(|outcome| matches!(
+            outcome,
+            SessionDeletionOutcome::Deleted(SessionDeletion {
+                worktree: Some(WorktreeOutcome::RemovalFailed { path, .. }),
+                ..
+            }) if path == &cleanup_failure
+        )));
+        let notices = result.notices();
+        assert_eq!(notices.len(), 2);
+        assert!(notices.iter().any(|notice| notice.contains("dirty")));
+        assert!(
+            notices
+                .iter()
+                .any(|notice| notice.contains("could not be removed"))
+        );
+    }
+
+    #[tokio::test]
+    async fn recursive_archive_snapshot_wins_a_racing_child_launch() {
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        storage
+            .upsert_session(&tree_metadata("root", None))
+            .unwrap();
+        let manager = Arc::new(SessionManager::new(
+            Arc::new(FakeProvider::default()),
+            storage.clone(),
+            Arc::new(MemoryDiagnostics::default()),
+        ));
+        let lifecycle = manager.lifecycle.lock().await;
+        let archive_manager = manager.clone();
+        let archive = tokio::spawn(async move {
+            archive_manager
+                .archive_session_scoped("root", &SessionRoots::default(), LifecycleScope::Recursive)
+                .await
+        });
+        tokio::task::yield_now().await;
+
+        let child_manager = manager.clone();
+        let child = tokio::spawn(async move {
+            let mut request = request(PathBuf::from("/tmp"));
+            request.kind = SessionKind::Chat;
+            request.parent_session_id = Some("root".to_owned());
+            request.launch_origin = SessionLaunchOrigin::AgentTool;
+            request.host_tool_call_id = Some("racing-child".to_owned());
+            child_manager.create_session(request).await
+        });
+        drop(lifecycle);
+
+        let archival = archive.await.unwrap().unwrap();
+        assert_eq!(archival.affected, ["root"]);
+        assert!(matches!(
+            child.await.unwrap(),
+            Err(SessionManagerError::Storage(
+                StorageError::ParentSessionNotFound(parent)
+            )) if parent == "root"
+        ));
+        assert!(storage.list_sessions().unwrap().is_empty());
+        assert_eq!(storage.list_archived_sessions().unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn recursive_delete_does_not_partially_run_while_a_descendant_restores() {
+        let storage = Arc::new(Storage::open_in_memory().unwrap());
+        storage
+            .upsert_session(&tree_metadata("root", None))
+            .unwrap();
+        storage
+            .upsert_session(&tree_metadata("child", Some("root")))
+            .unwrap();
+        let manager = SessionManager::new(
+            Arc::new(FakeProvider::default()),
+            storage.clone(),
+            Arc::new(MemoryDiagnostics::default()),
+        );
+        assert!(manager.begin_restore("child").await);
+
+        let result = manager
+            .delete_session_scoped("root", &SessionRoots::default(), LifecycleScope::Recursive)
+            .await;
+
+        assert!(matches!(
+            result,
+            Err(SessionManagerError::SessionRestoreInProgress(id)) if id == "child"
+        ));
+        assert_eq!(storage.list_sessions().unwrap().len(), 2);
+        manager.finish_restore("child").await;
+    }
+
     #[tokio::test]
     async fn sessions_own_independent_provider_runtimes() {
         let factory = FakeProviderFactory::default();
@@ -4379,14 +5232,30 @@ mod tests {
         std::fs::write(&pasted, b"pasted").unwrap();
         std::fs::write(&owned, b"precious").unwrap();
 
-        let removed = remove_attachments(&[pasted.clone(), owned.clone()], Some(managed.path()));
+        let (removed, warnings) =
+            remove_attachments(&[pasted.clone(), owned.clone()], Some(managed.path()));
 
         assert_eq!(removed, 1);
+        assert!(warnings.is_empty());
         assert!(!pasted.exists(), "the pasted image was left behind");
         assert!(
             owned.exists(),
             "deleting a session deleted a file the user owns"
         );
+    }
+
+    #[test]
+    fn attachment_cleanup_failures_are_reported() {
+        let managed = tempdir().unwrap();
+        let attachment = managed.path().join("attachment-directory");
+        std::fs::create_dir(&attachment).unwrap();
+
+        let (removed, warnings) =
+            remove_attachments(std::slice::from_ref(&attachment), Some(managed.path()));
+
+        assert_eq!(removed, 0);
+        assert_eq!(warnings.len(), 1);
+        assert!(warnings[0].contains(attachment.to_string_lossy().as_ref()));
     }
 
     /// The runtime's own state directory is removed with the session.
@@ -4397,7 +5266,10 @@ mod tests {
         std::fs::create_dir_all(&directory).unwrap();
         std::fs::write(directory.join("events.jsonl"), b"{}").unwrap();
 
-        assert!(remove_runtime_state("sdk-session-1", Some(root.path())));
+        assert_eq!(
+            remove_runtime_state("sdk-session-1", Some(root.path())),
+            (true, None)
+        );
         assert!(!directory.exists());
     }
 
@@ -4409,10 +5281,10 @@ mod tests {
         let outside = root.path().parent().unwrap().join("gcabb-escape-probe");
         std::fs::create_dir_all(&outside).unwrap();
 
-        assert!(!remove_runtime_state(
-            "../gcabb-escape-probe",
-            Some(root.path())
-        ));
+        assert_eq!(
+            remove_runtime_state("../gcabb-escape-probe", Some(root.path())),
+            (false, None)
+        );
         assert!(outside.exists(), "a session id escaped the state root");
         std::fs::remove_dir_all(&outside).ok();
     }
@@ -4424,9 +5296,12 @@ mod tests {
         let file = managed.path().join("abc-clipboard.png");
         std::fs::write(&file, b"pasted").unwrap();
 
-        assert_eq!(remove_attachments(std::slice::from_ref(&file), None), 0);
+        assert_eq!(
+            remove_attachments(std::slice::from_ref(&file), None),
+            (0, Vec::new())
+        );
         assert!(file.exists());
-        assert!(!remove_runtime_state("sdk-session-1", None));
+        assert_eq!(remove_runtime_state("sdk-session-1", None), (false, None));
     }
 
     #[tokio::test]

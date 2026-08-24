@@ -32,8 +32,9 @@ use gpui::{
     list, px, relative, rgb, size,
 };
 use session_manager::{
-    ArchiveOutcome, RestoreFailure, RestoreOutcome, SessionHandle, SessionManager,
-    SessionPlanResponseRequest, SessionRoots, WorktreeOutcome,
+    RestoreFailure, RestoreOutcome, SessionArchivalOutcome, SessionDeletionOutcome, SessionHandle,
+    SessionLifecycleArchival, SessionLifecycleDeletion, SessionManager, SessionPlanResponseRequest,
+    SessionRoots, UnarchiveScope,
 };
 use session_orchestrator::{
     LaunchOrigin, LaunchProgress, LaunchRequest, LaunchTitle, SessionOrchestrator,
@@ -70,6 +71,7 @@ const BORDER: u32 = 0x0030_363d;
 const PRIMARY: u32 = 0x00f0_f3f6;
 const MUTED: u32 = 0x008b_949e;
 const GREEN: u32 = 0x003f_b950;
+const DESCENDANT_COUNT_DISPLAY_LIMIT: usize = 99;
 const DATA_DIRECTORY_NAME: &str = "GCABB-data";
 const PERSISTENT_DATA_ENTRIES: &[&str] = &[
     "gcabb.db",
@@ -945,19 +947,16 @@ enum ServiceUpdate {
     SessionHydrated(SessionHandle),
     SessionAdded(SessionHandle),
     SessionsDiscovered(Vec<SessionHandle>),
-    /// A session was deleted and must be dropped from the UI.
-    SessionDeleted(String),
+    /// A scoped delete completed and every affected session must leave the UI.
+    SessionsDeleted(SessionLifecycleDeletion),
     /// A session deletion failed; the spinner shown while it was in flight
     /// must be cleared and the error surfaced.
     SessionDeleteFailed {
         app_session_id: String,
         error: String,
     },
-    /// A session was archived and must move from the sidebar into the archive.
-    SessionArchived {
-        session: SessionMetadata,
-        archived_at: String,
-    },
+    /// A scoped archive completed and every affected session must leave the sidebar.
+    SessionsArchived(SessionLifecycleArchival),
     /// An archive operation failed; clear the in-flight spinner and say why.
     SessionArchiveFailed {
         app_session_id: String,
@@ -1116,16 +1115,19 @@ enum ServiceCommand {
     },
     DeleteSession {
         app_session_id: String,
-        /// Root that owned this particular worktree, including a previous root.
-        worktrees_root: Option<PathBuf>,
+        scope: storage::LifecycleScope,
+        /// Explicit allowlist of current and prior GCABB worktree roots.
+        worktrees_roots: Vec<PathBuf>,
     },
     ArchiveSession {
         app_session_id: String,
-        /// Root that owned this particular worktree, including a previous root.
-        worktrees_root: Option<PathBuf>,
+        scope: storage::LifecycleScope,
+        /// Explicit allowlist of current and prior GCABB worktree roots.
+        worktrees_roots: Vec<PathBuf>,
     },
     UnarchiveSession {
         app_session_id: String,
+        scope: UnarchiveScope,
     },
     /// Register a directory chosen by the user as a project.
     AddProject {
@@ -1152,6 +1154,21 @@ enum ServiceCommand {
     SetHostWorktreesRoot(PathBuf),
 }
 
+#[derive(Clone, Copy, Debug, Eq, PartialEq)]
+enum LifecycleAction {
+    Archive,
+    Delete,
+}
+
+#[derive(Clone, Debug, Eq, PartialEq)]
+struct LifecycleConfirmation {
+    action: LifecycleAction,
+    session_id: String,
+    title: String,
+    descendant_ids: Vec<String>,
+    recursive: bool,
+}
+
 struct AppService {
     updates: Receiver<ServiceUpdate>,
     commands: Sender<ServiceCommand>,
@@ -1176,6 +1193,7 @@ struct ArchivedSessionRow {
     id: String,
     title: String,
     archived_at: String,
+    parent_session_id: Option<String>,
 }
 
 fn bootstrap_unread_children(storage: &Storage) -> Vec<(String, String)> {
@@ -1240,6 +1258,7 @@ impl AppService {
                     id: archived.metadata.id,
                     title: archived.metadata.title,
                     archived_at: archived.archive.archived_at,
+                    parent_session_id: archived.metadata.parent_session_id,
                 })
                 .collect(),
             selected_session: storage.selected_session().unwrap_or(None),
@@ -1301,6 +1320,7 @@ impl AppService {
                 let host_worktrees_root = Arc::new(Mutex::new(worktrees_root));
                 let session_roots = SessionRoots {
                     worktrees: host_worktrees_root.lock().ok().map(|root| root.clone()),
+                    managed_worktrees: Vec::new(),
                     attachments: attachments_directory(),
                     runtime_state: runtime_state_root(),
                 };
@@ -1420,23 +1440,24 @@ impl AppService {
                     match command {
                         ServiceCommand::DeleteSession {
                             app_session_id,
-                            worktrees_root,
+                            scope,
+                            worktrees_roots,
                         } => {
                             let mut deletion_roots = session_roots.clone();
-                            deletion_roots.worktrees = worktrees_root;
-                            match runtime
-                                .block_on(manager.delete_session(&app_session_id, &deletion_roots))
-                            {
+                            deletion_roots.worktrees = None;
+                            deletion_roots.managed_worktrees = worktrees_roots;
+                            match runtime.block_on(manager.delete_session_scoped(
+                                &app_session_id,
+                                &deletion_roots,
+                                scope,
+                            )) {
                                 Ok(deletion) => {
+                                    let notices = deletion.notices();
                                     let _ =
-                                        update_tx.send(ServiceUpdate::SessionDeleted(deletion.id));
-                                    // A preserved or unremovable worktree is
-                                    // worth saying out loud so it cannot be
-                                    // orphaned silently.
-                                    if let Some(notice) =
-                                        deletion.worktree.as_ref().and_then(WorktreeOutcome::notice)
-                                    {
-                                        let _ = update_tx.send(ServiceUpdate::ActionFailed(notice));
+                                        update_tx.send(ServiceUpdate::SessionsDeleted(deletion));
+                                    if !notices.is_empty() {
+                                        let _ = update_tx
+                                            .send(ServiceUpdate::ActionFailed(notices.join("\n")));
                                     }
                                 }
                                 Err(error) => {
@@ -1449,22 +1470,24 @@ impl AppService {
                         }
                         ServiceCommand::ArchiveSession {
                             app_session_id,
-                            worktrees_root,
+                            scope,
+                            worktrees_roots,
                         } => {
                             let mut archive_roots = session_roots.clone();
-                            archive_roots.worktrees = worktrees_root;
-                            match runtime
-                                .block_on(manager.archive_session(&app_session_id, &archive_roots))
-                            {
+                            archive_roots.worktrees = None;
+                            archive_roots.managed_worktrees = worktrees_roots;
+                            match runtime.block_on(manager.archive_session_scoped(
+                                &app_session_id,
+                                &archive_roots,
+                                scope,
+                            )) {
                                 Ok(archival) => {
-                                    let notice =
-                                        archival.worktree.as_ref().and_then(ArchiveOutcome::notice);
-                                    let _ = update_tx.send(ServiceUpdate::SessionArchived {
-                                        session: archival.metadata,
-                                        archived_at: timestamp(),
-                                    });
-                                    if let Some(notice) = notice {
-                                        let _ = update_tx.send(ServiceUpdate::ActionFailed(notice));
+                                    let notices = archival.notices();
+                                    let _ =
+                                        update_tx.send(ServiceUpdate::SessionsArchived(archival));
+                                    if !notices.is_empty() {
+                                        let _ = update_tx
+                                            .send(ServiceUpdate::ActionFailed(notices.join("\n")));
                                     }
                                 }
                                 Err(error) => {
@@ -1475,8 +1498,13 @@ impl AppService {
                                 }
                             }
                         }
-                        ServiceCommand::UnarchiveSession { app_session_id } => {
-                            match runtime.block_on(manager.unarchive_session(&app_session_id)) {
+                        ServiceCommand::UnarchiveSession {
+                            app_session_id,
+                            scope,
+                        } => {
+                            match runtime
+                                .block_on(manager.unarchive_session_scoped(&app_session_id, scope))
+                            {
                                 Ok(restoration) => {
                                     let restored_id = restoration.metadata.id.clone();
                                     let notice = restoration
@@ -2930,12 +2958,18 @@ struct SessionMvpView {
     /// Session being renamed, if the rename dialog is open.
     renaming_session: Option<String>,
     rename_input: Entity<TextInput>,
+    /// Archive or delete confirmation. Recursive always starts unchecked.
+    lifecycle_confirmation: Option<LifecycleConfirmation>,
+    lifecycle_confirmation_focus: FocusHandle,
     /// Sessions with a delete in flight, shown with a spinner in place of
     /// the status dot until the backend confirms removal.
     deleting_sessions: HashSet<String>,
     /// Sessions with an archive or unarchive in flight, treated like a delete
     /// so the row cannot be acted on twice.
     archiving_sessions: HashSet<String>,
+    /// Sessions removed by a lifecycle operation in this app run. Late
+    /// hydration updates for these ids must never recreate sidebar rows.
+    lifecycle_hidden_sessions: HashSet<String>,
     /// Agent-created children with a durable completion notification that has
     /// not been inspected yet.
     unread_children: HashMap<String, String>,
@@ -3233,8 +3267,11 @@ impl SessionMvpView {
             project_menu: None,
             renaming_session: None,
             rename_input,
+            lifecycle_confirmation: None,
+            lifecycle_confirmation_focus: cx.focus_handle(),
             deleting_sessions: HashSet::new(),
             archiving_sessions: HashSet::new(),
+            lifecycle_hidden_sessions: HashSet::new(),
             unread_children: HashMap::new(),
             pending_child_plans: HashMap::new(),
             archived_sessions: Vec::new(),
@@ -3768,7 +3805,7 @@ impl SessionMvpView {
                                 button
                                     .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
                                     .on_click(cx.listener(move |view, _, _, cx| {
-                                        view.unarchive_session(button_id.clone(), cx);
+                                        view.unarchive_session(&button_id, cx);
                                     }))
                             }),
                     ),
@@ -3915,14 +3952,125 @@ impl SessionMvpView {
                 id,
                 title: session.title,
                 archived_at,
+                parent_session_id: session.parent_session_id,
             },
         );
+    }
+
+    fn deterministic_selection_after(
+        &self,
+        affected: &HashSet<String>,
+        scope: storage::LifecycleScope,
+    ) -> Option<String> {
+        if scope != storage::LifecycleScope::Recursive
+            || self
+                .selected_session
+                .as_ref()
+                .is_none_or(|selected| !affected.contains(selected))
+        {
+            return None;
+        }
+        self.sessions
+            .iter()
+            .find(|session| !affected.contains(session.id()))
+            .map(|session| session.id().to_owned())
+    }
+
+    fn apply_sessions_deleted(
+        &mut self,
+        deletion: SessionLifecycleDeletion,
+        cx: &mut Context<Self>,
+    ) {
+        let affected = deletion.affected.into_iter().collect::<HashSet<_>>();
+        let successful = deletion
+            .outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                SessionDeletionOutcome::Deleted(deletion) => Some(deletion.id.clone()),
+                SessionDeletionOutcome::AlreadyGone { id } => Some(id.clone()),
+                SessionDeletionOutcome::Failed { .. } => None,
+            })
+            .collect::<HashSet<_>>();
+        let next_selection = self.deterministic_selection_after(&successful, deletion.scope);
+        self.lifecycle_hidden_sessions
+            .extend(successful.iter().cloned());
+        for id in &affected {
+            self.deleting_sessions.remove(id);
+            if !successful.contains(id) {
+                self.lifecycle_hidden_sessions.remove(id);
+            }
+        }
+        for id in &successful {
+            self.forget_session(id, cx);
+            self.archived_sessions.retain(|row| row.id != *id);
+        }
+        if let Some(next_selection) = next_selection {
+            self.select_session(next_selection, cx);
+        }
+    }
+
+    fn apply_sessions_archived(
+        &mut self,
+        archival: SessionLifecycleArchival,
+        cx: &mut Context<Self>,
+    ) {
+        let affected = archival.affected.into_iter().collect::<HashSet<_>>();
+        let successful = archival
+            .outcomes
+            .iter()
+            .filter_map(|outcome| match outcome {
+                SessionArchivalOutcome::Archived(archival) => Some(archival.metadata.id.clone()),
+                SessionArchivalOutcome::AlreadyArchived { id }
+                | SessionArchivalOutcome::AlreadyGone { id } => Some(id.clone()),
+                SessionArchivalOutcome::Failed { .. } => None,
+            })
+            .collect::<HashSet<_>>();
+        let next_selection = self.deterministic_selection_after(&successful, archival.scope);
+        self.lifecycle_hidden_sessions
+            .extend(successful.iter().cloned());
+        for id in &affected {
+            self.archiving_sessions.remove(id);
+            if !successful.contains(id) {
+                self.lifecycle_hidden_sessions.remove(id);
+            }
+        }
+        for outcome in archival.outcomes {
+            match outcome {
+                SessionArchivalOutcome::Archived(archival) => {
+                    let archival = *archival;
+                    self.apply_session_archived(archival.metadata, timestamp(), cx);
+                }
+                SessionArchivalOutcome::AlreadyArchived { id }
+                | SessionArchivalOutcome::AlreadyGone { id } => {
+                    self.forget_session(&id, cx);
+                }
+                SessionArchivalOutcome::Failed { .. } => {}
+            }
+        }
+        if let Some(next_selection) = next_selection {
+            self.select_session(next_selection, cx);
+        }
+    }
+
+    fn clear_failed_lifecycle(&mut self, root_id: &str, archive: bool) {
+        let affected = std::iter::once(root_id.to_owned())
+            .chain(self.descendant_ids(root_id))
+            .collect::<Vec<_>>();
+        for id in affected {
+            if archive {
+                self.archiving_sessions.remove(&id);
+            } else {
+                self.deleting_sessions.remove(&id);
+            }
+            self.lifecycle_hidden_sessions.remove(&id);
+        }
     }
 
     /// Returns an archived session to the session list.
     fn apply_session_unarchived(&mut self, session: SessionMetadata) {
         let id = session.id.clone();
         self.archiving_sessions.remove(&id);
+        self.lifecycle_hidden_sessions.remove(&id);
         self.archived_sessions.retain(|row| row.id != id);
         if !self.sessions.iter().any(|existing| existing.id() == id) {
             // Restored as a metadata-only placeholder; selecting it
@@ -4004,28 +4152,24 @@ impl SessionMvpView {
                 ServiceUpdate::SessionLaunchProgress(progress) => {
                     self.session_launch = Some(progress);
                 }
-                ServiceUpdate::SessionDeleted(id) => {
-                    self.deleting_sessions.remove(&id);
-                    self.forget_session(&id, cx);
+                ServiceUpdate::SessionsDeleted(deletion) => {
+                    self.apply_sessions_deleted(deletion, cx);
                 }
                 ServiceUpdate::SessionDeleteFailed {
                     app_session_id,
                     error,
                 } => {
-                    self.deleting_sessions.remove(&app_session_id);
+                    self.clear_failed_lifecycle(&app_session_id, false);
                     self.action_error = Some(error);
                 }
-                ServiceUpdate::SessionArchived {
-                    session,
-                    archived_at,
-                } => {
-                    self.apply_session_archived(session, archived_at, cx);
+                ServiceUpdate::SessionsArchived(archival) => {
+                    self.apply_sessions_archived(archival, cx);
                 }
                 ServiceUpdate::SessionArchiveFailed {
                     app_session_id,
                     error,
                 } => {
-                    self.archiving_sessions.remove(&app_session_id);
+                    self.clear_failed_lifecycle(&app_session_id, true);
                     self.action_error = Some(error);
                 }
                 ServiceUpdate::SessionUnarchived(session) => {
@@ -4189,6 +4333,9 @@ impl SessionMvpView {
 
     fn upsert_hydrated_session(&mut self, handle: SessionHandle, cx: &mut Context<Self>) {
         let id = handle.id().to_owned();
+        if self.lifecycle_hidden_sessions.contains(&id) {
+            return;
+        }
         let unavailable = handle.snapshot().status == SessionStatus::Unavailable;
         if let Some(index) = self.sessions.iter().position(|session| session.id() == id) {
             self.sessions[index] = SessionProjection::new(handle);
@@ -5141,6 +5288,96 @@ impl SessionMvpView {
         cx.notify();
     }
 
+    fn descendant_ids(&self, root_id: &str) -> Vec<String> {
+        let mut children = HashMap::<String, Vec<String>>::new();
+        for (id, parent) in self
+            .sessions
+            .iter()
+            .filter_map(|session| {
+                session
+                    .snapshot
+                    .metadata
+                    .parent_session_id
+                    .as_ref()
+                    .map(|parent| (session.id().to_owned(), parent.clone()))
+            })
+            .chain(self.archived_sessions.iter().filter_map(|session| {
+                session
+                    .parent_session_id
+                    .as_ref()
+                    .map(|parent| (session.id.clone(), parent.clone()))
+            }))
+        {
+            children.entry(parent).or_default().push(id);
+        }
+        for child_ids in children.values_mut() {
+            child_ids.sort();
+            child_ids.dedup();
+        }
+
+        let mut descendants = Vec::new();
+        let mut pending = vec![root_id.to_owned()];
+        let mut visited = HashSet::from([root_id.to_owned()]);
+        while let Some(parent) = pending.pop() {
+            let Some(child_ids) = children.get(&parent) else {
+                continue;
+            };
+            for child_id in child_ids.iter().rev() {
+                if visited.insert(child_id.clone()) {
+                    descendants.push(child_id.clone());
+                    pending.push(child_id.clone());
+                }
+            }
+        }
+        descendants
+    }
+
+    fn begin_lifecycle_confirmation(
+        &mut self,
+        action: LifecycleAction,
+        app_session_id: &str,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_menu = None;
+        if self.deleting_sessions.contains(app_session_id)
+            || self.archiving_sessions.contains(app_session_id)
+        {
+            cx.notify();
+            return;
+        }
+        let Some(title) = self
+            .sessions
+            .iter()
+            .find(|session| session.id() == app_session_id)
+            .map(|session| session.snapshot.metadata.title.clone())
+        else {
+            cx.notify();
+            return;
+        };
+        self.lifecycle_confirmation = Some(LifecycleConfirmation {
+            action,
+            descendant_ids: self.descendant_ids(app_session_id),
+            session_id: app_session_id.to_owned(),
+            title,
+            recursive: false,
+        });
+        cx.notify();
+    }
+
+    fn cancel_lifecycle_confirmation(&mut self, cx: &mut Context<Self>) {
+        self.lifecycle_confirmation = None;
+        cx.notify();
+    }
+
+    fn toggle_recursive_lifecycle(&mut self, cx: &mut Context<Self>) {
+        if let Some(confirmation) = self.lifecycle_confirmation.as_mut()
+            && !confirmation.descendant_ids.is_empty()
+        {
+            confirmation.recursive = !confirmation.recursive;
+        }
+        cx.notify();
+    }
+
     /// Open a session's working directory in the platform file manager.
     ///
     /// The session's `project_path` is its own worktree, and that is the folder
@@ -5171,62 +5408,108 @@ impl SessionMvpView {
         cx.notify();
     }
 
-    fn delete_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
+    fn delete_session(
+        &mut self,
+        app_session_id: &str,
+        scope: storage::LifecycleScope,
+        descendant_ids: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
         self.session_menu = None;
-        self.action_error = None;
-        let worktrees_root = self.owning_worktrees_root(&app_session_id);
-        self.deleting_sessions.insert(app_session_id.clone());
-        let _ = self.commands.send(ServiceCommand::DeleteSession {
-            app_session_id,
-            worktrees_root,
-        });
-        cx.notify();
-    }
-
-    /// Archive a session: its history is kept, its worktree is not.
-    fn archive_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
-        self.session_menu = None;
-        // A second archive while the first is still running would find the
-        // worktree already gone and have nothing left to capture.
-        if self.archiving_sessions.contains(&app_session_id) {
+        let affected = std::iter::once(app_session_id.to_owned())
+            .chain(descendant_ids)
+            .collect::<HashSet<_>>();
+        if affected
+            .iter()
+            .any(|id| self.deleting_sessions.contains(id) || self.archiving_sessions.contains(id))
+        {
             cx.notify();
             return;
         }
         self.action_error = None;
-        let worktrees_root = self.owning_worktrees_root(&app_session_id);
-        self.archiving_sessions.insert(app_session_id.clone());
-        let _ = self.commands.send(ServiceCommand::ArchiveSession {
-            app_session_id,
-            worktrees_root,
-        });
+        self.deleting_sessions.extend(affected.iter().cloned());
+        self.lifecycle_hidden_sessions
+            .extend(affected.iter().cloned());
+        if self
+            .commands
+            .send(ServiceCommand::DeleteSession {
+                app_session_id: app_session_id.to_owned(),
+                scope,
+                worktrees_roots: self
+                    .worktree_configuration
+                    .settings
+                    .managed_worktrees_roots(&self.worktree_configuration.default_root),
+            })
+            .is_err()
+        {
+            self.clear_failed_lifecycle(app_session_id, false);
+            self.action_error = Some("session service is unavailable".to_owned());
+        }
+        cx.notify();
+    }
+
+    /// Archive a session: its history is kept, its worktree is not.
+    fn archive_session(
+        &mut self,
+        app_session_id: &str,
+        scope: storage::LifecycleScope,
+        descendant_ids: Vec<String>,
+        cx: &mut Context<Self>,
+    ) {
+        self.session_menu = None;
+        let affected = std::iter::once(app_session_id.to_owned())
+            .chain(descendant_ids)
+            .collect::<HashSet<_>>();
+        if affected
+            .iter()
+            .any(|id| self.archiving_sessions.contains(id) || self.deleting_sessions.contains(id))
+        {
+            cx.notify();
+            return;
+        }
+        self.action_error = None;
+        self.archiving_sessions.extend(affected.iter().cloned());
+        self.lifecycle_hidden_sessions
+            .extend(affected.iter().cloned());
+        if self
+            .commands
+            .send(ServiceCommand::ArchiveSession {
+                app_session_id: app_session_id.to_owned(),
+                scope,
+                worktrees_roots: self
+                    .worktree_configuration
+                    .settings
+                    .managed_worktrees_roots(&self.worktree_configuration.default_root),
+            })
+            .is_err()
+        {
+            self.clear_failed_lifecycle(app_session_id, true);
+            self.action_error = Some("session service is unavailable".to_owned());
+        }
         cx.notify();
     }
 
     /// Bring an archived session back from the settings archive list.
-    fn unarchive_session(&mut self, app_session_id: String, cx: &mut Context<Self>) {
+    fn unarchive_session(&mut self, app_session_id: &str, cx: &mut Context<Self>) {
+        if self.archiving_sessions.contains(app_session_id) {
+            cx.notify();
+            return;
+        }
         self.action_error = None;
         self.settings_error = None;
-        self.archiving_sessions.insert(app_session_id.clone());
-        let _ = self
+        self.archiving_sessions.insert(app_session_id.to_owned());
+        if self
             .commands
-            .send(ServiceCommand::UnarchiveSession { app_session_id });
-        cx.notify();
-    }
-
-    /// Managed root that owns a session's worktree, including a root the user
-    /// has since changed away from.
-    fn owning_worktrees_root(&self, app_session_id: &str) -> Option<PathBuf> {
-        self.sessions
-            .iter()
-            .find(|session| session.id() == app_session_id)
-            .and_then(|session| {
-                self.worktree_configuration
-                    .settings
-                    .owning_root_for_worktree(
-                        Path::new(&session.snapshot.metadata.project_path),
-                        &self.worktree_configuration.default_root,
-                    )
+            .send(ServiceCommand::UnarchiveSession {
+                app_session_id: app_session_id.to_owned(),
+                scope: UnarchiveScope::Single,
             })
+            .is_err()
+        {
+            self.archiving_sessions.remove(app_session_id);
+            self.settings_error = Some("session service is unavailable".to_owned());
+        }
+        cx.notify();
     }
 
     /// Drop every trace of a session from the UI.
@@ -5340,7 +5623,14 @@ impl SessionMvpView {
                     "Archive session",
                     "Archive session",
                     PRIMARY,
-                    move |view, _, cx| view.archive_session(archive_id.clone(), cx),
+                    move |view, window, cx| {
+                        view.begin_lifecycle_confirmation(
+                            LifecycleAction::Archive,
+                            &archive_id,
+                            cx,
+                        );
+                        window.focus(&view.lifecycle_confirmation_focus, cx);
+                    },
                     cx,
                 ))
                 .child(Self::session_menu_item(
@@ -5348,10 +5638,240 @@ impl SessionMvpView {
                     "Delete session",
                     "Delete session",
                     RED,
-                    move |view, _, cx| view.delete_session(delete_id.clone(), cx),
+                    move |view, window, cx| {
+                        view.begin_lifecycle_confirmation(LifecycleAction::Delete, &delete_id, cx);
+                        window.focus(&view.lifecycle_confirmation_focus, cx);
+                    },
                     cx,
                 )),
         )
+    }
+
+    fn lifecycle_confirmation_dialog(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
+        let confirmation = self.lifecycle_confirmation.as_ref()?;
+        let action = confirmation.action;
+        let heading = match action {
+            LifecycleAction::Archive => format!("Archive “{}”?", confirmation.title),
+            LifecycleAction::Delete => format!("Delete “{}”?", confirmation.title),
+        };
+        let explanation = match action {
+            LifecycleAction::Archive => {
+                "The session record and full history are kept. Its runtime stops, and GCABB \
+                 captures uncommitted tracked and untracked work before removing a managed \
+                 worktree. Ignored files are not preserved."
+            }
+            LifecycleAction::Delete => {
+                "The session record is permanently deleted and its runtime stops. GCABB removes \
+                 managed worktrees only when they are clean; worktrees with uncommitted changes \
+                 are preserved. Runtime state and attachments are removed where possible."
+            }
+        };
+
+        Some(
+            div()
+                .id("lifecycle-confirmation-dialog")
+                .debug_selector(|| "lifecycle-confirmation-dialog".to_owned())
+                .accessibility_id("lifecycle-confirmation-dialog")
+                .role(Role::Dialog)
+                .aria_label(heading.clone())
+                .track_focus(&self.lifecycle_confirmation_focus)
+                .absolute()
+                .inset_0()
+                .flex()
+                .items_center()
+                .justify_center()
+                .bg(gpui::rgba(0x0000_00a8))
+                .child(
+                    div()
+                        .id("lifecycle-confirmation-panel")
+                        .w(px(500.0))
+                        .flex()
+                        .flex_col()
+                        .gap_3()
+                        .p_5()
+                        .rounded_lg()
+                        .bg(rgb(PANEL))
+                        .border_1()
+                        .border_color(rgb(BORDER))
+                        .shadow_lg()
+                        .child(
+                            div()
+                                .id("lifecycle-confirmation-heading")
+                                .role(Role::Heading)
+                                .aria_level(2)
+                                .text_xl()
+                                .font_weight(gpui::FontWeight::BOLD)
+                                .child(heading),
+                        )
+                        .child(div().text_sm().text_color(rgb(MUTED)).child(explanation))
+                        .when_some(
+                            self.lifecycle_recursive_control(action, cx),
+                            gpui::ParentElement::child,
+                        )
+                        .child(Self::lifecycle_confirmation_buttons(action, cx)),
+                ),
+        )
+    }
+
+    fn lifecycle_recursive_control(
+        &self,
+        action: LifecycleAction,
+        cx: &mut Context<Self>,
+    ) -> Option<gpui::AnyElement> {
+        let confirmation = self.lifecycle_confirmation.as_ref()?;
+        let descendant_count = confirmation.descendant_ids.len();
+        if descendant_count == 0 {
+            return None;
+        }
+        let recursive = confirmation.recursive;
+        let checkbox_label = match action {
+            LifecycleAction::Archive => "Also archive descendant sessions",
+            LifecycleAction::Delete => "Also delete descendant sessions",
+        };
+        let count_label = if descendant_count > DESCENDANT_COUNT_DISPLAY_LIMIT {
+            format!("{DESCENDANT_COUNT_DISPLAY_LIMIT}+ descendant sessions")
+        } else if descendant_count == 1 {
+            "1 descendant session".to_owned()
+        } else {
+            format!("{descendant_count} descendant sessions")
+        };
+        Some(
+            div()
+                .flex()
+                .flex_col()
+                .gap_3()
+                .child(
+                    div()
+                        .id("lifecycle-descendant-count")
+                        .debug_selector(|| "lifecycle-descendant-count".to_owned())
+                        .role(Role::Status)
+                        .aria_label(count_label.clone())
+                        .text_sm()
+                        .text_color(rgb(if action == LifecycleAction::Delete {
+                            RED
+                        } else {
+                            MUTED
+                        }))
+                        .child(format!(
+                            "{count_label}. Descendants are left intact unless you select the \
+                             option below."
+                        )),
+                )
+                .child(
+                    div()
+                        .id("lifecycle-recursive")
+                        .debug_selector(|| "lifecycle-recursive".to_owned())
+                        .accessibility_id("lifecycle-recursive")
+                        .role(Role::CheckBox)
+                        .aria_label(checkbox_label)
+                        .aria_selected(recursive)
+                        .focusable()
+                        .tab_stop(true)
+                        .flex()
+                        .items_center()
+                        .gap_2()
+                        .hover(gpui::Styled::cursor_pointer)
+                        .on_click(cx.listener(|view, _, _, cx| {
+                            view.toggle_recursive_lifecycle(cx);
+                        }))
+                        .child(
+                            div()
+                                .w(px(18.0))
+                                .h(px(18.0))
+                                .flex()
+                                .items_center()
+                                .justify_center()
+                                .rounded_sm()
+                                .border_1()
+                                .border_color(rgb(BORDER))
+                                .bg(rgb(if recursive { BLUE } else { SUBTLE }))
+                                .child(if recursive { "✓" } else { "" }),
+                        )
+                        .child(checkbox_label),
+                )
+                .into_any_element(),
+        )
+    }
+
+    fn lifecycle_confirmation_buttons(
+        action: LifecycleAction,
+        cx: &mut Context<Self>,
+    ) -> impl IntoElement {
+        let confirm_label = match action {
+            LifecycleAction::Archive => "Archive",
+            LifecycleAction::Delete => "Delete",
+        };
+        div()
+            .flex()
+            .justify_end()
+            .gap_2()
+            .child(
+                div()
+                    .id("lifecycle-cancel")
+                    .debug_selector(|| "lifecycle-cancel".to_owned())
+                    .role(Role::Button)
+                    .aria_label("Cancel")
+                    .focusable()
+                    .tab_stop(true)
+                    .px_4()
+                    .py_2()
+                    .rounded_md()
+                    .border_1()
+                    .border_color(rgb(BORDER))
+                    .text_color(rgb(MUTED))
+                    .child("Cancel")
+                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.cancel_lifecycle_confirmation(cx);
+                    })),
+            )
+            .child(
+                div()
+                    .id("lifecycle-confirm")
+                    .debug_selector(|| "lifecycle-confirm".to_owned())
+                    .role(Role::Button)
+                    .aria_label(format!("Confirm {}", confirm_label.to_lowercase()))
+                    .focusable()
+                    .tab_stop(true)
+                    .px_4()
+                    .py_2()
+                    .rounded_md()
+                    .bg(rgb(if action == LifecycleAction::Delete {
+                        RED
+                    } else {
+                        GREEN
+                    }))
+                    .text_color(rgb(BACKGROUND))
+                    .child(confirm_label)
+                    .hover(|style| style.opacity(0.85).cursor_pointer())
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.confirm_lifecycle(cx);
+                    })),
+            )
+    }
+
+    fn confirm_lifecycle(&mut self, cx: &mut Context<Self>) {
+        let Some(confirmation) = self.lifecycle_confirmation.take() else {
+            return;
+        };
+        let scope = if confirmation.recursive {
+            storage::LifecycleScope::Recursive
+        } else {
+            storage::LifecycleScope::Single
+        };
+        let descendants = if confirmation.recursive {
+            confirmation.descendant_ids
+        } else {
+            Vec::new()
+        };
+        match confirmation.action {
+            LifecycleAction::Archive => {
+                self.archive_session(&confirmation.session_id, scope, descendants, cx);
+            }
+            LifecycleAction::Delete => {
+                self.delete_session(&confirmation.session_id, scope, descendants, cx);
+            }
+        }
     }
 
     /// Context menu for a project, anchored where the user right-clicked.
@@ -11160,7 +11680,7 @@ impl SessionMvpView {
                 view.locate_session(locate_id.clone(), cx);
             }))
             .child(action_button("Delete session", RED, cx, move |view, cx| {
-                view.delete_session(delete_id.clone(), cx);
+                view.begin_lifecycle_confirmation(LifecycleAction::Delete, &delete_id, cx);
             }))
             .into_any_element()
     }
@@ -12241,6 +12761,9 @@ impl Render for SessionMvpView {
                 if view.renaming_session.is_some() {
                     view.cancel_rename(cx);
                 }
+                if view.lifecycle_confirmation.is_some() {
+                    view.cancel_lifecycle_confirmation(cx);
+                }
             }))
             .relative()
             .flex()
@@ -12276,6 +12799,24 @@ impl Render for SessionMvpView {
                     .flex_1()
                     .min_w_0()
                     .when_some(self.update_banner(cx), gpui::ParentElement::child)
+                    .when(
+                        self.selected_session.is_none() && self.action_error.is_some(),
+                        |main| {
+                            main.child(
+                                div()
+                                    .id("home-action-error")
+                                    .debug_selector(|| "home-action-error".to_owned())
+                                    .role(Role::Alert)
+                                    .aria_label(self.action_error.clone().unwrap_or_default())
+                                    .mx_auto()
+                                    .mt_4()
+                                    .max_w(px(CONVERSATION_COLUMN_WIDTH))
+                                    .text_sm()
+                                    .text_color(rgb(RED))
+                                    .child(self.action_error.clone().unwrap_or_default()),
+                            )
+                        },
+                    )
                     .when(!show_sidebar, |main| {
                         main.child(
                             div()
@@ -12514,6 +13055,10 @@ impl Render for SessionMvpView {
             .when_some(self.session_context_menu(cx), gpui::ParentElement::child)
             .when_some(self.project_context_menu(cx), gpui::ParentElement::child)
             .when_some(self.rename_dialog(cx), gpui::ParentElement::child)
+            .when_some(
+                self.lifecycle_confirmation_dialog(cx),
+                gpui::ParentElement::child,
+            )
             .when_some(self.settings_dialog(cx), gpui::ParentElement::child)
             .when_some(self.automations_dialog(cx), gpui::ParentElement::child)
             .when_some(self.diagnostics_dialog(cx), gpui::ParentElement::child)
@@ -14614,10 +15159,20 @@ pub(crate) mod tests {
             ));
 
             updates
-                .send(ServiceUpdate::SessionArchived {
-                    session: snapshot("parent", "Parent session").metadata,
-                    archived_at: "2".to_owned(),
-                })
+                .send(ServiceUpdate::SessionsArchived(
+                    session_manager::SessionLifecycleArchival {
+                        scope: storage::LifecycleScope::Single,
+                        affected: vec!["parent".to_owned()],
+                        outcomes: vec![session_manager::SessionArchivalOutcome::Archived(
+                            Box::new(session_manager::SessionArchival {
+                                metadata: snapshot("parent", "Parent session").metadata,
+                                worktree: None,
+                                warning: None,
+                            }),
+                        )],
+                        warnings: Vec::new(),
+                    },
+                ))
                 .unwrap();
             view.update(cx, |view, cx| {
                 view.apply_service_updates(cx);
@@ -14903,6 +15458,11 @@ pub(crate) mod tests {
                 .debug_bounds("Delete session")
                 .expect("delete session button");
             cx.simulate_click(delete.center(), Modifiers::none());
+            cx.run_until_parked();
+            let confirm = cx
+                .debug_bounds("lifecycle-confirm")
+                .expect("delete confirmation button");
+            cx.simulate_click(confirm.center(), Modifiers::none());
             assert!(matches!(
                 commands.recv().expect("delete command"),
                 ServiceCommand::DeleteSession { app_session_id, .. }
@@ -15857,7 +16417,9 @@ pub(crate) mod tests {
         }
 
         #[gpui::test]
-        fn clicking_delete_sends_a_delete_command(cx: &mut TestAppContext) {
+        fn delete_confirmation_without_descendants_has_no_recursive_control(
+            cx: &mut TestAppContext,
+        ) {
             let (view, cx, commands) = setup(cx);
             let row = cx
                 .debug_bounds("session-row")
@@ -15874,47 +16436,368 @@ pub(crate) mod tests {
 
             view.read_with(cx, |view, _| {
                 assert!(view.session_menu.is_none());
-                assert!(
-                    view.deleting_sessions.contains("session-1"),
-                    "row shows a spinner while the delete is in flight"
-                );
+                let confirmation = view
+                    .lifecycle_confirmation
+                    .as_ref()
+                    .expect("confirmation is open");
+                assert_eq!(confirmation.action, crate::LifecycleAction::Delete);
+                assert!(!confirmation.recursive);
+                assert!(confirmation.descendant_ids.is_empty());
             });
-            let command = commands.try_recv().expect("a command was sent");
+            assert!(cx.debug_bounds("lifecycle-confirmation-dialog").is_some());
+            assert!(cx.debug_bounds("lifecycle-recursive").is_none());
+            assert!(commands.try_recv().is_err(), "opening does not submit");
+
+            let confirm = cx
+                .debug_bounds("lifecycle-confirm")
+                .expect("confirm button rendered");
+            cx.simulate_click(confirm.center(), Modifiers::none());
+            cx.run_until_parked();
+            let command = commands
+                .try_iter()
+                .find(|command| matches!(command, ServiceCommand::DeleteSession { .. }))
+                .expect("a delete command was sent");
             match command {
-                ServiceCommand::DeleteSession { app_session_id, .. } => {
+                ServiceCommand::DeleteSession {
+                    app_session_id,
+                    scope,
+                    ..
+                } => {
                     assert_eq!(app_session_id, "session-1");
+                    assert_eq!(scope, storage::LifecycleScope::Single);
                 }
                 _ => panic!("expected a DeleteSession command"),
             }
         }
 
         #[gpui::test]
-        fn clicking_archive_sends_an_archive_command(cx: &mut TestAppContext) {
+        fn escape_closes_lifecycle_confirmation_without_submitting(cx: &mut TestAppContext) {
             let (view, cx, commands) = setup(cx);
             let row = cx
                 .debug_bounds("session-row")
                 .expect("session row rendered");
             cx.simulate_mouse_down(row.center(), MouseButton::Right, Modifiers::none());
             cx.simulate_mouse_up(row.center(), MouseButton::Right, Modifiers::none());
-            cx.run_until_parked();
-
             let item = cx
-                .debug_bounds("session-menu-archive")
-                .expect("archive item rendered");
+                .debug_bounds("session-menu-delete")
+                .expect("delete item rendered");
             cx.simulate_click(item.center(), Modifiers::none());
             cx.run_until_parked();
+            assert!(cx.debug_bounds("lifecycle-confirmation-dialog").is_some());
+
+            cx.simulate_keystrokes("escape");
+            cx.run_until_parked();
+
+            assert!(cx.debug_bounds("lifecycle-confirmation-dialog").is_none());
+            view.read_with(cx, |view, _| {
+                assert!(view.lifecycle_confirmation.is_none());
+            });
+            assert!(
+                commands.try_iter().all(|command| !matches!(
+                    command,
+                    ServiceCommand::ArchiveSession { .. } | ServiceCommand::DeleteSession { .. }
+                )),
+                "escape must not submit lifecycle work"
+            );
+        }
+
+        fn click_session_menu_item(cx: &mut VisualTestContext, selector: &'static str) {
+            let row = cx
+                .debug_bounds("session-row")
+                .expect("session row rendered");
+            cx.simulate_mouse_down(row.center(), MouseButton::Right, Modifiers::none());
+            cx.simulate_mouse_up(row.center(), MouseButton::Right, Modifiers::none());
+            cx.run_until_parked();
+            let item = cx
+                .debug_bounds(selector)
+                .expect("session menu item rendered");
+            cx.simulate_click(item.center(), Modifiers::none());
+            cx.run_until_parked();
+        }
+
+        #[gpui::test]
+        fn recursive_confirmation_counts_descendants_and_resets_unchecked(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.sessions
+                    .push(SessionProjection::for_test(SessionHandle::for_test(
+                        child_snapshot("child", "Child", "session-1"),
+                    )));
+                view.sessions
+                    .push(SessionProjection::for_test(SessionHandle::for_test(
+                        child_snapshot("grandchild", "Grandchild", "child"),
+                    )));
+                cx.notify();
+            });
+            click_session_menu_item(cx, "session-menu-archive");
 
             view.read_with(cx, |view, _| {
                 assert!(view.session_menu.is_none());
-                assert!(view.archiving_sessions.contains("session-1"));
+                let confirmation = view
+                    .lifecycle_confirmation
+                    .as_ref()
+                    .expect("confirmation is open");
+                assert_eq!(confirmation.action, crate::LifecycleAction::Archive);
+                assert_eq!(confirmation.descendant_ids.len(), 2);
+                assert!(!confirmation.recursive, "recursive defaults unchecked");
             });
-            let command = commands.try_recv().expect("a command was sent");
+            assert!(cx.debug_bounds("lifecycle-descendant-count").is_some());
+            let checkbox = cx
+                .debug_bounds("lifecycle-recursive")
+                .expect("accessible recursive checkbox rendered");
+            cx.simulate_click(checkbox.center(), Modifiers::none());
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(view.lifecycle_confirmation.as_ref().unwrap().recursive);
+            });
+            let checkbox = cx
+                .debug_bounds("lifecycle-recursive")
+                .expect("recursive checkbox remains rendered");
+            cx.simulate_click(checkbox.center(), Modifiers::none());
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(!view.lifecycle_confirmation.as_ref().unwrap().recursive);
+            });
+
+            let cancel = cx
+                .debug_bounds("lifecycle-cancel")
+                .expect("cancel button rendered");
+            cx.simulate_click(cancel.center(), Modifiers::none());
+            cx.run_until_parked();
+            view.read_with(cx, |view, _| {
+                assert!(
+                    view.lifecycle_confirmation.is_none(),
+                    "cancel closes the confirmation"
+                );
+            });
+            if let Ok(command) = commands.try_recv() {
+                assert!(
+                    !matches!(
+                        command,
+                        ServiceCommand::ArchiveSession { .. }
+                            | ServiceCommand::DeleteSession { .. }
+                    ),
+                    "cancel does not submit a lifecycle command"
+                );
+            }
+
+            click_session_menu_item(cx, "session-menu-archive");
+            view.read_with(cx, |view, _| {
+                assert!(
+                    !view.lifecycle_confirmation.as_ref().unwrap().recursive,
+                    "reopening resets recursive unchecked"
+                );
+            });
+            let checkbox = cx
+                .debug_bounds("lifecycle-recursive")
+                .expect("recursive checkbox rendered after reopening");
+            cx.simulate_click(checkbox.center(), Modifiers::none());
+            cx.run_until_parked();
+            let confirm = cx
+                .debug_bounds("lifecycle-confirm")
+                .expect("confirm button rendered");
+            cx.simulate_click(confirm.center(), Modifiers::none());
+            let command = commands
+                .try_iter()
+                .find(|command| matches!(command, ServiceCommand::ArchiveSession { .. }))
+                .expect("an archive command was sent");
             match command {
-                ServiceCommand::ArchiveSession { app_session_id, .. } => {
+                ServiceCommand::ArchiveSession {
+                    app_session_id,
+                    scope,
+                    ..
+                } => {
                     assert_eq!(app_session_id, "session-1");
+                    assert_eq!(scope, storage::LifecycleScope::Recursive);
                 }
                 _ => panic!("expected an ArchiveSession command"),
             }
+        }
+
+        #[gpui::test]
+        fn recursive_archive_selects_a_stable_survivor_and_ignores_late_hydration(
+            cx: &mut TestAppContext,
+        ) {
+            let (view, cx, _commands, updates) = setup_for_bootstrap(cx);
+            let root = snapshot("root", "Root");
+            let child = child_snapshot("child", "Child", "root");
+            let grandchild = child_snapshot("grandchild", "Grandchild", "child");
+            let other = snapshot("other", "Other");
+            view.update(cx, |view, cx| {
+                view.sessions = vec![
+                    SessionProjection::for_test(SessionHandle::for_test(root.clone())),
+                    SessionProjection::for_test(SessionHandle::for_test(child.clone())),
+                    SessionProjection::for_test(SessionHandle::for_test(grandchild.clone())),
+                    SessionProjection::for_test(SessionHandle::for_test(other)),
+                ];
+                view.selected_session = Some("child".to_owned());
+                cx.notify();
+            });
+            updates
+                .send(ServiceUpdate::SessionsArchived(
+                    session_manager::SessionLifecycleArchival {
+                        scope: storage::LifecycleScope::Recursive,
+                        affected: vec![
+                            "grandchild".to_owned(),
+                            "child".to_owned(),
+                            "root".to_owned(),
+                        ],
+                        outcomes: vec![grandchild, child, root]
+                            .into_iter()
+                            .map(|snapshot| {
+                                session_manager::SessionArchivalOutcome::Archived(Box::new(
+                                    session_manager::SessionArchival {
+                                        metadata: snapshot.metadata,
+                                        worktree: None,
+                                        warning: None,
+                                    },
+                                ))
+                            })
+                            .collect(),
+                        warnings: Vec::new(),
+                    },
+                ))
+                .unwrap();
+            view.update(cx, SessionMvpView::apply_service_updates);
+
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected_session.as_deref(), Some("other"));
+                assert_eq!(view.sessions.len(), 1);
+                assert_eq!(view.archived_sessions.len(), 3);
+            });
+
+            updates
+                .send(ServiceUpdate::SessionHydrated(SessionHandle::for_test(
+                    child_snapshot("child", "Late child", "root"),
+                )))
+                .unwrap();
+            view.update(cx, SessionMvpView::apply_service_updates);
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected_session.as_deref(), Some("other"));
+                assert!(
+                    view.sessions.iter().all(|session| session.id() != "child"),
+                    "late hydration must not resurrect an archived descendant"
+                );
+            });
+        }
+
+        #[gpui::test]
+        fn partial_recursive_archive_removes_only_successful_sessions(cx: &mut TestAppContext) {
+            let (view, cx, _commands, updates) = setup_for_bootstrap(cx);
+            let root = snapshot("root", "Root");
+            let child = child_snapshot("child", "Child", "root");
+            view.update(cx, |view, _| {
+                view.sessions = vec![
+                    SessionProjection::for_test(SessionHandle::for_test(root)),
+                    SessionProjection::for_test(SessionHandle::for_test(child.clone())),
+                ];
+                view.selected_session = Some("root".to_owned());
+                view.archiving_sessions =
+                    std::collections::HashSet::from(["root".to_owned(), "child".to_owned()]);
+                view.lifecycle_hidden_sessions =
+                    std::collections::HashSet::from(["root".to_owned(), "child".to_owned()]);
+            });
+            updates
+                .send(ServiceUpdate::SessionsArchived(
+                    session_manager::SessionLifecycleArchival {
+                        scope: storage::LifecycleScope::Recursive,
+                        affected: vec!["child".to_owned(), "root".to_owned()],
+                        outcomes: vec![
+                            session_manager::SessionArchivalOutcome::Archived(Box::new(
+                                session_manager::SessionArchival {
+                                    metadata: child.metadata,
+                                    worktree: None,
+                                    warning: None,
+                                },
+                            )),
+                            session_manager::SessionArchivalOutcome::Failed {
+                                id: "root".to_owned(),
+                                error: "database busy".to_owned(),
+                            },
+                        ],
+                        warnings: Vec::new(),
+                    },
+                ))
+                .unwrap();
+            view.update(cx, SessionMvpView::apply_service_updates);
+
+            view.read_with(cx, |view, _| {
+                assert_eq!(view.selected_session.as_deref(), Some("root"));
+                assert!(view.sessions.iter().any(|session| session.id() == "root"));
+                assert!(view.sessions.iter().all(|session| session.id() != "child"));
+                assert!(!view.lifecycle_hidden_sessions.contains("root"));
+                assert!(view.lifecycle_hidden_sessions.contains("child"));
+                assert!(view.archiving_sessions.is_empty());
+            });
+        }
+
+        #[gpui::test]
+        fn cleanup_warning_remains_visible_after_last_session_is_deleted(cx: &mut TestAppContext) {
+            let (view, cx, _commands, updates) = setup_for_bootstrap(cx);
+            view.update(cx, |view, _| {
+                view.sessions = vec![SessionProjection::for_test(SessionHandle::for_test(
+                    snapshot("session-1", "Only session"),
+                ))];
+                view.selected_session = Some("session-1".to_owned());
+            });
+            updates
+                .send(ServiceUpdate::SessionsDeleted(
+                    session_manager::SessionLifecycleDeletion {
+                        scope: storage::LifecycleScope::Recursive,
+                        affected: vec!["session-1".to_owned()],
+                        outcomes: vec![session_manager::SessionDeletionOutcome::AlreadyGone {
+                            id: "session-1".to_owned(),
+                        }],
+                        warnings: Vec::new(),
+                    },
+                ))
+                .unwrap();
+            updates
+                .send(ServiceUpdate::ActionFailed(
+                    "Dirty worktree preserved at /tmp/worktree".to_owned(),
+                ))
+                .unwrap();
+            view.update(cx, |view, cx| {
+                view.apply_service_updates(cx);
+                cx.notify();
+            });
+            cx.run_until_parked();
+
+            view.read_with(cx, |view, _| {
+                assert!(view.selected_session.is_none());
+                assert!(view.action_error.is_some());
+            });
+            assert!(cx.debug_bounds("home-action-error").is_some());
+        }
+
+        #[gpui::test]
+        fn duplicate_recursive_archive_submission_is_ignored(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.sessions
+                    .push(SessionProjection::for_test(SessionHandle::for_test(
+                        child_snapshot("child", "Child", "session-1"),
+                    )));
+                view.archive_session(
+                    "session-1",
+                    storage::LifecycleScope::Recursive,
+                    vec!["child".to_owned()],
+                    cx,
+                );
+                view.archive_session(
+                    "session-1",
+                    storage::LifecycleScope::Recursive,
+                    vec!["child".to_owned()],
+                    cx,
+                );
+            });
+            assert_eq!(
+                commands
+                    .try_iter()
+                    .filter(|command| matches!(command, ServiceCommand::ArchiveSession { .. }))
+                    .count(),
+                1
+            );
         }
 
         /// An archived session leaves the sidebar and turns up in settings,
@@ -15929,6 +16812,7 @@ pub(crate) mod tests {
                     id: "session-1".to_owned(),
                     title: "First session".to_owned(),
                     archived_at: "2026-01-01T00:00:00Z".to_owned(),
+                    parent_session_id: None,
                 }];
                 view.settings_visibility = crate::SettingsVisibility::Open;
                 cx.notify();
@@ -15949,8 +16833,12 @@ pub(crate) mod tests {
 
             let command = commands.try_recv().expect("a command was sent");
             match command {
-                ServiceCommand::UnarchiveSession { app_session_id } => {
+                ServiceCommand::UnarchiveSession {
+                    app_session_id,
+                    scope,
+                } => {
                     assert_eq!(app_session_id, "session-1");
+                    assert_eq!(scope, session_manager::UnarchiveScope::Single);
                 }
                 _ => panic!("expected an UnarchiveSession command"),
             }
@@ -19849,7 +20737,16 @@ pub(crate) mod tests {
                 cx.notify();
             });
             updates
-                .send(ServiceUpdate::SessionDeleted("session-1".to_owned()))
+                .send(ServiceUpdate::SessionsDeleted(
+                    session_manager::SessionLifecycleDeletion {
+                        scope: storage::LifecycleScope::Single,
+                        affected: vec!["session-1".to_owned()],
+                        outcomes: vec![session_manager::SessionDeletionOutcome::AlreadyGone {
+                            id: "session-1".to_owned(),
+                        }],
+                        warnings: Vec::new(),
+                    },
+                ))
                 .unwrap();
 
             view.update(cx, SessionMvpView::apply_service_updates);
