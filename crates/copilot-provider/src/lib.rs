@@ -2845,7 +2845,7 @@ fn resolve_custom_agents(
             ))
         })?;
         if path.starts_with(working_directory) {
-            native_names.insert(agent.name.clone());
+            native_names.insert(agent.id.clone());
             continue;
         }
         if let Some(root_index) = configuration_roots
@@ -2859,7 +2859,7 @@ fn resolve_custom_agents(
 
     let mut roster = CustomAgentRoster::default();
     for (_, _, agent) in candidates {
-        if !native_names.insert(agent.name.clone()) {
+        if !native_names.insert(agent.id.clone()) {
             continue;
         }
         roster
@@ -2874,13 +2874,8 @@ fn resolve_custom_agents(
 }
 
 fn custom_agent_config(agent: &AgentInfo) -> Result<CustomAgentConfig> {
-    let prompt = agent.prompt.clone().ok_or_else(|| {
-        ProviderError::Sdk(format!(
-            "custom agent {} did not expose its authored prompt",
-            agent.name
-        ))
-    })?;
-    let mut config = CustomAgentConfig::new(agent.name.clone(), prompt);
+    let prompt = agent_prompt(agent)?;
+    let mut config = CustomAgentConfig::new(agent.id.clone(), prompt);
     config.display_name = (!agent.display_name.is_empty()).then(|| agent.display_name.clone());
     config.description = (!agent.description.is_empty()).then(|| agent.description.clone());
     config.tools.clone_from(&agent.tools);
@@ -2900,6 +2895,44 @@ fn custom_agent_config(agent: &AgentInfo) -> Result<CustomAgentConfig> {
         );
     }
     Ok(config)
+}
+
+fn agent_prompt(agent: &AgentInfo) -> Result<String> {
+    if let Some(prompt) = agent.prompt.as_deref() {
+        return Ok(prompt.to_owned());
+    }
+    let path = agent.path.as_deref().ok_or_else(|| {
+        ProviderError::Sdk(format!(
+            "custom agent {} has neither an authored prompt nor a source file",
+            agent.name
+        ))
+    })?;
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        ProviderError::Sdk(format!(
+            "could not read custom agent {} at {path}: {error}",
+            agent.name
+        ))
+    })?;
+    let prompt = strip_frontmatter(&contents).trim();
+    if prompt.is_empty() {
+        return Err(ProviderError::Sdk(format!(
+            "custom agent {} has an empty prompt in {path}",
+            agent.name
+        )));
+    }
+    Ok(prompt.to_owned())
+}
+
+fn strip_frontmatter(contents: &str) -> &str {
+    if let Some(rest) = contents.strip_prefix("---\n") {
+        return rest
+            .split_once("\n---\n")
+            .map_or(contents, |(_, body)| body);
+    }
+    contents.strip_prefix("---\r\n").map_or(contents, |rest| {
+        rest.split_once("\r\n---\r\n")
+            .map_or(contents, |(_, body)| body)
+    })
 }
 
 #[must_use]
@@ -3127,6 +3160,112 @@ mod tests {
         assert_eq!(roster.agents[0].prompt, "ordered prompt");
         assert_eq!(roster.agents[0].infer, Some(true));
         assert_eq!(roster.invocability.get("ordered"), Some(&Some(false)));
+    }
+
+    #[test]
+    fn configured_agent_prompt_is_read_from_its_source_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let configured = directory.path().join("configured");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let agent_directory = configured.join(".github").join("agents");
+        std::fs::create_dir_all(&agent_directory).unwrap();
+        let path = agent_directory.join("reviewer.agent.md");
+        std::fs::write(
+            &path,
+            "---\nname: Reviewer\ntools: [read]\n---\n\nReview the supplied change.\n",
+        )
+        .unwrap();
+        let mut agent = discovered_agent("reviewer", &path, false);
+        agent.prompt = None;
+
+        let roster = resolve_custom_agents(
+            vec![agent],
+            &workspace.canonicalize().unwrap(),
+            &[configured.canonicalize().unwrap()],
+        )
+        .unwrap();
+
+        assert_eq!(roster.agents[0].prompt, "Review the supplied change.");
+    }
+
+    #[test]
+    fn configured_agent_prompt_accepts_windows_line_endings() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let configured = directory.path().join("configured");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let agent_directory = configured.join(".github").join("agents");
+        std::fs::create_dir_all(&agent_directory).unwrap();
+        let path = agent_directory.join("reviewer.agent.md");
+        std::fs::write(
+            &path,
+            "---\r\nname: Reviewer\r\ntools: [read]\r\n---\r\n\r\nReview the supplied change.\r\n",
+        )
+        .unwrap();
+        let mut agent = discovered_agent("reviewer", &path, false);
+        agent.prompt = None;
+
+        let roster = resolve_custom_agents(
+            vec![agent],
+            &workspace.canonicalize().unwrap(),
+            &[configured.canonicalize().unwrap()],
+        )
+        .unwrap();
+
+        assert_eq!(roster.agents[0].prompt, "Review the supplied change.");
+    }
+
+    #[test]
+    fn configured_agent_registers_with_its_stable_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let configured = directory.path().join("configured");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let agent_directory = configured.join(".github").join("agents");
+        std::fs::create_dir_all(&agent_directory).unwrap();
+        let path = agent_directory.join("code-reviewer.agent.md");
+        std::fs::write(&path, "Review the supplied change.\n").unwrap();
+        let mut agent = discovered_agent("Code Reviewer", &path, true);
+        agent.id = "code-reviewer".to_owned();
+        agent.prompt = None;
+
+        let roster = resolve_custom_agents(
+            vec![agent],
+            &workspace.canonicalize().unwrap(),
+            &[configured.canonicalize().unwrap()],
+        )
+        .unwrap();
+
+        assert_eq!(roster.agents[0].name, "code-reviewer");
+        assert_eq!(
+            roster.agents[0].display_name.as_deref(),
+            Some("Code Reviewer")
+        );
+    }
+
+    #[test]
+    fn configured_agent_with_an_empty_body_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let configured = directory.path().join("configured");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let agent_directory = configured.join(".github").join("agents");
+        std::fs::create_dir_all(&agent_directory).unwrap();
+        let path = agent_directory.join("empty.agent.md");
+        std::fs::write(&path, "---\nname: Empty\n---\n").unwrap();
+        let mut agent = discovered_agent("empty", &path, false);
+        agent.prompt = None;
+
+        let error = resolve_custom_agents(
+            vec![agent],
+            &workspace.canonicalize().unwrap(),
+            &[configured.canonicalize().unwrap()],
+        )
+        .err()
+        .expect("an empty prompt must fail");
+
+        assert!(error.to_string().contains("has an empty prompt"));
     }
 
     #[tokio::test]
