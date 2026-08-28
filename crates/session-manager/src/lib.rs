@@ -2,7 +2,7 @@
 
 use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
 
 use app_model::{
@@ -835,6 +835,7 @@ pub struct SessionManager {
     restoring: Mutex<HashSet<String>>,
     sessions: Mutex<HashMap<String, SessionRuntime>>,
     roots: SessionRoots,
+    configuration_roots: RwLock<Vec<PathBuf>>,
     host_tool_gateway: Option<HostToolGateway>,
 }
 
@@ -856,6 +857,7 @@ impl SessionManager {
             restoring: Mutex::new(HashSet::new()),
             sessions: Mutex::new(HashMap::new()),
             roots: SessionRoots::default(),
+            configuration_roots: RwLock::new(Vec::new()),
             host_tool_gateway: None,
         }
     }
@@ -864,6 +866,26 @@ impl SessionManager {
     pub fn with_session_roots(mut self, roots: SessionRoots) -> Self {
         self.roots = roots;
         self
+    }
+
+    #[must_use]
+    pub fn with_configuration_roots(mut self, roots: Vec<PathBuf>) -> Self {
+        self.configuration_roots = RwLock::new(roots);
+        self
+    }
+
+    pub fn set_configuration_roots(&self, roots: Vec<PathBuf>) {
+        *self
+            .configuration_roots
+            .write()
+            .unwrap_or_else(std::sync::PoisonError::into_inner) = roots;
+    }
+
+    fn configuration_roots(&self) -> Vec<PathBuf> {
+        self.configuration_roots
+            .read()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clone()
     }
 
     #[must_use]
@@ -1059,6 +1081,7 @@ impl SessionManager {
             let provider_session = provider
                 .create_session(SessionRequest {
                     working_directory: request.project_path.clone(),
+                    configuration_roots: self.configuration_roots(),
                     model: request.model.clone(),
                     mode: request.mode.clone(),
                     reasoning_effort: request.reasoning_effort.clone(),
@@ -3369,6 +3392,7 @@ impl SessionManager {
                         metadata.repository_root.as_deref(),
                     ),
                     working_directory,
+                    configuration_roots: self.configuration_roots(),
                     model: metadata.model.clone(),
                     mode: metadata.mode.clone(),
                     reasoning_effort: state.controls.reasoning_effort.clone(),
@@ -5835,6 +5859,7 @@ mod tests {
         let seeded = provider
             .create_session(SessionRequest {
                 working_directory: directory.path().to_owned(),
+                configuration_roots: Vec::new(),
                 model: None,
                 mode: None,
                 reasoning_effort: None,
@@ -6264,6 +6289,7 @@ mod tests {
         let seeded = provider
             .create_session(SessionRequest {
                 working_directory: worktree.clone(),
+                configuration_roots: Vec::new(),
                 model: None,
                 mode: None,
                 reasoning_effort: None,

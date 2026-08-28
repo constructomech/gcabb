@@ -23,7 +23,8 @@ activity, commands, and changes visible as they happen.
 - Type `/` in the composer to autocomplete app commands, including `/next` to
   queue what the agent should do after the current turn.
 - Choose a discovered custom agent, model, mode, reasoning effort, and context length.
-- Discover repository and user agents, skills, and instructions for each workspace.
+- Discover repository and user agents, skills, and instructions for each workspace,
+  with additional configuration folders selectable from the Agent menu.
 - Save app-open automations with natural-language schedules, optional conditions, and run history.
 - Use complete agent rosters for delegated subagent work.
 - Let an agent launch a child session in another local repository already
@@ -33,6 +34,21 @@ activity, commands, and changes visible as they happen.
 - Restore your selected session after restarting GCABB.
 
 GCABB is still experimental. Keep important work committed or backed up.
+
+## Additional Copilot configuration folders
+
+The Agent menu can add or remove workspace roots whose `.github/agents`,
+`.github/skills`, and `.github/instructions` directories should be available to
+GCABB sessions. The session repository remains authoritative when it defines an
+agent with the same name. Additional folders are considered in the order they
+were added.
+
+New and resumed sessions receive the configured resources. A connected session
+keeps the roster it started with until it reconnects, so its Agent menu never
+offers a selection the live runtime cannot load. The pinned SDK discovery API
+exposes authored prompts, tools, MCP servers, skills, and model preferences,
+but not authored per-agent reasoning effort; additional agents inherit the
+session's effort when the runtime cannot recover one.
 
 ## Session lifecycle safety
 
