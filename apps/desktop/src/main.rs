@@ -1156,6 +1156,7 @@ enum ServiceCommand {
     DiscoverWorkspaceConfiguration {
         project_paths: Vec<PathBuf>,
     },
+    SetConfigurationRoots(Vec<PathBuf>),
     SaveAutomation(Automation),
     DeleteAutomation {
         automation_id: String,
@@ -1240,7 +1241,12 @@ fn bootstrap_unread_children(storage: &Storage) -> Vec<(String, String)> {
 
 impl AppService {
     #[allow(clippy::too_many_lines)]
-    fn start(project_root: PathBuf, database_path: &Path, worktrees_root: PathBuf) -> Self {
+    fn start(
+        project_root: PathBuf,
+        database_path: &Path,
+        worktrees_root: PathBuf,
+        configuration_roots: Vec<PathBuf>,
+    ) -> Self {
         let startup_started = Instant::now();
         let diagnostics = Arc::new(TracingDiagnostics);
         let storage_started = Instant::now();
@@ -1344,6 +1350,7 @@ impl AppService {
                 let manager = Arc::new(
                     SessionManager::new(provider_factory, storage.clone(), diagnostics.clone())
                         .with_session_roots(session_roots.clone())
+                        .with_configuration_roots(configuration_roots)
                         .with_host_tool_gateway(HostToolGateway::new(host_tool_tx)),
                 );
                 let orchestrator = SessionOrchestrator::new(manager.clone(), session_roots.clone());
@@ -1752,6 +1759,9 @@ async fn handle_service_command(
 ) -> Result<Option<SessionHandle>, String> {
     let mut created = None;
     match command {
+        ServiceCommand::SetConfigurationRoots(roots) => {
+            manager.set_configuration_roots(roots);
+        }
         ServiceCommand::ForkSession {
             source_session_id,
             worktrees_root,
@@ -5361,10 +5371,17 @@ impl SessionMvpView {
     }
 
     fn agent_discovery_paths(&self) -> Vec<PathBuf> {
-        self.agent_discovery_path()
+        let mut paths = self
+            .agent_discovery_path()
             .map(PathBuf::from)
             .into_iter()
-            .collect()
+            .collect::<Vec<_>>();
+        for root in self.worktree_configuration.settings.configuration_roots() {
+            if !paths.contains(root) {
+                paths.push(root.clone());
+            }
+        }
+        paths
     }
 
     fn request_agent_discovery(&self) {
@@ -5373,6 +5390,88 @@ impl SessionMvpView {
             .send(ServiceCommand::DiscoverWorkspaceConfiguration {
                 project_paths: self.agent_discovery_paths(),
             });
+    }
+
+    fn request_agent_discovery_result(&self) -> Result<(), String> {
+        self.commands
+            .send(ServiceCommand::DiscoverWorkspaceConfiguration {
+                project_paths: self.agent_discovery_paths(),
+            })
+            .map_err(|error| format!("could not refresh Copilot configuration: {error}"))
+    }
+
+    fn persist_configuration_settings(&mut self, settings: AppSettings) -> Result<(), String> {
+        if let Some(data_dir) = self.worktree_configuration.data_dir.as_deref() {
+            settings
+                .save(data_dir)
+                .map_err(|error| format!("could not save Copilot configuration folder: {error}"))?;
+        }
+        self.worktree_configuration.settings = settings;
+        self.commands
+            .send(ServiceCommand::SetConfigurationRoots(
+                self.worktree_configuration
+                    .settings
+                    .configuration_roots()
+                    .to_vec(),
+            ))
+            .map_err(|error| format!("could not update Copilot configuration: {error}"))
+    }
+
+    fn persist_configuration_root(&mut self, root: PathBuf) -> Result<(), String> {
+        let mut settings = self.worktree_configuration.settings.clone();
+        settings.add_configuration_root(root);
+        self.persist_configuration_settings(settings)
+    }
+
+    fn remove_configuration_root(&mut self, root: &Path) -> Result<(), String> {
+        let mut settings = self.worktree_configuration.settings.clone();
+        if !settings.remove_configuration_root(root) {
+            return Ok(());
+        }
+        self.persist_configuration_settings(settings)?;
+        self.request_agent_discovery_result()
+    }
+
+    fn add_configuration_folder(&mut self, cx: &mut Context<Self>) {
+        self.open_control_menu = None;
+        self.action_error = None;
+        let paths = cx.prompt_for_paths(PathPromptOptions {
+            files: false,
+            directories: true,
+            multiple: false,
+            prompt: Some("Add Copilot configuration folder".into()),
+        });
+        cx.spawn(async move |view, cx| {
+            let selection = match paths.await {
+                Ok(Ok(paths)) => paths.and_then(|paths| paths.into_iter().next()),
+                Ok(Err(error)) => {
+                    let message = format!("could not open the folder picker: {error}");
+                    let _ = view.update(cx, |view, cx| {
+                        view.action_error = Some(message);
+                        cx.notify();
+                    });
+                    return;
+                }
+                Err(_) => None,
+            };
+            let Some(path) = selection else {
+                return;
+            };
+            let _ = view.update(cx, |view, cx| {
+                match configuration_workspace_root(&path)
+                    .and_then(|root| view.persist_configuration_root(root))
+                    .and_then(|()| view.request_agent_discovery_result())
+                {
+                    Ok(()) => {
+                        view.open_control_menu = Some(ControlMenu::Agent);
+                    }
+                    Err(error) => view.action_error = Some(error),
+                }
+                cx.notify();
+            });
+        })
+        .detach();
+        cx.notify();
     }
 
     /// Open the platform folder picker and register the chosen directory.
@@ -7139,16 +7238,13 @@ impl SessionMvpView {
     }
 
     fn agent_options(&self) -> Vec<(String, String, String)> {
-        let session_agents = self.selected().map_or(&[][..], |session| {
-            session.snapshot.controls.available_agents.as_slice()
-        });
-        let mut seen = HashSet::new();
-        let agents = self
-            .discovered_agents
+        let agents = self.selected().map_or_else(
+            || self.discovered_agents.as_slice(),
+            |session| session.snapshot.controls.available_agents.as_slice(),
+        );
+        let agents = agents
             .iter()
-            .chain(session_agents)
             .filter(|agent| agent.user_invocable != Some(false))
-            .filter(|agent| seen.insert(agent.id.clone()))
             .collect::<Vec<_>>();
         let default_description = if agents.is_empty()
             && self.discovered_skills.is_empty()
@@ -7189,7 +7285,7 @@ impl SessionMvpView {
             .unwrap_or_else(|| selected.to_owned())
     }
 
-    fn workspace_configuration_summary(&self) -> impl IntoElement {
+    fn workspace_configuration_summary(&self, cx: &mut Context<Self>) -> impl IntoElement {
         let skills = resource_names(&self.discovered_skills);
         let instructions = resource_names(&self.discovered_instructions);
         let errors = self.configuration_errors.join(" · ");
@@ -7213,6 +7309,61 @@ impl SessionMvpView {
             .when(!errors.is_empty(), |summary| {
                 summary.child(div().text_color(rgb(RED)).child(errors))
             })
+            .children(
+                self.worktree_configuration
+                    .settings
+                    .configuration_roots()
+                    .iter()
+                    .enumerate()
+                    .map(|(index, root)| {
+                        let root = root.clone();
+                        let label = root.display().to_string();
+                        div()
+                            .flex()
+                            .items_center()
+                            .gap_2()
+                            .child(div().flex_1().min_w_0().truncate().child(label.clone()))
+                            .child(
+                                div()
+                                    .id(("remove-configuration-folder", index))
+                                    .role(Role::Button)
+                                    .aria_label(format!("Remove configuration folder {label}"))
+                                    .focusable()
+                                    .tab_stop(true)
+                                    .px_2()
+                                    .rounded_md()
+                                    .child("×")
+                                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                                    .on_click(cx.listener(move |view, _, _, cx| {
+                                        if let Err(error) = view.remove_configuration_root(&root) {
+                                            view.action_error = Some(error);
+                                        }
+                                        cx.notify();
+                                    })),
+                            )
+                    }),
+            )
+            .child(
+                div()
+                    .id("add-configuration-folder")
+                    .debug_selector(|| "add-configuration-folder".to_owned())
+                    .accessibility_id("add-configuration-folder")
+                    .role(Role::Button)
+                    .aria_label("Add Copilot configuration folder")
+                    .focusable()
+                    .tab_stop(true)
+                    .mt_2()
+                    .px_2()
+                    .py_2()
+                    .rounded_md()
+                    .text_sm()
+                    .text_color(rgb(PRIMARY))
+                    .child("+ Add configuration folder…")
+                    .hover(|style| style.bg(rgb(ELEVATED)).cursor_pointer())
+                    .on_click(cx.listener(|view, _, _, cx| {
+                        view.add_configuration_folder(cx);
+                    })),
+            )
     }
     #[allow(clippy::too_many_lines)]
     fn control_menu(&self, cx: &mut Context<Self>) -> Option<impl IntoElement> {
@@ -7413,7 +7564,7 @@ impl SessionMvpView {
                     )
                 })
                 .when(menu == ControlMenu::Agent, |popup| {
-                    popup.child(self.workspace_configuration_summary())
+                    popup.child(self.workspace_configuration_summary(cx))
                 }),
         )
     }
@@ -13814,6 +13965,33 @@ fn changes_badge(session: Option<&SessionProjection>) -> String {
     )
 }
 
+fn configuration_workspace_root(path: &Path) -> Result<PathBuf, String> {
+    if !path.is_dir() {
+        return Err(format!("{} is not a directory", path.display()));
+    }
+    let canonical = path.canonicalize().unwrap_or_else(|_| path.to_owned());
+    let parent = canonical.parent();
+    if canonical
+        .file_name()
+        .is_some_and(|name| matches!(name.to_str(), Some("agents" | "skills" | "instructions")))
+        && parent
+            .and_then(Path::file_name)
+            .and_then(|name| name.to_str())
+            == Some(".github")
+    {
+        return parent
+            .and_then(Path::parent)
+            .map(Path::to_owned)
+            .ok_or_else(|| format!("{} has no workspace root", canonical.display()));
+    }
+    if canonical.file_name().and_then(|name| name.to_str()) == Some(".github") {
+        return parent
+            .map(Path::to_owned)
+            .ok_or_else(|| format!("{} has no workspace root", canonical.display()));
+    }
+    Ok(canonical)
+}
+
 fn resource_names(resources: &[WorkspaceResource]) -> String {
     if resources.is_empty() {
         return "None".to_owned();
@@ -14491,6 +14669,30 @@ Exit codes for the update commands:
   2  nothing to do
 ";
 
+fn start_app_service(
+    project_root: &Path,
+    data_dir: &Result<PathBuf, String>,
+    configuration: &WorktreeConfiguration,
+) -> AppService {
+    let worktrees_root = configuration
+        .settings
+        .worktrees_root(&configuration.default_root);
+    let configuration_roots = configuration.settings.configuration_roots().to_vec();
+    match data_dir
+        .as_ref()
+        .map_err(Clone::clone)
+        .and_then(|path| database_path(path))
+    {
+        Ok(path) => AppService::start(
+            project_root.to_owned(),
+            &path,
+            worktrees_root,
+            configuration_roots,
+        ),
+        Err(error) => AppService::failed(error),
+    }
+}
+
 fn main() {
     if let Err(error) = init_tracing("gcabb=info") {
         eprintln!("failed to initialize structured tracing: {error}");
@@ -14535,17 +14737,7 @@ fn main() {
     let project_root = std::env::current_dir().unwrap_or_else(|_| PathBuf::from("."));
     let branch = git_branch(&project_root);
     let worktree_configuration = WorktreeConfiguration::load(&data_dir);
-    let service_worktrees_root = worktree_configuration
-        .settings
-        .worktrees_root(&worktree_configuration.default_root);
-    let service = match data_dir
-        .as_ref()
-        .map_err(Clone::clone)
-        .and_then(|path| database_path(path))
-    {
-        Ok(path) => AppService::start(project_root.clone(), &path, service_worktrees_root),
-        Err(error) => AppService::failed(error),
-    };
+    let service = start_app_service(&project_root, &data_dir, &worktree_configuration);
     let chats_workspace = chats_directory(&project_root);
 
     gpui_platform::application().run(move |cx: &mut App| {
@@ -14605,17 +14797,40 @@ pub(crate) mod tests {
 
     use super::{
         COMPACT_WIDTH, ControlMenu, UPDATE_POLL_INTERVAL, UPDATE_POLL_JITTER, choice_response,
-        compact_layout, context_window_label, control_menu_id, control_menu_offset, default_branch,
-        default_context_tier, effort_label, format_terminal_auto_expand_delay,
-        migrate_persistent_data, parse_terminal_auto_expand_delay, permission_scope_description,
-        prioritized_base_refs, reasoning_effort_for_model, repository_root, toggled_menu,
-        token_label, update_poll_delay_for,
+        compact_layout, configuration_workspace_root, context_window_label, control_menu_id,
+        control_menu_offset, default_branch, default_context_tier, effort_label,
+        format_terminal_auto_expand_delay, migrate_persistent_data,
+        parse_terminal_auto_expand_delay, permission_scope_description, prioritized_base_refs,
+        reasoning_effort_for_model, repository_root, toggled_menu, token_label,
+        update_poll_delay_for,
     };
     use app_model::SessionLocation;
     use std::fmt::Write as _;
     use std::path::{Path, PathBuf};
     use std::process::Command;
     use std::time::Duration;
+
+    #[test]
+    fn configuration_picker_normalizes_github_directories_to_the_workspace() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let agents = workspace.join(".github").join("agents");
+        std::fs::create_dir_all(&agents).unwrap();
+
+        assert_eq!(
+            configuration_workspace_root(&agents).unwrap(),
+            workspace.canonicalize().unwrap()
+        );
+    }
+
+    #[test]
+    fn configuration_picker_keeps_a_workspace_root() {
+        let directory = tempfile::tempdir().unwrap();
+        assert_eq!(
+            configuration_workspace_root(directory.path()).unwrap(),
+            directory.path().canonicalize().unwrap()
+        );
+    }
 
     fn git(dir: &Path, args: &[&str]) {
         let output = Command::new("git")
@@ -16159,15 +16374,37 @@ pub(crate) mod tests {
         }
 
         #[gpui::test]
+        fn agent_menu_offers_a_configuration_folder_picker(cx: &mut TestAppContext) {
+            let (view, cx, _commands) = setup(cx);
+            view.update(cx, |view, cx| {
+                view.toggle_control_menu(super::super::ControlMenu::Agent, cx);
+                cx.notify();
+            });
+            cx.run_until_parked();
+            assert!(cx.debug_bounds("add-configuration-folder").is_some());
+        }
+
+        #[gpui::test]
+        fn configuration_folder_changes_report_a_stopped_service(cx: &mut TestAppContext) {
+            let (view, cx, commands) = setup(cx);
+            drop(commands);
+
+            view.update(cx, |view, _| {
+                let error = view
+                    .persist_configuration_root(std::path::PathBuf::from("/configuration"))
+                    .expect_err("a stopped service rejects configuration changes");
+                assert!(error.contains("could not update Copilot configuration"));
+            });
+        }
+
+        #[gpui::test]
         fn agent_selector_is_visible_without_custom_agents(cx: &mut TestAppContext) {
             let (_view, cx, _commands) = setup(cx);
             cx.run_until_parked();
             assert!(cx.debug_bounds("agent").is_some());
         }
         #[gpui::test]
-        fn discovered_project_agents_survive_an_empty_selected_session_roster(
-            cx: &mut TestAppContext,
-        ) {
+        fn selected_session_uses_its_runtime_agent_roster(cx: &mut TestAppContext) {
             let (view, cx, _commands) = setup(cx);
             view.update(cx, |view, _| {
                 view.selected_session = Some("session-1".to_owned());
@@ -16185,11 +16422,8 @@ pub(crate) mod tests {
                         .available_agents
                         .is_empty()
                 );
-                assert!(
-                    view.agent_options()
-                        .iter()
-                        .any(|(id, _, _)| id == "workspace-reviewer")
-                );
+                assert_eq!(view.agent_options().len(), 1);
+                assert_eq!(view.agent_options()[0].1, "Default agent");
             });
         }
         #[gpui::test]

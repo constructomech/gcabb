@@ -1,6 +1,6 @@
 #![allow(clippy::missing_errors_doc)]
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::time::{Duration, Instant, SystemTime, UNIX_EPOCH};
@@ -32,10 +32,10 @@ use github_copilot_sdk::rpc::{
 use github_copilot_sdk::session::Session;
 use github_copilot_sdk::tool::ToolHandler;
 use github_copilot_sdk::{
-    Client, ClientMode, ClientOptions, DeliveryMode, ElicitationRequest, ElicitationResult,
-    ExitPlanModeData, MessageOptions, PermissionRequestData, PermissionRequestKind, RequestId,
-    ResumeSessionConfig, SessionConfig, SessionId, SystemMessageConfig, Tool, ToolInvocation,
-    ToolResult, ToolResultExpanded,
+    Client, ClientMode, ClientOptions, CustomAgentConfig, DeliveryMode, ElicitationRequest,
+    ElicitationResult, ExitPlanModeData, MessageOptions, PermissionRequestData,
+    PermissionRequestKind, RequestId, ResumeSessionConfig, SessionConfig, SessionId,
+    SystemMessageConfig, Tool, ToolInvocation, ToolResult, ToolResultExpanded,
 };
 use serde::{Deserialize, Serialize};
 use serde_json::{Value, json};
@@ -69,6 +69,9 @@ pub type Result<T> = std::result::Result<T, ProviderError>;
 #[derive(Clone, Debug, Default)]
 pub struct SessionRequest {
     pub working_directory: PathBuf,
+    /// Additional workspace roots whose Copilot configuration should be
+    /// available to this session and its delegated subagents.
+    pub configuration_roots: Vec<PathBuf>,
     pub model: Option<String>,
     pub mode: Option<String>,
     pub reasoning_effort: Option<String>,
@@ -1438,6 +1441,7 @@ pub struct CopilotProvider {
     client: Mutex<Option<Client>>,
     sessions: Mutex<HashMap<String, Arc<Session>>>,
     selected_agents: Mutex<HashMap<String, Option<String>>>,
+    agent_invocability: Mutex<HashMap<String, HashMap<String, Option<bool>>>>,
     diagnostics: Arc<dyn DiagnosticsSink>,
 }
 
@@ -1504,6 +1508,7 @@ impl CopilotProvider {
             client: Mutex::new(None),
             sessions: Mutex::new(HashMap::new()),
             selected_agents: Mutex::new(HashMap::new()),
+            agent_invocability: Mutex::new(HashMap::new()),
             diagnostics,
         }
     }
@@ -1577,13 +1582,18 @@ impl CopilotProvider {
         }
     }
 
-    fn session_config(request: &SessionRequest, broker: Arc<InteractionBroker>) -> SessionConfig {
+    fn session_config(
+        request: &SessionRequest,
+        broker: Arc<InteractionBroker>,
+        custom_agents: Vec<CustomAgentConfig>,
+    ) -> SessionConfig {
         let mut config = SessionConfig::default()
             .with_working_directory(&request.working_directory)
             .with_client_name("gcabb")
             .with_enable_config_discovery(true)
             .with_enable_on_demand_instruction_discovery(true)
             .with_enable_skills(true)
+            .with_include_sub_agent_streaming_events(true)
             .with_permission_handler(broker.clone())
             .with_elicitation_handler(broker.clone())
             .with_user_input_handler(broker.clone())
@@ -1592,7 +1602,11 @@ impl CopilotProvider {
         if let Some(binding) = request.host_tools.clone() {
             config = config.with_tools(host_tools(binding));
         }
-        config.skill_directories = repository_skill_directories(&request.working_directory);
+        if !custom_agents.is_empty() {
+            config = config.with_custom_agents(custom_agents);
+        }
+        config.skill_directories = configuration_directories(request, "skills");
+        config.instruction_directories = configuration_directories(request, "instructions");
         config.model.clone_from(&request.model);
         config
             .reasoning_effort
@@ -1605,6 +1619,7 @@ impl CopilotProvider {
         sdk_session_id: &str,
         request: &SessionRequest,
         broker: Arc<InteractionBroker>,
+        custom_agents: Vec<CustomAgentConfig>,
     ) -> ResumeSessionConfig {
         let mut config = ResumeSessionConfig::new(sdk_session_id.into())
             .with_working_directory(&request.working_directory)
@@ -1612,6 +1627,7 @@ impl CopilotProvider {
             .with_enable_config_discovery(true)
             .with_enable_on_demand_instruction_discovery(true)
             .with_enable_skills(true)
+            .with_include_sub_agent_streaming_events(true)
             .with_permission_handler(broker.clone())
             .with_elicitation_handler(broker.clone())
             .with_user_input_handler(broker.clone())
@@ -1620,13 +1636,52 @@ impl CopilotProvider {
         if let Some(binding) = request.host_tools.clone() {
             config = config.with_tools(host_tools(binding));
         }
-        config.skill_directories = repository_skill_directories(&request.working_directory);
+        if !custom_agents.is_empty() {
+            config = config.with_custom_agents(custom_agents);
+        }
+        config.skill_directories = configuration_directories(request, "skills");
+        config.instruction_directories = configuration_directories(request, "instructions");
         config.model.clone_from(&request.model);
         config
             .reasoning_effort
             .clone_from(&request.reasoning_effort);
         config.context_tier.clone_from(&request.context_tier);
         config
+    }
+
+    async fn discover_custom_agents(&self, request: &SessionRequest) -> Result<CustomAgentRoster> {
+        if request.configuration_roots.is_empty() {
+            return Ok(CustomAgentRoster::default());
+        }
+        let working_directory = canonical_directory(&request.working_directory)?;
+        let mut configuration_roots = Vec::new();
+        for root in &request.configuration_roots {
+            let root = canonical_directory(root)?;
+            if root != working_directory && !configuration_roots.contains(&root) {
+                configuration_roots.push(root);
+            }
+        }
+        if configuration_roots.is_empty() {
+            return Ok(CustomAgentRoster::default());
+        }
+        let mut project_paths = vec![working_directory.clone()];
+        project_paths.extend(configuration_roots.iter().cloned());
+        let client = self.client().await?;
+        let discovered = client
+            .rpc()
+            .agents()
+            .discover(AgentsDiscoverRequest {
+                exclude_host_agents: None,
+                project_paths: Some(
+                    project_paths
+                        .iter()
+                        .map(|path| path.to_string_lossy().into_owned())
+                        .collect(),
+                ),
+            })
+            .await
+            .map_err(|error| ProviderError::Sdk(error.to_string()))?;
+        resolve_custom_agents(discovered.agents, &working_directory, &configuration_roots)
     }
 
     fn record(
@@ -1695,6 +1750,7 @@ impl AgentProvider for CopilotProvider {
                 .collect::<Vec<_>>()
         };
         self.selected_agents.lock().await.clear();
+        self.agent_invocability.lock().await.clear();
         let mut errors = Vec::new();
         for session in sessions {
             if let Err(error) = session.disconnect().await {
@@ -1717,10 +1773,11 @@ impl AgentProvider for CopilotProvider {
         let started = Instant::now();
         let (interaction_tx, interactions) = mpsc::channel(16);
         let broker = Arc::new(InteractionBroker::new(interaction_tx, &request));
+        let custom_agents = self.discover_custom_agents(&request).await?;
         let session = self
             .client()
             .await?
-            .create_session(Self::session_config(&request, broker))
+            .create_session(Self::session_config(&request, broker, custom_agents.agents))
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))?;
         if let Err(error) = session.rpc().skills().ensure_loaded().await {
@@ -1732,6 +1789,10 @@ impl AgentProvider for CopilotProvider {
             )));
         }
         let sdk_session_id = session.id().to_string();
+        self.agent_invocability
+            .lock()
+            .await
+            .insert(sdk_session_id.clone(), custom_agents.invocability);
         self.record(
             "create_session",
             millis(started.elapsed().as_millis()),
@@ -1750,10 +1811,16 @@ impl AgentProvider for CopilotProvider {
         let started = Instant::now();
         let (interaction_tx, interactions) = mpsc::channel(16);
         let broker = Arc::new(InteractionBroker::new(interaction_tx, &request));
+        let custom_agents = self.discover_custom_agents(&request).await?;
         let session = self
             .client()
             .await?
-            .resume_session(Self::resume_config(sdk_session_id, &request, broker))
+            .resume_session(Self::resume_config(
+                sdk_session_id,
+                &request,
+                broker,
+                custom_agents.agents,
+            ))
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))?;
         // The SDK's automatic resume reload is best-effort and only logs errors.
@@ -1766,6 +1833,10 @@ impl AgentProvider for CopilotProvider {
                 "failed to reload session skills: {error}"
             )));
         }
+        self.agent_invocability
+            .lock()
+            .await
+            .insert(sdk_session_id.to_owned(), custom_agents.invocability);
         self.record(
             "resume_session",
             millis(started.elapsed().as_millis()),
@@ -1890,6 +1961,13 @@ impl AgentProvider for CopilotProvider {
             .get(sdk_session_id)
             .cloned()
             .flatten();
+        let invocability = self
+            .agent_invocability
+            .lock()
+            .await
+            .get(sdk_session_id)
+            .cloned()
+            .unwrap_or_default();
         Ok(SessionControls {
             model: current.model_id,
             mode: serde_json::to_value(mode)
@@ -1899,7 +1977,11 @@ impl AgentProvider for CopilotProvider {
             reasoning_effort: current.reasoning_effort,
             context_tier: current.context_tier.as_ref().and_then(context_tier_id),
             available_models: models.list.iter().filter_map(model_option).collect(),
-            available_agents: agents.agents.iter().map(agent_option).collect(),
+            available_agents: agents
+                .agents
+                .iter()
+                .map(|agent| agent_option(agent, &invocability))
+                .collect(),
         })
     }
 
@@ -1999,6 +2081,7 @@ impl AgentProvider for CopilotProvider {
             .await
             .map_err(|error| ProviderError::Sdk(error.to_string()))?;
         self.selected_agents.lock().await.remove(sdk_session_id);
+        self.agent_invocability.lock().await.remove(sdk_session_id);
         Ok(())
     }
 
@@ -2034,7 +2117,7 @@ impl AgentProvider for CopilotProvider {
         )
         .map_err(|error| ProviderError::Sdk(error.to_string()))?;
         Ok(WorkspaceConfiguration {
-            agents: agents.agents.iter().map(agent_option).collect(),
+            agents: agents.agents.iter().map(discovered_agent_option).collect(),
             skills: skills
                 .skills
                 .iter()
@@ -2536,7 +2619,7 @@ fn model_option(value: &Value) -> Option<ModelOption> {
     })
 }
 
-fn agent_option(agent: &AgentInfo) -> AgentOption {
+fn agent_option(agent: &AgentInfo, invocability: &HashMap<String, Option<bool>>) -> AgentOption {
     AgentOption {
         id: agent.id.clone(),
         name: if agent.display_name.is_empty() {
@@ -2546,8 +2629,17 @@ fn agent_option(agent: &AgentInfo) -> AgentOption {
         },
         description: agent.description.clone(),
         model: agent.model.clone(),
-        user_invocable: agent.user_invocable,
+        user_invocable: invocability
+            .get(&agent.id)
+            .or_else(|| invocability.get(&agent.name))
+            .copied()
+            .flatten()
+            .or(agent.user_invocable),
     }
+}
+
+fn discovered_agent_option(agent: &AgentInfo) -> AgentOption {
+    agent_option(agent, &HashMap::new())
 }
 
 /// Builds the selectable context-window tiers for a model. The default tier is
@@ -2702,9 +2794,145 @@ fn timestamp() -> String {
     )
 }
 
-fn repository_skill_directories(working_directory: &Path) -> Option<Vec<PathBuf>> {
-    let directory = working_directory.join(".github").join("skills");
-    directory.is_dir().then_some(vec![directory])
+fn configuration_directories(request: &SessionRequest, kind: &str) -> Option<Vec<PathBuf>> {
+    let mut directories = Vec::new();
+    for root in std::iter::once(&request.working_directory).chain(&request.configuration_roots) {
+        let directory = root.join(".github").join(kind);
+        if directory.is_dir() && !directories.contains(&directory) {
+            directories.push(directory);
+        }
+    }
+    (!directories.is_empty()).then_some(directories)
+}
+
+#[derive(Default)]
+struct CustomAgentRoster {
+    agents: Vec<CustomAgentConfig>,
+    invocability: HashMap<String, Option<bool>>,
+}
+
+fn canonical_directory(path: &Path) -> Result<PathBuf> {
+    let canonical = path.canonicalize().map_err(|error| {
+        ProviderError::Sdk(format!(
+            "could not resolve Copilot configuration directory {}: {error}",
+            path.display()
+        ))
+    })?;
+    if !canonical.is_dir() {
+        return Err(ProviderError::Sdk(format!(
+            "Copilot configuration path is not a directory: {}",
+            canonical.display()
+        )));
+    }
+    Ok(canonical)
+}
+
+fn resolve_custom_agents(
+    agents: Vec<AgentInfo>,
+    working_directory: &Path,
+    configuration_roots: &[PathBuf],
+) -> Result<CustomAgentRoster> {
+    let mut native_names = HashSet::new();
+    let mut candidates = Vec::new();
+    for agent in agents {
+        let Some(path) = agent.path.as_deref() else {
+            continue;
+        };
+        let path = Path::new(path).canonicalize().map_err(|error| {
+            ProviderError::Sdk(format!(
+                "could not resolve custom agent {} at {path}: {error}",
+                agent.name
+            ))
+        })?;
+        if path.starts_with(working_directory) {
+            native_names.insert(agent.id.clone());
+            continue;
+        }
+        if let Some(root_index) = configuration_roots
+            .iter()
+            .position(|root| path.starts_with(root))
+        {
+            candidates.push((root_index, path, agent));
+        }
+    }
+    candidates.sort_by(|left, right| left.0.cmp(&right.0).then_with(|| left.1.cmp(&right.1)));
+
+    let mut roster = CustomAgentRoster::default();
+    for (_, _, agent) in candidates {
+        if !native_names.insert(agent.id.clone()) {
+            continue;
+        }
+        roster
+            .invocability
+            .insert(agent.id.clone(), agent.user_invocable);
+        roster
+            .invocability
+            .insert(agent.name.clone(), agent.user_invocable);
+        roster.agents.push(custom_agent_config(&agent)?);
+    }
+    Ok(roster)
+}
+
+fn custom_agent_config(agent: &AgentInfo) -> Result<CustomAgentConfig> {
+    let prompt = agent_prompt(agent)?;
+    let mut config = CustomAgentConfig::new(agent.id.clone(), prompt);
+    config.display_name = (!agent.display_name.is_empty()).then(|| agent.display_name.clone());
+    config.description = (!agent.description.is_empty()).then(|| agent.description.clone());
+    config.tools.clone_from(&agent.tools);
+    config.infer = Some(true);
+    config.skills.clone_from(&agent.skills);
+    config.model.clone_from(&agent.model);
+    if let Some(servers) = &agent.mcp_servers {
+        config.mcp_servers = Some(
+            servers
+                .iter()
+                .map(|(name, value)| {
+                    serde_json::from_value(value.clone())
+                        .map(|server| (name.clone(), server))
+                        .map_err(ProviderError::from)
+                })
+                .collect::<Result<_>>()?,
+        );
+    }
+    Ok(config)
+}
+
+fn agent_prompt(agent: &AgentInfo) -> Result<String> {
+    if let Some(prompt) = agent.prompt.as_deref() {
+        return Ok(prompt.to_owned());
+    }
+    let path = agent.path.as_deref().ok_or_else(|| {
+        ProviderError::Sdk(format!(
+            "custom agent {} has neither an authored prompt nor a source file",
+            agent.name
+        ))
+    })?;
+    let contents = std::fs::read_to_string(path).map_err(|error| {
+        ProviderError::Sdk(format!(
+            "could not read custom agent {} at {path}: {error}",
+            agent.name
+        ))
+    })?;
+    let prompt = strip_frontmatter(&contents).trim();
+    if prompt.is_empty() {
+        return Err(ProviderError::Sdk(format!(
+            "custom agent {} has an empty prompt in {path}",
+            agent.name
+        )));
+    }
+    Ok(prompt.to_owned())
+}
+
+fn strip_frontmatter(contents: &str) -> &str {
+    if let Some(rest) = contents.strip_prefix("---\n") {
+        return rest
+            .split_once("\n---\n")
+            .map_or(contents, |(_, body)| body);
+    }
+    contents.strip_prefix("---\r\n").map_or(contents, |rest| {
+        rest.split_once("\r\n---\r\n")
+            .map_or(contents, |(_, body)| body)
+    })
 }
 
 #[must_use]
@@ -2719,7 +2947,7 @@ mod tests {
 
     use diagnostics::MemoryDiagnostics;
     use github_copilot_sdk::handler::{ExitPlanModeHandler, PermissionHandler, PermissionResult};
-    use github_copilot_sdk::rpc::PermissionDecision;
+    use github_copilot_sdk::rpc::{AgentInfo, PermissionDecision};
     use github_copilot_sdk::{
         DeliveryMode, PermissionRequestData, PermissionRequestKind, RequestId, SessionId,
         ToolInvocation, ToolResult,
@@ -2736,8 +2964,8 @@ mod tests {
         SendSessionMessageToolResult, SessionChangeSummary, SessionMessageDelivery, SessionRequest,
         command_identifier, message_options, model_option, permission_choices, permission_domain,
         permission_for_domain, permission_for_location, permission_for_session,
-        permission_stays_in_worktree, provider_fork_result, resolve_root, sdk_context_windows,
-        sdk_fork_request,
+        permission_stays_in_worktree, provider_fork_result, resolve_custom_agents, resolve_root,
+        sdk_context_windows, sdk_fork_request,
     };
 
     fn interaction_broker() -> Arc<InteractionBroker> {
@@ -2790,11 +3018,14 @@ mod tests {
             ..SessionRequest::default()
         };
 
-        let create = CopilotProvider::session_config(&request, interaction_broker());
-        let resume = CopilotProvider::resume_config("session", &request, interaction_broker());
+        let create = CopilotProvider::session_config(&request, interaction_broker(), Vec::new());
+        let resume =
+            CopilotProvider::resume_config("session", &request, interaction_broker(), Vec::new());
 
         assert_eq!(create.enable_skills, Some(true));
         assert_eq!(resume.enable_skills, Some(true));
+        assert_eq!(create.include_sub_agent_streaming_events, Some(true));
+        assert_eq!(resume.include_sub_agent_streaming_events, Some(true));
         assert_eq!(
             create.skill_directories.as_deref(),
             Some(std::slice::from_ref(&skill_directory))
@@ -2815,11 +3046,226 @@ mod tests {
             ..SessionRequest::default()
         };
 
-        let create = CopilotProvider::session_config(&request, interaction_broker());
-        let resume = CopilotProvider::resume_config("session", &request, interaction_broker());
+        let create = CopilotProvider::session_config(&request, interaction_broker(), Vec::new());
+        let resume =
+            CopilotProvider::resume_config("session", &request, interaction_broker(), Vec::new());
 
         assert_eq!(create.skill_directories, None);
         assert_eq!(resume.skill_directories, None);
+    }
+
+    #[test]
+    fn session_configs_load_additional_skills_and_instructions() {
+        let directory = tempfile::tempdir().unwrap();
+        let working_directory = directory.path().join("worktree");
+        let configuration_root = directory.path().join("configuration");
+        let workspace_skill_directory = working_directory.join(".github").join("skills");
+        let skill_directory = configuration_root.join(".github").join("skills");
+        let instruction_directory = configuration_root.join(".github").join("instructions");
+        std::fs::create_dir_all(&workspace_skill_directory).unwrap();
+        std::fs::create_dir_all(&skill_directory).unwrap();
+        std::fs::create_dir_all(&instruction_directory).unwrap();
+        let request = SessionRequest {
+            working_directory,
+            configuration_roots: vec![configuration_root],
+            ..SessionRequest::default()
+        };
+
+        let create = CopilotProvider::session_config(&request, interaction_broker(), Vec::new());
+        let resume =
+            CopilotProvider::resume_config("session", &request, interaction_broker(), Vec::new());
+
+        assert_eq!(
+            create.skill_directories,
+            Some(vec![
+                workspace_skill_directory.clone(),
+                skill_directory.clone()
+            ])
+        );
+        assert_eq!(
+            resume.skill_directories,
+            Some(vec![workspace_skill_directory, skill_directory])
+        );
+        assert_eq!(
+            create.instruction_directories,
+            Some(vec![instruction_directory.clone()])
+        );
+        assert_eq!(
+            resume.instruction_directories,
+            Some(vec![instruction_directory])
+        );
+    }
+
+    fn discovered_agent(name: &str, path: &Path, user_invocable: bool) -> AgentInfo {
+        AgentInfo {
+            id: name.to_owned(),
+            name: name.to_owned(),
+            display_name: name.to_owned(),
+            description: format!("{name} description"),
+            path: Some(path.to_string_lossy().into_owned()),
+            prompt: Some(format!("{name} prompt")),
+            tools: Some(vec!["read".to_owned()]),
+            user_invocable: Some(user_invocable),
+            ..AgentInfo::default()
+        }
+    }
+
+    #[test]
+    fn configured_agents_preserve_root_order_and_repository_precedence() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let first = directory.path().join("first");
+        let second = directory.path().join("second");
+        let outside = directory.path().join("outside");
+        for root in [&workspace, &first, &second, &outside] {
+            std::fs::create_dir_all(root.join(".github").join("agents")).unwrap();
+        }
+        let agent_path = |root: &Path, name: &str| {
+            let path = root.join(".github").join("agents").join(name);
+            std::fs::write(&path, "agent").unwrap();
+            path
+        };
+        let native = agent_path(&workspace, "shared.agent.md");
+        let first_shared = agent_path(&first, "shared.agent.md");
+        let first_ordered = agent_path(&first, "ordered.agent.md");
+        let second_ordered = agent_path(&second, "ordered.agent.md");
+        let second_only = agent_path(&second, "second.agent.md");
+        let outside_path = agent_path(&outside, "outside.agent.md");
+
+        let roster = resolve_custom_agents(
+            vec![
+                discovered_agent("ordered", &second_ordered, true),
+                discovered_agent("second", &second_only, true),
+                discovered_agent("shared", &first_shared, true),
+                discovered_agent("outside", &outside_path, true),
+                discovered_agent("shared", &native, true),
+                discovered_agent("ordered", &first_ordered, false),
+            ],
+            &workspace.canonicalize().unwrap(),
+            &[
+                first.canonicalize().unwrap(),
+                second.canonicalize().unwrap(),
+            ],
+        )
+        .unwrap();
+
+        assert_eq!(
+            roster
+                .agents
+                .iter()
+                .map(|agent| agent.name.as_str())
+                .collect::<Vec<_>>(),
+            ["ordered", "second"]
+        );
+        assert_eq!(roster.agents[0].prompt, "ordered prompt");
+        assert_eq!(roster.agents[0].infer, Some(true));
+        assert_eq!(roster.invocability.get("ordered"), Some(&Some(false)));
+    }
+
+    #[test]
+    fn configured_agent_prompt_is_read_from_its_source_file() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let configured = directory.path().join("configured");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let agent_directory = configured.join(".github").join("agents");
+        std::fs::create_dir_all(&agent_directory).unwrap();
+        let path = agent_directory.join("reviewer.agent.md");
+        std::fs::write(
+            &path,
+            "---\nname: Reviewer\ntools: [read]\n---\n\nReview the supplied change.\n",
+        )
+        .unwrap();
+        let mut agent = discovered_agent("reviewer", &path, false);
+        agent.prompt = None;
+
+        let roster = resolve_custom_agents(
+            vec![agent],
+            &workspace.canonicalize().unwrap(),
+            &[configured.canonicalize().unwrap()],
+        )
+        .unwrap();
+
+        assert_eq!(roster.agents[0].prompt, "Review the supplied change.");
+    }
+
+    #[test]
+    fn configured_agent_prompt_accepts_windows_line_endings() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let configured = directory.path().join("configured");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let agent_directory = configured.join(".github").join("agents");
+        std::fs::create_dir_all(&agent_directory).unwrap();
+        let path = agent_directory.join("reviewer.agent.md");
+        std::fs::write(
+            &path,
+            "---\r\nname: Reviewer\r\ntools: [read]\r\n---\r\n\r\nReview the supplied change.\r\n",
+        )
+        .unwrap();
+        let mut agent = discovered_agent("reviewer", &path, false);
+        agent.prompt = None;
+
+        let roster = resolve_custom_agents(
+            vec![agent],
+            &workspace.canonicalize().unwrap(),
+            &[configured.canonicalize().unwrap()],
+        )
+        .unwrap();
+
+        assert_eq!(roster.agents[0].prompt, "Review the supplied change.");
+    }
+
+    #[test]
+    fn configured_agent_registers_with_its_stable_id() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let configured = directory.path().join("configured");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let agent_directory = configured.join(".github").join("agents");
+        std::fs::create_dir_all(&agent_directory).unwrap();
+        let path = agent_directory.join("code-reviewer.agent.md");
+        std::fs::write(&path, "Review the supplied change.\n").unwrap();
+        let mut agent = discovered_agent("Code Reviewer", &path, true);
+        agent.id = "code-reviewer".to_owned();
+        agent.prompt = None;
+
+        let roster = resolve_custom_agents(
+            vec![agent],
+            &workspace.canonicalize().unwrap(),
+            &[configured.canonicalize().unwrap()],
+        )
+        .unwrap();
+
+        assert_eq!(roster.agents[0].name, "code-reviewer");
+        assert_eq!(
+            roster.agents[0].display_name.as_deref(),
+            Some("Code Reviewer")
+        );
+    }
+
+    #[test]
+    fn configured_agent_with_an_empty_body_is_rejected() {
+        let directory = tempfile::tempdir().unwrap();
+        let workspace = directory.path().join("workspace");
+        let configured = directory.path().join("configured");
+        std::fs::create_dir_all(&workspace).unwrap();
+        let agent_directory = configured.join(".github").join("agents");
+        std::fs::create_dir_all(&agent_directory).unwrap();
+        let path = agent_directory.join("empty.agent.md");
+        std::fs::write(&path, "---\nname: Empty\n---\n").unwrap();
+        let mut agent = discovered_agent("empty", &path, false);
+        agent.prompt = None;
+
+        let error = resolve_custom_agents(
+            vec![agent],
+            &workspace.canonicalize().unwrap(),
+            &[configured.canonicalize().unwrap()],
+        )
+        .err()
+        .expect("an empty prompt must fail");
+
+        assert!(error.to_string().contains("has an empty prompt"));
     }
 
     #[tokio::test]
@@ -2837,8 +3283,13 @@ mod tests {
             )),
             ..SessionRequest::default()
         };
-        let create = CopilotProvider::session_config(&request, interaction_broker());
-        let resume = CopilotProvider::resume_config("sdk-parent", &request, interaction_broker());
+        let create = CopilotProvider::session_config(&request, interaction_broker(), Vec::new());
+        let resume = CopilotProvider::resume_config(
+            "sdk-parent",
+            &request,
+            interaction_broker(),
+            Vec::new(),
+        );
         assert_eq!(
             create
                 .tools

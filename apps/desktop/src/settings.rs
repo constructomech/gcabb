@@ -16,6 +16,8 @@ pub struct AppSettings {
     worktrees_root: Option<PathBuf>,
     /// Roots GCABB has used, retained so existing worktrees remain managed.
     managed_worktrees_roots: Vec<PathBuf>,
+    /// Additional workspaces scanned for Copilot agents, skills, and instructions.
+    configuration_roots: Vec<PathBuf>,
     /// How long a shell must remain running before its transcript card opens.
     terminal_auto_expand_delay_ms: u64,
 }
@@ -25,6 +27,7 @@ impl Default for AppSettings {
         Self {
             worktrees_root: None,
             managed_worktrees_roots: Vec::new(),
+            configuration_roots: Vec::new(),
             terminal_auto_expand_delay_ms: DEFAULT_TERMINAL_AUTO_EXPAND_DELAY_MS,
         }
     }
@@ -85,6 +88,24 @@ impl AppSettings {
 
     pub fn set_terminal_auto_expand_delay(&mut self, delay: Duration) {
         self.terminal_auto_expand_delay_ms = u64::try_from(delay.as_millis()).unwrap_or(u64::MAX);
+    }
+
+    #[must_use]
+    pub fn configuration_roots(&self) -> &[PathBuf] {
+        &self.configuration_roots
+    }
+
+    pub fn add_configuration_root(&mut self, root: PathBuf) {
+        if !self.configuration_roots.contains(&root) {
+            self.configuration_roots.push(root);
+        }
+    }
+
+    pub fn remove_configuration_root(&mut self, root: &Path) -> bool {
+        let previous_len = self.configuration_roots.len();
+        self.configuration_roots
+            .retain(|configured| configured != root);
+        self.configuration_roots.len() != previous_len
     }
 
     /// Change where future worktrees are created while retaining ownership of
@@ -209,10 +230,35 @@ mod tests {
         let custom = data.path().join("custom");
         let mut settings = AppSettings::default();
         settings.set_worktrees_root(custom, &default);
+        settings.add_configuration_root(data.path().join("workspace"));
         settings.set_terminal_auto_expand_delay(Duration::from_millis(2_500));
         settings.save(data.path()).unwrap();
 
         assert_eq!(AppSettings::load(data.path()), settings);
+    }
+
+    #[test]
+    fn configuration_roots_are_deduplicated() {
+        let mut settings = AppSettings::default();
+        let root = std::path::PathBuf::from("/workspace");
+
+        settings.add_configuration_root(root.clone());
+        settings.add_configuration_root(root.clone());
+
+        assert_eq!(settings.configuration_roots(), &[root]);
+    }
+
+    #[test]
+    fn configuration_roots_can_be_removed() {
+        let mut settings = AppSettings::default();
+        let retained = std::path::PathBuf::from("/retained");
+        let removed = std::path::PathBuf::from("/removed");
+        settings.add_configuration_root(retained.clone());
+        settings.add_configuration_root(removed.clone());
+
+        assert!(settings.remove_configuration_root(&removed));
+        assert!(!settings.remove_configuration_root(&removed));
+        assert_eq!(settings.configuration_roots(), &[retained]);
     }
 
     #[test]
