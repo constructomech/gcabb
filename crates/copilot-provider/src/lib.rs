@@ -1605,6 +1605,7 @@ impl CopilotProvider {
         if !custom_agents.is_empty() {
             config = config.with_custom_agents(custom_agents);
         }
+        config.additional_directories = additional_directories(request);
         config.skill_directories = configuration_directories(request, "skills");
         config.instruction_directories = configuration_directories(request, "instructions");
         config.model.clone_from(&request.model);
@@ -1639,6 +1640,7 @@ impl CopilotProvider {
         if !custom_agents.is_empty() {
             config = config.with_custom_agents(custom_agents);
         }
+        config.additional_directories = additional_directories(request);
         config.skill_directories = configuration_directories(request, "skills");
         config.instruction_directories = configuration_directories(request, "instructions");
         config.model.clone_from(&request.model);
@@ -2794,6 +2796,22 @@ fn timestamp() -> String {
     )
 }
 
+/// Configuration roots the agent must be able to read directly.
+///
+/// The runtime loads instructions, skills, and custom agents out of these
+/// roots, so tool calls that follow up on that content (reading a skill file,
+/// say) would otherwise trip a permission prompt for a path the user already
+/// trusted by configuring it.
+fn additional_directories(request: &SessionRequest) -> Option<Vec<PathBuf>> {
+    let mut directories = Vec::new();
+    for root in &request.configuration_roots {
+        if root.is_dir() && root != &request.working_directory && !directories.contains(root) {
+            directories.push(root.clone());
+        }
+    }
+    (!directories.is_empty()).then_some(directories)
+}
+
 fn configuration_directories(request: &SessionRequest, kind: &str) -> Option<Vec<PathBuf>> {
     let mut directories = Vec::new();
     for root in std::iter::once(&request.working_directory).chain(&request.configuration_roots) {
@@ -3094,6 +3112,52 @@ mod tests {
             resume.instruction_directories,
             Some(vec![instruction_directory])
         );
+    }
+
+    #[test]
+    fn session_configs_grant_access_to_configuration_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let working_directory = directory.path().join("worktree");
+        let configuration_root = directory.path().join("configuration");
+        let missing_root = directory.path().join("missing");
+        std::fs::create_dir_all(&working_directory).unwrap();
+        std::fs::create_dir_all(&configuration_root).unwrap();
+        let request = SessionRequest {
+            working_directory: working_directory.clone(),
+            configuration_roots: vec![
+                configuration_root.clone(),
+                configuration_root.clone(),
+                working_directory,
+                missing_root,
+            ],
+            ..SessionRequest::default()
+        };
+
+        let create = CopilotProvider::session_config(&request, interaction_broker(), Vec::new());
+        let resume =
+            CopilotProvider::resume_config("session", &request, interaction_broker(), Vec::new());
+
+        assert_eq!(
+            create.additional_directories,
+            Some(vec![configuration_root.clone()])
+        );
+        assert_eq!(resume.additional_directories, Some(vec![configuration_root]));
+    }
+
+    #[test]
+    fn session_configs_omit_additional_directories_without_configuration_roots() {
+        let directory = tempfile::tempdir().unwrap();
+        let request = SessionRequest {
+            working_directory: directory.path().to_path_buf(),
+            ..SessionRequest::default()
+        };
+
+        let create = CopilotProvider::session_config(&request, interaction_broker(), Vec::new());
+        let resume =
+            CopilotProvider::resume_config("session", &request, interaction_broker(), Vec::new());
+
+        assert_eq!(create.additional_directories, None);
+        assert_eq!(resume.additional_directories, None);
     }
 
     fn discovered_agent(name: &str, path: &Path, user_invocable: bool) -> AgentInfo {
